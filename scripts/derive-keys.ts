@@ -47,19 +47,72 @@ const KEYS_DIR = path.join(REPO_ROOT, "tasks", "keys");
  *               NOT part of the answer — the question asks what the handlers
  *               reach, not who the handlers are.
  */
-type KeySpec =
-  | { id: string; kind: "callers"; file: string; symbol: string; notes: string }
-  | { id: string; kind: "refs"; file: string; symbol: string; notes: string }
-  | { id: string; kind: "subscribes"; event: string; notes: string }
-  | { id: string; kind: "literal"; text: string; notes: string }
-  | { id: string; kind: "importers"; file: string; notes: string }
-  | { id: string; kind: "hop"; event: string; prefix: string; notes: string };
+type CodeSpecBody =
+  | { kind: "callers"; file: string; symbol: string }
+  | { kind: "refs"; file: string; symbol: string }
+  | { kind: "subscribes"; event: string }
+  | { kind: "literal"; text: string }
+  | { kind: "importers"; file: string }
+  | { kind: "hop"; event: string; prefix: string };
+
+/**
+ * Doc-side derivations, added with the corpus-v2 documentation layer. They read
+ * `corpus/taskflow/docs/**` as text and apply the same two conventions the docs
+ * checker enforces, so a key can never disagree with `pnpm docs:check`:
+ *
+ * `docs-id-home` — the single file whose heading DEFINES each id (`^#+ REQ-061`).
+ *                  This is the "which document governs X" answer for a `locate`.
+ * `docs-id-refs` — every doc that mentions the id anywhere outside a defining
+ *                  heading, plus the definer. The rename-impact set of an id.
+ * `docs-cites-code` — every doc that names the code path inside backticks.
+ *                  `field` narrows it to one metadata line (`Implemented by`,
+ *                  `Verified by`, `Code`), which is the difference between "docs
+ *                  that mention this file" and "docs that claim to specify it".
+ * `docs-decided-in` — the ADR files named by the `Decided in:` lines of one
+ *                  design document: a two-hop traceability question.
+ * `docs-discrepancy` — the doc paths of named entries in
+ *                  `tasks/keys/docs-discrepancies.json`. The ground truth was
+ *                  written when the discrepancies were planted, so the key is a
+ *                  projection of that record, never a fresh reading of the docs.
+ * `union`        — set union of other specs, for `impact` keys that must span
+ *                  documents AND code.
+ */
+type DocSpecBody =
+  | { kind: "docs-id-home"; ids: string[] }
+  | { kind: "docs-id-refs"; ids: string[] }
+  | { kind: "docs-cites-code"; code: string; field?: string; dirs?: string[] }
+  | { kind: "docs-decided-in"; file: string }
+  | { kind: "docs-discrepancy"; ids: string[] }
+  | { kind: "union"; parts: SpecBody[] };
+
+type SpecBody = CodeSpecBody | DocSpecBody;
+type KeySpec = SpecBody & { id: string; notes: string };
 
 const EXCLUSION_RULE =
   "Derived mechanically by scripts/derive-keys.ts (ts-morph over corpus/taskflow/tsconfig.json); " +
   "re-running it must reproduce this file. Paths are repo-relative to the corpus root. " +
   "tests/** is excluded from every key: the tasks ask about application code, and a spec that " +
   "merely exercises a symbol is not a place the behaviour lives.";
+
+/** The same promise for the doc-side keys, which are text-derived rather than compiler-derived. */
+const DOC_EXCLUSION_RULE =
+  "Derived mechanically by scripts/derive-keys.ts from corpus/taskflow/docs/** using the same two " +
+  "conventions scripts/check-docs-corpus.ts enforces (a heading whose text starts with an id DEFINES " +
+  "it; a backticked src/tests/scripts path is a code citation); re-running it must reproduce this " +
+  "file. Paths are repo-relative to the corpus root. The aggregator documents traceability.md, " +
+  "glossary.md and every index.md are excluded from doc keys: they are generated from, or index, the " +
+  "whole corpus, so they cite nearly every id and path and would appear in every answer regardless " +
+  "of the question.";
+
+/** Doc-side kinds get DOC_EXCLUSION_RULE; a union spanning both gets the pair. */
+function exclusionRuleFor(spec: KeySpec): string {
+  const usesDocs = (body: SpecBody): boolean =>
+    body.kind === "union" ? body.parts.some(usesDocs) : body.kind.startsWith("docs-");
+  const usesCode = (body: SpecBody): boolean =>
+    body.kind === "union" ? body.parts.some(usesCode) : !body.kind.startsWith("docs-");
+  if (usesDocs(spec) && usesCode(spec)) return `${EXCLUSION_RULE} ${DOC_EXCLUSION_RULE}`;
+  return usesDocs(spec) ? DOC_EXCLUSION_RULE : EXCLUSION_RULE;
+}
 
 const SPECS: readonly KeySpec[] = [
   {
@@ -254,6 +307,189 @@ const SPECS: readonly KeySpec[] = [
       "and the UI/hooks that consume it. Files that call checkLimit() and immediately read one " +
       "property off the result without naming the type are out.",
   },
+
+  // -------------------------------------------------------------------------
+  // tasks-docs.json — the doc<->code set over the corpus-v2 documentation layer.
+  // These answer with DOCUMENT paths (and, for `impact`, documents and code
+  // together). See tasks/README.md and docs/plan/GRAPH-V2.md.
+  // -------------------------------------------------------------------------
+
+  // locate: which document GOVERNS a behaviour described in prose.
+  {
+    id: "DLOC1-issue-number-scope",
+    kind: "docs-id-home",
+    ids: ["REQ-061"],
+    notes:
+      "The single document that DEFINES the requirement governing issue-number allocation scope " +
+      "(REQ-061, numbers unique per project and never reused). Documents that merely restate or " +
+      "cite the rule — the DB dictionary, the issue design and the API catalogue — are out: the " +
+      "question asks which document governs the behaviour, and exactly one heading defines it.",
+  },
+  {
+    id: "DLOC2-webhook-retry-decision",
+    kind: "docs-id-home",
+    ids: ["ADR-018"],
+    notes:
+      "The architecture decision record that DEFINES the queue-and-backoff webhook delivery policy " +
+      "(ADR-018). The webhook requirements, the webhook service design and the delivery runbook all " +
+      "cite the decision but do not make it; only the ADR itself is the governing document.",
+  },
+  {
+    id: "DLOC3-subscriber-isolation",
+    kind: "docs-id-home",
+    ids: ["DES-052"],
+    notes:
+      "The design document that DEFINES how one event subscriber's failure is prevented from " +
+      "aborting the others (DES-052, Promise.allSettled handler isolation). ADR-005 decides that " +
+      "there IS an in-process bus; the mechanism that isolates handlers is specified only here.",
+  },
+  {
+    id: "DLOC4-webhook-delivery-history-screen",
+    kind: "docs-cites-code",
+    code: "src/app/(dashboard)/[orgSlug]/settings/webhooks/page.tsx",
+    dirs: ["docs/ui/"],
+    notes:
+      "The UI specification whose Files field names the webhook settings page — the screen where an " +
+      "administrator inspects past delivery attempts. Restricted to docs/ui/ because the question " +
+      "asks for the screen specification, not every document that mentions the page component.",
+  },
+
+  // reference: traceability between documents and code.
+  {
+    id: "DREF1-webhook-service-requirements",
+    kind: "docs-cites-code",
+    code: "src/server/services/webhook-service.ts",
+    field: "Implemented by",
+    notes:
+      "Every requirements document that claims webhook-service.ts as an implementation site, i.e. " +
+      "names it on an `Implemented by:` line. Documents that mention the module in prose, in a " +
+      "design `Code:` field, or in a runbook are NOT part of the answer — the question asks which " +
+      "requirements the module implements, and only the Implemented by field asserts that.",
+  },
+  {
+    id: "DREF2-digest-cadence-adrs",
+    kind: "docs-decided-in",
+    file: "docs/design/service-digest-and-email.md",
+    notes:
+      "Every architecture decision record named on a `Decided in:` line of the digest and email " +
+      "service design — the ADRs the digest cadence and delivery design trace back through. This " +
+      "is a two-hop question: the design document is the hop, the ADRs are the answer, and the " +
+      "design document itself is therefore not in the set.",
+  },
+  {
+    id: "DREF3-permission-matrix-verified-by",
+    kind: "docs-cites-code",
+    code: "tests/lib/permissions.matrix.test.ts",
+    field: "Verified by",
+    notes:
+      "Every requirements document with at least one requirement whose `Verified by:` field names " +
+      "the permission-matrix spec. Documents that cite the spec in the test plan or in prose are " +
+      "out; only a Verified by claim counts, which is what makes this mechanically checkable " +
+      "against the documents rather than a judgement about coverage.",
+  },
+  {
+    id: "DREF4-adr017-references",
+    kind: "docs-id-refs",
+    ids: ["ADR-017"],
+    notes:
+      "DELIBERATELY EASY control: every document that mentions ADR-017, a literal id lookup a grep " +
+      "answers exactly. Included so the doc set has a zero-advantage reference baseline to compare " +
+      "the semantic questions against. The defining ADR is included; the aggregator documents are " +
+      "not.",
+  },
+
+  // impact: documents AND code that a change forces.
+  {
+    id: "DIMP1-error-code-union",
+    kind: "union",
+    parts: [
+      { kind: "refs", file: "src/types/api.ts", symbol: "ErrorCode" },
+      { kind: "docs-cites-code", code: "src/types/api.ts" },
+      { kind: "docs-cites-code", code: "src/lib/errors.ts" },
+    ],
+    notes:
+      "Adding a member to the shared ErrorCode union. Code side: every file naming the union (the " +
+      "status map, the action wrapper, the error translator, the UI copy tables). Document side: " +
+      "every document citing the union's declaring module or the error-translation module, which " +
+      "is where the per-action error lists that would go stale are anchored.",
+  },
+  {
+    id: "DIMP2-job-cadence-table",
+    kind: "union",
+    parts: [
+      { kind: "importers", file: "src/server/jobs/scheduler.ts" },
+      { kind: "docs-cites-code", code: "src/server/jobs/scheduler.ts" },
+    ],
+    notes:
+      "Adding a job to the scheduler's cadence table. Code side: every module importing the " +
+      "scheduler (the declaring module is excluded by the importers rule even though the table " +
+      "lives there — see the notes on the code-side keys). Document side: every document citing " +
+      "scheduler.ts, i.e. the background-job design, the job requirements and the ops runbooks.",
+  },
+  {
+    id: "DIMP3-notification-kind-union",
+    kind: "union",
+    parts: [
+      { kind: "refs", file: "src/types/notification.ts", symbol: "NotificationKind" },
+      { kind: "docs-cites-code", code: "src/types/notification.ts" },
+    ],
+    notes:
+      "Adding a member to the NotificationKind union. Code side: every file naming the union — the " +
+      "service, the repository, the preference table and the inbox UI. Document side: every " +
+      "document citing the declaring module. A deliberately narrow document side: it tests whether " +
+      "a wide code impact is reported without inventing document hits to match it.",
+  },
+  {
+    id: "DIMP4-req157-renumber",
+    kind: "docs-id-refs",
+    ids: ["REQ-157"],
+    notes:
+      "DELIBERATELY EASY control: renumbering REQ-157 forces an edit in every document that " +
+      "mentions the id, which is a literal lookup a grep answers exactly. Included so the doc set " +
+      "has a zero-advantage impact baseline. Document-only by construction — an id is a documentation " +
+      "artifact and appears nowhere in the code.",
+  },
+
+  // discrepancy: documents the frozen code contradicts, within one domain.
+  {
+    id: "DDIS1-permissions-and-role-gates",
+    kind: "docs-discrepancy",
+    ids: ["D01", "D07", "D11"],
+    notes:
+      "The documents whose role-gate claims the ROLE_MATRIX contradicts: comment creation stated as " +
+      "open to viewers, project archiving stated as owner-only, and the flags settings screen stated " +
+      "as member-and-above. Projected from tasks/keys/docs-discrepancies.json, which was written " +
+      "when the discrepancies were planted, so the key never depends on re-reading the documents.",
+  },
+  {
+    id: "DDIS2-time-and-retry-constants",
+    kind: "docs-discrepancy",
+    ids: ["D02", "D08", "D09"],
+    notes:
+      "The documents whose time-and-retry constants the code contradicts: the digest job cadence, " +
+      "the webhook attempt ceiling's stated source of truth, and the session TTL. Projected from " +
+      "tasks/keys/docs-discrepancies.json. Note the corpus contains correct statements of two of " +
+      "these values elsewhere, so the domain is not uniformly wrong.",
+  },
+  {
+    id: "DDIS3-schema-indexes",
+    kind: "docs-discrepancy",
+    ids: ["D03", "D12"],
+    notes:
+      "The database dictionary pages whose index definitions the Drizzle schema contradicts: an " +
+      "index on search_index that does not exist, and the issue-number unique index described over " +
+      "the wrong columns. Projected from tasks/keys/docs-discrepancies.json.",
+  },
+  {
+    id: "DDIS4-quotas-flags-and-rate-limits",
+    kind: "docs-discrepancy",
+    ids: ["D04", "D05", "D06", "D10"],
+    notes:
+      "The documents whose quota, rollout and throttling numbers the configuration contradicts: an " +
+      "error code an action cannot return, the free-plan project quota, a percentage rollout, and a " +
+      "rate-limit refill rate. Projected from tasks/keys/docs-discrepancies.json. The largest of " +
+      "the four discrepancy domains, and the one whose documents sit furthest apart.",
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -314,7 +550,7 @@ function isCallee(node: Node): boolean {
   return false;
 }
 
-function deriveCallers(spec: Extract<KeySpec, { kind: "callers" }>): string[] {
+function deriveCallers(spec: Extract<CodeSpecBody, { kind: "callers" }>): string[] {
   const decl = declarationOrThrow(spec.file, spec.symbol);
   const files = new Set<string>();
   for (const node of referencingNodes(decl)) {
@@ -325,7 +561,7 @@ function deriveCallers(spec: Extract<KeySpec, { kind: "callers" }>): string[] {
   return [...files];
 }
 
-function deriveRefs(spec: Extract<KeySpec, { kind: "refs" }>): string[] {
+function deriveRefs(spec: Extract<CodeSpecBody, { kind: "refs" }>): string[] {
   const decl = declarationOrThrow(spec.file, spec.symbol);
   const files = new Set<string>();
   for (const node of referencingNodes(decl)) {
@@ -337,7 +573,7 @@ function deriveRefs(spec: Extract<KeySpec, { kind: "refs" }>): string[] {
 
 const SUBSCRIBE_FNS = new Set(["subscribe", "subscribeOnce"]);
 
-function deriveSubscribes(spec: Extract<KeySpec, { kind: "subscribes" }>): string[] {
+function deriveSubscribes(spec: Extract<CodeSpecBody, { kind: "subscribes" }>): string[] {
   const files = new Set<string>();
   for (const sf of project.getSourceFiles()) {
     const rel = corpusPath(sf);
@@ -359,7 +595,7 @@ function deriveSubscribes(spec: Extract<KeySpec, { kind: "subscribes" }>): strin
   return [...files];
 }
 
-function deriveLiteral(spec: Extract<KeySpec, { kind: "literal" }>): string[] {
+function deriveLiteral(spec: Extract<CodeSpecBody, { kind: "literal" }>): string[] {
   const files = new Set<string>();
   for (const sf of project.getSourceFiles()) {
     const rel = corpusPath(sf);
@@ -384,7 +620,7 @@ function directImports(sf: SourceFile): string[] {
   return out;
 }
 
-function deriveImporters(spec: Extract<KeySpec, { kind: "importers" }>): string[] {
+function deriveImporters(spec: Extract<CodeSpecBody, { kind: "importers" }>): string[] {
   const target = sourceFileOrThrow(spec.file).getFilePath();
   const files = new Set<string>();
   for (const sf of project.getSourceFiles()) {
@@ -397,8 +633,8 @@ function deriveImporters(spec: Extract<KeySpec, { kind: "importers" }>): string[
   return [...files];
 }
 
-function deriveHop(spec: Extract<KeySpec, { kind: "hop" }>): string[] {
-  const seeds = deriveSubscribes({ id: spec.id, kind: "subscribes", event: spec.event, notes: "" });
+function deriveHop(spec: Extract<CodeSpecBody, { kind: "hop" }>): string[] {
+  const seeds = deriveSubscribes({ kind: "subscribes", event: spec.event });
   if (seeds.length === 0) throw new Error(`derive-keys: no subscribers for ${spec.event}`);
   const files = new Set<string>();
   for (const seed of seeds) {
@@ -409,21 +645,203 @@ function deriveHop(spec: Extract<KeySpec, { kind: "hop" }>): string[] {
   return [...files];
 }
 
-function derive(spec: KeySpec): string[] {
+// ---------------------------------------------------------------------------
+// doc-side derivation (corpus-v2 documentation layer)
+// ---------------------------------------------------------------------------
+
+const DOCS_ROOT = path.join(CORPUS_ROOT, "docs");
+
+/** Same conventions as scripts/check-docs-corpus.ts — keep the two in step. */
+const ID_PATTERN = /\b(REQ|DES|ADR)-(\d{3})\b/g;
+const HEADING_DEF = /^#{1,6}\s+(REQ|DES|ADR)-(\d{3})\b/;
+const CODE_PATH = /`((?:src|tests|scripts)\/[^`\s*]+?\.(?:ts|tsx|js|mjs|json|sql|css|md))`/g;
+const FENCE = /^\s*```/;
+
+/**
+ * Aggregator documents excluded from every doc key.
+ *
+ * `traceability.md` is generated from the other documents' metadata and
+ * therefore cites nearly every id and path in the corpus; the per-directory
+ * `index.md` files and `glossary.md` are the same kind of artifact by hand.
+ * Including them would make every doc key contain the same three or four
+ * files regardless of the question — the doc-side analogue of the `tests/**`
+ * exclusion applied to the code keys.
+ */
+function isExcludedDoc(rel: string): boolean {
+  const base = path.posix.basename(rel);
+  return base === "index.md" || rel === "docs/traceability.md" || rel === "docs/glossary.md";
+}
+
+interface DocFile {
+  /** Corpus-relative POSIX path, e.g. `docs/requirements/issues.md`. */
+  rel: string;
+  lines: string[];
+}
+
+function listDocs(): DocFile[] {
+  const out: DocFile[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".md")) {
+        const rel = path.relative(CORPUS_ROOT, full).split(path.sep).join("/");
+        out.push({ rel, lines: fs.readFileSync(full, "utf8").split("\n") });
+      }
+    }
+  };
+  walk(DOCS_ROOT);
+  return out;
+}
+
+const DOCS = listDocs();
+
+/** Scan a document line by line, mirroring the checker's fenced-block handling. */
+function scanDoc(doc: DocFile, visit: (line: string, inFence: boolean, isDefHeading: boolean) => void): void {
+  let inFence = false;
+  for (const line of doc.lines) {
+    if (FENCE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    visit(line, inFence, !inFence && HEADING_DEF.test(line));
+  }
+}
+
+function deriveDocsIdHome(spec: Extract<DocSpecBody, { kind: "docs-id-home" }>): string[] {
+  const found = new Map<string, string>();
+  for (const doc of DOCS) {
+    scanDoc(doc, (line, inFence) => {
+      if (inFence) return;
+      const def = HEADING_DEF.exec(line);
+      if (!def) return;
+      const id = `${def[1]}-${def[2]}`;
+      if (!spec.ids.includes(id)) return;
+      const previous = found.get(id);
+      if (previous && previous !== doc.rel) {
+        throw new Error(`derive-keys: ${id} is defined in both ${previous} and ${doc.rel}`);
+      }
+      found.set(id, doc.rel);
+    });
+  }
+  for (const id of spec.ids) {
+    if (!found.has(id)) throw new Error(`derive-keys: no document defines ${id}`);
+  }
+  return [...new Set(found.values())];
+}
+
+function deriveDocsIdRefs(spec: Extract<DocSpecBody, { kind: "docs-id-refs" }>): string[] {
+  const files = new Set<string>();
+  for (const doc of DOCS) {
+    if (isExcludedDoc(doc.rel)) continue;
+    scanDoc(doc, (line, inFence) => {
+      if (inFence) return;
+      for (const m of line.matchAll(ID_PATTERN)) {
+        if (spec.ids.includes(`${m[1]}-${m[2]}`)) files.add(doc.rel);
+      }
+    });
+  }
+  if (files.size === 0) throw new Error(`derive-keys: no document references ${spec.ids.join(", ")}`);
+  return [...files];
+}
+
+function deriveDocsCitesCode(spec: Extract<DocSpecBody, { kind: "docs-cites-code" }>): string[] {
+  const files = new Set<string>();
+  const fieldPrefix = spec.field ? `- **${spec.field}:**` : null;
+  for (const doc of DOCS) {
+    if (isExcludedDoc(doc.rel)) continue;
+    if (spec.dirs && !spec.dirs.some((d) => doc.rel.startsWith(d))) continue;
+    // A metadata value may wrap onto continuation lines; once a matching field
+    // opens, keep reading until the next `- **Field:**` or a blank line.
+    let inField = fieldPrefix === null;
+    scanDoc(doc, (line) => {
+      if (fieldPrefix !== null) {
+        if (line.startsWith(fieldPrefix)) inField = true;
+        else if (/^- \*\*[^*]+:\*\*/.test(line) || line.trim() === "") inField = false;
+      }
+      if (!inField) return;
+      for (const m of line.matchAll(CODE_PATH)) {
+        if (m[1] === spec.code) files.add(doc.rel);
+      }
+    });
+  }
+  if (files.size === 0) {
+    throw new Error(`derive-keys: no document cites ${spec.code}${spec.field ? ` under "${spec.field}"` : ""}`);
+  }
+  return [...files];
+}
+
+function deriveDocsDecidedIn(spec: Extract<DocSpecBody, { kind: "docs-decided-in" }>): string[] {
+  const doc = DOCS.find((d) => d.rel === spec.file);
+  if (!doc) throw new Error(`derive-keys: no such document ${spec.file}`);
+  const ids = new Set<string>();
+  let inField = false;
+  scanDoc(doc, (line) => {
+    if (line.startsWith("- **Decided in:**")) inField = true;
+    else if (/^- \*\*[^*]+:\*\*/.test(line) || line.trim() === "") inField = false;
+    if (!inField) return;
+    for (const m of line.matchAll(ID_PATTERN)) {
+      if (m[1] === "ADR") ids.add(`${m[1]}-${m[2]}`);
+    }
+  });
+  if (ids.size === 0) throw new Error(`derive-keys: ${spec.file} has no "Decided in:" ADR references`);
+  return deriveDocsIdHome({ kind: "docs-id-home", ids: [...ids] });
+}
+
+interface Discrepancy {
+  id: string;
+  doc_path: string;
+}
+
+function deriveDocsDiscrepancy(spec: Extract<DocSpecBody, { kind: "docs-discrepancy" }>): string[] {
+  const file = path.join(KEYS_DIR, "docs-discrepancies.json");
+  const record = JSON.parse(fs.readFileSync(file, "utf8")) as { discrepancies: Discrepancy[] };
+  const byId = new Map(record.discrepancies.map((d) => [d.id, d]));
+  const files = new Set<string>();
+  for (const id of spec.ids) {
+    const entry = byId.get(id);
+    if (!entry) throw new Error(`derive-keys: docs-discrepancies.json has no entry ${id}`);
+    // The record stores repo-relative paths; keys are corpus-relative.
+    const prefix = "corpus/taskflow/";
+    if (!entry.doc_path.startsWith(prefix)) {
+      throw new Error(`derive-keys: ${id} doc_path is not under ${prefix}: ${entry.doc_path}`);
+    }
+    files.add(entry.doc_path.slice(prefix.length));
+  }
+  return [...files];
+}
+
+function deriveBody(spec: SpecBody): string[] {
   switch (spec.kind) {
     case "callers":
-      return deriveCallers(spec).sort();
+      return deriveCallers(spec);
     case "refs":
-      return deriveRefs(spec).sort();
+      return deriveRefs(spec);
     case "subscribes":
-      return deriveSubscribes(spec).sort();
+      return deriveSubscribes(spec);
     case "literal":
-      return deriveLiteral(spec).sort();
+      return deriveLiteral(spec);
     case "importers":
-      return deriveImporters(spec).sort();
+      return deriveImporters(spec);
     case "hop":
-      return deriveHop(spec).sort();
+      return deriveHop(spec);
+    case "docs-id-home":
+      return deriveDocsIdHome(spec);
+    case "docs-id-refs":
+      return deriveDocsIdRefs(spec);
+    case "docs-cites-code":
+      return deriveDocsCitesCode(spec);
+    case "docs-decided-in":
+      return deriveDocsDecidedIn(spec);
+    case "docs-discrepancy":
+      return deriveDocsDiscrepancy(spec);
+    case "union":
+      return [...new Set(spec.parts.flatMap(deriveBody))];
   }
+}
+
+function derive(spec: KeySpec): string[] {
+  return deriveBody(spec).sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +872,7 @@ function main(): void {
     const files = derive(spec);
     const keyPath = path.join(KEYS_DIR, `${spec.id}.json`);
     const existing = readExisting(keyPath);
-    const next: KeyFile = { files, notes: `${spec.notes} ${EXCLUSION_RULE}` };
+    const next: KeyFile = { files, notes: `${spec.notes} ${exclusionRuleFor(spec)}` };
     const serialized = `${JSON.stringify(next, null, 2)}\n`;
 
     const before = new Set(existing?.files ?? []);

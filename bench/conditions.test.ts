@@ -1,15 +1,19 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CONDITIONS,
   HAIKU_MODEL,
+  assertRegistryMatchesDisk,
   conditionNames,
   effectiveModel,
+  getCondition,
   overlayDirs,
   resolveCondition,
 } from "./conditions.js";
 import { buildArgs } from "./lib/claude-p.js";
+import { applyOverlay } from "./lib/copy.js";
 import { REPO_ROOT } from "./lib/env.js";
 
 const OVERLAYS = path.join(REPO_ROOT, "overlays");
@@ -126,5 +130,115 @@ describe("graphify-strict overlay", () => {
       .filter((e) => e.isFile())
       .map((e) => path.relative(path.join(OVERLAYS, "graphify-strict"), path.join(e.parentPath, e.name)));
     expect(files.sort()).toEqual([path.join(".claude", "settings.json"), "README.md"]);
+  });
+});
+
+describe("graphify-strict-v2 overlay", () => {
+  const settingsOf = (overlay: string): string =>
+    fs.readFileSync(path.join(OVERLAYS, overlay, ".claude", "settings.json"), "utf8");
+
+  it("layers on graphify-v2 rather than duplicating the 6.4 MB graph", () => {
+    expect(resolveCondition("graphify-strict-v2").overlays).toEqual(["graphify-v2", "graphify-strict-v2"]);
+  });
+
+  it("differs from the graphify-v2 overlay by exactly the --strict flag", () => {
+    expect(settingsOf("graphify-strict-v2")).toBe(
+      settingsOf("graphify-v2").replace("hook-guard read", "hook-guard read --strict"),
+    );
+  });
+
+  it("carries nothing but the settings delta", () => {
+    const root = path.join(OVERLAYS, "graphify-strict-v2");
+    const files = fs
+      .readdirSync(root, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile())
+      .map((e) => path.relative(root, path.join(e.parentPath, e.name)));
+    expect(files.sort()).toEqual([path.join(".claude", "settings.json"), "README.md"]);
+  });
+
+  it("ships no .overlay-base marker: layering is declared in the registry only", () => {
+    for (const spec of CONDITIONS) {
+      for (const dir of overlayDirs(spec, OVERLAYS)) {
+        expect(fs.existsSync(path.join(dir, ".overlay-base")), dir).toBe(false);
+      }
+    }
+  });
+});
+
+describe("v2 arms", () => {
+  it("registers graphify-v2 as a full overlay on the v2 corpus", () => {
+    const spec = getCondition("graphify-v2");
+    expect(spec.overlays).toEqual(["graphify-v2"]);
+    expect(spec.corpus).toBe("v2");
+    expect(spec.model).toBeUndefined();
+    expect(spec.extraClaudeArgs).toBeUndefined();
+  });
+
+  it("keeps the v1 arms on the v1 corpus and the v2 arms on v2", () => {
+    expect(getCondition("baseline").corpus).toBe("v1");
+    expect(getCondition("graphify").corpus).toBe("v1");
+    expect(getCondition("graphify-strict").corpus).toBe("v1");
+    expect(getCondition("graphify-strict-v2").corpus).toBe("v2");
+  });
+
+  it("declares a corpus generation for every registered arm", () => {
+    for (const spec of CONDITIONS) expect(spec.corpus, spec.name).toMatch(/^v[12]$/);
+  });
+});
+
+describe("registry vs disk", () => {
+  it("references every overlay directory on disk, and nothing that is not there", () => {
+    const onDisk = fs
+      .readdirSync(OVERLAYS, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+    const referenced = [...new Set(CONDITIONS.flatMap((c) => c.overlays))].sort();
+    expect(referenced).toEqual(onDisk);
+  });
+
+  it("passes the disk consistency assertion", () => {
+    expect(() => assertRegistryMatchesDisk(OVERLAYS)).not.toThrow();
+  });
+
+  it("fails loudly when a declared overlay directory is missing", () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "bench-overlays-"));
+    expect(() => assertRegistryMatchesDisk(empty)).toThrow(/missing overlay directory/);
+  });
+});
+
+describe("getCondition", () => {
+  it("names the unknown condition and the registered ones when asked for a typo", () => {
+    expect(() => getCondition("grahpify-v2")).toThrow(/grahpify-v2/);
+    expect(() => getCondition("grahpify-v2")).toThrow(/baseline/);
+  });
+
+  it("returns the same spec as resolveCondition for a registered arm", () => {
+    expect(getCondition("graphify-strict")).toEqual(resolveCondition("graphify-strict"));
+  });
+});
+
+describe("applyOverlay with a delta chain", () => {
+  it("lets the delta win on collision and inherits the rest from its base", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-overlay-"));
+    const dest = path.join(root, "work");
+    fs.mkdirSync(dest);
+
+    const overlays = path.join(root, "overlays");
+    const base = path.join(overlays, "base");
+    fs.mkdirSync(path.join(base, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(base, ".claude", "settings.json"), '{"mode":"nudge"}');
+    fs.writeFileSync(path.join(base, "big.json"), "inherited");
+
+    const delta = path.join(overlays, "delta");
+    fs.mkdirSync(path.join(delta, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(delta, ".claude", "settings.json"), '{"mode":"strict"}');
+
+    for (const dir of overlayDirs({ name: "delta", overlays: ["base", "delta"] }, overlays)) {
+      applyOverlay(dir, dest);
+    }
+
+    expect(fs.readFileSync(path.join(dest, ".claude", "settings.json"), "utf8")).toBe('{"mode":"strict"}');
+    expect(fs.readFileSync(path.join(dest, "big.json"), "utf8")).toBe("inherited");
   });
 });

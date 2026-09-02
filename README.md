@@ -63,6 +63,8 @@ An original, LLM-generated multi-tenant project/issue-management SaaS built for 
 
 45 tasks, 9 per category: [`tasks/tasks.json`](tasks/tasks.json) (15) and [`tasks/tasks-ext.json`](tasks/tasks-ext.json) (30). Keys for reference and impact tasks are derived mechanically with ts-morph (`pnpm keys:derive --check` reproduces all 18). Injected bugs each break exactly one existing test and pass `tsc`.
 
+A third set, [`tasks/tasks-docs.json`](tasks/tasks-docs.json) (20), asks doc↔code questions over the `corpus/taskflow/docs/` layer and swaps `fix` for a new `discrepancy` category — "within this domain, which documents state something the code does not do", against 12 planted contradictions. Its keys are derived mechanically too, from the documents' own `Implemented by` / `Verified by` / `Decided in` fields and id-definition headings. See [`tasks/README.md`](tasks/README.md) and [`docs/plan/GRAPH-V2.md`](docs/plan/GRAPH-V2.md).
+
 | Category | Grader | Example |
 |---|---|---|
 | locate | set F1 vs key files | "Where is a webhook refused because the plan's quota is used up?" |
@@ -93,9 +95,10 @@ Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`
 
 ```
 bench/       harness: run / matrix / collect / grade / analyze / report (TypeScript, vitest-tested)
-corpus/      the frozen Taskflow app (corpus-v1)
+corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
 overlays/    per-condition files copied onto a fresh corpus clone before each run
-tasks/       tasks.json, tasks-ext.json, keys/, rubrics, bugs/*.patch
+             (bench/conditions.ts layers several of them for the delta arms)
+tasks/       tasks.json, tasks-ext.json, tasks-docs.json, keys/, rubrics, bugs/*.patch
 results/     set 1 (results/), set 2 (results/ext/), pooled (results/combined/)
 docs/plan/   design, implementation plan, research notes (Japanese)
 ```
