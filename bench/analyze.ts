@@ -16,10 +16,15 @@ export interface RunRow {
   category: string | null;
   condition: string;
   rep: number;
+  /** PRIMARY information volume: all models, subagents included. */
+  uncached_equivalent_all: number | null;
+  /** SECONDARY: main session only (`usage.*`), understates runs with subagents. */
   uncached_equivalent: number | null;
   total_cost_usd: number | null;
   num_turns: number | null;
+  output_tokens_all: number | null;
   output_tokens: number | null;
+  subagents_spawned: number | null;
   duration_ms: number | null;
   first_turn_cache_creation: number | null;
   tool_calls: Record<string, number>;
@@ -89,7 +94,12 @@ export function bootstrapMeanCI(values: readonly number[], B = 2000, seed = "gra
 
 // --- aggregation -------------------------------------------------------------
 
-const METRIC_KEYS = ["uncached_equivalent", "total_cost_usd", "num_turns"] as const;
+/**
+ * Paired-analysis metrics. `uncached_equivalent_all` leads because it is the
+ * only information-volume figure commensurable with `total_cost_usd`;
+ * `uncached_equivalent` (main session only) follows as the secondary reading.
+ */
+const METRIC_KEYS = ["uncached_equivalent_all", "uncached_equivalent", "total_cost_usd", "num_turns"] as const;
 export type PairedMetric = (typeof METRIC_KEYS)[number];
 
 export interface ConditionSummary {
@@ -99,8 +109,13 @@ export interface ConditionSummary {
   accuracy: number | null;
   successes: number;
   graded: number;
-  /** Tokens-to-Success: total tokens of successful runs / number of successes. */
+  /** Tokens-to-Success (PRIMARY, all models): total uncached_equivalent_all of successful runs / successes. */
   t2s: number | null;
+  /** Tokens-to-Success on the main-session-only figure (secondary). */
+  t2s_main: number | null;
+  /** Runs that spawned at least one subagent, and the total spawned. */
+  subagent_runs: number;
+  subagents_spawned_total: number;
   metrics: Record<string, { median: number | null; q1: number | null; q3: number | null; mean: number | null; n: number }>;
   tool_calls: Record<string, number>;
   tool_result_bytes: Record<string, number>;
@@ -147,9 +162,10 @@ export function summarizeCondition(condition: string, rows: RunRow[]): Condition
   const own = rows.filter((r) => r.condition === condition);
   const graded = own.filter((r) => r.success !== null);
   const successes = graded.filter((r) => r.success === true);
-  const tokensOfSuccesses = successes.map((r) => r.uncached_equivalent).filter((v): v is number => v !== null);
+  const tokensOfSuccesses = successes.map((r) => r.uncached_equivalent_all).filter((v): v is number => v !== null);
+  const tokensOfSuccessesMain = successes.map((r) => r.uncached_equivalent).filter((v): v is number => v !== null);
   const metrics: ConditionSummary["metrics"] = {};
-  for (const key of [...METRIC_KEYS, "output_tokens", "duration_ms"] as const) {
+  for (const key of [...METRIC_KEYS, "output_tokens_all", "output_tokens", "duration_ms"] as const) {
     const xs = own.map((r) => r[key as keyof RunRow] as number | null).filter((v): v is number => typeof v === "number");
     metrics[key] = { median: median(xs), q1: quantile(xs, 0.25), q3: quantile(xs, 0.75), mean: mean(xs), n: xs.length };
   }
@@ -167,6 +183,9 @@ export function summarizeCondition(condition: string, rows: RunRow[]): Condition
     successes: successes.length,
     graded: graded.length,
     t2s: successes.length === 0 ? null : tokensOfSuccesses.reduce((a, b) => a + b, 0) / successes.length,
+    t2s_main: successes.length === 0 ? null : tokensOfSuccessesMain.reduce((a, b) => a + b, 0) / successes.length,
+    subagent_runs: own.filter((r) => (r.subagents_spawned ?? 0) > 0).length,
+    subagents_spawned_total: own.reduce((a, r) => a + (r.subagents_spawned ?? 0), 0),
     metrics,
     tool_calls: toolCalls,
     tool_result_bytes: toolBytes,
@@ -271,10 +290,13 @@ export function loadRows(ids: string[] = listRunIds()): RunRow[] {
       category: meta?.category ?? null,
       condition: m.condition ?? meta?.condition ?? id.split("__")[1] ?? "unknown",
       rep: m.rep ?? meta?.rep ?? 1,
+      uncached_equivalent_all: m.uncached_equivalent_all ?? null,
       uncached_equivalent: m.uncached_equivalent,
       total_cost_usd: m.total_cost_usd,
       num_turns: m.num_turns,
+      output_tokens_all: m.output_tokens_all ?? null,
       output_tokens: m.output_tokens,
+      subagents_spawned: m.subagents_spawned ?? null,
       duration_ms: m.duration_ms,
       first_turn_cache_creation: m.first_turn_cache_creation,
       tool_calls: m.tool_calls ?? {},

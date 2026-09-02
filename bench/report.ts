@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { analyze, loadRows, type Analysis, type ConditionSummary, type PairedResult, type RunRow } from "./analyze.js";
-import { RESULTS_DIR, runDir } from "./lib/env.js";
+import { REPO_ROOT, RESULTS_DIR, runDir } from "./lib/env.js";
 
 const CSV_COLUMNS = [
   "run_id",
@@ -9,11 +9,14 @@ const CSV_COLUMNS = [
   "category",
   "condition",
   "rep",
+  "uncached_equivalent_all",
   "uncached_equivalent",
   "input_tokens",
   "cache_creation_input_tokens",
   "cache_read_input_tokens",
+  "output_tokens_all",
   "output_tokens",
+  "subagents_spawned",
   "first_turn_cache_creation",
   "total_cost_usd",
   "num_turns",
@@ -68,11 +71,14 @@ export function buildCsv(rows: RunRow[]): string {
       category: r.category,
       condition: r.condition,
       rep: r.rep,
+      uncached_equivalent_all: r.uncached_equivalent_all,
       uncached_equivalent: r.uncached_equivalent,
       input_tokens: x.input_tokens ?? null,
       cache_creation_input_tokens: x.cache_creation_input_tokens ?? null,
       cache_read_input_tokens: x.cache_read_input_tokens ?? null,
+      output_tokens_all: r.output_tokens_all,
       output_tokens: r.output_tokens,
+      subagents_spawned: r.subagents_spawned,
       first_turn_cache_creation: r.first_turn_cache_creation,
       total_cost_usd: r.total_cost_usd,
       num_turns: r.num_turns,
@@ -112,15 +118,26 @@ function ciLine(p: PairedResult, digits: number): string {
 
 function conditionTable(summaries: ConditionSummary[]): string {
   const head =
-    "| condition | runs | uncached_equiv median (IQR) | cost USD median | turns median | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S |\n" +
-    "|---|---|---|---|---|---|---|---|---|---|---|---|";
+    "| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |\n" +
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
   const body = summaries.map((s) => {
-    const u = s.metrics.uncached_equivalent;
+    const ua = s.metrics.uncached_equivalent_all;
+    const um = s.metrics.uncached_equivalent;
     const c = s.metrics.total_cost_usd;
     const t = s.metrics.num_turns;
-    return `| ${s.condition} | ${s.runs} | ${fmt(u?.median)} (${fmt(u?.q1)}–${fmt(u?.q3)}) | ${fmt(c?.median, 3)} | ${fmt(t?.median, 1)} | ${s.tool_calls.Read ?? 0} | ${s.tool_calls.Grep ?? 0} | ${s.tool_calls.Glob ?? 0} | ${s.tool_calls.Bash ?? 0} | ${s.tool_calls["Bash(graphify)"] ?? 0} | ${pct(s.accuracy)} (${s.successes}/${s.graded}) | ${fmt(s.t2s)} |`;
+    return `| ${s.condition} | ${s.runs} | **${fmt(ua?.median)}** (${fmt(ua?.q1)}–${fmt(ua?.q3)}) | ${fmt(um?.median)} | ${fmt(c?.median, 3)} | ${fmt(t?.median, 1)} | ${s.subagents_spawned_total} in ${s.subagent_runs} run(s) | ${s.tool_calls.Read ?? 0} | ${s.tool_calls.Grep ?? 0} | ${s.tool_calls.Glob ?? 0} | ${s.tool_calls.Bash ?? 0} | ${s.tool_calls["Bash(graphify)"] ?? 0} | ${pct(s.accuracy)} (${s.successes}/${s.graded}) | ${fmt(s.t2s)} |`;
   });
   return [head, ...body].join("\n");
+}
+
+/** The frozen corpus's sha256 tree hash, read from its own record in docs/plan/CORPUS.md. */
+export function corpusTreeHash(): string {
+  try {
+    const md = fs.readFileSync(path.join(REPO_ROOT, "docs/plan/CORPUS.md"), "utf8");
+    return /`([0-9a-f]{64})`/.exec(md)?.[1] ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function versionsBlock(rows: RunRow[]): string {
@@ -153,14 +170,19 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push("## 1. Environment\n");
   out.push(versionsBlock(rows));
   out.push(`\n- Bootstrap: B=${a.bootstrap_B}, percentile 95% CI, seed \`${a.seed}\`, resampled over **tasks**.`);
-  out.push("- Corpus tree hash: see `docs/plan/CORPUS.md`.\n");
+  out.push(`- Corpus: \`corpus-v1\`, tree hash (sha256) \`${corpusTreeHash()}\` (source: \`docs/plan/CORPUS.md\`).`);
+  out.push(`- Report generated: ${a.generated_at.slice(0, 10)}.\n`);
 
   out.push("## 2. Overall\n");
   out.push(conditionTable(a.by_condition));
   out.push("");
   out.push(
-    "`uncached_equivalent` = input + cache_creation + cache_read. Tool columns are totals across all runs of the condition. " +
-      "T2S (tokens-to-success) = total `uncached_equivalent` of successful runs / number of successful runs.\n",
+    "**`uncached_all` (PRIMARY) = Σ over every entry of `modelUsage` of (inputTokens + cacheReadInputTokens + cacheCreationInputTokens)** — " +
+      "it covers the main session *and* any subagent, so it is commensurable with `total_cost_usd`. " +
+      "`uncached_main` (secondary) is the same sum taken from `usage.*`, which the result JSON populates for the **main session only**; " +
+      "a run that spawned a subagent therefore reports less information volume there than it actually consumed. " +
+      "The `subagents` column lets the two be reconciled. Tool columns are totals across all runs of the condition. " +
+      "T2S (tokens-to-success) = total `uncached_all` of successful runs / number of successful runs.\n",
   );
   out.push("Fixed overhead, reported separately so readers can subtract it (architecture.md §5):\n");
   out.push("| condition | first-turn cache_creation (median) |");
@@ -198,8 +220,14 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     out.push("");
   }
 
-  out.push("## 6. Counter-productive cases\n");
+  out.push("## 6. Counter-productive cases and subagent use\n");
   const cp = a.counter_productive;
+  for (const s of a.by_condition) {
+    out.push(
+      `- \`${s.condition}\`: **${s.subagents_spawned_total}** subagent(s) spawned across **${s.subagent_runs}**/${s.runs} run(s). ` +
+        `T2S all-model ${fmt(s.t2s)} vs main-session-only ${fmt(s.t2s_main)}.`,
+    );
+  }
   out.push(`- Runs that opened \`graphify-out/graph.json\` directly: **${cp.read_graph_json.length}**${cp.read_graph_json.length ? ` (${cp.read_graph_json.map((r) => `\`${r}\``).join(", ")})` : ""}`);
   out.push(`- graphify-condition runs that never invoked the \`graphify\` CLI (nudge ignored): **${cp.graphify_never_invoked.length}**${cp.graphify_never_invoked.length ? ` (${cp.graphify_never_invoked.map((r) => `\`${r}\``).join(", ")})` : ""}`);
   out.push("");
@@ -219,6 +247,8 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push("- Bootstrap resamples tasks, so the interval reflects task-to-task variation, not within-task run noise.");
   out.push("- Where a CI crosses zero the honest reading is \"no difference detected at this N\", not \"no difference exists\".");
   out.push("- The fixed ~21k-token system-prompt/tool-definition overhead is included in both arms and not subtracted (see §2).");
+  out.push("- **1 repetition per (task × condition)**: within-task run-to-run variance is unmeasured, so any single per-task difference may be run noise.");
+  out.push("- Subagent traffic is counted in `uncached_all`, but a subagent's tool calls never reach the parent transcript, so the tool-call columns stay main-session-only.");
   out.push("- Raw per-run data lives in `results/runs/<run-id>/` and `results/summary.csv`.\n");
   return out.join("\n");
 }

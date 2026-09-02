@@ -8,6 +8,10 @@ import type { ClaudeResult } from "./lib/claude-p.js";
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const result = JSON.parse(fs.readFileSync(path.join(FIXTURES, "sample-result.json"), "utf8")) as ClaudeResult;
 const transcript = fs.readFileSync(path.join(FIXTURES, "sample-transcript.jsonl"), "utf8");
+/** A run that spawned a subagent: two entries under modelUsage. */
+const subagentResult = JSON.parse(
+  fs.readFileSync(path.join(FIXTURES, "sample-result-subagent.json"), "utf8"),
+) as ClaudeResult;
 
 describe("classifyToolCall", () => {
   it("splits graphify out of Bash", () => {
@@ -83,9 +87,34 @@ describe("computeMetrics", () => {
     expect(m.modelUsage?.["claude-haiku-4-5"]?.costUSD).toBe(0.0172612);
   });
 
+  it("derives the all-model figures from modelUsage", () => {
+    // single model: the all-model sum matches the main-only sum exactly
+    expect(m.uncached_equivalent_all).toBe(10 + 7294 + 13782);
+    expect(m.output_tokens_all).toBe(66);
+  });
+
+  it("counts subagent traffic that usage.* omits", () => {
+    const s = computeMetrics("FIX1__baseline__r1", subagentResult, null, {
+      task_id: "FIX1",
+      condition: "baseline",
+      rep: 1,
+    });
+    // main session only — what usage.* reports
+    expect(s.uncached_equivalent).toBe(12 + 21000 + 111070);
+    expect(s.output_tokens).toBe(1500);
+    // both models — sonnet main session plus the haiku subagent
+    expect(s.uncached_equivalent_all).toBe(12 + 21000 + 111070 + (8 + 5000 + 40000));
+    expect(s.output_tokens_all).toBe(1500 + 900);
+    // the all-model figure must exceed the main-only one whenever a subagent ran
+    expect(s.uncached_equivalent_all!).toBeGreaterThan(s.uncached_equivalent!);
+    expect(s.subagents_spawned).toBe(1);
+  });
+
   it("nulls every usage field when the schema changes under us", () => {
     const m2 = computeMetrics("x", { num_turns: 3 } as ClaudeResult, null, null);
     expect(m2.uncached_equivalent).toBeNull();
+    expect(m2.uncached_equivalent_all).toBeNull();
+    expect(m2.output_tokens_all).toBeNull();
     expect(m2.input_tokens).toBeNull();
     expect(m2.total_cost_usd).toBeNull();
     expect(m2.num_turns).toBe(3);

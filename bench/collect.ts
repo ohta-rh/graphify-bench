@@ -15,9 +15,25 @@ export interface Metrics {
   cache_creation_input_tokens: number | null;
   cache_read_input_tokens: number | null;
   output_tokens: number | null;
-  /** input + cache_creation + cache_read. Primary information-volume metric. */
+  /**
+   * input + cache_creation + cache_read from `usage.*`. **Main session only** —
+   * the pilot showed `usage.*` excludes subagent traffic while `total_cost_usd`
+   * includes it, so this understates any run that spawned a subagent. Kept as
+   * the SECONDARY figure; use `uncached_equivalent_all` for headline numbers.
+   */
   uncached_equivalent: number | null;
   thinking_tokens: number | null;
+
+  // result JSON: modelUsage (all models = main session + subagents)
+  /**
+   * Σ over `modelUsage[*]` of (inputTokens + cacheReadInputTokens +
+   * cacheCreationInputTokens). **PRIMARY information-volume metric**: unlike
+   * `uncached_equivalent` this covers subagent traffic too, so it is
+   * commensurable with `total_cost_usd`.
+   */
+  uncached_equivalent_all: number | null;
+  /** Σ over `modelUsage[*]` of `outputTokens` — all models, subagents included. */
+  output_tokens_all: number | null;
 
   // result JSON: cost / shape
   total_cost_usd: number | null;
@@ -166,6 +182,30 @@ export function computeMetrics(
       ? null
       : (input ?? 0) + (cacheCreate ?? 0) + (cacheRead ?? 0);
 
+  const models = result?.modelUsage ? Object.values(result.modelUsage) : null;
+  const sumModels = (f: (u: ClaudeModelUsage) => number | null): number | null => {
+    if (!models || models.length === 0) return null;
+    let total = 0;
+    let sawAny = false;
+    for (const u of models) {
+      const v = f(u);
+      if (v !== null) {
+        total += v;
+        sawAny = true;
+      }
+    }
+    return sawAny ? total : null;
+  };
+  const uncachedAll = sumModels(
+    (u) => {
+      const i = num(u.inputTokens);
+      const r = num(u.cacheReadInputTokens);
+      const c = num(u.cacheCreationInputTokens);
+      return i === null && r === null && c === null ? null : (i ?? 0) + (r ?? 0) + (c ?? 0);
+    },
+  );
+  const outputAll = sumModels((u) => num(u.outputTokens));
+
   const t = transcript
     ? parseTranscript(transcript)
     : {
@@ -191,6 +231,9 @@ export function computeMetrics(
     output_tokens: num(usage.output_tokens),
     uncached_equivalent: uncached,
     thinking_tokens: num(usage.output_tokens_details?.thinking_tokens),
+
+    uncached_equivalent_all: uncachedAll,
+    output_tokens_all: outputAll,
 
     total_cost_usd: num(result?.total_cost_usd),
     num_turns: num(result?.num_turns),
@@ -256,7 +299,7 @@ async function main(): Promise<void> {
   for (const id of ids) {
     const m = collectRun(id);
     console.log(
-      `${id}  uncached=${m.uncached_equivalent ?? "-"}  cost=${m.total_cost_usd ?? "-"}  turns=${m.num_turns ?? "-"}  tools=${JSON.stringify(m.tool_calls)}${m.collect_error ? `  ERROR: ${m.collect_error}` : ""}`,
+      `${id}  uncached_all=${m.uncached_equivalent_all ?? "-"}  uncached_main=${m.uncached_equivalent ?? "-"}  subagents=${m.subagents_spawned ?? "-"}  cost=${m.total_cost_usd ?? "-"}  turns=${m.num_turns ?? "-"}  tools=${JSON.stringify(m.tool_calls)}${m.collect_error ? `  ERROR: ${m.collect_error}` : ""}`,
     );
   }
 }

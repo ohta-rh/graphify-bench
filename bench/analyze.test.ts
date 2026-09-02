@@ -5,14 +5,17 @@ import { shuffle } from "./lib/rng.js";
 import type { Task } from "../tasks/tasks.schema.js";
 
 function row(over: Partial<RunRow> & Pick<RunRow, "task_id" | "condition">): RunRow {
-  return {
+  const merged: RunRow = {
     run_id: `${over.task_id}__${over.condition}__r${over.rep ?? 1}`,
     category: "locate",
     rep: 1,
+    uncached_equivalent_all: null,
     uncached_equivalent: 1000,
     total_cost_usd: 1,
     num_turns: 10,
+    output_tokens_all: null,
     output_tokens: 100,
+    subagents_spawned: 0,
     duration_ms: 1000,
     first_turn_cache_creation: 7000,
     tool_calls: {},
@@ -25,6 +28,11 @@ function row(over: Partial<RunRow> & Pick<RunRow, "task_id" | "condition">): Run
     success: true,
     ...over,
   };
+  // Default the all-model figures to the main-session ones: a run with no
+  // subagent has identical values, which is the common case in these fixtures.
+  if (over.uncached_equivalent_all === undefined) merged.uncached_equivalent_all = merged.uncached_equivalent;
+  if (over.output_tokens_all === undefined) merged.output_tokens_all = merged.output_tokens;
+  return merged;
 }
 
 /** Synthetic: graphify uses 20% fewer tokens on every task. */
@@ -109,6 +117,28 @@ describe("analyze", () => {
     expect(baseline.t2s).toBeCloseTo((11000 + 12000 + 13000 + 14000 + 15000 + 16000) / 6, 6);
     expect(baseline.metrics.uncached_equivalent!.median).toBe(13500);
     expect(baseline.metrics.uncached_equivalent!.q1).toBe(12250);
+  });
+
+  it("makes uncached_equivalent_all the primary paired metric and keeps main-only as secondary", () => {
+    expect(a.paired[0]!.metric).toBe("uncached_equivalent_all");
+    expect(a.paired.map((p) => p.metric)).toContain("uncached_equivalent");
+  });
+
+  it("separates all-model from main-only when a subagent ran", () => {
+    const rows = syntheticRows();
+    // one baseline run spawned a subagent: its all-model volume exceeds main-only
+    const target = rows.find((r) => r.task_id === "T1" && r.condition === "baseline")!;
+    target.subagents_spawned = 1;
+    target.uncached_equivalent_all = target.uncached_equivalent! * 3;
+    const b = analyze(rows, "fixed-seed", 2000);
+    const base = b.by_condition.find((c) => c.condition === "baseline")!;
+    expect(base.subagent_runs).toBe(1);
+    expect(base.subagents_spawned_total).toBe(1);
+    expect(base.t2s!).toBeGreaterThan(base.t2s_main!);
+    const allDiff = b.paired.find((p) => p.metric === "uncached_equivalent_all")!;
+    const mainDiff = b.paired.find((p) => p.metric === "uncached_equivalent")!;
+    // graphify looks relatively cheaper once the baseline's subagent is counted
+    expect(allDiff.ci.point!).toBeLessThan(mainDiff.ci.point!);
   });
 
   it("puts every fully-successful task in the iso-accuracy subset", () => {
