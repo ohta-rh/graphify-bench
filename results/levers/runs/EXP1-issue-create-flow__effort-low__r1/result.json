@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 81458,
+  "stop_reason": "end_turn",
+  "session_id": "cdced2c3-58f1-4f19-9ead-3acd74a4321e",
+  "total_cost_usd": 0.2478561,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 4058,
+    "cache_read_input_tokens": 30190,
+    "output_tokens": 1444,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 4058,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1444,
+        "cache_read_input_tokens": 30190,
+        "cache_creation_input_tokens": 4058,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 4058
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1013,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001073,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 26,
+      "outputTokens": 7379,
+      "cacheReadInputTokens": 259213,
+      "cacheCreationInputTokens": 39146,
+      "webSearchRequests": 0,
+      "costUSD": 0.2467831,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 99,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## New Issue submission: end-to-end flow\n\n**1. Page (server component) — `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx`**\nResolves `org`/`actor`/`project` via `loadProjectContext`, runs redundant UX-only pre-checks (`can(actor, \"issue:create\", ...)` and a plan-quota check via `getPlanLimits` + `listIssues`), then renders `<IssueForm onSubmit={createIssueAction} />`, wiring the Server Action directly into the client component.\n\n**2. Client form — `src/components/domain/issue/issue-form.tsx` (`IssueForm`)**\n`\"use client\"`, validates locally with `zodResolver(createIssueSchema)` from `src/schemas/issue.ts`. Submission goes through `useFormAction` (`src/hooks/use-form-action.ts`), whose `submit()` invokes the Server Action and tracks pending/error state.\n\n**3. Server Action — `src/actions/issues/create-issue.ts`**\n`createIssueAction` is built by `withAction(createIssueSchema, handler, { revalidate: [\"issues\"], cacheProfile: \"minutes\" })` from `src/actions/_lib/with-action.ts`. `withAction` runs first, as the shared gate pipeline:\n- `schema.safeParse(raw)` — server-side re-validation (never trusts the client).\n- `resolveActorFor(...)` → `getActor`/`requireActorFor` (`src/lib/actor.ts`) → `getSessionPrincipal()` (`src/lib/session.ts`) — auth/session gate; throws `UnauthorizedActionError` if absent.\n- Calls the handler, then `revalidateTagged([\"issues\"], \"minutes\")` on success, and normalizes any thrown error via `toActionResult`/`toAppError` (`src/lib/errors.ts`).\n\nInside the handler:\n- `can(actor, \"issue:create\", ...)` (`src/lib/permissions.ts`) — authorization gate, throws `ForbiddenActionError`.\n- `assertProjectHasRoom(actor, input)` — plan-quota gate using `getPlanLimits` (`src/config/plan-limits.ts`) vs. `listIssues(...)`.\n- `createIssue(actor, input)` — hands off to the service layer.\n- On success: an action-specific `revalidateTagged([orgTag, projectTag, issueTag(issue.id)], \"minutes\")`.\n\n**4. Service layer — `src/server/services/issue-service.ts` (`createIssue`)**\nRuns a second, more thorough set of gates: `assertOrgScope` (tenant isolation, `src/lib/tenant.ts`) → `findProjectById`/`requireFound` (404) → `assertNotArchived` (`src/lib/soft-delete.ts`) → `assertCan` (defense-in-depth permission recheck against the loaded project resource) → quota recheck via `wouldExceedLimit`. Then `issueRepo.nextIssueNumber(...)` allocates the human-facing issue number.\n\n**5. Database write — `src/server/repositories/issue-repository.ts` (`insertIssue`)**\nDrizzle insert into the `issues` table, generating `id: newId()` and a timestamp.\n\n**6. Post-write — event fan-out**\n`issue-service.ts` calls `emit(\"issue.created\", ...)` (`src/lib/event-bus.ts`). Listeners registered centrally in `src/server/services/event-registry.ts` (wired at boot via `src/instrumentation.ts`) fan this out to: `activity-service.ts` (audit log entry), `usage-service.ts` (increments org usage counters), `search-service.ts` (search index update), and `webhook-service.ts` (enqueues outbound webhook delivery).\n\n**7. Response back to the client**\nBack in the action layer, the two `revalidateTagged` calls invalidate Next's cache tags, the result is wrapped via `stamp()` into an `ActionResult<Issue>`, and returned up through `useFormAction` to `IssueForm`, whose `onSuccess` calls `form.reset()`. No server-side redirect occurs — the page stays put with a cleared form.",
+  "ttft_ms": 12785,
+  "type": "result",
+  "duration_ms": 12818,
+  "uuid": "8d6ee8d8-3361-49ee-b523-cc4da9751506",
+  "ttft_stream_ms": 976,
+  "time_to_request_ms": 4,
+  "queued_turn_count": 0
+}

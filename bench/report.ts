@@ -546,7 +546,11 @@ export function modelMixBlock(a: Analysis): string[] {
         "reconcile with the headline volume rather than describing some adjacent quantity. Note that a " +
         "~1k-token Haiku entry appears in **every** arm, including plain `baseline`: that is Claude Code's own " +
         "background helper call, not delegated exploration. Only an arm whose Haiku row is orders of magnitude " +
-        "larger than that has actually moved work onto Haiku.\n",
+        "larger than that has actually moved work onto Haiku.\n\n" +
+        "That helper's size is a deterministic function of the task prompt, so every Sonnet arm running the same " +
+        "task set reports the **identical** Haiku total. Rows agreeing to the token are therefore the expected " +
+        "result here, not a copy-paste fault — and they are what makes the figure usable as a baseline to read " +
+        "a genuinely delegating arm against.\n",
     );
     out.push(`| condition | ${models.map((m) => `\`${m}\` tokens`).join(" | ")} | ${models.map((m) => `\`${m}\` cost`).join(" | ")} |`);
     out.push(`|---|${models.map(() => "---").join("|")}|${models.map(() => "---").join("|")}|`);

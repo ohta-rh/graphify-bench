@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 216422,
+  "stop_reason": "end_turn",
+  "session_id": "16c28e11-0f7d-41ed-8234-b10bcdede0f6",
+  "total_cost_usd": 0.4412735499999999,
+  "usage": {
+    "input_tokens": 10,
+    "cache_creation_input_tokens": 18949,
+    "cache_read_input_tokens": 196713,
+    "output_tokens": 3925,
+    "output_tokens_details": {
+      "thinking_tokens": 571
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 18949,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2333,
+        "cache_read_input_tokens": 48865,
+        "cache_creation_input_tokens": 723,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 723
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1296,
+      "outputTokens": 12189,
+      "cacheReadInputTokens": 924548,
+      "cacheCreationInputTokens": 47215,
+      "webSearchRequests": 0,
+      "costUSD": 0.21371454999999995,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 6126,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 16,
+      "outputTokens": 4923,
+      "cacheReadInputTokens": 274905,
+      "cacheCreationInputTokens": 30829,
+      "webSearchRequests": 0,
+      "costUSD": 0.227559,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 662,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 8,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the full path from browser click to (simulated) webhook call, in the order things actually execute.\n\n**1. Something puts delivery in motion.** The browser submits the \"create issue\" form, which invokes the server action `createIssueAction` in `src/actions/issues/create-issue.ts`. After permission and plan-quota checks, it calls `createIssue(actor, input)` in `src/server/services/issue-service.ts`. That function does its own gating (org scope, `issue:create` permission, project-archived check, per-project issue quota), inserts the row via `issueRepo.insertIssue`, and then — this is the trigger — calls `emit(\"issue.created\", {...})` from `src/lib/event-bus.ts`, passing the actor envelope plus `issueId`, `projectId`, `title`, `assigneeId`, `priority`. `emit` is Taskflow's in-process, typed pub/sub bus: it synchronously invokes every handler registered for `\"issue.created\"`, isolating failures so one throwing handler can't break the mutation or its siblings.\n\nHandlers only exist because they were registered up front. At process boot, Next's `instrumentation.ts` hook calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which in turn calls `registerWebhookListeners()` in `src/server/services/webhook-service.ts` (alongside the activity, search, usage, and notification registrations). So by the time a user creates an issue, a webhook subscriber for `\"issue.created\"` is already sitting on the bus.\n\n**2. Working out which endpoints care.** The webhook listener registered in `registerWebhookListeners` (`webhook-service.ts`) reacts to `\"issue.created\"` by calling its internal `enqueueForOrg(payload.orgId, \"issue.created\", JSON.stringify(payload))`. `enqueueForOrg` calls `webhookRepo.listEndpoints(orgId)` (`src/server/repositories/webhook-repository.ts`), which reads every row from the `webhookEndpoints` table for that org (schema in `src/server/db/schema/webhooks.ts`). It then filters: skip endpoints where `enabled` is false, and skip endpoints whose `eventTypes` JSON array (parsed) doesn't include `\"issue.created\"`. For every endpoint that survives both checks, it calls `webhookRepo.enqueueDelivery(orgId, endpoint.id, eventType, payload)`, which inserts a row into `webhookDeliveries` with `status: \"pending\"` and `attempts: 0`. So \"which endpoints get told\" is decided per-org, per-event-type, purely from that endpoint's subscribed `eventTypes` list, at enqueue time — not at send time.\n\n**3. What actually performs the send.** This is the one place the implementation deliberately stops short: there is no outbound HTTP call. Delivery is drained by `runWebhookDeliveryJob` in `src/server/jobs/webhook-delivery-job.ts`, invoked via `POST /api/cron/webhook-delivery` (`src/app/api/cron/webhook-delivery/route.ts`, guarded by `assertCronSecret`) and also wired into the in-process scheduler. The job calls `webhookRepo.claimPendingDeliveries(CLAIM_BATCH)` (batch of 25), which atomically bumps `attempts` on each claimed row so a crashed worker can't reclaim the same row forever. For each claimed delivery it re-checks the org's plan/feature-flag entitlement, finds the matching endpoint, and then computes `signPayload(endpoint.secret, delivery.payload)` — an HMAC-SHA256 over the raw JSON string, hex-encoded (`webhook-service.ts`). Instead of firing a `fetch`, it logs the would-be delivery (endpoint URL, event type, truncated signature, computed backoff) via `createLogger(\"webhook-delivery-job\")` and marks the row delivered with `webhookRepo.markDelivered`. The code comment is explicit about this: \"There is no outbound HTTP in Taskflow — the corpus builds and runs offline — so 'delivery' means computing the signature the receiver would verify and logging the attempt.\"\n\n**4. What happens on failure / retry.** Failure paths all funnel into `webhookRepo.markDeliveryFailed`, which sets `status: \"failed\"` and stores a truncated error string. The job marks a delivery failed for good in three cases: the org's plan/flag no longer allows webhooks; `delivery.attempts > MAX_ATTEMPTS` (6, defined in `webhook-delivery-job.ts`); or the endpoint has been deleted/disabled since enqueue. Retry pacing is exponential backoff computed by `backoffMs(attempts)` — `min(300_000, 2^(attempts-1) * 1000)` ms, i.e. immediate, then 1s, 2s, 4s, 8s, 16s, 32s, capped at 5 minutes — though since there's no real network call, this value is only logged, not slept on. There's no separate dead-letter table; a permanently failed delivery just stays as a `webhookDeliveries` row with `status: \"failed\"` and a `lastError`.\n\n**5. Proving the message came from Taskflow.** Each endpoint gets a 32-byte random secret at creation time (`randomToken(SECRET_BYTES)` in `createWebhook`, `webhook-service.ts`), stored once and never rotated — rotating means deleting and recreating the endpoint. The signature the receiver must recompute is `HMAC-SHA256(secret, rawPayloadString)`, hex-encoded, produced by `signPayload` in `webhook-service.ts`; the doc comment on that function states it's \"the only thing proving the delivery came from Taskflow,\" so the receiver has to hash the exact byte-for-byte body it received, using the shared secret, and compare it to the value Taskflow sent. There's a self-serve way to sanity-check this: `POST /api/webhooks/[endpointId]/test` (`src/app/api/webhooks/[endpointId]/test/route.ts`) builds a `webhook.test` payload and returns both the payload and its computed signature in the JSON response, so a customer can verify their own verification code against a known-good pair. One gap worth flagging: because no real HTTP send exists, the codebase never defines the actual transport detail a customer would need — there's no header name (e.g. an `X-Taskflow-Signature`-style header) specified anywhere; the signature is only ever logged or returned in a JSON test response, not attached to a real outbound request.",
+  "ttft_ms": 3216,
+  "type": "result",
+  "duration_ms": 44854,
+  "uuid": "7a9bc604-3f01-48c7-af13-87eea8cd3400",
+  "ttft_stream_ms": 1574,
+  "time_to_request_ms": 3,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 79911,
+  "stop_reason": "end_turn",
+  "session_id": "bf537bb7-7b3f-4a63-bbbc-b4b2927766cb",
+  "total_cost_usd": 0.30995,
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 3468,
+    "cache_read_input_tokens": 63146,
+    "output_tokens": 2010,
+    "output_tokens_details": {
+      "thinking_tokens": 123
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 3468,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1538,
+        "cache_read_input_tokens": 32852,
+        "cache_creation_input_tokens": 910,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 910
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 18,
+      "outputTokens": 7772,
+      "cacheReadInputTokens": 215175,
+      "cacheCreationInputTokens": 66227,
+      "webSearchRequests": 0,
+      "costUSD": 0.308863,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 462,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "general-purpose": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 3,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Confirmed — the trace checks out against the source. Here's the full picture.\n\n## Editing the title, end to end\n\nWhen an issue title is edited, the write goes through either the server action `updateIssueAction` in `src/actions/issues/update-issue.ts` or the JSON route `PATCH` handler in `src/app/api/issues/[issueId]/route.ts` — both re-implement the same authorization check independently rather than sharing a gate. Each calls `updateIssue(actor, input)` in `src/server/services/issue-service.ts`, which runs `assertOrgScope`, loads the current row, calls `assertCan(actor, \"issue:update\", issueResource(before))`, checks `assertNotArchived`, then persists via `issueRepo.updateIssue(...)` (`src/server/repositories/issue-repository.ts`). Once the write commits, it calls `emit(\"issue.updated\", { ...actorEnvelope(actor), issueId, projectId, changedFields })` through the in-process event bus (`src/lib/event-bus.ts`).\n\n## Keeping the searchable copy in sync\n\nThe index update is **not** transactional with the write — it's asynchronous, decoupled via that event bus. `emit()` fans the event out to every subscriber and awaits them with `Promise.allSettled`, so a failing indexer never rolls back or even surfaces an error to the original request; it's isolated and logged instead. `registerSearchListeners()` in `src/server/services/search-service.ts` subscribes to `issue.updated` (line 143) and, notably, doesn't trust the event payload's title/body — it re-reads the current row from the database and calls `indexIssue(orgId, issue)` (line 88). That function upserts into a denormalized `search_index` table via `searchRepo.upsertSearchDocument(orgId, \"issue\", issue.id, [title, description].join(\"\\n\"), projectId)`, keyed on `(orgId, subjectKind, subjectId)` so repeated edits just overwrite the same row. A separate bulk path, `runSearchReindexJob` in `src/server/jobs/search-reindex-job.ts`, calls the same `indexIssue` for full-org rebuilds after imports or drift.\n\nThe stored document (`search_index` table, schema in `src/server/db/schema/webhooks.ts`) has just: `id`, `orgId`, `subjectKind`, `subjectId`, `projectId`, `content` (title + description concatenated), `indexedAt`. No permission/ACL data is denormalized into it — access control is entirely a query-time concern.\n\n## Running the search\n\nA colleague's search hits `searchAction` (`src/actions/search/search.ts`) or the palette's `GET` in `src/app/api/search/route.ts`, both calling `search(actor, input)` in `src/server/services/search-service.ts` (line 46). That function runs, in order: `assertOrgScope(actor, input.orgId)`, `assertCan(actor, \"issue:read\", orgResource(input.orgId))`, `consumeRateLimit(input.orgId, SEARCH_QUERY_BUCKET)`, an `isEnabled(\"advanced_search\", ...)` feature-flag check, then delegates to `searchRepo.searchDocuments(input)`, which runs a `LIKE %q%` match over `content`, filtered by org and optional `kinds`/`projectId`, with keyset pagination.\n\n## When a valid-looking query gets refused\n\nFour independent gates can reject an otherwise well-formed query:\n- **Tenant mismatch** — `assertOrgScope` throws if the actor's org doesn't match the requested org.\n- **Insufficient role** — `assertCan(actor, \"issue:read\", ...)` in `src/lib/permissions.ts` denies if the actor's role rank is below `viewer` for that org.\n- **Rate limiting** — `consumeRateLimit` (`src/lib/rate-limit.ts`) enforces a token bucket (120 capacity, 60/min refill, scaled by the org's plan) and throws once exhausted, independent of query validity.\n- **Plan/feature gating** — `isEnabled(\"advanced_search\", ...)` (`src/lib/feature-flags.ts`): if the query text contains `:` (field-scoped syntax like `status:done`) but the org's plan lacks `advanced_search`, `search()` throws rather than silently degrading; outside of field-scoped syntax, if the flag is off the requested `kinds` are just narrowed to `[\"issue\"]` instead of being rejected. The JSON route additionally checks a `command_palette` flag and returns `forbidden` if it's off.",
+  "ttft_ms": 2453,
+  "type": "result",
+  "duration_ms": 20980,
+  "uuid": "a2689e70-2e20-427e-8da5-e0cf8d4db5ac",
+  "ttft_stream_ms": 822,
+  "time_to_request_ms": 7,
+  "queued_turn_count": 0
+}

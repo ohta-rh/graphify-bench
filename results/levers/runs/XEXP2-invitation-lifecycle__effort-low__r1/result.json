@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 133618,
+  "stop_reason": "end_turn",
+  "session_id": "fb000d68-b5b1-4c5b-9499-5cc3299070cf",
+  "total_cost_usd": 0.3783927,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 5354,
+    "cache_read_input_tokens": 30420,
+    "output_tokens": 1711,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 5354,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1711,
+        "cache_read_input_tokens": 30420,
+        "cache_creation_input_tokens": 5354,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5354
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 36,
+      "outputTokens": 11897,
+      "cacheReadInputTokens": 501656,
+      "cacheCreationInputTokens": 52962,
+      "webSearchRequests": 0,
+      "costUSD": 0.3773007,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 769,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## The invitation lifecycle\n\n**1. Before creation, on the members settings page.** `src/app/(dashboard)/[orgSlug]/settings/members/page.tsx` loads the tenant context and checks `can(actor, \"member:invite\", …)` before it even renders the invite form. The client component `src/components/domain/member/invite-member-form.tsx` (`InviteMemberForm`) redundantly re-checks `can(...)` for UX (not real enforcement), validates the typed email/role against `inviteMemberSchema` (`src/schemas/member.ts`), and disables submission if the org is out of seats (`seatCheck.exceeded`). Submitting calls the server action `inviteMemberAction` in `src/actions/members/invite-member.ts`, wrapped by `withAction(inviteMemberSchema, handler, ...)`, which re-parses the input with Zod, re-checks the `member:invite` permission (now with a real `PENDING_MEMBER_ID` resource), enforces `consumeRateLimit(orgId, \"member:invite\")`, and re-derives seat usage via `getOrganizationSummary`/`getPlanLimits` to reject if the invite would exceed the plan's seat limit. It then delegates to the service layer, `inviteMembers` in `src/server/services/invitation-service.ts`, which repeats org-scope assertion, permission check, rate limiting, and a seat check that counts *both* active members (`memberRepo.countActiveMembers`) and pending invitations (`invitationRepo.countPendingInvitations`) — so pending invites consume seats too. There is no explicit \"already invited\" dedup beyond a non-unique `(orgId, email)` index.\n\n**2. What's stored vs. what travels in the link.** For each invite, `inviteMembers` generates a raw 32-byte token with `randomToken(32)` (`src/lib/hash.ts`, `crypto.randomBytes(...).toString(\"base64url\")`), but only `hashToken(token)` — a SHA-256 hex digest — is persisted via `invitationRepo.insertInvitation`. The `invitations` table (`src/server/db/schema/members.ts`) stores `orgId`, `email`, `role`, `invitedBy`, `tokenHash`, `expiresAt` (14 days out), `acceptedAt`, and `revokedAt`, with a unique index on `tokenHash`. The raw token itself is never written to the database — it exists only in the invite link (`/invite/[token]`), so a DB leak alone can't be used to accept invitations. (Note: in this codebase snapshot, no call site actually renders `InviteEmail`/sends the mail — `inviteMembers` only calls `emit(\"member.invited\", ...)`, which the activity service turns into an audit-log entry; email delivery of the link appears unwired.)\n\n**3. When the link is used.** `src/app/(auth)/invite/[token]/page.tsx` only checks the token's *shape* against `invitationTokenSchema` (`src/schemas/invitation.ts`, `/^[A-Za-z0-9_-]+$/`, length 32–128) — deliberately no DB lookup at this stage. It requires a signed-in session (`getSessionPrincipal()`, redirecting to `/login?next=...` otherwise) and renders `InviteAcceptForm`, which calls the server action `acceptInvitationAction` (`src/actions/members/accept-invitation.ts`). That action re-parses the token, confirms the session principal, and calls `acceptInvitation(userId, { token })` in the service layer. `acceptInvitation` hashes the incoming token and looks it up by `hashToken` via `invitationRepo.findInvitationByTokenHash` — the one repository call deliberately unscoped by `orgId`, since \"the hash carries the tenant with it.\" It then checks `revokedAt`, `acceptedAt` (idempotent re-accept if already a member), and `expiresAt` against the current time before proceeding.\n\n**4. What happens once membership exists.** On success, `memberRepo.insertMember` writes the actual membership row, `invitationRepo.markInvitationAccepted` closes out the invitation, and `emit(\"member.joined\", ...)` fires through the in-process event bus (`src/lib/event-bus.ts`, wired at boot by `registerEventHandlers()` in `src/server/services/event-registry.ts`). Two listeners react: `usage-service.ts` increments the org's `seatsUsed` counter, and `notification-service.ts` creates an in-app notification for the org owner. There's no `member.joined` activity-log listener, so acceptance itself isn't separately audit-logged (only `member.invited` is). There's also no permission/session cache to invalidate — `resolveActor(userId, orgId)` in `src/server/services/member-service.ts` re-reads membership fresh from the DB on every request, so the new role is visible immediately. Back in `acceptInvitationAction`, `assertSeatAvailable` re-derives the `Actor` post-acceptance and re-validates the org isn't over its seat limit before the client redirects into the workspace.",
+  "ttft_ms": 16720,
+  "type": "result",
+  "duration_ms": 16743,
+  "uuid": "57e9d38f-29e8-4e25-af6d-cf90421a2343",
+  "ttft_stream_ms": 1038,
+  "time_to_request_ms": 5,
+  "queued_turn_count": 0
+}

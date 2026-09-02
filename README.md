@@ -6,7 +6,7 @@ It now also measures a second, structurally different prebuilt index — [MemPal
 
 ## Headline
 
-500 runs, 65 tasks, 13 conditions, one repetition each, about $116 of API spend. Every run's `result.json` and full transcript is committed.
+635 runs, 65 tasks, 16 conditions, one repetition each, about $145 of API spend. Every run's `result.json` and full transcript is committed.
 
 **For Sonnet 5 on a code-only corpus, graphify changes nothing measurable. It starts paying off when the explorer is weak (Haiku 4.5) or when the questions span documentation and code, and it is clearly counter-productive when a literal grep would do.**
 
@@ -32,6 +32,21 @@ MemPalace, measured on the same tasks and graded the same way (differences are `
 | Sonnet 5, 20 doc↔code tasks, vs `graphify-v2` | crosses 0 | **+$0.086 [+0.009, +0.164]** | **60% / 80%** | same |
 | Haiku 4.5, 20 doc↔code tasks, vs `haiku-graphify-v2` | crosses 0 | crosses 0 | **55% / 75%** | same |
 
+**Runtime levers**, measured on the same 45 code tasks with Sonnet 5. These arms add no index and no tool — they change only how `claude -p` is invoked, which is the one thing that has actually moved the numbers in this repository.
+
+| setting | tokens | cost | accuracy (arm / reference) | wall median | report |
+|---|---|---|---|---|---|
+| `--effort medium`, vs `baseline` | **−81k [−138k, −31k]** | **−$0.049 [−0.082, −0.022]** | 80% / 84% | 16 s vs 29 s | [`results/levers`](results/levers/REPORT.md) |
+| `--effort low`, vs `baseline` | **−133k [−192k, −80k]** | **−$0.087 [−0.119, −0.059]** | 80% / 84% | 16 s vs 29 s | same |
+| `--effort medium`, vs `baseline-nosub` | crosses 0 | **+$0.023 [+0.002, +0.044]** | 80% / 84% | 16 s vs 33 s | same |
+| `--effort low`, vs `baseline-nosub` | **−58k [−118k, −0.004k]** | crosses 0 | 80% / 84% | 16 s vs 33 s | same |
+| Explore subagent pinned to Haiku, vs `baseline` | **+270k [+104k, +466k]** | crosses 0 | 80% / 84% | 20 s vs 29 s | same |
+| Explore subagent pinned to Haiku, vs `baseline-nosub` | **+345k [+179k, +526k]** | **+$0.091 [+0.056, +0.132]** | 80% / 84% | 20 s vs 33 s | same |
+
+**Lowering reasoning effort is the only lever here that is cheaper *and* faster, but it cannot beat simply banning subagents.** Against plain `baseline`, `--effort low` cuts tokens 25% and cost 26% with CIs clear of zero and roughly halves wall time; the thinking-token share falls monotonically (37% → 20% → 16%), which is what confirms the flag actually took effect rather than the arm merely writing less. Against the fairer `baseline-nosub` reference, `--effort medium` is *more* expensive and `--effort low` wins only on tokens — so `--disallowedTools Agent`, found in Phase 8, remains the strongest single lever measured here. The accuracy cost is two tasks (84% → 80%), both `locate`, and both effort arms lost the same two; at n=45 with one repetition that gap is not separable from noise.
+
+**Pinning exploration to Haiku works mechanically and still loses.** The project-local `.claude/agents/Explore.md` override fired on all 15 runs that delegated to `Explore` (Haiku carried 150k–3.35M tokens each, 54% of the arm's tokens and 28% of its cost, while the main session stayed on Sonnet), but a weak explorer searches inefficiently enough to erase its own price advantage: +59% tokens against `baseline` and +101% against `baseline-nosub`. The 8 runs that chose the `general-purpose` agent instead stayed on Sonnet entirely — the override covers `Explore` only.
+
 Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
 
 Three findings behind the table:
@@ -51,6 +66,8 @@ A measurement lesson worth stating up front: the result JSON's `usage` block cov
 | `graphify` / `graphify-v2` | Exactly what `graphify install --project` produces: the `## graphify` section in `CLAUDE.md`, the PreToolUse nudge hooks on `Bash|Grep` and `Read|Glob`, the project-local skill, plus a prebuilt frozen `graphify-out/`. v1 is the code-only graph; v2 adds semantic extraction of the docs. No `memory/` or `LESSONS.md` carry-over: every run starts from a fresh copy of the corpus. |
 | `graphify-strict`, `-strict-v2` | Same plus `hook-guard read --strict`. |
 | `baseline-nosub` | Baseline with `--disallowedTools Agent`. |
+| `effort-medium`, `effort-low` | Baseline's overlay byte for byte, invoked with `--effort medium` / `low` instead of the default `high`. Nothing in the corpus copy differs, so `run.meta.json` records the effort that actually ran. |
+| `haiku-explore` | Baseline's `CLAUDE.md` byte for byte plus one `.claude/agents/Explore.md` declaring `model: haiku`. A project agent named `Explore` overrides Claude Code's built-in, so delegated exploration runs on Haiku while the main session stays on Sonnet. No instruction text changes — the arm varies *who explores*, not what the agent is told. |
 | `mempalace` / `mempalace-v2` | MemPalace 3.9.0: a `## mempalace` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `mempalace-mcp` server reached via `--mcp-config --strict-mcp-config`, exposing `mempalace_search` over a prebuilt ChromaDB index. The index is built once per corpus generation and **cloned into a private temp directory per run**, never into the corpus copy. v1 indexes the code, v2 the code and `docs/`. |
 | `haiku-*` | The same overlays with `claude-haiku-4-5`. |
 
@@ -102,8 +119,14 @@ nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/t
 nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/tasks-docs.json \
   --conditions mempalace-v2,haiku-mempalace-v2 --reps 1 --concurrency 3 >> results/mempalace/full.log 2>&1 &
 
+# Runtime levers. No index and no MCP server; the code arms need the same
+# docs-free corpus-v1 snapshot the mempalace code arms used.
+nohup env BENCH_RESULTS_DIR=results/levers pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions effort-medium,effort-low,haiku-explore --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/levers/full.log 2>&1 &
+
 pnpm bench:collect && pnpm bench:grade && pnpm bench:analyze && pnpm bench:report   # per results dir
 pnpm bench:report:combined && pnpm bench:report:structural && pnpm bench:report:docs
+pnpm bench:analyze:levers && pnpm bench:report:levers
 ```
 
 Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`. Conditions are declared in `bench/conditions.ts`. Environment variables: `BENCH_MODEL`, `BENCH_EFFORT`, `BENCH_REPS`, `BENCH_MAX_BUDGET_USD`, `BENCH_RESULTS_DIR`.
@@ -115,7 +138,7 @@ bench/       harness: run / matrix / collect / grade / analyze / report / condit
 corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
 overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace)
 tasks/       three task files, keys/, rubrics, bugs/*.patch, docs-discrepancies.json
-results/     runs/ ext/ (code sets), structural/, docs/, combined/, mempalace/ — raw result.json + transcript.jsonl per run
+results/     runs/ ext/ (code sets), structural/, docs/, combined/, mempalace/, levers/ — raw result.json + transcript.jsonl per run
 .palaces/    gitignored MemPalace indexes; rebuild with `pnpm palace:build v1|v2` (stats in docs/plan/MEMPALACE.md)
 docs/plan/   design, implementation plan, research notes, corpus and graph build records (Japanese)
 ```
@@ -131,3 +154,6 @@ docs/plan/   design, implementation plan, research notes, corpus and graph build
 - The `mempalace` arms run with `--strict-mcp-config` and so are the only arms that do not also carry the measuring host's own MCP servers (present elsewhere as deferred names only). Fixed-overhead comparisons include that asymmetry.
 - Wall-clock numbers in the `--speed` section were measured at concurrency 3 on one machine and are secondary. Per-tool-call latency is the sturdier half: it shows `mempalace_search` at ~43 ms against `graphify query` at ~294 ms, and graphify's PreToolUse hook adding ~55 ms to every `Read`.
 - `graphify benchmark` numbers such as "70x fewer tokens" are synthetic estimates from node counts and fixed sample questions. They are not comparable to these measurements.
+- The `--effort` arms are compared against a `baseline` measured at effort `high`, which is this harness's default and not Claude Code's. They say what lowering effort does here, not what a default-configured session would spend.
+- `--effort` and `--disallowedTools Agent` both reduce the same thing — how much exploring and thinking the agent does — so their savings are not independent, and this benchmark has not measured the two applied together.
+- The Haiku-explore override covers the `Explore` agent only. In 8 of 23 delegating runs the model chose the `general-purpose` agent, which inherits the main model, so the arm is a partial treatment by construction.

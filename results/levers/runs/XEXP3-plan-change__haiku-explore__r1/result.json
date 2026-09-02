@@ -1,0 +1,111 @@
+{
+  "duration_api_ms": 201999,
+  "stop_reason": "end_turn",
+  "session_id": "7405ba14-e2f3-4bdf-98fa-b38f4f6c5a6f",
+  "total_cost_usd": 0.47151535,
+  "usage": {
+    "input_tokens": 10,
+    "cache_creation_input_tokens": 26699,
+    "cache_read_input_tokens": 163368,
+    "output_tokens": 4177,
+    "output_tokens_details": {
+      "thinking_tokens": 347
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 26699,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2306,
+        "cache_read_input_tokens": 42667,
+        "cache_creation_input_tokens": 2791,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2791
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1341,
+      "outputTokens": 11644,
+      "cacheReadInputTokens": 1492310,
+      "cacheCreationInputTokens": 65171,
+      "webSearchRequests": 0,
+      "costUSD": 0.29025575000000003,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 3507,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 10,
+      "outputTokens": 4177,
+      "cacheReadInputTokens": 163368,
+      "cacheCreationInputTokens": 26699,
+      "webSearchRequests": 0,
+      "costUSD": 0.1812596,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 347,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have everything verified directly against the source. Here's the full trace.\n\n## Who can make the change\n\nThe change runs through `changePlanAction()` in `src/actions/billing/change-plan.ts`, a Next.js server action (`\"use server\"`). It authorizes via `can(actor, \"org:manage_billing\", { kind: \"billing\", orgId })` from `src/lib/permissions.ts`. That function delegates to `explain()`, which (in order) checks that the actor's `orgId` matches the resource's org (rejecting cross-tenant access), lets platform staff through unconditionally, and otherwise looks up `ROLE_MATRIX[\"org:manage_billing\"]`, which is hard-coded to `\"owner\"` (line 29). So only a member whose role rank is ≥ owner can downgrade the plan; the same `assertCan` check is repeated defensively inside the service layer (`billing-service.ts`'s `changePlan()`, line 131), so even a caller that skips the action layer can't bypass it.\n\n## What is compared before the downgrade is accepted\n\nOnce authorized, `changePlanAction` calls its own local helper `assertPlanFitsCurrentUsage()` (same file, lines 49–67). This fetches live usage via `getUsage(actor, orgId)` from `src/server/services/usage-service.ts`, fetches the *target* plan's limits via `getPlanLimits(input.plan)` from `src/config/plan-limits.ts`, and for each of `seats`, `projects`, and `storageMb` calls `wouldExceedLimit(input.plan, resource, used, 0)` — a zero-delta check, since nothing new is being consumed, it's only asking whether what's already in use still fits under the smaller plan's caps. If any resource is already over the new plan's limit, it throws a `PlanLimitError` and the downgrade never reaches persistence. `changePlan()` in `billing-service.ts` (lines 135–142) redundantly re-runs the identical comparison over `SUMMARY_RESOURCES` (`seats`, `projects`, `storageMb`, `webhooks`) as a second line of defense before writing to the database — so an org on `growth` with 40 seats cannot silently drop to `starter` (10-seat cap) and strand 37 members.\n\n## Where the plan is recorded, and what's authoritative\n\nThe write happens in `subscriptionRepo.updateSubscriptionPlan()` (`src/server/repositories/subscription-repository.ts`, lines 61–76), which updates the `subscriptions` table (`src/server/db/schema/billing.ts`) — setting `plan`, `interval`, `status: \"active\"`, and `updatedAt`. There is a second, denormalized `plan` column on the `organizations` table (`src/server/db/schema/organizations.ts`), but it is explicitly documented as display-only and is *not* touched by this flow. `billing-service.ts`'s internal `planFor(orgId)` (lines 211–221) is the canonical resolver every quota check goes through: it reads `subscriptions` first and only falls back to `organizations.plan` if no subscription row exists at all. So `subscriptions.plan` is authoritative; `organizations.plan` can lag or diverge and is only a convenience for display.\n\n## What happens right after\n\n`changePlan()` emits a `\"billing.plan_changed\"` event via `emit()` from `src/lib/event-bus.ts`, carrying `{ from: currentPlan, to: input.plan }` plus actor info. Subscribers to that event include `src/server/services/activity-service.ts` (records an activity-log entry, e.g. \"Plan growth → starter\") and `src/server/services/webhook-service.ts` (enqueues the event for delivery to the org's registered webhook endpoints). Back in the action, `changePlanAction` also calls `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` from `src/lib/cache.ts`, invalidating cached data tagged for that org so subsequent reads pick up the new plan.\n\n## What changes elsewhere in the product because of the new plan value\n\nEverything downstream reads through the same two primitives — `getPlanLimits`/`wouldExceedLimit`/`getLimit` from `src/config/plan-limits.ts`, and `planAtLeast` for feature gating:\n\n- **Feature flags**: `isEnabled()` in `src/lib/feature-flags.ts` evaluates `\"plan\"`-strategy flags with `planAtLeast(ctx.plan, strategy.minPlan)`. Flags defined in `src/config/feature-flags.ts` gated this way include `kanban_board`, `csv_export` (starter+), `activity_feed`, `digest_email`, `webhooks`, `issue_templates` (growth+), and `advanced_search`, `public_projects`, `ai_issue_summary` (enterprise+). A downgrade from growth to starter immediately drops access to webhooks, activity feed, and digest email anywhere those flags are checked, since `ctx.plan` is built from the (now-updated) subscription.\n- **Quota enforcement in day-to-day actions**: `billing-service.ts`'s `checkLimit()`/`assertWithinLimit()` are called by create-paths outside billing — e.g. project creation, issue creation, invitations, webhook registration, attachment uploads — each asking whether the org is within the new, smaller plan's `seats`/`projects`/`issuesPerProject`/`storageMb`/`webhooks` caps before allowing the action.\n- **Background jobs**: retention/cleanup jobs (e.g. a job reading `getPlanLimits(org.plan).retentionDays`) and webhook delivery logic that checks `getPlanLimits(org.plan).webhooks <= 0` to skip delivery entirely on plans with no webhook allowance.\n- **UI outside billing pages**: settings pages for members, webhooks, and project/issue creation forms read plan limits (via a client hook like `use-plan-limits.ts` calling `getPlanLimits(org.plan)`) to show usage meters and enable/disable actions once the org is at or over its new cap.\n\nIn short: **authorize** (`can`/`assertCan`, owner-only) → **compare** (`assertPlanFitsCurrentUsage` / the duplicate check in `changePlan`, both via `wouldExceedLimit`) → **persist** (`subscriptionRepo.updateSubscriptionPlan` writes `subscriptions.plan`, the authoritative value) → **react** (`billing.plan_changed` event → activity log + webhook enqueue; cache tag revalidation) → **propagate** (every later feature-flag check via `planAtLeast`, every quota check via `checkLimit`/`wouldExceedLimit`, and any UI/job reading `org.plan` or the resolved subscription plan immediately reflects the smaller plan).",
+  "ttft_ms": 1472,
+  "type": "result",
+  "duration_ms": 201758,
+  "uuid": "f4cebb33-4944-472d-a748-a2e51beb8723",
+  "ttft_stream_ms": 901,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}

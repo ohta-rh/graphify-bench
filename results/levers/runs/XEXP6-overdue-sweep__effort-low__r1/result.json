@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 70408,
+  "stop_reason": "end_turn",
+  "session_id": "f552445e-486b-4da8-b185-2c1a808bb58d",
+  "total_cost_usd": 0.23036109999999999,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 2959,
+    "cache_read_input_tokens": 30186,
+    "output_tokens": 1424,
+    "output_tokens_details": {
+      "thinking_tokens": 12
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 2959,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1424,
+        "cache_read_input_tokens": 30186,
+        "cache_creation_input_tokens": 2959,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2959
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001108,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 18,
+      "outputTokens": 5962,
+      "cacheReadInputTokens": 180503,
+      "cacheCreationInputTokens": 44767,
+      "webSearchRequests": 0,
+      "costUSD": 0.2292531,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 177,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "general-purpose": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the full path from due-date passing to a single, per-channel alert reaching the assignee:\n\n**1. What starts the check**\n\nTwo triggers converge on the same job. `src/app/api/cron/overdue/route.ts` exposes a `POST` handler that authenticates via `assertCronSecret()` (`src/app/api/_lib/responses.ts`) and calls `runOverdueIssueJob(new Date())`. Separately, `src/server/jobs/scheduler.ts` (started from `src/instrumentation.ts`) runs `tick(now)` on an interval; it checks `CADENCE_MINUTES[\"overdue-issues\"] = 60` via `isDue()`, and when due, `enqueue()`s an `\"overdue-issues\"` job onto `src/server/jobs/queue.ts`, later drained by `drain()`. Both paths land on `runOverdueIssueJob` in `src/server/jobs/overdue-issue-job.ts`, wrapped by `runJob(\"overdue-issues\", ...)` (`src/server/jobs/types.ts`).\n\n**2. How the candidate set is narrowed**\n\nFor each org (batched 50 at a time from `usageRepo.listOrgIdsForRollup`), `issueRepo.listOverdueIssues(orgId, stamp)` (`src/server/repositories/issue-repository.ts`, ~line 507) filters `issues` on: not archived, `dueAt` non-null, `dueAt < now`, and `status` in `[\"backlog\", \"todo\", \"in_progress\", \"in_review\"]` (excluding done/closed). The job adds a defensive `dueAt === null` skip and consults its dedupe set (below).\n\n**3. What the checker does and doesn't do**\n\n`overdue-issue-job.ts` deliberately owns no notification logic — its own comment says so. For each qualifying issue it just calls `emit(\"issue.overdue\", { orgId, issueId, projectId, dueAt, assigneeId, occurredAt })` on the in-process pub/sub in `src/lib/event-bus.ts`, and tracks `processed`/`failed` counts for logging. Sending the alert is entirely someone else's job.\n\n**4. What prevents repeated announcements**\n\nThe job keeps a module-scope `const reported = new Set<string>()` (line ~28). Once an issue's event is emitted successfully, `reported.add(issue.id)` runs, so later sweeps in the same process skip it. This is purely in-memory — reset only by a test-only `resetOverdueTracking()` — so it doesn't persist across restarts or multiple instances, and there's no DB-level flag (no `overdueNotifiedAt` column or dedupe table) backing it up. The dedupe guarantee is real but fragile, living entirely in that one Set.\n\n**5. How the alert reaches the right person on their chosen channels**\n\nA separate subscriber, `registerFanOut()` in `src/server/services/notification-service.ts`, listens for `\"issue.overdue\"` and — when `assigneeId` is set — calls `notify(orgId, \"issue_overdue\", [assigneeId], {...})`. `notify()` loads the assignee's row from `notification_preferences` (unique on `orgId, userId, kind`, `src/server/db/schema/notifications.ts`) via `preferenceRepo.getPreference`, then `resolveChannels(preference, flags)` turns `inApp`/`email`/`digestOnly` booleans (defaulting to `[\"in_app\", \"email\"]` if no row exists, and suppressing immediate email under `digestOnly` unless the `digest_email` feature flag disables digesting) into a channel list. If the assignee has muted everything, nothing is written; otherwise one row (`kind: \"issue_overdue\"`, title, body, href, channels) is persisted via `notificationRepo.insertNotifications`. Users edit these preferences through `notification-preferences-form.tsx`, which calls `updatePreference` → `preferenceRepo.upsertPreference`. Actual email rendering/sending for the `\"email\"` channel goes through `src/emails/overdue-email.tsx` and `src/server/services/email-service.ts`, though the final DB-row-to-email-send wiring wasn't fully traced in this pass.",
+  "ttft_ms": 1449,
+  "type": "result",
+  "duration_ms": 14364,
+  "uuid": "1a25854e-e25f-4522-ac82-a165cf2569c2",
+  "ttft_stream_ms": 885,
+  "time_to_request_ms": 5,
+  "queued_turn_count": 0
+}

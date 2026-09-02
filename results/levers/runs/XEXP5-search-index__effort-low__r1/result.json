@@ -1,0 +1,111 @@
+{
+  "duration_api_ms": 69160,
+  "stop_reason": "end_turn",
+  "session_id": "4ec71938-45bd-4269-9dde-d761a029d41f",
+  "total_cost_usd": 0.23910149999999997,
+  "usage": {
+    "input_tokens": 6,
+    "cache_creation_input_tokens": 16006,
+    "cache_read_input_tokens": 79327,
+    "output_tokens": 2230,
+    "output_tokens_details": {
+      "thinking_tokens": 51
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 16006,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1471,
+        "cache_read_input_tokens": 31402,
+        "cache_creation_input_tokens": 3363,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3363
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 22,
+      "outputTokens": 5666,
+      "cacheReadInputTokens": 205095,
+      "cacheCreationInputTokens": 46513,
+      "webSearchRequests": 0,
+      "costUSD": 0.23801450000000002,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 67,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 3,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Confirmed against source. Here's the full write-to-search path.\n\n## Write side: keeping the index in sync\n\nWhen a title edit hits `updateIssueAction()` in `src/actions/issues/update-issue.ts`, it's parsed against `updateIssueSchema` and permission-checked before calling `updateIssue()` in `src/server/services/issue-service.ts`. That service function loads the current row via `issueRepo.findIssueById`, re-asserts `issue:update` permission and non-archived state, persists the change through `issueRepo.updateIssue(input)`, and — critically — finishes by calling `emit(\"issue.updated\", { orgId, issueId, projectId, changedFields })` from `src/lib/event-bus.ts`. This is an in-process pub/sub emit, not a DB trigger or a queue: there's no transactional guarantee tying the write and the reindex together, they're just sequenced in the same request.\n\nThe consumer side lives in `src/server/services/search-service.ts`. At process start (wired up via `registerEventHandlers()` in `src/server/services/event-registry.ts`, invoked from instrumentation), `registerSearchListeners()` subscribes to `issue.updated` (plus `issue.created`, `issue.archived`, and equivalent comment/project events). On `issue.updated` the handler deliberately **re-reads** the issue with `issueRepo.findIssueById` rather than trusting the event payload — the comment above the function calls this out explicitly, so a partially-applied write can never get indexed as if it fully succeeded — then calls `indexIssue(orgId, issue)`, which calls `searchRepo.upsertSearchDocument(orgId, \"issue\", issue.id, [title, description].join(\"\\n\"), projectId)`.\n\nWhat's stored: the `search_index` table, defined in `src/server/db/schema/webhooks.ts`, holds `id`, `orgId`, `subjectKind` (`\"issue\" | \"comment\" | \"project\"`), `subjectId`, `projectId`, a denormalized `content` field (title and description concatenated with a newline — no separate title column), and `indexedAt`. So the searchable copy is a flattened text blob per subject, not a structured mirror of the issue row.\n\n## Read side: what a query goes through\n\nA colleague's search hits `searchAction()` in `src/actions/search/search.ts`, which validates input against `searchQuerySchema` (`src/schemas/search.ts` — `q` is bounded `min(1)`/`max(200)` chars) and checks `org:read` permission, then loads org context (`getOrganizationSummary`), builds a feature-flag context (`buildFlagContext`), and checks `isEnabled(\"advanced_search\", context)` to narrow `kinds` to `[\"issue\"]` if the org's plan doesn't include advanced search. It then calls `search(actor, {...input, kinds})` in `search-service.ts`, which:\n\n1. `assertOrgScope` / `assertCan(actor, \"issue:read\", orgResource(orgId))`\n2. `consumeRateLimit(input.orgId, \"search:query\")` from `src/lib/rate-limit.ts` — a token bucket\n3. re-checks `advanced_search` for the org's plan\n4. calls `searchRepo.searchDocuments(input)` (`src/server/repositories/search-repository.ts`), which does a `LIKE %q%` scan over `content`, scoped by org/kind/project, paginated\n5. maps rows to `SearchHit[]` (title = first line of `content`, snippet built by `snippetAround`, href from `hrefFor`)\n\n## Where a valid-looking query gets refused\n\nTwo rejection points, both in `search()`:\n- **Rate limiting**: `consumeRateLimit` returns `verdict.allowed === false` once the org's query bucket is exhausted, throwing `Search rate limit reached; try again after ${verdict.resetAt}` — a syntactically perfect query fails purely on request volume.\n- **Feature-flag gating of query syntax**: if `input.q.includes(\":\")` (field-scoped syntax like `status:done`) and the org's plan doesn't have `advanced_search` enabled, it throws `\"Field-scoped search is not included in this plan\"`. Note this only rejects colon-containing queries — a plain-text query on a non-advanced plan is instead silently narrowed to `kinds: [\"issue\"]` upstream in the action, not rejected.",
+  "ttft_ms": 1469,
+  "type": "result",
+  "duration_ms": 68397,
+  "uuid": "6cae1943-e237-4660-9b5e-09778530a617",
+  "ttft_stream_ms": 888,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}
