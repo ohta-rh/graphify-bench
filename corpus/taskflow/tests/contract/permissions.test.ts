@@ -3,11 +3,18 @@ import { can, explain, assertCan, PermissionDeniedError, ROLE_MATRIX } from "@/l
 import type { Actor, Role } from "@/types/member";
 import type { OrgId, UserId, IssueId, ProjectId, CommentId } from "@/types/common";
 import type { PermissionAction, PermissionResource } from "@/types/permission";
+import {
+  commentIdSchema,
+  issueIdSchema,
+  orgIdSchema,
+  projectIdSchema,
+  userIdSchema,
+} from "@/schemas/common";
 
-const ORG = "01ORGAAAAAAAAAAAAAAAAAAAAA" as OrgId;
-const OTHER_ORG = "01ORGBBBBBBBBBBBBBBBBBBBBB" as OrgId;
-const ALICE = "01USRAAAAAAAAAAAAAAAAAAAAA" as UserId;
-const BOB = "01USRBBBBBBBBBBBBBBBBBBBBB" as UserId;
+const ORG = "01HZZZGGGGGGGGGGGGGGGGGGGG" as OrgId;
+const OTHER_ORG = "01HZZZHHHHHHHHHHHHHHHHHHHH" as OrgId;
+const ALICE = "01HZZZAAAAAAAAAAAAAAAAAAAA" as UserId;
+const BOB = "01HZZZBBBBBBBBBBBBBBBBBBBB" as UserId;
 
 function actor(role: Role, overrides: Partial<Actor> = {}): Actor {
   return { userId: ALICE, orgId: ORG, role, ...overrides };
@@ -19,8 +26,8 @@ function issueBy(authorId: UserId, assigneeId: UserId | null = null): Permission
   return {
     kind: "issue",
     orgId: ORG,
-    projectId: "01PRJAAAAAAAAAAAAAAAAAAAAA" as ProjectId,
-    issueId: "01ISSAAAAAAAAAAAAAAAAAAAAA" as IssueId,
+    projectId: "01HZZZPPPPPPPPPPPPPPPPPPPP" as ProjectId,
+    issueId: "01HZZZSSSSSSSSSSSSSSSSSSSS" as IssueId,
     authorId,
     assigneeId,
   };
@@ -30,7 +37,7 @@ function commentBy(authorId: UserId): PermissionResource {
   return {
     kind: "comment",
     orgId: ORG,
-    commentId: "01CMTAAAAAAAAAAAAAAAAAAAAA" as CommentId,
+    commentId: "01HZZZCCCCCCCCCCCCCCCCCCCC" as CommentId,
     authorId,
   };
 }
@@ -94,5 +101,34 @@ describe("can()", () => {
         if (allowed) seenAllowed = true;
       }
     }
+  });
+});
+
+describe("fixture ids", () => {
+  // The ids above are cast with `as`, which skips validation. If a fixture
+  // drifts outside Crockford base32 (no I, L, O, U) the permission tests keep
+  // passing while every schema in `src/schemas` would reject the same value —
+  // so the contract fixtures are checked against the real schema here.
+  it("are valid ULIDs under the shared branded-id schemas", () => {
+    expect(orgIdSchema.parse(ORG)).toBe(ORG);
+    expect(orgIdSchema.parse(OTHER_ORG)).toBe(OTHER_ORG);
+    expect(userIdSchema.parse(ALICE)).toBe(ALICE);
+    expect(userIdSchema.parse(BOB)).toBe(BOB);
+
+    const issue = issueBy(ALICE);
+    if (issue.kind !== "issue") throw new Error("expected an issue resource");
+    expect(projectIdSchema.parse(issue.projectId)).toBe(issue.projectId);
+    expect(issueIdSchema.parse(issue.issueId)).toBe(issue.issueId);
+
+    const comment = commentBy(ALICE);
+    if (comment.kind !== "comment") {
+      throw new Error("expected a comment resource");
+    }
+    expect(commentIdSchema.parse(comment.commentId)).toBe(comment.commentId);
+  });
+
+  it("rejects the excluded letters, which is why the fixtures avoid them", () => {
+    expect(() => orgIdSchema.parse("01ORGAAAAAAAAAAAAAAAAAAAAA")).toThrow();
+    expect(() => userIdSchema.parse("01USRAAAAAAAAAAAAAAAAAAAAA")).toThrow();
   });
 });
