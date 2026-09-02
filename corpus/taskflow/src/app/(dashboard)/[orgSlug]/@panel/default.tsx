@@ -1,10 +1,12 @@
 /**
- * REQUIRED default for the `@panel` parallel slot — without it Next 16 fails the build.
+ * REQUIRED default for the `@panel` parallel slot — without it Next 16 fails the
+ * build.
  *
- * STUB — owner D. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
+ * Owner D. Rendered when the slot has no match for the current URL, which is
+ * every route except `/[orgSlug]` and `/[orgSlug]/notifications`. Returning
+ * `null` collapses the aside rather than leaving an empty column.
  */
 
 export default function DefaultSlot() {
-  return <div data-stub="src/app/(dashboard)/[orgSlug]/@panel/default.tsx" />;
+  return null;
 }
