@@ -21,6 +21,18 @@ const LIVE_ONLY = {} as const;
 const logger = createLogger("overdue-issue-job");
 
 /**
+ * Issues already announced this process's lifetime. A later sweep still
+ * finds a still-open, still-overdue issue — this is what keeps the job from
+ * re-emitting `issue.overdue` for it on every pass.
+ */
+const reported = new Set<string>();
+
+/** Test-only: clears the reported set so a fresh scenario starts empty. */
+export function resetOverdueTracking(): void {
+  reported.clear();
+}
+
+/**
  * Publishes one `issue.overdue` per still-open, past-due issue. The job owns
  * no notification logic: it announces the fact, and whoever cares (in-app
  * alerts, the digest, webhooks) reacts on the bus.
@@ -40,6 +52,7 @@ export async function runOverdueIssueJob(now: Date): Promise<JobResult> {
 
       for (const issue of overdue) {
         if (issue.dueAt === null) continue;
+        if (reported.has(issue.id)) continue;
 
         try {
           await emit("issue.overdue", {
@@ -51,6 +64,7 @@ export async function runOverdueIssueJob(now: Date): Promise<JobResult> {
             dueAt: issue.dueAt,
             assigneeId: issue.assigneeId,
           });
+          reported.add(issue.id);
           result.processed += 1;
         } catch (error) {
           result.failed += 1;

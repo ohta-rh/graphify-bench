@@ -4,6 +4,7 @@
  * Must call (do not reimplement): isEnabled, renderEmail
  */
 import { isEnabled } from "@/lib/feature-flags";
+import { DIGEST_MAX_ENTRIES } from "@/config/constants";
 import * as notificationRepo from "@/server/repositories/notification-repository";
 import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
 import * as orgRepo from "@/server/repositories/organization-repository";
@@ -48,7 +49,8 @@ export async function buildDigest(
       title: notification.title,
       href: notification.href,
       occurredAt: notification.createdAt,
-    }));
+    }))
+    .slice(0, DIGEST_MAX_ENTRIES);
 
   if (entries.length < MIN_ENTRIES) return null;
 
