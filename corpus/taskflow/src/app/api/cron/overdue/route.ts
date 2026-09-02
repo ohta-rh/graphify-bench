@@ -1,24 +1,24 @@
 /**
  * Cron-style trigger for the overdue scan.
  *
- * STUB — owner D. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
+ * Owner D. The job emits `issue.overdue`; the notification fan-out is a
+ * subscriber, so this route never sends anything itself.
  *
  * Must call (do not reimplement): runOverdueIssueJob
  */
 
-export async function GET(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/overdue/route.ts" } },
-    { status: 501 },
-  );
-}
+import { assertCronSecret, errorResponse } from "@/app/api/_lib/responses";
+import { runOverdueIssueJob } from "@/server/jobs/overdue-issue-job";
+
+export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/overdue/route.ts" } },
-    { status: 501 },
-  );
+  try {
+    assertCronSecret(request);
+
+    const result = await runOverdueIssueJob(new Date());
+    return Response.json(result);
+  } catch (error) {
+    return errorResponse(error);
+  }
 }

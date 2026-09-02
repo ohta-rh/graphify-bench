@@ -1,24 +1,25 @@
 /**
  * Cron-style trigger for the usage rollup.
  *
- * STUB — owner D. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
+ * Owner D. `OrganizationUsage` is a cached aggregate; the quota guards read it
+ * rather than counting rows on every check, which is why it needs a periodic
+ * recompute to stay honest.
  *
  * Must call (do not reimplement): runUsageRollupJob
  */
 
-export async function GET(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/usage-rollup/route.ts" } },
-    { status: 501 },
-  );
-}
+import { assertCronSecret, errorResponse } from "@/app/api/_lib/responses";
+import { runUsageRollupJob } from "@/server/jobs/usage-rollup-job";
+
+export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/usage-rollup/route.ts" } },
-    { status: 501 },
-  );
+  try {
+    assertCronSecret(request);
+
+    const result = await runUsageRollupJob(new Date());
+    return Response.json(result);
+  } catch (error) {
+    return errorResponse(error);
+  }
 }

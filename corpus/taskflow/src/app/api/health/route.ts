@@ -1,22 +1,19 @@
 /**
  * Liveness probe; the only unauthenticated JSON route.
  *
- * STUB — owner D. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
+ * Owner D. Deliberately touches nothing — no database, no session, no service.
+ * A health check that queries the database reports the database, not the app,
+ * and turns one slow query into a restart loop.
  */
+
+export const dynamic = "force-dynamic";
 
 export async function GET(request: Request): Promise<Response> {
   void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/health/route.ts" } },
-    { status: 501 },
-  );
-}
 
-export async function POST(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/health/route.ts" } },
-    { status: 501 },
-  );
+  return Response.json({
+    status: "ok",
+    service: "taskflow",
+    checkedAt: new Date().toISOString(),
+  });
 }

@@ -1,24 +1,25 @@
 /**
  * Cron-style trigger that drains the webhook queue.
  *
- * STUB — owner D. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
+ * Owner D. Deliveries are queued by a subscriber to
+ * `webhook.delivery_requested` and retried here with the backoff the job
+ * computes, so a customer's endpoint being down never blocks a mutation.
  *
  * Must call (do not reimplement): runWebhookDeliveryJob
  */
 
-export async function GET(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/webhook-delivery/route.ts" } },
-    { status: 501 },
-  );
-}
+import { assertCronSecret, errorResponse } from "@/app/api/_lib/responses";
+import { runWebhookDeliveryJob } from "@/server/jobs/webhook-delivery-job";
+
+export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  void request;
-  return Response.json(
-    { error: { code: "internal_error", message: "stub: src/app/api/cron/webhook-delivery/route.ts" } },
-    { status: 501 },
-  );
+  try {
+    assertCronSecret(request);
+
+    const result = await runWebhookDeliveryJob(new Date());
+    return Response.json(result);
+  } catch (error) {
+    return errorResponse(error);
+  }
 }
