@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { analyze, loadRowsFromSources, resolveCli, type Analysis, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
+import { analyze, loadRowsFromSources, resolveCli, TREATMENT, type Analysis, type ComparisonResult, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
+import { resolveCondition } from "./conditions.js";
+import { TRACKED_SUBCOMMANDS } from "./features.js";
 import { REPO_ROOT } from "./lib/env.js";
 
 const CSV_COLUMNS = [
@@ -116,8 +118,68 @@ const pct = (v: number | null): string => (v === null ? "–" : `${(v * 100).toF
 function ciLine(p: PairedResult, digits: number): string {
   const { point, lo, hi, crossesZero, n } = p.ci;
   const rel = p.relativeCi.point;
-  const verdict = crossesZero === null ? "n too small" : crossesZero ? "**CI crosses 0 — no detectable difference**" : point !== null && point < 0 ? "graphify lower" : "graphify higher";
+  // Analyses written before Phase 6 carry no condition names on the pair; they
+  // were always graphify−baseline, so that is the fallback.
+  const treat = p.treatment_condition ?? TREATMENT;
+  const verdict = crossesZero === null ? "n too small" : crossesZero ? "**CI crosses 0 — no detectable difference**" : point !== null && point < 0 ? `${treat} lower` : `${treat} higher`;
   return `| ${p.metric} | ${n} | ${fmt(point, digits)} | [${fmt(lo, digits)}, ${fmt(hi, digits)}] | ${rel === null ? "–" : `${(rel * 100).toFixed(1)}%`} | ${verdict} |`;
+}
+
+/** The single sentence a reader should take away from one comparison. */
+export function comparisonVerdict(c: ComparisonResult): string {
+  const primary = c.paired.find((p) => p.metric === "uncached_equivalent_all");
+  const cost = c.paired.find((p) => p.metric === "total_cost_usd");
+  const turns = c.paired.find((p) => p.metric === "num_turns");
+  const b = c.by_condition.find((s) => s.condition === c.baseline);
+  const t = c.by_condition.find((s) => s.condition === c.treatment);
+  const acc =
+    b && t && b.accuracy !== null && t.accuracy !== null
+      ? `accuracy ${pct(t.accuracy)} vs ${pct(b.accuracy)} (${t.successes}/${t.graded} vs ${b.successes}/${b.graded})`
+      : "accuracy not comparable";
+  const describe = (p: PairedResult | undefined, label: string, digits: number): string => {
+    if (!p) return `${label} –`;
+    if (p.ci.crossesZero !== false) return `${label} no detectable difference`;
+    const dir = (p.ci.point ?? 0) < 0 ? "lower" : "higher";
+    return `${label} ${dir} by ${fmt(Math.abs(p.ci.point ?? 0), digits)} (95% CI [${fmt(p.ci.lo, digits)}, ${fmt(p.ci.hi, digits)}])`;
+  };
+  return (
+    `**Verdict.** \`${c.treatment}\` vs \`${c.baseline}\` over ${c.n_tasks} paired tasks: ` +
+    `${describe(primary, "tokens", 0)}; ${describe(cost, "cost", 4)}; ${describe(turns, "turns", 1)}; ${acc}.`
+  );
+}
+
+function comparisonBlock(c: ComparisonResult, heading: string): string[] {
+  const out: string[] = [];
+  out.push(`### ${heading}\n`);
+  if (c.question) out.push(`_${c.question}_\n`);
+  out.push(conditionTable(c.by_condition));
+  out.push("");
+  out.push(`Paired difference (\`${c.treatment}\` − \`${c.baseline}\`), all ${c.n_tasks} tasks:\n`);
+  out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
+  out.push("|---|---|---|---|---|---|");
+  for (const p of c.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
+  out.push("");
+  if (c.iso_accuracy_tasks.length === 0) {
+    out.push("_No task succeeded in every run of both arms, so there is no iso-accuracy subset._\n");
+  } else {
+    out.push(`Iso-accuracy subset (${c.iso_accuracy_tasks.length}/${c.n_tasks} tasks where every graded run of both arms succeeded):\n`);
+    out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
+    out.push("|---|---|---|---|---|---|");
+    for (const p of c.paired_iso) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
+    out.push("");
+  }
+  out.push("Per category (primary metric `uncached_equivalent_all`):\n");
+  out.push("| category | tasks | mean diff | 95% CI | mean relative | verdict |");
+  out.push("|---|---|---|---|---|---|");
+  for (const cat of c.by_category) {
+    const p = cat.paired.find((x) => x.metric === "uncached_equivalent_all");
+    if (!p) continue;
+    out.push(`| ${cat.category} | ${cat.tasks.length} |${ciLine(p, 1).split("|").slice(3).join("|")}`);
+  }
+  out.push("");
+  out.push(comparisonVerdict(c));
+  out.push("");
+  return out;
 }
 
 function conditionTable(summaries: ConditionSummary[]): string {
@@ -166,6 +228,59 @@ function versionsBlock(rows: RunRow[]): string {
   return "- (no run.meta.json available)";
 }
 
+interface RunMetaLite {
+  condition?: string;
+  condition_spec?: {
+    overlays?: string[];
+    effective_model?: string;
+    extraClaudeArgs?: string[];
+    note?: string;
+  };
+}
+
+/**
+ * One row per arm describing what was actually varied — overlays, model, extra
+ * CLI args — read from `run.meta.json`. Returns null when no run records a
+ * `condition_spec`, which is the case for measurement sets captured before the
+ * condition registry existed; the section is then omitted entirely rather than
+ * printed full of "unknown".
+ */
+export function conditionsBlock(rows: RunRow[]): string | null {
+  const specs = new Map<string, NonNullable<RunMetaLite["condition_spec"]>>();
+  for (const r of rows) {
+    if (specs.has(r.condition)) continue;
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(r.run_dir, "run.meta.json"), "utf8")) as RunMetaLite;
+      if (meta.condition_spec) specs.set(r.condition, meta.condition_spec);
+    } catch {
+      continue;
+    }
+  }
+  if (specs.size === 0) return null;
+  // Notes are free text and legitimately contain `|` (matchers like "Read|Glob"),
+  // which would otherwise split the markdown cell and shift every later column.
+  const cell = (s: string): string => s.replace(/\|/g, "\\|");
+  const lines = [
+    "| condition | model | overlays | extra `claude` args | what it isolates |",
+    "|---|---|---|---|---|",
+  ];
+  for (const name of [...specs.keys()].sort()) {
+    const s = specs.get(name)!;
+    const args = s.extraClaudeArgs?.length ? `\`${s.extraClaudeArgs.join(" ")}\`` : "–";
+    lines.push(
+      `| \`${name}\` | \`${s.effective_model ?? "?"}\` | ${(s.overlays ?? []).map((o) => `\`${o}\``).join(" + ") || "–"} | ${cell(args)} | ${cell(s.note ?? "–")} |`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Accuracy per arm, so a model-strength comparison reads at a glance. */
+function accuracyTable(summaries: ConditionSummary[]): string {
+  const lines = ["| condition | graded | successes | accuracy |", "|---|---|---|---|"];
+  for (const s of summaries) lines.push(`| \`${s.condition}\` | ${s.graded} | ${s.successes} | ${pct(s.accuracy)} |`);
+  return lines.join("\n");
+}
+
 /** Render one named subgroup (a measurement set, or the easy/rest split). */
 function subgroupBlock(g: SubgroupResult, label: string): string[] {
   const out: string[] = [];
@@ -191,6 +306,15 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push(`\n- Bootstrap: B=${a.bootstrap_B}, percentile 95% CI, seed \`${a.seed}\`, resampled over **tasks**.`);
   out.push(`- Corpus: \`corpus-v1\`, tree hash (sha256) \`${corpusTreeHash()}\` (source: \`docs/plan/CORPUS.md\`).`);
   out.push(`- Report generated: ${a.generated_at.slice(0, 10)}.\n`);
+  const conditions = conditionsBlock(rows);
+  if (conditions) {
+    out.push(
+      "The `Model` line above is the harness default; arms that override it are listed here. " +
+        "Every field comes from the run's own `run.meta.json`, not from the report's assumptions.\n",
+    );
+    out.push(conditions);
+    out.push("");
+  }
 
   out.push(sec("Overall"));
   out.push(conditionTable(a.by_condition));
@@ -248,6 +372,90 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     out.push("|---|---|---|---|---|---|");
     for (const p of cat.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
     out.push("");
+  }
+
+  const comparisons = a.comparisons ?? [];
+  if (comparisons.length > 0) {
+    out.push(sec("Structural comparisons"));
+    out.push(
+      "Each block below is an independent paired comparison between two arms, computed with the same " +
+        "machinery as §3: per-task pairing over the same task set, percentile bootstrap over tasks, an " +
+        "iso-accuracy subset scoped to just those two arms, and a per-category breakdown. Arms that are " +
+        "not part of a block are excluded from it entirely.\n",
+    );
+    for (const c of comparisons) out.push(...comparisonBlock(c, `\`${c.treatment}\` vs \`${c.baseline}\``));
+
+    // A model-strength table only makes sense when arms actually differ by model.
+    const haiku = a.by_condition.filter((s) => s.condition.startsWith("haiku-"));
+    if (haiku.length > 0) {
+      out.push("### Accuracy by model strength\n");
+      out.push(
+        "The token comparisons above are only meaningful alongside accuracy: an arm that answers fewer " +
+          "tasks correctly can always look cheaper. This table puts every arm's accuracy side by side so a " +
+          "Haiku-vs-Sonnet reading is not mistaken for an efficiency result.\n",
+      );
+      out.push(accuracyTable(a.by_condition));
+      out.push("");
+    }
+  }
+
+  const usage = a.feature_usage ?? [];
+  if (usage.length > 0) {
+    out.push(sec("Features never exercised"));
+    out.push(
+      "graphify exposes more than `query`. The table counts, per arm, how many times each subcommand was " +
+        "invoked across all runs (and, in parentheses, how many runs used it at least once). A zero column " +
+        "is the point: it means the benchmark never put that feature under measurement, so nothing here — " +
+        "positive or negative — can be read as evidence about it.\n",
+    );
+    const cols = [...TRACKED_SUBCOMMANDS];
+    out.push(`| condition | runs | ${cols.map((c) => `\`${c}\``).join(" | ")} |`);
+    out.push(`|---|---|${cols.map(() => "---").join("|")}|`);
+    for (const u of usage) {
+      const cells = cols.map((c) => {
+        const total = u.subcommands[c] ?? 0;
+        return total === 0 ? "**0**" : `${total} (${u.runs_using[c] ?? 0})`;
+      });
+      out.push(`| \`${u.condition}\` | ${u.runs} | ${cells.join(" | ")} |`);
+    }
+    out.push("");
+    out.push("| condition | runs reading `graph.json` directly | runs that never invoked the CLI (nudge ignored) | strict denials: total (median/run) |");
+    out.push("|---|---|---|---|");
+    for (const u of usage) {
+      // "The nudge was ignored" is only a statement about an arm that HAS a
+      // graph and a hook to ignore; on a baseline arm the same count would read
+      // as 100% ignored, which would be nonsense rather than a finding.
+      const hasGraph = resolveCondition(u.condition).overlays.includes("graphify");
+      out.push(
+        `| \`${u.condition}\` | ${u.graph_json_read_runs} | ${hasGraph ? u.never_invoked_runs : "n/a (no graph)"} | ${u.strict_denials_total} (${u.strict_denials_median ?? "–"}) |`,
+      );
+    }
+    out.push("");
+    // The strict arm's whole premise is that the block fires. If it never did,
+    // saying so is the finding — otherwise the arm reads as "strict changes
+    // nothing", when the truth is "strict never engaged".
+    const strictArms = usage.filter((u) => resolveCondition(u.condition).overlays.includes("graphify-strict"));
+    const inertStrict = strictArms.filter((u) => u.runs > 0 && u.strict_denials_total === 0);
+    if (inertStrict.length > 0) {
+      out.push(
+        `> **The strict block never fired.** Across ${inertStrict.map((u) => `${u.runs} \`${u.condition}\``).join(" and ")} ` +
+          "runs the hook denied **zero** reads, confirmed three ways: no `permissionDecision` in any transcript, no deny " +
+          "text, and `permission_denials` = 0 in every `result.json`. The cause is in graphify's own guard " +
+          "(`cli.py::_query_stamp_fresh`): strict suppresses its block while a query/explain/path ran within the last " +
+          "30 minutes, and the overlay's `CLAUDE.md` already steers the agent to `graphify query` **before** its first " +
+          "raw `Read`. The soft nudge wins the race every time, so the strict flag is inert under this overlay — " +
+          "`graphify-strict` vs `graphify` is therefore a null result about a knob that never engaged, **not** " +
+          "evidence that forcing graph-first exploration does nothing.\n",
+      );
+    }
+    out.push(
+      "> **Cross-session memory was never measured.** `save-result`, `reflect` and `affected` are the " +
+        "mechanisms by which graphify is supposed to compound across sessions, and they were invoked **zero " +
+        "times in every arm**. Each benchmark run is a fresh corpus copy with a fresh session, so there is no " +
+        "second session for a saved result to pay off in — the design that would exercise them is a different " +
+        "experiment, not a variation of this one. The honest statement is that this benchmark measures " +
+        "single-session retrieval only.\n",
+    );
   }
 
   out.push(sec("Counter-productive cases and subagent use"));
@@ -316,7 +524,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
 }
 
 async function main(): Promise<void> {
-  const { sources, easy, outDir } = resolveCli(process.argv.slice(2));
+  const { sources, easy, outDir, comparisons, featureUsage } = resolveCli(process.argv.slice(2));
   const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
     console.log(`no metrics under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
@@ -324,9 +532,19 @@ async function main(): Promise<void> {
   }
   fs.mkdirSync(outDir, { recursive: true });
   const analysisPath = path.join(outDir, "analysis.json");
-  const analysis: Analysis = fs.existsSync(analysisPath)
+  // An analysis.json written by `bench:analyze` is reused verbatim so the report
+  // and the machine-readable analysis can never disagree — but only if it already
+  // carries what this invocation asks for. Requesting comparisons or feature usage
+  // that the stored analysis lacks means it was produced by a different question,
+  // so re-analyse rather than silently dropping the requested sections.
+  const stored = fs.existsSync(analysisPath)
     ? (JSON.parse(fs.readFileSync(analysisPath, "utf8")) as Analysis)
-    : analyze(rows);
+    : null;
+  const storedIsEnough =
+    stored !== null &&
+    (comparisons.length === 0 || (stored.comparisons?.length ?? 0) >= comparisons.length) &&
+    (!featureUsage || (stored.feature_usage?.length ?? 0) > 0);
+  const analysis: Analysis = storedIsEnough ? stored : analyze(rows, undefined, undefined, { comparisons, featureUsage });
   const csvPath = path.join(outDir, "summary.csv");
   const mdPath = path.join(outDir, "REPORT.md");
   fs.writeFileSync(csvPath, buildCsv(rows));

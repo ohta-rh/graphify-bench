@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 90376,
+  "stop_reason": "end_turn",
+  "session_id": "ba40309d-2af7-4776-b02e-b191553b5b1e",
+  "total_cost_usd": 0.21820449999999997,
+  "usage": {
+    "input_tokens": 218,
+    "cache_creation_input_tokens": 39602,
+    "cache_read_input_tokens": 1048805,
+    "output_tokens": 6562,
+    "output_tokens_details": {
+      "thinking_tokens": 1549
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39602,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1810,
+        "cache_read_input_tokens": 52494,
+        "cache_creation_input_tokens": 890,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 890
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 218,
+      "outputTokens": 6562,
+      "cacheReadInputTokens": 1048805,
+      "cacheCreationInputTokens": 39602,
+      "webSearchRequests": 0,
+      "costUSD": 0.21711249999999996,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1549,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 27,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Based on my investigation of the codebase, here's how the system handles a workspace plan downgrade:\n\n## Authorization\n\nOnly **organization owners** can change the plan. The permission system in `src/lib/permissions.ts` defines `org:manage_billing` as requiring the \"owner\" role. This is enforced in `src/actions/billing/change-plan.ts` via `can(actor, \"org:manage_billing\", ...)` at line 31, which throws a `ForbiddenActionError` if the actor lacks this permission.\n\n## Validation: Comparing Usage Against New Plan Limits\n\nBefore accepting the downgrade, the system runs `assertPlanFitsCurrentUsage()` in `src/actions/billing/change-plan.ts` (lines 49-67). This function:\n\n1. Fetches current live usage from `src/server/services/usage-service.ts` (seats used, projects used, storage consumed)\n2. Loads the target plan's limits from `src/config/plan-limits.ts` using `getPlanLimits(input.plan)` — this is the authoritative registry of quota values for free, starter, growth, and enterprise plans\n3. Calls `wouldExceedLimit(plan, resource, used, 0)` for each dimension (seats, projects, storageMb). The delta is zero because the org isn't consuming anything new — it's just being asked \"would what's already in use still fit?\"\n4. If any dimension would exceed the new plan's limit, throws `PlanLimitError`, rejecting the downgrade entirely\n\nFor example, if an organization on the \"growth\" plan (50 seats) has 40 members and tries to downgrade to \"starter\" (10 seats), the change is rejected because `wouldExceedLimit(\"starter\", \"seats\", 40, 0)` returns true.\n\n## Where the Plan is Recorded and Source of Truth\n\nThe plan is stored in two places:\n\n- **Authoritative source**: The `subscriptions` table, `plan` column (defined in `src/server/db/schema/billing.ts`, line 9)\n- **Denormalized cache**: The `organizations` table, `plan` column (defined in `src/server/db/schema/organizations.ts`, line 11)\n\nWhen quota decisions are made, the system reads from the subscription first. The `planFor()` function in `src/server/services/billing-service.ts` (lines 211-221) checks the subscription row; if none exists, it falls back to the organization's denormalized `plan` field. The comment at lines 207-209 explicitly states the subscription row is \"the authority on which plan an org is on.\"\n\nThe plan is updated via `src/server/repositories/subscription-repository.ts`, `updateSubscriptionPlan()` (lines 61-76), which executes an SQL UPDATE on the subscriptions table and sets status to \"active\" (ending any trial period).\n\n## Consequences\n\nWhen the plan change succeeds, `src/server/services/billing-service.ts` (line 150) emits a `billing.plan_changed` event carrying the actor ID, organization ID, source plan, and target plan:\n\n1. **Activity logging**: `src/server/services/activity-service.ts` subscribes to this event and calls `record()` (lines 225-232), appending an audit-log row documenting \"Plan {from} → {to}\"\n2. **Webhook dispatch**: `src/server/services/webhook-service.ts` subscribes to the event and enqueues it to be sent to any webhooks the organization has subscribed to the `billing.plan_changed` event type\n3. **Cache invalidation**: The action clears cached organization data using `revalidateTagged([orgTag(input.orgId)], ...)` so downstream code sees the new plan immediately\n\n## Behavioral Changes Across the Product\n\nOnce the new plan takes effect, several systems immediately start enforcing new limits and feature gating:\n\n**Feature flags gated by plan** (defined in `src/config/feature-flags.ts`):\n- `kanban_board` (requires \"starter\" or above) — board view vanishes on free\n- `activity_feed` (requires \"growth\" or above) — audit log page becomes inaccessible\n- `webhooks` (requires \"growth\" or above) — webhook configuration is hidden\n- `digest_email`, `public_projects`, `advanced_search`, `csv_export` — each tied to a minimum plan\n\nThe `isEnabled()` function in `src/lib/feature-flags.ts` calls `planAtLeast()` at line 36 to check if the current plan satisfies a flag's minimum. These checks run on both server and client (via the `snapshotFlags()` handoff), so UI components like the board view in `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/board/page.tsx` and the activity feed in `src/app/(dashboard)/[orgSlug]/activity/page.tsx` immediately hide or redirect users if the feature is no longer enabled.\n\n**Quota enforcement on create operations**:\n- `src/actions/projects/create-project.ts` reads `summary.organization.plan` and calls `getPlanLimits()` to fetch the new limits, then rejects project creation if `projectsUsed >= limits.projects`\n- Similar checks apply to issue creation, seat additions, and webhook creation\n- The `src/server/services/billing-service.ts` `checkLimit()` function (lines 80-97) is the central guard that all create paths call\n\n**UI updates reflecting new limits**:\n- Components like `src/components/domain/billing/usage-panel.tsx` and pages like `src/app/(dashboard)/[orgSlug]/settings/members/page.tsx` read the plan and display limit banners (e.g., \"5 of 10 seats used on the starter plan\")\n- The org switcher (`src/components/domain/nav/org-switcher.tsx`) shows the new plan as the description\n\nThe entire flow ensures that a downgrade is atomic: either it succeeds (subscription row is updated, event fires, cache clears) or it fails with a clear error message, and the organization remains on its previous plan.",
+  "ttft_ms": 2426,
+  "type": "result",
+  "duration_ms": 91055,
+  "uuid": "9fcb89ee-0f10-4df5-a456-72e6e2f813d1",
+  "ttft_stream_ms": 776,
+  "time_to_request_ms": 20,
+  "queued_turn_count": 0
+}

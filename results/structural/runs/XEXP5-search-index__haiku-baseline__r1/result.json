@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 88069,
+  "stop_reason": "end_turn",
+  "session_id": "2e4c50cb-77e8-4acf-8118-72de024ca489",
+  "total_cost_usd": 0.1780819,
+  "usage": {
+    "input_tokens": 202,
+    "cache_creation_input_tokens": 30750,
+    "cache_read_input_tokens": 829429,
+    "output_tokens": 6470,
+    "output_tokens_details": {
+      "thinking_tokens": 1831
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 30750,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 2100,
+        "cache_read_input_tokens": 43287,
+        "cache_creation_input_tokens": 1245,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1245
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 202,
+      "outputTokens": 6470,
+      "cacheReadInputTokens": 829429,
+      "cacheCreationInputTokens": 30750,
+      "webSearchRequests": 0,
+      "costUSD": 0.17699489999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1831,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 25,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have a complete picture of the search system. Let me write the explanation.\n\n## How Issue Search Stays in Sync\n\nWhen someone edits an issue title in your application, the searchable copy stays current through a **write-time event listener** that re-indexes on every change. Here's how the flow works from both ends.\n\n### The Write Side: Updating an Issue\n\nWhen a colleague edits an issue title, the update flows through **`src/actions/issues/update-issue.ts`**, which is a Next.js Server Action. This action:\n\n1. Parses and validates the request with `updateIssueSchema`\n2. Checks permissions via `can(actor, \"issue:update\", ...)` — verifying the actor has the `member` role or higher, or that they're the issue's author/assignee (ownership escalation)\n3. Calls `updateIssue()` in **`src/server/services/issue-service.ts`** (lines 83–109), which:\n   - Re-checks org scope and permissions to catch any drift\n   - Calls `issueRepo.updateIssue()` to persist the change to the primary database\n   - Emits an `issue.updated` event with metadata about which fields changed\n\nThat `emit()` call goes to **`src/lib/event-bus.ts`** (line 54), an in-process pub/sub that immediately calls all registered handlers in parallel, waiting for them all to settle. Errors in one handler never fail the emit or sibling handlers.\n\n### Keeping the Index in Step\n\nAt process startup, **`src/server/services/event-registry.ts`** calls `registerSearchListeners()` from **`src/server/services/search-service.ts`** (lines 137–183), which registers handlers for `issue.updated` and other events. When `issue.updated` fires:\n\n1. The handler re-reads the current issue from the database via `issueRepo.findIssueById()` — it never trusts the event payload, so a partially-applied write can never be indexed as if it succeeded\n2. Calls `indexIssue(orgId, issue)` (line 145), which combines the title and description and calls `searchRepo.upsertSearchDocument()`\n\nThe search repository in **`src/server/repositories/search-repository.ts`** (lines 18–59) upserts into a `searchIndex` table by **(org, kind, subject ID)** as a natural key. Each row stores:\n- `orgId`: tenant boundary\n- `subjectKind`: \"issue\", \"comment\", or \"project\"\n- `subjectId`: the issue ID\n- `projectId`: optional project filter\n- `content`: the searchable text (title + description, newline-separated)\n- `indexedAt`: most-recent index time\n\n### The Query Side: Searching\n\nWhen someone searches moments later, they hit **`src/app/api/search/route.ts`** (the command palette endpoint) or a Server Action. The endpoint:\n\n1. Extracts `orgSlug` and `q` from query parameters\n2. Resolves the org and actor via `getActor(orgSlug)`\n3. Checks `can(actor, \"org:read\", ...)` — the actor must be at least a `viewer` in the org\n4. Checks the `command_palette` feature flag; if disabled, rejects the query with `forbidden`\n5. Checks the `advanced_search` flag; if the query includes a colon (field-scoped syntax like `status:done`), and the actor's plan doesn't include `advanced_search`, rejects it\n6. Calls `search(actor, input)` in **`src/server/services/search-service.ts`** (lines 46–86), which:\n   - Re-checks org scope and the `issue:read` permission (role must be `viewer` or higher)\n   - Checks rate limits via `consumeRateLimit(input.orgId, SEARCH_QUERY_BUCKET)`; if exhausted, throws a rate-limit error\n   - Calls `searchDocuments(input)` in the repository\n\nThe repository query in **`src/server/repositories/search-repository.ts`** (lines 83–121) does a **substring match** using SQL's `like()` function (`%${input.q}%`), filters by org tenant, optionally by `subjectKind` (issue/comment/project), and optional `projectId`, then orders by `indexedAt` descending and paginates using keyset cursors.\n\n### When a Query is Refused\n\nA search request is rejected in these situations:\n\n1. **Cross-tenant boundary**: actor's `orgId` doesn't match the resource `orgId` — checked by `assertOrgScope()`\n2. **Insufficient role**: actor is not a `viewer` or higher — checked by the `ROLE_MATRIX` entry `\"issue:read\": \"viewer\"`\n3. **Rate limit exhausted**: the org has hit its search query token bucket limit for the window\n4. **Advanced search not available**: query contains `:` but the org's plan doesn't include the `advanced_search` feature, checked via `isEnabled(\"advanced_search\", context)` against the plan strategy in **`src/lib/feature-flags.ts`** (line 36)\n5. **Feature disabled**: the `command_palette` feature flag is disabled for this org\n6. **Bad schema**: query is empty or longer than 200 characters, caught by `searchQuerySchema.min(1).max(200)` in **`src/schemas/search.ts`** (line 9)\n\nThe permission model is centralized in **`src/lib/permissions.ts`**: every check goes through `can()` or `assertCan()`, which evaluates in order—cross-tenant guard, platform staff bypass, role matrix, then ownership escalations. Feature flags use **`src/lib/feature-flags.ts`** `isEnabled()`, which evaluates a `strategy` (off/on/plan-gated/role-gated/percentage rollout) and respects org-level flag overrides.",
+  "ttft_ms": 2853,
+  "type": "result",
+  "duration_ms": 89244,
+  "uuid": "bc065855-7c2a-4bd7-9ccf-e9f718f754f8",
+  "ttft_stream_ms": 841,
+  "time_to_request_ms": 15,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 76045,
+  "stop_reason": "end_turn",
+  "session_id": "5919a784-0713-4fb2-8a57-39cfb27158e7",
+  "total_cost_usd": 0.3920922,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 48846,
+    "cache_read_input_tokens": 644626,
+    "output_tokens": 6663,
+    "output_tokens_details": {
+      "thinking_tokens": 2629
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 48846,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2040,
+        "cache_read_input_tokens": 66574,
+        "cache_creation_input_tokens": 1031,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1031
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 28,
+      "outputTokens": 6663,
+      "cacheReadInputTokens": 644626,
+      "cacheCreationInputTokens": 48846,
+      "webSearchRequests": 0,
+      "costUSD": 0.3909952,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2629,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 25,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "This confirms the full picture. I have everything needed to answer.\n\n## What happens when an org owner downgrades their plan\n\n**Who is allowed.** The billing page (`src/app/(dashboard)/[orgSlug]/settings/billing/page.tsx`) gates the whole page on `can(actor, \"org:manage_billing\", {kind: \"billing\", orgId})`. `can()` lives in `src/lib/permissions.ts` and consults `ROLE_MATRIX`, where `org:manage_billing` requires role `\"owner\"` — the highest rank — with no ownership-escalation override, so only the org owner (not an admin/member/viewer) can reach this action. The action itself, `changePlanAction` in `src/actions/billing/change-plan.ts`, re-checks the same `can()` call, and the service layer underneath (`changePlan` in `src/server/services/billing-service.ts`) re-checks again via `assertCan`, so authorization is enforced three times on the same path (UI gate, action, service).\n\n**What is compared against what.** Submitting the form calls `changePlanAction` → the wrapped handler in `change-plan.ts`. Before touching anything, `assertPlanFitsCurrentUsage()` calls `getUsage(actor, orgId)` (`usage-service.ts`) to pull live counters (seats/projects/storage used) and compares each against the **target** (smaller) plan's ceilings from `getPlanLimits()`/`wouldExceedLimit()` in `src/config/plan-limits.ts`, using a requested delta of `0` — i.e. \"does what's already in use still fit the new plan?\". If any dimension is already over the new plan's limit, it throws `PlanLimitError` and the downgrade is refused before any write happens. `changePlan()` in `billing-service.ts` performs the identical check again (seats/projects/storage/webhooks) as a second, service-level gate before writing.\n\n**Where the plan is recorded and what's authoritative.** If both checks pass, `subscriptionRepo.updateSubscriptionPlan(orgId, plan, interval)` (`src/server/repositories/subscription-repository.ts`) updates the `subscriptions` table row — this is the only place the new plan is persisted. The code is explicit about this: the comment above `planFor()` in `billing-service.ts` states \"the subscription row is the authority on which plan an org is on; the denormalised `organizations.plan` column is only a display convenience.\" Critically, `organization-repository.ts`'s `updateOrg()` never sets the `plan` column at all — it's written once, at org creation (`insertOrg`), and is otherwise immutable through the app's normal update paths. So after a downgrade, `subscriptions.plan` = new (smaller) plan, but `organizations.plan` stays frozen at whatever it was when the org was created.\n\n**What happens afterwards.** `changePlan()` emits a `billing.plan_changed` event via `emit()` (`src/lib/event-bus.ts`) with `from`/`to` plan and actor info. Two listeners react: `activity-service.ts` records it to the audit log (`\"changed the plan\"`), and `webhook-service.ts`'s `registerWebhookListeners()` enqueues it for delivery to any org webhook endpoints. Back in `change-plan.ts`, `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` invalidates the Next.js cache tag for that org so billing-page data refreshes.\n\n**Where behavior diverges away from the billing pages.** This is the consequential part: almost every quota/entitlement check *outside* billing reads `org.plan` (the stale, never-updated `organizations.plan` column) rather than `subscription.plan`. Concretely: `attachment-service.ts` (storage quota), `invitation-service.ts` (seat quota on invites), `issue-service.ts` (issues-per-project quota), `project-service.ts` (project quota), `webhook-service.ts` (webhook count and the `webhooks` feature flag gate), `feature-flag-service.ts`'s `buildFlagContext()` (which decides which flags like `advanced_search`/`ai_issue_summary` are enabled via `planAtLeast()` in `plan-limits.ts`), plus `notification-service.ts`, `search-service.ts`, and `activity-service.ts`'s own flag-context builders — all pull `org.plan` from `organization-service.ts`/`organization-repository.ts`, not the subscription. Even `usage-service.ts`'s `recomputeUsage()` job checks warn-thresholds against `getPlanLimits(org.plan)`. The dashboard shell (`(dashboard)/[orgSlug]/layout.tsx`) explicitly documents this as an \"invariant\" — \"the flag snapshot was evaluated against that organization's plan\" — computing `snapshotFlags(buildFlagContext(actor, org))` from the same stale `org.plan` on every navigation.\n\nSo the practical effect of a downgrade: the billing page itself (`getBillingSummary`, which calls `planFor()` and prefers the subscription row) immediately shows the new, cheaper plan and its correct meters/invoice estimate. But everywhere else — issue creation limits, project creation limits, seat-invite limits, storage limits, webhook counts and the webhooks feature gate, and which premium feature flags are enabled — continues to enforce the **old, bigger** plan's limits, because those code paths read the never-updated `organizations.plan` column. (Only the `trial-expiry-job.ts` downgrade path and org creation ever wrote a plan value onto that column historically, and neither backfills it on a manual billing-page downgrade.) One additional wrinkle: `src/lib/rate-limit.ts` exposes `setOrgPlan()` to scale API-rate-limit buckets by plan, but nothing in the codebase ever calls it, so the rate limiter is permanently stuck defaulting to the free-plan ceiling regardless of actual plan — a pre-existing, unrelated dead code path rather than something the downgrade itself changes.",
+  "ttft_ms": 1478,
+  "type": "result",
+  "duration_ms": 76039,
+  "uuid": "3cf8f40b-3e1b-44d9-aefb-d76c9873ea32",
+  "ttft_stream_ms": 864,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

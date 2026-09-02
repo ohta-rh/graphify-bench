@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { captureTranscript, runClaudeP, type ClaudePInvocation } from "./lib/claude-p.js";
+import { effectiveModel, overlayDirs, resolveCondition, type ConditionSpec } from "./conditions.js";
 import { applyOverlay, cloneDir } from "./lib/copy.js";
 import { REPO_ROOT, readEnv, runDir, runId, type BenchEnv } from "./lib/env.js";
 import type { Task } from "../tasks/tasks.schema.js";
@@ -41,7 +42,16 @@ export interface RunMeta {
   started_at: string;
   finished_at: string;
   corpus_dir: string;
+  /**
+   * The resolved arm definition: which overlays were layered, the model that
+   * actually ran, and any extra `claude` arguments. Recorded so a run directory
+   * is self-describing — `condition` alone does not say what was varied.
+   */
+  condition_spec: ConditionSpec & { effective_model: string };
+  /** First (primary) overlay directory. Kept for backward compatibility. */
   overlay_dir: string;
+  /** Every overlay directory, in application order (later files win). */
+  overlay_dirs: string[];
   overlay_files: string[];
   copy_strategy: string | null;
   copy_ms: number | null;
@@ -140,7 +150,12 @@ function writeJson(file: string, value: unknown): void {
  * is still analysable and `matrix.ts` can move on.
  */
 export async function executeRun(req: RunRequest): Promise<RunMeta> {
-  const env: BenchEnv = { ...readEnv(), ...req.env };
+  const base: BenchEnv = { ...readEnv(), ...req.env };
+  const spec = resolveCondition(req.condition);
+  const dirs = overlayDirs(spec, req.overlaysDir);
+  // The arm's model override wins over BENCH_MODEL, and `env.model` is what the
+  // report reads, so it must carry the model that actually ran — not the default.
+  const env: BenchEnv = { ...base, model: effectiveModel(spec, base.model) };
   const id = runId(req.task.id, req.condition, req.rep);
   const outDir = runDir(id);
   const sessionId = crypto.randomUUID();
@@ -163,7 +178,9 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     started_at: startedAt.toISOString(),
     finished_at: startedAt.toISOString(),
     corpus_dir: req.corpusDir,
-    overlay_dir: path.join(req.overlaysDir, req.condition),
+    condition_spec: { ...spec, effective_model: env.model },
+    overlay_dir: dirs[0] ?? path.join(req.overlaysDir, req.condition),
+    overlay_dirs: dirs,
     overlay_files: [],
     copy_strategy: null,
     copy_ms: null,
@@ -196,8 +213,13 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     meta.copy_ms = copied.durationMs;
     meta.timings_ms.copy = copied.durationMs;
 
-    // 2. overlay for this condition
-    meta.overlay_files = applyOverlay(meta.overlay_dir, workDir);
+    // 2. overlay(s) for this condition, layered left to right
+    const written: string[] = [];
+    for (const dir of dirs) {
+      if (!fs.existsSync(dir)) throw new Error(`overlay not found for condition "${req.condition}": ${dir}`);
+      written.push(...applyOverlay(dir, workDir));
+    }
+    meta.overlay_files = [...new Set(written)];
 
     // 3. optional bug patch — after the overlay, identically in both conditions
     if (req.task.patch) {
@@ -217,7 +239,8 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       effort: env.effort,
       maxTurns: env.maxTurns,
       maxBudgetUsd: env.maxBudgetUsd,
-      env: env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : undefined,
+      extraArgs: spec.extraClaudeArgs,
+      env: { ...(env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : {}), ...(spec.env ?? {}) },
     });
     meta.timings_ms.claude = Date.now() - tClaude;
     meta.claude = {

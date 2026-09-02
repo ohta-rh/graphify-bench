@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listRunIds } from "./collect.js";
+import { featureUsageForRun, summarizeFeatureUsage, type ConditionFeatureUsage } from "./features.js";
 import { REPO_ROOT, RESULTS_DIR, RUNS_DIR, runDir } from "./lib/env.js";
 import { mulberry32 } from "./lib/rng.js";
 import type { Metrics } from "./collect.js";
@@ -136,10 +137,43 @@ export interface ConditionSummary {
 
 export interface PairedResult {
   metric: PairedMetric;
-  /** Per-task mean(graphify) - mean(baseline). Negative = graphify used less. */
+  /** Condition the difference is measured FROM (the reference arm). */
+  baseline_condition: string;
+  /** Condition the difference is measured TO (the arm under test). */
+  treatment_condition: string;
+  /**
+   * Per-task mean(treatment) − mean(baseline). Negative = the treatment used
+   * less. The `baseline`/`graphify` field names are historical: they are the
+   * left and right sides of whatever pair this result compares.
+   */
   perTask: Array<{ task_id: string; baseline: number | null; graphify: number | null; diff: number | null; relative: number | null }>;
   ci: BootstrapCI;
   relativeCi: BootstrapCI;
+}
+
+/** A named A-vs-B comparison to run in addition to the default graphify−baseline. */
+export interface ComparisonSpec {
+  /** Reference arm. */
+  baseline: string;
+  /** Arm under test. */
+  treatment: string;
+  /** Optional one-line question this comparison answers, echoed in the report. */
+  question?: string;
+}
+
+export interface ComparisonResult extends ComparisonSpec {
+  name: string;
+  n_tasks: number;
+  /** Tasks with a graded, fully-successful run in BOTH arms. */
+  iso_accuracy_tasks: string[];
+  by_condition: ConditionSummary[];
+  paired: PairedResult[];
+  paired_iso: PairedResult[];
+  by_category: Array<{ category: string; tasks: string[]; paired: PairedResult[] }>;
+}
+
+export function comparisonName(spec: ComparisonSpec): string {
+  return `${spec.treatment} vs ${spec.baseline}`;
 }
 
 /** A named subset of the runs, summarized exactly like the whole. */
@@ -180,6 +214,14 @@ export interface Analysis {
   by_easy: SubgroupResult[];
   failures: Array<{ run_id: string; condition: string; task_id: string; terminal_reason: string | null; is_error: boolean | null }>;
   counter_productive: { read_graph_json: string[]; graphify_never_invoked: string[] };
+  /**
+   * Named A-vs-B comparisons beyond the headline `graphify − baseline`. Absent
+   * from analyses produced before Phase 6, so every consumer must treat it as
+   * optional — that is what keeps the pre-existing combined report reproducible.
+   */
+  comparisons?: ComparisonResult[];
+  /** Per-condition graphify feature usage, when the caller supplied it. */
+  feature_usage?: ConditionFeatureUsage[];
 }
 
 function sumInto(target: Record<string, number>, source: Record<string, number> | undefined): void {
@@ -229,12 +271,19 @@ export function summarizeCondition(condition: string, rows: RunRow[]): Condition
   };
 }
 
-export function pairByTask(rows: RunRow[], metric: PairedMetric, seed: string, B: number): PairedResult {
+export function pairByTask(
+  rows: RunRow[],
+  metric: PairedMetric,
+  seed: string,
+  B: number,
+  baselineCondition: string = BASELINE,
+  treatmentCondition: string = TREATMENT,
+): PairedResult {
   const taskIds = [...new Set(rows.map((r) => r.task_id))].sort();
   const perTask: PairedResult["perTask"] = [];
   for (const task_id of taskIds) {
-    const b = mean(rows.filter((r) => r.task_id === task_id && r.condition === BASELINE).map((r) => pick(r, metric)).filter((v): v is number => v !== null));
-    const g = mean(rows.filter((r) => r.task_id === task_id && r.condition === TREATMENT).map((r) => pick(r, metric)).filter((v): v is number => v !== null));
+    const b = mean(rows.filter((r) => r.task_id === task_id && r.condition === baselineCondition).map((r) => pick(r, metric)).filter((v): v is number => v !== null));
+    const g = mean(rows.filter((r) => r.task_id === task_id && r.condition === treatmentCondition).map((r) => pick(r, metric)).filter((v): v is number => v !== null));
     const diff = b === null || g === null ? null : g - b;
     const relative = b === null || g === null || b === 0 ? null : (g - b) / b;
     perTask.push({ task_id, baseline: b, graphify: g, diff, relative });
@@ -243,37 +292,94 @@ export function pairByTask(rows: RunRow[], metric: PairedMetric, seed: string, B
   const rels = perTask.map((p) => p.relative).filter((v): v is number => v !== null);
   return {
     metric,
+    baseline_condition: baselineCondition,
+    treatment_condition: treatmentCondition,
     perTask,
     ci: bootstrapMeanCI(diffs, B, `${seed}:${metric}:abs`),
     relativeCi: bootstrapMeanCI(rels, B, `${seed}:${metric}:rel`),
   };
 }
 
+/** Tasks where every graded run of BOTH named arms succeeded. */
+export function isoAccuracyTasks(rows: RunRow[], baseline: string, treatment: string): string[] {
+  const taskIds = [...new Set(rows.map((r) => r.task_id))].sort();
+  return taskIds.filter((t) => {
+    const forTask = rows.filter((r) => r.task_id === t && r.success !== null);
+    const b = forTask.filter((r) => r.condition === baseline);
+    const g = forTask.filter((r) => r.condition === treatment);
+    return b.length > 0 && g.length > 0 && [...b, ...g].every((r) => r.success === true);
+  });
+}
+
+/**
+ * Run one named A-vs-B comparison with the same machinery as the headline pair:
+ * overall paired CIs, an iso-accuracy subset scoped to these two arms, and a
+ * per-category breakdown. Rows of other conditions are ignored throughout, so a
+ * six-arm results directory yields six clean two-arm comparisons.
+ */
+export function compare(rows: RunRow[], spec: ComparisonSpec, seed: string, B: number): ComparisonResult {
+  const { baseline, treatment } = spec;
+  const own = rows.filter((r) => r.condition === baseline || r.condition === treatment);
+  const iso = isoAccuracyTasks(own, baseline, treatment);
+  const isoRows = own.filter((r) => iso.includes(r.task_id));
+  const key = `${seed}:cmp:${treatment}:${baseline}`;
+  const categories = [...new Set(own.map((r) => r.category).filter((c): c is string => !!c))].sort();
+  return {
+    ...spec,
+    name: comparisonName(spec),
+    n_tasks: new Set(own.map((r) => r.task_id)).size,
+    iso_accuracy_tasks: iso,
+    by_condition: [baseline, treatment].map((c) => summarizeCondition(c, own)),
+    paired: METRIC_KEYS.map((m) => pairByTask(own, m, key, B, baseline, treatment)),
+    paired_iso: METRIC_KEYS.map((m) => pairByTask(isoRows, m, `${key}:iso`, B, baseline, treatment)),
+    by_category: categories.map((category) => {
+      const sub = own.filter((r) => r.category === category);
+      return {
+        category,
+        tasks: [...new Set(sub.map((r) => r.task_id))].sort(),
+        paired: METRIC_KEYS.map((m) => pairByTask(sub, m, `${key}:${category}`, B, baseline, treatment)),
+      };
+    }),
+  };
+}
+
 /** Summarize an arbitrary named subset of rows with the same machinery as the whole. */
 export function subgroup(group: string, rows: RunRow[], conditions: string[], seed: string, B: number): SubgroupResult {
+  // Only arms that actually appear in this subset. Once a results directory
+  // holds arms that were not run on every measurement set, listing the global
+  // condition set here would print rows of zeros for arms the subgroup never
+  // contained — a table that looks like a result but is an absence.
+  const present = conditions.filter((c) => rows.some((r) => r.condition === c));
   return {
     group,
     n_runs: rows.length,
     n_tasks: new Set(rows.map((r) => r.task_id)).size,
     tasks: [...new Set(rows.map((r) => r.task_id))].sort(),
-    by_condition: conditions.map((c) => summarizeCondition(c, rows)),
+    by_condition: present.map((c) => summarizeCondition(c, rows)),
     paired: METRIC_KEYS.map((m) => pairByTask(rows, m, `${seed}:${group}`, B)),
   };
 }
 
-export function analyze(rows: RunRow[], seed = "graphify-bench-bootstrap", B = 2000): Analysis {
+export interface AnalyzeOptions {
+  /** Extra named A-vs-B comparisons; the headline pair is always computed. */
+  comparisons?: ComparisonSpec[];
+  /** Include per-condition graphify feature usage (reads each run's transcript). */
+  featureUsage?: boolean;
+}
+
+export function analyze(
+  rows: RunRow[],
+  seed = "graphify-bench-bootstrap",
+  B = 2000,
+  opts: AnalyzeOptions = {},
+): Analysis {
   const conditions = [...new Set(rows.map((r) => r.condition))].sort();
   const taskIds = [...new Set(rows.map((r) => r.task_id))].sort();
 
   // iso-accuracy: keep only tasks where both conditions were graded and every
   // graded run succeeded. Comparing tokens across arms that answered differently
   // would credit an arm for giving up early.
-  const isoTasks = taskIds.filter((t) => {
-    const forTask = rows.filter((r) => r.task_id === t && r.success !== null);
-    const b = forTask.filter((r) => r.condition === BASELINE);
-    const g = forTask.filter((r) => r.condition === TREATMENT);
-    return b.length > 0 && g.length > 0 && [...b, ...g].every((r) => r.success === true);
-  });
+  const isoTasks = isoAccuracyTasks(rows, BASELINE, TREATMENT);
   const isoRows = rows.filter((r) => isoTasks.includes(r.task_id));
 
   const categories = [...new Set(rows.map((r) => r.category).filter((c): c is string => !!c))].sort();
@@ -321,6 +427,18 @@ export function analyze(rows: RunRow[], seed = "graphify-bench-bootstrap", B = 2
         .filter((r) => r.condition === TREATMENT && (r.tool_calls["Bash(graphify)"] ?? 0) === 0)
         .map((r) => r.run_id),
     },
+    // Both fields stay absent unless asked for, so an analysis of the original
+    // two-arm data serializes byte-for-byte as it did before Phase 6.
+    ...(opts.comparisons?.length
+      ? { comparisons: opts.comparisons.map((c) => compare(rows, c, seed, B)) }
+      : {}),
+    ...(opts.featureUsage
+      ? {
+          feature_usage: summarizeFeatureUsage(
+            rows.map((r) => ({ condition: r.condition, usage: featureUsageForRun(r.run_dir) })),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -442,7 +560,13 @@ export function loadRows(
  * and `--out dir` are what let one invocation aggregate several measurement
  * sets into a single combined analysis.
  */
-export function resolveCli(argv: string[]): { sources: RunSource[]; easy: Set<string>; outDir: string } {
+export function resolveCli(argv: string[]): {
+  sources: RunSource[];
+  easy: Set<string>;
+  outDir: string;
+  comparisons: ComparisonSpec[];
+  featureUsage: boolean;
+} {
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 && i + 1 < argv.length && !argv[i + 1]!.startsWith("--") ? argv[i + 1] : undefined;
@@ -452,17 +576,35 @@ export function resolveCli(argv: string[]): { sources: RunSource[]; easy: Set<st
     sources: parseRunSources(flag("runs"), REPO_ROOT),
     easy: easyTaskIds((flag("tasks") ?? "").split(",").map((s) => s.trim()).filter(Boolean), REPO_ROOT),
     outDir: out ? path.resolve(REPO_ROOT, out) : RESULTS_DIR,
+    comparisons: parseComparisons(flag("compare")),
+    featureUsage: argv.includes("--feature-usage"),
   };
 }
 
+/**
+ * Parse `--compare "treatment:baseline,other:baseline"`. Each entry names the
+ * arm under test first and the reference second, matching how the resulting
+ * difference is signed (treatment − baseline).
+ */
+export function parseComparisons(spec: string | undefined): ComparisonSpec[] {
+  const entries = (spec ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return entries.map((entry) => {
+    const parts = entry.split(":").map((s) => s.trim());
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      throw new Error(`--compare entry must be "treatment:baseline", got ${JSON.stringify(entry)}`);
+    }
+    return { treatment: parts[0]!, baseline: parts[1]! };
+  });
+}
+
 async function main(): Promise<void> {
-  const { sources, easy, outDir } = resolveCli(process.argv.slice(2));
+  const { sources, easy, outDir, comparisons, featureUsage } = resolveCli(process.argv.slice(2));
   const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
     console.log(`no metrics.json under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
     return;
   }
-  const analysis = analyze(rows);
+  const analysis = analyze(rows, undefined, undefined, { comparisons, featureUsage });
   fs.mkdirSync(outDir, { recursive: true });
   const out = path.join(outDir, "analysis.json");
   fs.writeFileSync(out, `${JSON.stringify(analysis, null, 2)}\n`);
@@ -472,6 +614,15 @@ async function main(): Promise<void> {
     console.log(
       `  ${p.metric}: mean diff ${point?.toFixed(3) ?? "-"} [${lo?.toFixed(3) ?? "-"}, ${hi?.toFixed(3) ?? "-"}]${crossesZero ? "  (CI crosses 0 — no detectable difference)" : ""}`,
     );
+  }
+  for (const c of analysis.comparisons ?? []) {
+    console.log(`  [${c.name}] ${c.n_tasks} tasks, iso subset ${c.iso_accuracy_tasks.length}`);
+    for (const p of c.paired) {
+      const { point, lo, hi, crossesZero } = p.ci;
+      console.log(
+        `    ${p.metric}: ${point?.toFixed(3) ?? "-"} [${lo?.toFixed(3) ?? "-"}, ${hi?.toFixed(3) ?? "-"}]${crossesZero ? "  (crosses 0)" : ""}`,
+      );
+    }
   }
 }
 

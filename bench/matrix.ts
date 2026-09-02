@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { collectRun } from "./collect.js";
+import { overlayDirs, resolveCondition } from "./conditions.js";
 import { REPO_ROOT, readEnv, runDir, runId } from "./lib/env.js";
 import { shuffle } from "./lib/rng.js";
 import { executeRun } from "./run.js";
@@ -33,7 +34,8 @@ export function isComplete(id: string): boolean {
 
 interface Cli {
   profile: string;
-  tasksFile: string;
+  /** One or more task files; `--tasks a.json,b.json` pools them into one matrix. */
+  tasksFiles: string[];
   corpus: string;
   overlays: string;
   conditions: string[];
@@ -63,9 +65,15 @@ export function parseCli(argv: string[]): Cli {
     .map((c) => c.trim())
     .filter(Boolean);
   const concurrency = Math.min(3, Math.max(1, Number(flag(argv, "concurrency") ?? "1")));
+  const tasksFiles = (flag(argv, "tasks") ?? "tasks/tasks.json")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((f) => path.resolve(REPO_ROOT, f));
+  if (tasksFiles.length === 0) throw new Error("--tasks resolved to no files");
   return {
     profile,
-    tasksFile: path.resolve(REPO_ROOT, flag(argv, "tasks") ?? "tasks/tasks.json"),
+    tasksFiles,
     corpus: path.resolve(REPO_ROOT, flag(argv, "corpus") ?? "corpus/taskflow"),
     overlays: path.resolve(REPO_ROOT, flag(argv, "overlays") ?? "overlays"),
     conditions,
@@ -81,11 +89,24 @@ export function parseCli(argv: string[]): Cli {
 
 async function main(): Promise<void> {
   const cli = parseCli(process.argv.slice(2));
-  const parsed = parseTaskFile(JSON.parse(fs.readFileSync(cli.tasksFile, "utf8")));
 
-  let tasks = parsed.tasks;
+  // Pool several task files into one matrix. `patch`/`key`/`spec` are resolved
+  // relative to the file that declared the task, so each task carries its own
+  // tasks directory rather than inheriting a single global one.
+  let tasks: Task[] = [];
+  const tasksDirOf = new Map<string, string>();
+  for (const file of cli.tasksFiles) {
+    const parsed = parseTaskFile(JSON.parse(fs.readFileSync(file, "utf8")));
+    for (const t of parsed.tasks) {
+      const prev = tasksDirOf.get(t.id);
+      if (prev !== undefined) throw new Error(`duplicate task id "${t.id}" across ${cli.tasksFiles.join(", ")}`);
+      tasksDirOf.set(t.id, path.dirname(file));
+      tasks.push(t);
+    }
+  }
+
   if (cli.only.length > 0) tasks = tasks.filter((t) => cli.only.includes(t.id));
-  if (tasks.length === 0) throw new Error(`no tasks selected from ${cli.tasksFile}`);
+  if (tasks.length === 0) throw new Error(`no tasks selected from ${cli.tasksFiles.join(", ")}`);
   const placeholders = tasks.filter((t) => t.placeholder);
   if (placeholders.length > 0 && !cli.allowPlaceholder) {
     throw new Error(
@@ -95,8 +116,9 @@ async function main(): Promise<void> {
   }
   if (!fs.existsSync(cli.corpus)) throw new Error(`corpus not found: ${cli.corpus}`);
   for (const condition of cli.conditions) {
-    const dir = path.join(cli.overlays, condition);
-    if (!fs.existsSync(dir)) throw new Error(`overlay not found for condition "${condition}": ${dir}`);
+    for (const dir of overlayDirs(resolveCondition(condition), cli.overlays)) {
+      if (!fs.existsSync(dir)) throw new Error(`overlay not found for condition "${condition}": ${dir}`);
+    }
   }
 
   const cells = enumerateCells(tasks, cli.conditions, cli.reps, cli.seed);
@@ -126,7 +148,7 @@ async function main(): Promise<void> {
         rep: cell.rep,
         corpusDir: cli.corpus,
         overlaysDir: cli.overlays,
-        tasksDir: path.dirname(cli.tasksFile),
+        tasksDir: tasksDirOf.get(cell.task.id) ?? path.dirname(cli.tasksFiles[0]!),
       });
       let metricsSummary = "metrics=failed";
       try {
