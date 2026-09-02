@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listRunIds } from "./collect.js";
-import { RESULTS_DIR, runDir } from "./lib/env.js";
+import { REPO_ROOT, RESULTS_DIR, RUNS_DIR, runDir } from "./lib/env.js";
 import { mulberry32 } from "./lib/rng.js";
 import type { Metrics } from "./collect.js";
 import type { Grade } from "./grade.js";
@@ -12,6 +12,16 @@ export const TREATMENT = "graphify";
 /** One run flattened for analysis. */
 export interface RunRow {
   run_id: string;
+  /**
+   * Directory the run's artifacts live in. Carried on the row (rather than
+   * derived from the global `RUNS_DIR`) so an analysis can span several runs
+   * directories — that is what makes the combined 45-task report possible.
+   */
+  run_dir: string;
+  /** Which measurement set the run belongs to, e.g. `set1` / `ext`. */
+  set: string;
+  /** Task carries a `DELIBERATELY EASY` note — a designed zero-advantage control. */
+  easy: boolean;
   task_id: string;
   category: string | null;
   condition: string;
@@ -132,6 +142,16 @@ export interface PairedResult {
   relativeCi: BootstrapCI;
 }
 
+/** A named subset of the runs, summarized exactly like the whole. */
+export interface SubgroupResult {
+  group: string;
+  n_runs: number;
+  n_tasks: number;
+  tasks: string[];
+  by_condition: ConditionSummary[];
+  paired: PairedResult[];
+}
+
 export interface Analysis {
   generated_at: string;
   seed: string;
@@ -146,6 +166,18 @@ export interface Analysis {
   paired: PairedResult[];
   paired_iso: PairedResult[];
   by_category: Array<{ category: string; tasks: string[]; paired: PairedResult[] }>;
+  /**
+   * One entry per measurement set when the analysis spans more than one, so
+   * drift between independently-authored task sets stays visible instead of
+   * being averaged away by the pooled numbers.
+   */
+  by_set: SubgroupResult[];
+  /**
+   * `easy` = the designed zero-advantage controls (tasks whose notes carry
+   * `DELIBERATELY EASY`), `rest` = everything else. Empty when no task file was
+   * supplied, since the flag lives in the task definitions, not the run dirs.
+   */
+  by_easy: SubgroupResult[];
   failures: Array<{ run_id: string; condition: string; task_id: string; terminal_reason: string | null; is_error: boolean | null }>;
   counter_productive: { read_graph_json: string[]; graphify_never_invoked: string[] };
 }
@@ -217,6 +249,18 @@ export function pairByTask(rows: RunRow[], metric: PairedMetric, seed: string, B
   };
 }
 
+/** Summarize an arbitrary named subset of rows with the same machinery as the whole. */
+export function subgroup(group: string, rows: RunRow[], conditions: string[], seed: string, B: number): SubgroupResult {
+  return {
+    group,
+    n_runs: rows.length,
+    n_tasks: new Set(rows.map((r) => r.task_id)).size,
+    tasks: [...new Set(rows.map((r) => r.task_id))].sort(),
+    by_condition: conditions.map((c) => summarizeCondition(c, rows)),
+    paired: METRIC_KEYS.map((m) => pairByTask(rows, m, `${seed}:${group}`, B)),
+  };
+}
+
 export function analyze(rows: RunRow[], seed = "graphify-bench-bootstrap", B = 2000): Analysis {
   const conditions = [...new Set(rows.map((r) => r.condition))].sort();
   const taskIds = [...new Set(rows.map((r) => r.task_id))].sort();
@@ -254,6 +298,20 @@ export function analyze(rows: RunRow[], seed = "graphify-bench-bootstrap", B = 2
         paired: METRIC_KEYS.map((m) => pairByTask(sub, m, `${seed}:${category}`, B)),
       };
     }),
+    // Only meaningful across >1 set; a single-set analysis would just restate §2.
+    by_set: (() => {
+      const sets = [...new Set(rows.map((r) => r.set))].sort();
+      return sets.length < 2 ? [] : sets.map((s) => subgroup(s, rows.filter((r) => r.set === s), conditions, `${seed}:set`, B));
+    })(),
+    // Needs the task definitions; with none supplied every row is easy=false.
+    by_easy: (() => {
+      const easyRows = rows.filter((r) => r.easy);
+      if (easyRows.length === 0) return [];
+      return [
+        subgroup("easy", easyRows, conditions, `${seed}:easy`, B),
+        subgroup("rest", rows.filter((r) => !r.easy), conditions, `${seed}:easy`, B),
+      ];
+    })(),
     failures: rows
       .filter((r) => r.is_error === true || r.success === false || r.success === null)
       .map((r) => ({ run_id: r.run_id, condition: r.condition, task_id: r.task_id, terminal_reason: r.terminal_reason, is_error: r.is_error })),
@@ -276,17 +334,84 @@ function readJson<T>(file: string): T | null {
   }
 }
 
-export function loadRows(ids: string[] = listRunIds()): RunRow[] {
+/** A runs directory plus the label its runs are tagged with. */
+export interface RunSource {
+  label: string;
+  dir: string;
+}
+
+/**
+ * Parse `--runs`. Entries are `dir` or `label=dir`; an unlabelled entry takes
+ * the name of the directory *containing* `runs/`, with the repository's own
+ * top-level `results/runs` reading as `set1`.
+ */
+export function parseRunSources(spec: string | undefined, root: string): RunSource[] {
+  const entries = (spec ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (entries.length === 0) return [{ label: "set1", dir: RUNS_DIR }];
+  return entries.map((entry) => {
+    const eq = entry.indexOf("=");
+    const label = eq > 0 ? entry.slice(0, eq).trim() : "";
+    const dir = path.resolve(root, eq > 0 ? entry.slice(eq + 1).trim() : entry);
+    if (label) return { label, dir };
+    const parent = path.basename(path.dirname(dir));
+    return { label: parent === "results" ? "set1" : parent, dir };
+  });
+}
+
+/**
+ * Task ids whose notes mark them as designed zero-advantage controls. The
+ * marker is the literal `DELIBERATELY EASY` string the task authors used; no
+ * other heuristic is applied, so the subset is exactly what the task file says.
+ */
+export function easyTaskIds(taskFiles: string[], root: string): Set<string> {
+  const ids = new Set<string>();
+  for (const file of taskFiles) {
+    const parsed = readJson<{ tasks?: Array<{ id?: string; notes?: string }> }>(path.resolve(root, file));
+    for (const t of parsed?.tasks ?? []) {
+      if (t.id && /DELIBERATELY EASY/i.test(t.notes ?? "")) ids.add(t.id);
+    }
+  }
+  return ids;
+}
+
+function listRunIdsIn(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort();
+}
+
+/** Load every run under each source directory, tagging rows with set and easy-flag. */
+export function loadRowsFromSources(sources: RunSource[], easy: Set<string> = new Set()): RunRow[] {
+  const rows: RunRow[] = [];
+  for (const src of sources) {
+    for (const id of listRunIdsIn(src.dir)) {
+      rows.push(...loadRows([id], { dir: path.join(src.dir, id), set: src.label, easy }));
+    }
+  }
+  return rows;
+}
+
+export function loadRows(
+  ids: string[] = listRunIds(),
+  opts?: { dir?: string; set?: string; easy?: Set<string> },
+): RunRow[] {
   const rows: RunRow[] = [];
   for (const id of ids) {
-    const dir = runDir(id);
+    const dir = opts?.dir ?? runDir(id);
     const m = readJson<Metrics>(path.join(dir, "metrics.json"));
     if (!m) continue;
     const g = readJson<Grade>(path.join(dir, "grade.json"));
     const meta = readJson<{ category?: string; condition?: string; rep?: number; task_id?: string }>(path.join(dir, "run.meta.json"));
+    const task_id = m.task_id ?? meta?.task_id ?? id.split("__")[0] ?? id;
     rows.push({
       run_id: id,
-      task_id: m.task_id ?? meta?.task_id ?? id.split("__")[0] ?? id,
+      run_dir: dir,
+      set: opts?.set ?? "set1",
+      easy: opts?.easy?.has(task_id) ?? false,
+      task_id,
       category: meta?.category ?? null,
       condition: m.condition ?? meta?.condition ?? id.split("__")[1] ?? "unknown",
       rep: m.rep ?? meta?.rep ?? 1,
@@ -312,15 +437,34 @@ export function loadRows(ids: string[] = listRunIds()): RunRow[] {
   return rows;
 }
 
+/**
+ * `--runs a,b` (each `dir` or `label=dir`), `--tasks f1,f2` (for the easy flag)
+ * and `--out dir` are what let one invocation aggregate several measurement
+ * sets into a single combined analysis.
+ */
+export function resolveCli(argv: string[]): { sources: RunSource[]; easy: Set<string>; outDir: string } {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 && i + 1 < argv.length && !argv[i + 1]!.startsWith("--") ? argv[i + 1] : undefined;
+  };
+  const out = flag("out");
+  return {
+    sources: parseRunSources(flag("runs"), REPO_ROOT),
+    easy: easyTaskIds((flag("tasks") ?? "").split(",").map((s) => s.trim()).filter(Boolean), REPO_ROOT),
+    outDir: out ? path.resolve(REPO_ROOT, out) : RESULTS_DIR,
+  };
+}
+
 async function main(): Promise<void> {
-  const rows = loadRows();
+  const { sources, easy, outDir } = resolveCli(process.argv.slice(2));
+  const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
-    console.log("no metrics.json under results/runs/ — run bench:collect first");
+    console.log(`no metrics.json under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
     return;
   }
   const analysis = analyze(rows);
-  fs.mkdirSync(RESULTS_DIR, { recursive: true });
-  const out = path.join(RESULTS_DIR, "analysis.json");
+  fs.mkdirSync(outDir, { recursive: true });
+  const out = path.join(outDir, "analysis.json");
   fs.writeFileSync(out, `${JSON.stringify(analysis, null, 2)}\n`);
   console.log(`wrote ${out}: ${analysis.n_runs} runs over ${analysis.n_tasks} tasks`);
   for (const p of analysis.paired) {

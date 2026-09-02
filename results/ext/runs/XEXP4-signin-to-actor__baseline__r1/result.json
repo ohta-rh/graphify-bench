@@ -1,0 +1,111 @@
+{
+  "duration_api_ms": 115910,
+  "stop_reason": "end_turn",
+  "session_id": "a1e29dfa-e651-4a58-b065-66ef2c8ae6c8",
+  "total_cost_usd": 0.3677969,
+  "usage": {
+    "input_tokens": 6,
+    "cache_creation_input_tokens": 17556,
+    "cache_read_input_tokens": 83840,
+    "output_tokens": 3261,
+    "output_tokens_details": {
+      "thinking_tokens": 211
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 17556,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2005,
+        "cache_read_input_tokens": 35878,
+        "cache_creation_input_tokens": 437,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 437
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1042,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001117,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 26,
+      "outputTokens": 11577,
+      "cacheReadInputTokens": 342232,
+      "cacheCreationInputTokens": 62431,
+      "webSearchRequests": 0,
+      "costUSD": 0.36667989999999995,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 641,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 3,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "All the files check out. Here's the full trace from keystroke to rendered sidebar.\n\n## Sign-in\n\nThe form lives in `src/app/(auth)/login/login-form.tsx`, a client component (`LoginForm`) driven by `useActionState`. On submit it first runs client-side validation with `loginSchema.safeParse` (`src/schemas/auth.ts`), then invokes the Server Action `loginAction` in `src/actions/auth/login.ts` directly as the form's `action` — there's no fetch to an API route.\n\n`loginAction` re-validates the same `loginSchema` server-side (never trust the client), calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")`, and hands off to `login()` in `src/server/services/auth-service.ts`.\n\n## Credential checking\n\n`login()` does the real work: `userRepo.findUserByEmail(email)` and `userRepo.findPasswordHash(user.id)` (`src/server/repositories/user-repository.ts`), then `verifyPassword(password, storedHash)` from `src/lib/hash.ts`. There's no bcrypt/argon2 dependency — it's a hand-rolled scrypt KDF over `node:crypto`, storing hashes as `scrypt:<saltHex>:<keyHex>` and comparing with `timingSafeEqual` for constant-time safety. A missing user and a wrong password both throw the identical \"Those credentials did not match\" to avoid user enumeration, and the rate limit is consumed *before* the check so brute-forcing is throttled regardless of outcome.\n\n## Session creation\n\nOn success, `login()` calls `createSessionToken(userId)` in `src/server/services/session-service.ts`, which generates a 32-byte random token (`randomToken`), hashes it with SHA-256 (`hashToken`), and writes only the hash — plus `userId`, `activeOrgId`, `expiresAt` (30-day TTL) — into the `sessions` table via `sessionRepo.createSession()` (`src/server/db/schema/users.ts` / `src/server/repositories/session-repository.ts`). The raw token never touches the database. Back in `loginAction`, that raw token is set into the browser via `setSessionCookie(token, expiresAt)` in `src/lib/session.ts`:\n\n```ts\njar.set(SESSION_COOKIE_NAME, token, {\n  httpOnly: true,\n  sameSite: \"lax\",\n  secure: process.env.NODE_ENV === \"production\",\n  path: \"/\",\n  expires: parseIso(expiresAt),\n});\n```\n\nThe cookie is named `taskflow_session`. So: the DB holds the token *hash* plus session metadata (userId, org, expiry); the browser holds only an opaque random string, no user id, role, or claims embedded in it.\n\n## Re-establishing identity per request\n\n`src/proxy.ts` (Next.js 16's renamed `middleware.ts`) does a cheap edge-level check: for any non-public path it just looks for the presence of the `taskflow_session` cookie and redirects to `/login?next=...` if it's missing — it explicitly cannot touch the database from the edge. The real verification happens server-side via `getSessionPrincipal()` in `src/lib/session.ts`, which reads the cookie, calls `resolveSession(token)` (hashes the token, looks it up in `sessions` joined to `users`), and returns a `SessionPrincipal` only if `expiresAt` is still in the future.\n\n## \"Still signed in\" and expiry\n\nExpiry is checked twice — once in the repository lookup (an expired row is treated as not found) and again explicitly in `getSessionPrincipal()`. There's no sliding/refresh; sessions just expire at the fixed 30-day mark, with a `purgeExpiredSessions` sweep for cleanup. The actual sign-in gate for the whole app is `src/app/(dashboard)/layout.tsx`, which calls `getSessionPrincipal()` and `redirect(\"/login\")` if null — the proxy's cookie-presence check is only a coarse first filter, not the source of truth.\n\n## From bare identity to workspace authorization\n\nInside `src/app/(dashboard)/[orgSlug]/layout.tsx`, the principal is resolved again and passed, along with the `orgSlug`, into `resolveActorForOrg(principal, orgSlug)` (`src/server/services/session-service.ts`). That function loads the org by slug, looks up the caller's row in `members` via `memberRepo.findMember(org.id, userId)`, and — if the membership is active — builds an `Actor { userId, orgId, role }`. This `Actor` is the object every downstream authorization check operates on; if there's no active membership, the layout calls `notFound()`.\n\nThe layout renders `DashboardShell` (`src/app/(dashboard)/[orgSlug]/_components/dashboard-shell.tsx`), which passes `actor` down to `AppSidebar` (`src/components/domain/nav/app-sidebar.tsx`, a client component). The sidebar doesn't branch on `actor.role` directly; it calls `visibleNav(SIDEBAR_NAV, actor, flags)` from `src/config/nav.ts`, which filters a declarative nav tree by checking each item's permission `action` (e.g. `\"member:invite\"`, `\"org:manage_billing\"`) through `can(actor, action, resource)` in `src/lib/permissions.ts`. `can()` is the single authorization chokepoint: it enforces the cross-tenant guard (`actor.orgId === resource.orgId`), a platform-staff bypass, then a `ROLE_MATRIX` lookup ranked by `owner > admin > member > viewer`, plus ownership-based escalations. Whatever passes that filter is what actually renders as sidebar links — so the same declarative nav config, gated by the same `can()` function used everywhere else in the app, is what produces the \"role-tailored\" sidebar the user sees.",
+  "ttft_ms": 2084,
+  "type": "result",
+  "duration_ms": 115232,
+  "uuid": "cad4c48c-6da5-465a-8a3b-a34e5c861479",
+  "ttft_stream_ms": 942,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

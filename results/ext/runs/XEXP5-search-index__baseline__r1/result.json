@@ -1,0 +1,114 @@
+{
+  "duration_api_ms": 162247,
+  "stop_reason": "end_turn",
+  "session_id": "5aa7ce38-ce7d-4ab7-9642-6fed837b7ffc",
+  "total_cost_usd": 0.49073620000000007,
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 10527,
+    "cache_read_input_tokens": 66420,
+    "output_tokens": 2924,
+    "output_tokens_details": {
+      "thinking_tokens": 147
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 10527,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2478,
+        "cache_read_input_tokens": 35955,
+        "cache_creation_input_tokens": 5037,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5037
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 32,
+      "outputTokens": 13775,
+      "cacheReadInputTokens": 551566,
+      "cacheCreationInputTokens": 83269,
+      "webSearchRequests": 0,
+      "costUSD": 0.4896492,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1167,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 3,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How an edited issue title becomes searchable\n\n### The write path\n\nEditing a title runs through the Server Action wrapper `withAction` (`src/actions/_lib/with-action.ts`), which validates the input against `updateIssueSchema` (`src/schemas/issue.ts`) and resolves the caller into an `Actor`. The action `updateIssueAction` (`src/actions/issues/update-issue.ts`) then calls `updateIssue(actor, input)` in `src/server/services/issue-service.ts`.\n\n`updateIssue` (`issue-service.ts:81-105`) does the actual work in order:\n\n1. `assertOrgScope(actor, input.orgId)` (`src/lib/tenant.ts`) — confirms the actor belongs to the org they're writing into.\n2. Loads the current row with `issueRepo.findIssueById`, and `requireFound`s it.\n3. `assertCan(actor, \"issue:update\", issueResource(before))` (`src/lib/permissions.ts`) — a permission check specific to this issue.\n4. `assertNotArchived(\"Issue\", before.id, before)`.\n5. `issueRepo.updateIssue(input)` — the real SQL `UPDATE` on the `issues` table (Drizzle/SQLite), which is where the new title lands.\n6. `emit(\"issue.updated\", { ...actorEnvelope(actor), issueId, projectId, changedFields })` via the in-process pub/sub bus in `src/lib/event-bus.ts`.\n\nThere is no database trigger, no CDC pipeline, and no external search service (no Elasticsearch/Algolia/Meilisearch) involved. The searchable copy is kept in sync purely through this event bus: `emit()` runs every subscriber for `\"issue.updated\"` and `await`s them all via `Promise.allSettled`, but a handler that throws is only reported to error sinks (`reportHandlerError`) — it never fails the update or the action. So the title write and the index update are two separate SQLite statements, not one transaction; if indexing throws, the row change still succeeds and the index silently falls behind.\n\nThe subscriber that does the reindexing is registered once at process startup — `registerSearchListeners()` in `src/server/services/search-service.ts`, wired up by `registerEventHandlers` in `src/server/services/event-registry.ts` (invoked from `src/instrumentation.ts`). Its handler for `\"issue.updated\"` is:\n\n```ts\nsubscribe(\"issue.updated\", async (payload) => {\n  const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);\n  if (issue) await indexIssue(payload.orgId, issue);\n}),\n```\n\nNotably it re-reads the issue from the database rather than trusting the event payload's fields — a deliberate choice so a partially-applied write can never be indexed as though it fully succeeded. `indexIssue` (`search-service.ts`) builds the document body as `[issue.title, issue.description ?? \"\"].join(\"\\n\")` and calls `searchRepo.upsertSearchDocument(orgId, \"issue\", issue.id, content, issue.projectId)` in `src/server/repositories/search-repository.ts`, which does an application-level \"find by (org, kind, subject) then update-or-insert\" against the `search_index` table (not a DB-level `ON CONFLICT`).\n\n### What's stored in the searchable copy\n\nThe table is `search_index`, defined in `src/server/db/schema/webhooks.ts`:\n\n```ts\nexport const searchIndex = sqliteTable(\"search_index\", {\n  id: idColumn(),\n  ...tenantColumns,                 // orgId, timestamps\n  subjectKind: text(\"subject_kind\", { enum: [\"issue\", \"comment\", \"project\"] }).notNull(),\n  subjectId: text(\"subject_id\").notNull(),\n  projectId: text(\"project_id\"),\n  content: text(\"content\").notNull(),\n  indexedAt: text(\"indexed_at\").notNull(),\n}, (table) => [index(\"search_index_org_kind_idx\").on(table.orgId, table.subjectKind)]);\n```\n\nThere's no dedicated `title` column — the title is just the first line of `content` (recovered at query time with `row.content.split(\"\\n\")[0]`), and `content` is plain `text`, not a SQLite FTS5 virtual table or a `tsvector`. Matching is done later with a `LIKE '%...%'` predicate, so this is a denormalized copy searched by substring, not a real full-text-search engine.\n\n### The query path\n\nTwo entry points funnel into the same core: the command-palette API route `GET` in `src/app/api/search/route.ts`, and the Server Action `searchAction` in `src/actions/search/search.ts` (a comment in the route explicitly notes both must stay equally strict). Both end up calling `search(actor, input)` in `src/server/services/search-service.ts`, which runs, in order:\n\n1. `assertOrgScope(actor, input.orgId)` — rejects if the actor isn't scoped to that org (`TenantScopeError`).\n2. `assertCan(actor, \"issue:read\", orgResource(input.orgId))` — rejects on insufficient role (`PermissionDeniedError`).\n3. `consumeRateLimit(input.orgId, \"search:query\")` (`src/lib/rate-limit.ts`) — a token bucket (120 capacity, 60/min refill, scaled by plan). If exhausted, throws `Error(\"Search rate limit reached; try again after ${verdict.resetAt}\")`.\n4. Loads the org and evaluates the `advanced_search` feature flag via `isEnabled` (`src/lib/feature-flags.ts`), which is gated to `enterprise` plans (or explicit overrides).\n5. **The refusal that looks like a normal query but isn't**: `if (input.q.includes(\":\") && !advanced) throw new Error(\"Field-scoped search is not included in this plan\")`. A colon is treated as reserved field-scoped search syntax (e.g. `status:done`); on non-enterprise plans, a query containing one is rejected outright rather than silently searched as literal text.\n6. Only after all that does it call `searchRepo.searchDocuments(input)`, which builds a Drizzle query filtering by `orgId` (mandatory tenant scoping), `like(searchIndex.content, '%' + q + '%')`, optionally `subjectKind IN (...)`, and optionally `projectId`, then paginates with a keyset cursor ordered by `indexedAt desc, id desc`.\n7. Results are mapped back to `SearchHit`s: `title` = first line of `content`, `snippet` computed by `snippetAround`, `href` computed by `hrefFor`.\n\nBefore any of this, `q` itself is Zod-validated by `searchQuerySchema` (`src/schemas/search.ts`: `min(1)`, `max(200)`), so empty or overlong queries never reach `search()` at all — that failure surfaces as `failure(\"validation_failed\", ...)` on the API route or a structured validation error from `withAction` on the Server Action.\n\nSo a syntactically valid-looking query — right length, sensible characters — gets refused for three distinct reasons that have nothing to do with its shape: the caller lacks org/role permission, the caller has burst past the rate-limit bucket, or the query contains a colon and the org's plan doesn't include `advanced_search`.",
+  "ttft_ms": 3939,
+  "type": "result",
+  "duration_ms": 31700,
+  "uuid": "b904b17f-453f-454e-92b5-471596cf6756",
+  "ttft_stream_ms": 1732,
+  "time_to_request_ms": 5,
+  "queued_turn_count": 0
+}

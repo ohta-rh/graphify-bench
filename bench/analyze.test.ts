@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { analyze, bootstrapMeanCI, median, quantile, summarizeCondition, type RunRow } from "./analyze.js";
+import { analyze, bootstrapMeanCI, easyTaskIds, median, parseRunSources, quantile, summarizeCondition, type RunRow } from "./analyze.js";
 import { enumerateCells } from "./matrix.js";
 import { shuffle } from "./lib/rng.js";
 import type { Task } from "../tasks/tasks.schema.js";
@@ -7,6 +10,9 @@ import type { Task } from "../tasks/tasks.schema.js";
 function row(over: Partial<RunRow> & Pick<RunRow, "task_id" | "condition">): RunRow {
   const merged: RunRow = {
     run_id: `${over.task_id}__${over.condition}__r${over.rep ?? 1}`,
+    run_dir: `/tmp/runs/${over.task_id}__${over.condition}`,
+    set: "set1",
+    easy: false,
     category: "locate",
     rep: 1,
     uncached_equivalent_all: null,
@@ -197,5 +203,73 @@ describe("matrix enumeration", () => {
   it("shuffle preserves the multiset", () => {
     const xs = [1, 2, 3, 4, 5, 6, 7, 8];
     expect([...shuffle(xs, "k")].sort((p, q) => p - q)).toEqual(xs);
+  });
+});
+
+describe("multi-set analysis", () => {
+  /** Two sets: `a` where graphify halves tokens, `b` where it does not move. */
+  function twoSetRows(): RunRow[] {
+    const rows: RunRow[] = [];
+    for (const [set, gTokens] of [["a", 500], ["b", 1000]] as const) {
+      for (let i = 1; i <= 3; i++) {
+        const task_id = `${set}${i}`;
+        rows.push(row({ task_id, condition: "baseline", set, uncached_equivalent: 1000 }));
+        rows.push(row({ task_id, condition: "graphify", set, uncached_equivalent: gTokens }));
+      }
+    }
+    return rows;
+  }
+
+  it("splits by set and keeps each set's own effect", () => {
+    const a = analyze(twoSetRows());
+    expect(a.by_set.map((g) => g.group)).toEqual(["a", "b"]);
+    expect(a.by_set[0]!.n_tasks).toBe(3);
+    const aDiff = a.by_set[0]!.paired.find((p) => p.metric === "uncached_equivalent_all")!;
+    const bDiff = a.by_set[1]!.paired.find((p) => p.metric === "uncached_equivalent_all")!;
+    expect(aDiff.ci.point).toBeCloseTo(-500, 6);
+    expect(bDiff.ci.point).toBeCloseTo(0, 6);
+  });
+
+  it("omits the per-set breakdown when there is only one set", () => {
+    expect(analyze(syntheticRows()).by_set).toEqual([]);
+  });
+
+  it("splits easy controls from the rest, and omits the split when nothing is flagged", () => {
+    const rows = twoSetRows().map((r) => (r.task_id === "a1" ? { ...r, easy: true } : r));
+    const a = analyze(rows);
+    expect(a.by_easy.map((g) => g.group)).toEqual(["easy", "rest"]);
+    expect(a.by_easy[0]!.tasks).toEqual(["a1"]);
+    expect(a.by_easy[1]!.n_tasks).toBe(5);
+    expect(analyze(twoSetRows()).by_easy).toEqual([]);
+  });
+});
+
+describe("run sources and easy flags", () => {
+  it("labels an unlabelled runs dir by its parent, with results/runs reading as set1", () => {
+    const s = parseRunSources("results/runs,results/ext/runs", "/repo");
+    expect(s.map((x) => x.label)).toEqual(["set1", "ext"]);
+    expect(s[1]!.dir).toBe("/repo/results/ext/runs");
+  });
+
+  it("honours an explicit label=dir and defaults to the results dir when unset", () => {
+    expect(parseRunSources("mine=/x/runs", "/repo")[0]).toEqual({ label: "mine", dir: "/x/runs" });
+    expect(parseRunSources(undefined, "/repo")).toHaveLength(1);
+  });
+
+  it("reads the easy flag from the task notes marker only", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bench-tasks-"));
+    const file = path.join(dir, "t.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        tasks: [
+          { id: "E1", notes: "DELIBERATELY EASY (1 of 2). grep finds it." },
+          { id: "H1", notes: "Genuinely hard; no single grep reproduces the answer." },
+          { id: "N1" },
+        ],
+      }),
+    );
+    expect([...easyTaskIds([file], "/repo")]).toEqual(["E1"]);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

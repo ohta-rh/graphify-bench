@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { analyze, loadRows, type Analysis, type ConditionSummary, type PairedResult, type RunRow } from "./analyze.js";
-import { REPO_ROOT, RESULTS_DIR, runDir } from "./lib/env.js";
+import { analyze, loadRowsFromSources, resolveCli, type Analysis, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
+import { REPO_ROOT } from "./lib/env.js";
 
 const CSV_COLUMNS = [
   "run_id",
+  "set",
   "task_id",
   "category",
+  "easy",
   "condition",
   "rep",
   "uncached_equivalent_all",
@@ -52,9 +54,9 @@ interface RawMetricsExtras {
   permission_denials?: number | null;
 }
 
-function readExtras(id: string): RawMetricsExtras {
+function readExtras(dir: string): RawMetricsExtras {
   try {
-    return JSON.parse(fs.readFileSync(path.join(runDir(id), "metrics.json"), "utf8")) as RawMetricsExtras;
+    return JSON.parse(fs.readFileSync(path.join(dir, "metrics.json"), "utf8")) as RawMetricsExtras;
   } catch {
     return {};
   }
@@ -63,12 +65,14 @@ function readExtras(id: string): RawMetricsExtras {
 export function buildCsv(rows: RunRow[]): string {
   const lines = [CSV_COLUMNS.join(",")];
   for (const r of rows) {
-    const x = readExtras(r.run_id);
+    const x = readExtras(r.run_dir);
     const tc = r.tool_calls;
     const record: Record<(typeof CSV_COLUMNS)[number], unknown> = {
       run_id: r.run_id,
+      set: r.set,
       task_id: r.task_id,
       category: r.category,
+      easy: r.easy,
       condition: r.condition,
       rep: r.rep,
       uncached_equivalent_all: r.uncached_equivalent_all,
@@ -143,7 +147,7 @@ export function corpusTreeHash(): string {
 function versionsBlock(rows: RunRow[]): string {
   for (const r of rows) {
     try {
-      const meta = JSON.parse(fs.readFileSync(path.join(runDir(r.run_id), "run.meta.json"), "utf8")) as {
+      const meta = JSON.parse(fs.readFileSync(path.join(r.run_dir, "run.meta.json"), "utf8")) as {
         versions?: Record<string, string | null>;
         env?: { model?: string; effort?: string; maxTurns?: number; maxBudgetUsd?: number };
       };
@@ -162,18 +166,33 @@ function versionsBlock(rows: RunRow[]): string {
   return "- (no run.meta.json available)";
 }
 
+/** Render one named subgroup (a measurement set, or the easy/rest split). */
+function subgroupBlock(g: SubgroupResult, label: string): string[] {
+  const out: string[] = [];
+  out.push(`### ${label} — ${g.n_runs} runs over ${g.n_tasks} task${g.n_tasks === 1 ? "" : "s"}\n`);
+  out.push(conditionTable(g.by_condition));
+  out.push("");
+  out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
+  out.push("|---|---|---|---|---|---|");
+  for (const p of g.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
+  out.push("");
+  return out;
+}
+
 export function buildReport(a: Analysis, rows: RunRow[]): string {
   const out: string[] = [];
+  let sectionNo = 0;
+  const sec = (title: string): string => `## ${++sectionNo}. ${title}\n`;
   out.push("# graphify-bench results\n");
   out.push(`Generated ${a.generated_at}. ${a.n_runs} runs over ${a.n_tasks} tasks, conditions: ${a.conditions.join(", ")}.\n`);
 
-  out.push("## 1. Environment\n");
+  out.push(sec("Environment"));
   out.push(versionsBlock(rows));
   out.push(`\n- Bootstrap: B=${a.bootstrap_B}, percentile 95% CI, seed \`${a.seed}\`, resampled over **tasks**.`);
   out.push(`- Corpus: \`corpus-v1\`, tree hash (sha256) \`${corpusTreeHash()}\` (source: \`docs/plan/CORPUS.md\`).`);
   out.push(`- Report generated: ${a.generated_at.slice(0, 10)}.\n`);
 
-  out.push("## 2. Overall\n");
+  out.push(sec("Overall"));
   out.push(conditionTable(a.by_condition));
   out.push("");
   out.push(
@@ -190,7 +209,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   for (const s of a.by_condition) out.push(`| ${s.condition} | ${fmt(s.first_turn_cache_creation_median)} |`);
   out.push("");
 
-  out.push("## 3. Paired difference (graphify − baseline), all tasks\n");
+  out.push(sec("Paired difference (graphify − baseline), all tasks"));
   out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
   out.push("|---|---|---|---|---|---|");
   for (const p of a.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
@@ -207,7 +226,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     );
   }
 
-  out.push("## 4. Iso-accuracy subset\n");
+  out.push(sec("Iso-accuracy subset"));
   out.push(
     a.iso_accuracy_tasks.length === 0
       ? "_No task succeeded in every run of both conditions, so there is no iso-accuracy subset._\n"
@@ -222,7 +241,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     out.push("");
   }
 
-  out.push("## 5. By category\n");
+  out.push(sec("By category"));
   for (const cat of a.by_category) {
     out.push(`### ${cat.category} (${cat.tasks.length} task${cat.tasks.length === 1 ? "" : "s"})\n`);
     out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
@@ -231,7 +250,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     out.push("");
   }
 
-  out.push("## 6. Counter-productive cases and subagent use\n");
+  out.push(sec("Counter-productive cases and subagent use"));
   const cp = a.counter_productive;
   for (const s of a.by_condition) {
     out.push(
@@ -243,7 +262,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push(`- graphify-condition runs that never invoked the \`graphify\` CLI (nudge ignored): **${cp.graphify_never_invoked.length}**${cp.graphify_never_invoked.length ? ` (${cp.graphify_never_invoked.map((r) => `\`${r}\``).join(", ")})` : ""}`);
   out.push("");
 
-  out.push("## 7. Failed and ungraded runs\n");
+  out.push(sec("Failed and ungraded runs"));
   const harnessFailures = a.failures.filter((f) => f.is_error === true || (f.terminal_reason !== null && f.terminal_reason !== "completed"));
   out.push(
     `Harness failures (\`is_error\`, or \`terminal_reason\` other than \`completed\`): **${harnessFailures.length}**. ` +
@@ -259,30 +278,57 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
     out.push("");
   }
 
-  out.push("## 8. Limitations\n");
+  if (a.by_set.length > 0) {
+    out.push(sec("Per-set breakdown (drift between measurement sets)"));
+    out.push(
+      "The two task sets were authored separately. Pooling them is only legitimate if they behave alike, " +
+        "so each set is re-analysed on its own here: a large gap between the two blocks means the pooled " +
+        "numbers above are averaging over a real difference in task design, not just sampling noise.\n",
+    );
+    for (const g of a.by_set) out.push(...subgroupBlock(g, `set \`${g.group}\``));
+  }
+
+  if (a.by_easy.length > 0) {
+    out.push(sec("Deliberately-easy controls vs the rest"));
+    const easy = a.by_easy.find((g) => g.group === "easy");
+    out.push(
+      "Some tasks were written as **designed zero-advantage controls**: their answer is reproduced exactly by a " +
+        "single literal `grep`, so a structural index has nothing to add and the expected effect is zero or negative. " +
+        "They are marked `DELIBERATELY EASY` in the task notes and are separated out here so they neither flatter " +
+        "nor drag the headline number." +
+        (easy ? ` Easy tasks: ${easy.tasks.map((t) => `\`${t}\``).join(", ")}.` : "") +
+        "\n",
+    );
+    for (const g of a.by_easy) out.push(...subgroupBlock(g, g.group === "easy" ? "easy (zero-advantage controls)" : "rest"));
+  }
+
+  out.push(sec("Limitations"));
   out.push(`- N = ${a.n_runs} runs over ${a.n_tasks} tasks; a single corpus and a single model. These results do not generalize to other codebases or models.`);
   out.push("- Bootstrap resamples tasks, so the interval reflects task-to-task variation, not within-task run noise.");
   out.push("- Where a CI crosses zero the honest reading is \"no difference detected at this N\", not \"no difference exists\".");
   out.push("- The fixed ~21k-token system-prompt/tool-definition overhead is included in both arms and not subtracted (see §2).");
   out.push("- **1 repetition per (task × condition)**: within-task run-to-run variance is unmeasured, so any single per-task difference may be run noise.");
   out.push("- Subagent traffic is counted in `uncached_all`, but a subagent's tool calls never reach the parent transcript, so the tool-call columns stay main-session-only.");
-  out.push("- Raw per-run data lives in `results/runs/<run-id>/` and `results/summary.csv`.\n");
+  out.push(
+    `- Raw per-run data lives in ${[...new Set(rows.map((r) => `\`${path.relative(REPO_ROOT, path.dirname(r.run_dir))}/<run-id>/\``))].join(", ")} and the \`summary.csv\` beside this report.\n`,
+  );
   return out.join("\n");
 }
 
 async function main(): Promise<void> {
-  const rows = loadRows();
+  const { sources, easy, outDir } = resolveCli(process.argv.slice(2));
+  const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
-    console.log("no metrics under results/runs/ — run bench:collect first");
+    console.log(`no metrics under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
     return;
   }
-  fs.mkdirSync(RESULTS_DIR, { recursive: true });
-  const analysisPath = path.join(RESULTS_DIR, "analysis.json");
+  fs.mkdirSync(outDir, { recursive: true });
+  const analysisPath = path.join(outDir, "analysis.json");
   const analysis: Analysis = fs.existsSync(analysisPath)
     ? (JSON.parse(fs.readFileSync(analysisPath, "utf8")) as Analysis)
     : analyze(rows);
-  const csvPath = path.join(RESULTS_DIR, "summary.csv");
-  const mdPath = path.join(RESULTS_DIR, "REPORT.md");
+  const csvPath = path.join(outDir, "summary.csv");
+  const mdPath = path.join(outDir, "REPORT.md");
   fs.writeFileSync(csvPath, buildCsv(rows));
   fs.writeFileSync(mdPath, buildReport(analysis, rows));
   console.log(`wrote ${csvPath} (${rows.length} rows) and ${mdPath}`);
