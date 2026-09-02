@@ -344,7 +344,14 @@ export function compare(rows: RunRow[], spec: ComparisonSpec, seed: string, B: n
 }
 
 /** Summarize an arbitrary named subset of rows with the same machinery as the whole. */
-export function subgroup(group: string, rows: RunRow[], conditions: string[], seed: string, B: number): SubgroupResult {
+export function subgroup(
+  group: string,
+  rows: RunRow[],
+  conditions: string[],
+  seed: string,
+  B: number,
+  treatment: string = TREATMENT,
+): SubgroupResult {
   // Only arms that actually appear in this subset. Once a results directory
   // holds arms that were not run on every measurement set, listing the global
   // condition set here would print rows of zeros for arms the subgroup never
@@ -356,7 +363,7 @@ export function subgroup(group: string, rows: RunRow[], conditions: string[], se
     n_tasks: new Set(rows.map((r) => r.task_id)).size,
     tasks: [...new Set(rows.map((r) => r.task_id))].sort(),
     by_condition: present.map((c) => summarizeCondition(c, rows)),
-    paired: METRIC_KEYS.map((m) => pairByTask(rows, m, `${seed}:${group}`, B)),
+    paired: METRIC_KEYS.map((m) => pairByTask(rows, m, `${seed}:${group}`, B, BASELINE, treatment)),
   };
 }
 
@@ -365,6 +372,18 @@ export interface AnalyzeOptions {
   comparisons?: ComparisonSpec[];
   /** Include per-condition graphify feature usage (reads each run's transcript). */
   featureUsage?: boolean;
+  /**
+   * Which arm the headline sections (§3 paired, §4 iso-accuracy, §5 by-category,
+   * the per-set and easy/rest subgroups) treat as the treatment. Defaults to
+   * `graphify`, the arm every earlier measurement set used.
+   *
+   * It has to be settable because the arm under test is not always named
+   * `graphify`: the docs set runs `graphify-v2` and no `graphify` at all, and a
+   * hardcoded name there would silently pair the baseline against nothing and
+   * render every headline table as "n too small" — an empty result that reads
+   * like a harness fault rather than the missing-arm it is.
+   */
+  treatment?: string;
 }
 
 export function analyze(
@@ -375,11 +394,12 @@ export function analyze(
 ): Analysis {
   const conditions = [...new Set(rows.map((r) => r.condition))].sort();
   const taskIds = [...new Set(rows.map((r) => r.task_id))].sort();
+  const treatment = opts.treatment ?? TREATMENT;
 
   // iso-accuracy: keep only tasks where both conditions were graded and every
   // graded run succeeded. Comparing tokens across arms that answered differently
   // would credit an arm for giving up early.
-  const isoTasks = isoAccuracyTasks(rows, BASELINE, TREATMENT);
+  const isoTasks = isoAccuracyTasks(rows, BASELINE, treatment);
   const isoRows = rows.filter((r) => isoTasks.includes(r.task_id));
 
   const categories = [...new Set(rows.map((r) => r.category).filter((c): c is string => !!c))].sort();
@@ -394,28 +414,30 @@ export function analyze(
     by_condition: conditions.map((c) => summarizeCondition(c, rows)),
     by_condition_iso: conditions.map((c) => summarizeCondition(c, isoRows)),
     iso_accuracy_tasks: isoTasks,
-    paired: METRIC_KEYS.map((m) => pairByTask(rows, m, seed, B)),
-    paired_iso: METRIC_KEYS.map((m) => pairByTask(isoRows, m, `${seed}:iso`, B)),
+    paired: METRIC_KEYS.map((m) => pairByTask(rows, m, seed, B, BASELINE, treatment)),
+    paired_iso: METRIC_KEYS.map((m) => pairByTask(isoRows, m, `${seed}:iso`, B, BASELINE, treatment)),
     by_category: categories.map((category) => {
       const sub = rows.filter((r) => r.category === category);
       return {
         category,
         tasks: [...new Set(sub.map((r) => r.task_id))].sort(),
-        paired: METRIC_KEYS.map((m) => pairByTask(sub, m, `${seed}:${category}`, B)),
+        paired: METRIC_KEYS.map((m) => pairByTask(sub, m, `${seed}:${category}`, B, BASELINE, treatment)),
       };
     }),
     // Only meaningful across >1 set; a single-set analysis would just restate §2.
     by_set: (() => {
       const sets = [...new Set(rows.map((r) => r.set))].sort();
-      return sets.length < 2 ? [] : sets.map((s) => subgroup(s, rows.filter((r) => r.set === s), conditions, `${seed}:set`, B));
+      return sets.length < 2
+        ? []
+        : sets.map((s) => subgroup(s, rows.filter((r) => r.set === s), conditions, `${seed}:set`, B, treatment));
     })(),
     // Needs the task definitions; with none supplied every row is easy=false.
     by_easy: (() => {
       const easyRows = rows.filter((r) => r.easy);
       if (easyRows.length === 0) return [];
       return [
-        subgroup("easy", easyRows, conditions, `${seed}:easy`, B),
-        subgroup("rest", rows.filter((r) => !r.easy), conditions, `${seed}:easy`, B),
+        subgroup("easy", easyRows, conditions, `${seed}:easy`, B, treatment),
+        subgroup("rest", rows.filter((r) => !r.easy), conditions, `${seed}:easy`, B, treatment),
       ];
     })(),
     failures: rows
@@ -424,7 +446,7 @@ export function analyze(
     counter_productive: {
       read_graph_json: rows.filter((r) => r.read_graph_json).map((r) => r.run_id),
       graphify_never_invoked: rows
-        .filter((r) => r.condition === TREATMENT && (r.tool_calls["Bash(graphify)"] ?? 0) === 0)
+        .filter((r) => r.condition === treatment && (r.tool_calls["Bash(graphify)"] ?? 0) === 0)
         .map((r) => r.run_id),
     },
     // Both fields stay absent unless asked for, so an analysis of the original
@@ -566,6 +588,8 @@ export function resolveCli(argv: string[]): {
   outDir: string;
   comparisons: ComparisonSpec[];
   featureUsage: boolean;
+  treatment: string;
+  corpusLabel: string;
 } {
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
@@ -578,6 +602,12 @@ export function resolveCli(argv: string[]): {
     outDir: out ? path.resolve(REPO_ROOT, out) : RESULTS_DIR,
     comparisons: parseComparisons(flag("compare")),
     featureUsage: argv.includes("--feature-usage"),
+    treatment: flag("treatment") ?? TREATMENT,
+    // Which corpus generation the runs were measured against. It cannot be
+    // inferred: `baseline` ships no graph and is registered `v1` precisely
+    // because it is corpus-independent, so the same arm appears in both a
+    // corpus-v1 and a corpus-v2 measurement. The caller states it.
+    corpusLabel: flag("corpus-label") ?? "corpus-v1",
   };
 }
 
@@ -598,13 +628,13 @@ export function parseComparisons(spec: string | undefined): ComparisonSpec[] {
 }
 
 async function main(): Promise<void> {
-  const { sources, easy, outDir, comparisons, featureUsage } = resolveCli(process.argv.slice(2));
+  const { sources, easy, outDir, comparisons, featureUsage, treatment } = resolveCli(process.argv.slice(2));
   const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
     console.log(`no metrics.json under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
     return;
   }
-  const analysis = analyze(rows, undefined, undefined, { comparisons, featureUsage });
+  const analysis = analyze(rows, undefined, undefined, { comparisons, featureUsage, treatment });
   fs.mkdirSync(outDir, { recursive: true });
   const out = path.join(outDir, "analysis.json");
   fs.writeFileSync(out, `${JSON.stringify(analysis, null, 2)}\n`);

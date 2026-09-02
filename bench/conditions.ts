@@ -108,6 +108,16 @@ export const CONDITIONS: readonly ConditionSpec[] = [
       "raw Read of an indexed file is DENIED and redirected to `graphify query`. A delta overlay: " +
       "it ships only the settings file and inherits the multi-megabyte graph from `graphify-v2`.",
   },
+  {
+    name: "haiku-graphify-v2",
+    overlays: ["graphify-v2"],
+    corpus: "v2",
+    model: HAIKU_MODEL,
+    note:
+      "`graphify-v2` run by a weaker explorer. Its reference arm is `haiku-baseline`, which ships " +
+      "no graph and therefore reads whatever corpus it is pointed at — on corpus-v2 that includes " +
+      "the documentation layer, so the pair isolates the graph, not the presence of the docs.",
+  },
 ] as const;
 
 const BY_NAME = new Map(CONDITIONS.map((c) => [c.name, c]));

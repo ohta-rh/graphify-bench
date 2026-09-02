@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { analyze, loadRowsFromSources, resolveCli, TREATMENT, type Analysis, type ComparisonResult, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
@@ -206,6 +207,32 @@ export function corpusTreeHash(): string {
   }
 }
 
+/**
+ * Hash of the corpus-v2 documentation layer, by the same definition
+ * `scripts/freeze-corpus.sh` uses for `src`+`tests`. Computed here rather than
+ * read from a document because no freeze record covers `docs/`, and it is
+ * written to reproduce exactly, from the repository root:
+ *
+ *   find corpus/taskflow/docs -type f | sort | xargs shasum -a 256 | shasum -a 256
+ *
+ * Paths are therefore repo-relative — an absolute path would make the value
+ * depend on where the checkout happens to live.
+ */
+export function docsTreeHash(): string {
+  const rel = "corpus/taskflow/docs";
+  const root = path.join(REPO_ROOT, rel);
+  if (!fs.existsSync(root)) return "unknown";
+  const files = fs
+    .readdirSync(root, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => path.join(rel, path.relative(root, path.join(e.parentPath, e.name))))
+    .sort();
+  const inner = files
+    .map((f) => `${createHash("sha256").update(fs.readFileSync(path.join(REPO_ROOT, f))).digest("hex")}  ${f}\n`)
+    .join("");
+  return createHash("sha256").update(inner).digest("hex");
+}
+
 function versionsBlock(rows: RunRow[]): string {
   for (const r of rows) {
     try {
@@ -294,8 +321,23 @@ function subgroupBlock(g: SubgroupResult, label: string): string[] {
   return out;
 }
 
-export function buildReport(a: Analysis, rows: RunRow[]): string {
+export interface ReportOptions {
+  /**
+   * Corpus generation the runs were measured against, printed in §1. It is a
+   * caller statement rather than something derived from the rows: `baseline`
+   * ships no graph and reads whatever corpus it is pointed at, so the same arm
+   * appears in a corpus-v1 and a corpus-v2 measurement alike.
+   */
+  corpusLabel?: string;
+}
+
+export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {}): string {
   const out: string[] = [];
+  // The headline arm is read back off the analysis rather than assumed: the
+  // paired results record which arm they were computed against, so a report
+  // rendered from a stored analysis.json cannot label it as a different one.
+  const treatment = a.paired[0]?.treatment_condition ?? TREATMENT;
+  const corpusLabel = opts.corpusLabel ?? "corpus-v1";
   let sectionNo = 0;
   const sec = (title: string): string => `## ${++sectionNo}. ${title}\n`;
   out.push("# graphify-bench results\n");
@@ -304,7 +346,13 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push(sec("Environment"));
   out.push(versionsBlock(rows));
   out.push(`\n- Bootstrap: B=${a.bootstrap_B}, percentile 95% CI, seed \`${a.seed}\`, resampled over **tasks**.`);
-  out.push(`- Corpus: \`corpus-v1\`, tree hash (sha256) \`${corpusTreeHash()}\` (source: \`docs/plan/CORPUS.md\`).`);
+  out.push(
+    `- Corpus: \`${corpusLabel}\`, tree hash (sha256) \`${corpusTreeHash()}\` (source: \`docs/plan/CORPUS.md\`).` +
+      (corpusLabel === "corpus-v1"
+        ? ""
+        : ` That hash pins \`src\`+\`tests\`, which \`${corpusLabel}\` leaves frozen; its addition is the ` +
+          `\`docs/\` layer, hashed the same way: \`${docsTreeHash()}\`.`),
+  );
   out.push(`- Report generated: ${a.generated_at.slice(0, 10)}.\n`);
   const conditions = conditionsBlock(rows);
   if (conditions) {
@@ -333,17 +381,17 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   for (const s of a.by_condition) out.push(`| ${s.condition} | ${fmt(s.first_turn_cache_creation_median)} |`);
   out.push("");
 
-  out.push(sec("Paired difference (graphify − baseline), all tasks"));
+  out.push(sec(`Paired difference (${treatment} − baseline), all tasks`));
   out.push("| metric | tasks | mean diff | 95% CI | mean relative | verdict |");
   out.push("|---|---|---|---|---|---|");
   for (const p of a.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
   out.push("");
   const subBase = a.by_condition.find((s) => s.condition === "baseline");
-  const subTreat = a.by_condition.find((s) => s.condition === "graphify");
+  const subTreat = a.by_condition.find((s) => s.condition === treatment);
   if (subBase && subTreat && subBase.subagent_runs !== subTreat.subagent_runs) {
     out.push(
       `> **Why the two token rows disagree.** Subagent use is asymmetric between the arms ` +
-        `(baseline ${subBase.subagent_runs}/${subBase.runs} runs, graphify ${subTreat.subagent_runs}/${subTreat.runs}). ` +
+        `(baseline ${subBase.subagent_runs}/${subBase.runs} runs, ${treatment} ${subTreat.subagent_runs}/${subTreat.runs}). ` +
         `\`uncached_equivalent\` cannot see a subagent's tokens, so it charges that work to nobody and makes the ` +
         `subagent-spawning arm look cheap; \`uncached_equivalent_all\` counts it. **Read the \`_all\` row** — the ` +
         `main-only row is retained only to show the size of the distortion.\n`,
@@ -524,7 +572,7 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
 }
 
 async function main(): Promise<void> {
-  const { sources, easy, outDir, comparisons, featureUsage } = resolveCli(process.argv.slice(2));
+  const { sources, easy, outDir, comparisons, featureUsage, treatment, corpusLabel } = resolveCli(process.argv.slice(2));
   const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
     console.log(`no metrics under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
@@ -543,12 +591,18 @@ async function main(): Promise<void> {
   const storedIsEnough =
     stored !== null &&
     (comparisons.length === 0 || (stored.comparisons?.length ?? 0) >= comparisons.length) &&
-    (!featureUsage || (stored.feature_usage?.length ?? 0) > 0);
-  const analysis: Analysis = storedIsEnough ? stored : analyze(rows, undefined, undefined, { comparisons, featureUsage });
+    (!featureUsage || (stored.feature_usage?.length ?? 0) > 0) &&
+    // A stored analysis computed against a different headline arm answers a
+    // different question; reusing it would print `treatment` in the heading over
+    // numbers paired against something else.
+    (stored.paired[0]?.treatment_condition ?? TREATMENT) === treatment;
+  const analysis: Analysis = storedIsEnough
+    ? stored
+    : analyze(rows, undefined, undefined, { comparisons, featureUsage, treatment });
   const csvPath = path.join(outDir, "summary.csv");
   const mdPath = path.join(outDir, "REPORT.md");
   fs.writeFileSync(csvPath, buildCsv(rows));
-  fs.writeFileSync(mdPath, buildReport(analysis, rows));
+  fs.writeFileSync(mdPath, buildReport(analysis, rows, { corpusLabel }));
   console.log(`wrote ${csvPath} (${rows.length} rows) and ${mdPath}`);
 }
 

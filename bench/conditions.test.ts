@@ -174,6 +174,27 @@ describe("v2 arms", () => {
     expect(spec.extraClaudeArgs).toBeUndefined();
   });
 
+  it("registers haiku-graphify-v2 as the v2 graph run by the weak explorer", () => {
+    const spec = getCondition("haiku-graphify-v2");
+    expect(spec.overlays).toEqual(["graphify-v2"]);
+    expect(spec.corpus).toBe("v2");
+    expect(spec.model).toBe(HAIKU_MODEL);
+    expect(spec.extraClaudeArgs).toBeUndefined();
+    expect(spec.env).toBeUndefined();
+  });
+
+  it("pairs haiku-graphify-v2 with haiku-baseline: same model, overlay is the only difference", () => {
+    const treatment = getCondition("haiku-graphify-v2");
+    const reference = getCondition("haiku-baseline");
+    expect(effectiveModel(treatment, "claude-sonnet-5")).toBe(effectiveModel(reference, "claude-sonnet-5"));
+    expect(treatment.extraClaudeArgs).toEqual(reference.extraClaudeArgs);
+    expect(treatment.overlays).not.toEqual(reference.overlays);
+  });
+
+  it("gives haiku-graphify-v2 the same overlay chain as its sonnet twin graphify-v2", () => {
+    expect(getCondition("haiku-graphify-v2").overlays).toEqual(getCondition("graphify-v2").overlays);
+  });
+
   it("keeps the v1 arms on the v1 corpus and the v2 arms on v2", () => {
     expect(getCondition("baseline").corpus).toBe("v1");
     expect(getCondition("graphify").corpus).toBe("v1");
