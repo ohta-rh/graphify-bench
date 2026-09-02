@@ -56,6 +56,49 @@ export function cloneDir(src: string, dest: string): CopyResult {
   }
 }
 
+/**
+ * Name of the one-line marker file that makes an overlay a *delta* over another.
+ *
+ * A delta overlay ships only the files that differ from its base, so a variant
+ * that changes a single settings key does not have to duplicate a multi-megabyte
+ * `graph.json`. `resolveOverlayChain` expands the marker into the application
+ * order; the marker itself never reaches the agent.
+ */
+export const OVERLAY_BASE_FILE = ".overlay-base";
+
+/**
+ * Expand a condition into the overlay directories to apply, base-first.
+ *
+ * `overlays/<condition>/.overlay-base` names the condition this one layers over
+ * (a bare directory name under the same `overlays/` root, not a path). Chains
+ * may nest; a cycle or a missing base is a hard error, because the silent
+ * failure mode — a strict variant quietly measured with its base's settings —
+ * is exactly what the delta mechanism exists to prevent.
+ */
+export function resolveOverlayChain(overlaysDir: string, condition: string): string[] {
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  let current = condition;
+  for (;;) {
+    if (seen.has(current)) {
+      throw new Error(`overlay base cycle: ${[...seen, current].join(" -> ")}`);
+    }
+    seen.add(current);
+    const dir = path.join(overlaysDir, current);
+    if (!fs.existsSync(dir)) {
+      throw new Error(`overlay not found for condition "${current}": ${dir}`);
+    }
+    chain.unshift(dir);
+    const marker = path.join(dir, OVERLAY_BASE_FILE);
+    if (!fs.existsSync(marker)) return chain;
+    const base = fs.readFileSync(marker, "utf8").trim();
+    if (base === "" || base.includes("/") || base.includes("\\")) {
+      throw new Error(`${marker} must name a sibling overlay directory, got ${JSON.stringify(base)}`);
+    }
+    current = base;
+  }
+}
+
 /** Recursively overlay `src` onto `dest`, overwriting files that collide. */
 export function applyOverlay(src: string, dest: string): string[] {
   if (!fs.existsSync(src)) return [];
@@ -63,6 +106,7 @@ export function applyOverlay(src: string, dest: string): string[] {
   const walk = (rel: string): void => {
     const from = path.join(src, rel);
     for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      if (rel === "." && entry.name === OVERLAY_BASE_FILE) continue;
       const childRel = path.join(rel, entry.name);
       const to = path.join(dest, childRel);
       if (entry.isDirectory()) {

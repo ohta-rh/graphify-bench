@@ -1,11 +1,15 @@
 /**
- * Rewrite the absolute `graphify` executable path inside
- * `overlays/graphify/.claude/settings.json` to this machine's `which graphify`.
+ * Rewrite the absolute `graphify` executable path inside every overlay's
+ * `.claude/settings.json` to this machine's `which graphify`.
  *
  * `graphify install --project` bakes an absolute path into its PreToolUse hook
  * command, so an overlay captured on one machine silently no-ops on another —
  * the hook fails to spawn and condition B quietly degrades into condition A.
- * Run this after refreshing the overlay, and on any new host before measuring.
+ * Run this after refreshing an overlay, and on any new host before measuring.
+ *
+ * Every overlay that ships a settings file is maintained, including the delta
+ * overlays: `graphify-strict-v2` ships only its settings file, so it is exactly
+ * the kind of overlay whose hook paths would otherwise be forgotten.
  *
  * Usage: pnpm exec tsx scripts/patch-overlay.ts [--check] [--exe <path>]
  */
@@ -14,7 +18,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "../bench/lib/env.js";
 
-const SETTINGS = path.join(REPO_ROOT, "overlays", "graphify", ".claude", "settings.json");
+const OVERLAYS_DIR = path.join(REPO_ROOT, "overlays");
+
+/** Every overlay's `.claude/settings.json` that exists, in directory order. */
+export function overlaySettingsFiles(overlaysDir: string): string[] {
+  if (!fs.existsSync(overlaysDir)) return [];
+  return fs
+    .readdirSync(overlaysDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(overlaysDir, entry.name, ".claude", "settings.json"))
+    .filter((file) => fs.existsSync(file))
+    .sort();
+}
 
 function whichGraphify(): string | null {
   try {
@@ -44,9 +59,10 @@ function main(): void {
   const exeFlagIndex = process.argv.indexOf("--exe");
   const exe = exeFlagIndex >= 0 ? process.argv[exeFlagIndex + 1] : whichGraphify();
 
-  if (!fs.existsSync(SETTINGS)) {
+  const settingsFiles = overlaySettingsFiles(OVERLAYS_DIR);
+  if (settingsFiles.length === 0) {
     // Expected before the Phase 2 worker lands the overlay. Not an error.
-    console.log(`[patch-overlay] ${path.relative(REPO_ROOT, SETTINGS)} does not exist yet — nothing to patch.`);
+    console.log("[patch-overlay] no overlay ships a .claude/settings.json yet — nothing to patch.");
     return;
   }
   if (!exe) {
@@ -55,20 +71,29 @@ function main(): void {
     return;
   }
 
-  const before = fs.readFileSync(SETTINGS, "utf8");
-  const { text, replaced } = rewriteGraphifyPaths(before, exe);
-  if (replaced === 0) {
-    console.log(`[patch-overlay] already points at ${exe} (or contains no absolute graphify path).`);
-    return;
+  let stale = 0;
+  for (const settings of settingsFiles) {
+    const rel = path.relative(REPO_ROOT, settings);
+    const before = fs.readFileSync(settings, "utf8");
+    const { text, replaced } = rewriteGraphifyPaths(before, exe);
+    if (replaced === 0) {
+      console.log(`[patch-overlay] ${rel}: already points at ${exe} (or contains no absolute graphify path).`);
+      continue;
+    }
+    stale += replaced;
+    if (check) {
+      console.error(`[patch-overlay] ${rel}: ${replaced} path(s) do not match ${exe}.`);
+      continue;
+    }
+    JSON.parse(text); // fail loudly rather than write a broken settings.json
+    fs.writeFileSync(settings, text);
+    console.log(`[patch-overlay] ${rel}: rewrote ${replaced} path(s) to ${exe}`);
   }
-  if (check) {
-    console.error(`[patch-overlay] ${replaced} path(s) do not match ${exe}. Re-run without --check to fix.`);
+
+  if (check && stale > 0) {
+    console.error(`[patch-overlay] ${stale} path(s) stale across ${settingsFiles.length} overlay(s). Re-run without --check to fix.`);
     process.exitCode = 1;
-    return;
   }
-  JSON.parse(text); // fail loudly rather than write a broken settings.json
-  fs.writeFileSync(SETTINGS, text);
-  console.log(`[patch-overlay] rewrote ${replaced} path(s) to ${exe}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

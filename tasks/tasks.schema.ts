@@ -11,6 +11,12 @@ export const CategorySchema = z.enum([
   "explain", // 3: architecture explanation
   "impact", // 4: impact analysis
   "fix", // 5: small bug fix
+  // 6: doc-vs-code contradiction detection. Introduced with the documentation
+  // layer (corpus-v2): the answer is the set of DOCUMENT paths whose stated
+  // behaviour the frozen code does not implement. Graded `set-f1` like the other
+  // set categories, so `grade.ts` needs no change; only the prompt contract and
+  // the key's provenance differ.
+  "discrepancy",
 ]);
 export type Category = z.infer<typeof CategorySchema>;
 

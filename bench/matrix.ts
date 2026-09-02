@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { collectRun } from "./collect.js";
 import { REPO_ROOT, readEnv, runDir, runId } from "./lib/env.js";
+import { getCondition } from "./conditions.js";
+import { resolveOverlayChain } from "./lib/copy.js";
 import { shuffle } from "./lib/rng.js";
 import { executeRun } from "./run.js";
 import { parseTaskFile, type Task } from "../tasks/tasks.schema.js";
@@ -95,8 +97,11 @@ async function main(): Promise<void> {
   }
   if (!fs.existsSync(cli.corpus)) throw new Error(`corpus not found: ${cli.corpus}`);
   for (const condition of cli.conditions) {
-    const dir = path.join(cli.overlays, condition);
-    if (!fs.existsSync(dir)) throw new Error(`overlay not found for condition "${condition}": ${dir}`);
+    // Registry first (a typo'd condition name is the common mistake), then the
+    // `.overlay-base` chain, so a delta overlay whose base is missing or cyclic
+    // fails here rather than silently degrading mid-matrix.
+    getCondition(condition);
+    resolveOverlayChain(cli.overlays, condition);
   }
 
   const cells = enumerateCells(tasks, cli.conditions, cli.reps, cli.seed);

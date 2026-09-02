@@ -107,6 +107,46 @@ occurrences of a string literal, which is by construction exactly what a text sc
 returns. Neither has a hop a graph index can shortcut, so a condition difference on
 these two would be noise, not signal.
 
+## The docs set (`tasks-docs.json`)
+
+Twenty tasks over the **corpus-v2 documentation layer** (`corpus/taskflow/docs/`,
+139 files / 262k words), four in each of five categories. It replaces `fix` with a
+new category, `discrepancy`, and every answer is a **document** path — except the
+`impact` keys, which deliberately span documents and code in one list.
+
+| category | grader | what it asks | keys |
+|---|---|---|---|
+| `locate` | `set-f1` | which document *governs* a behaviour described in prose | the one file whose heading defines the id |
+| `reference` | `set-f1` | traceability: which requirements a module implements, which ADRs a design traces through, which requirements a spec verifies | metadata fields (`Implemented by`, `Verified by`, `Decided in`) |
+| `explain` | `llm-judge` | a requirement → design → code → test chain, end to end | five-element rubric |
+| `impact` | `set-f1` | what a change forces, in documents **and** code | union of a code spec and a doc spec |
+| `discrepancy` | `set-f1` | within one domain, which documents state something the code does not do | the planted-discrepancy record |
+
+### `discrepancy`
+
+The corpus contains exactly **12** deliberate doc-vs-code contradictions, recorded
+in `keys/docs-discrepancies.json` when they were planted (never linked from the
+documentation, and excluded from `pnpm docs:check`). The four tasks partition all
+twelve into four domains — role gates, time-and-retry constants, schema indexes,
+and quota/rollout/throttling numbers — of two to four documents each.
+
+Their `success_threshold` is **0.6**, not the 0.9 the other set categories use.
+Finding two of three planted contradictions is a genuinely useful result and the
+threshold has to be able to say so; at 0.9 the category would report an almost
+uniform zero and measure nothing. `grade.ts` is unchanged — `discrepancy` is a new
+*category*, not a new grader, and scores through `scoreSet` exactly like `locate`.
+
+The prompts name no document, no path and no id: each one describes a domain in
+prose ("who is allowed to write a comment, archive a project, open the flag
+settings screen") and asks for the documents the code contradicts.
+
+### The two grep-trivial controls
+
+`DREF4-adr017-references` and `DIMP4-req157-renumber` are literal id lookups that
+`grep -rl` answers exactly. They are the doc set's zero-advantage baseline: a
+condition difference on these two is noise. Both are marked `DELIBERATELY EASY`
+in their `notes`, which is where `bench/tasks.test.ts` looks for them.
+
 ## Ground truth
 
 Categories 2 and 4 (`reference`, `impact`) are derived **mechanically** by
@@ -130,9 +170,39 @@ task files.
 application behaviour lives; a spec that merely exercises a symbol is not that place.
 `.next/**` and `.d.ts` files are excluded for the same reason.
 
-`locate` keys are **hand-authored** — deciding where a behaviour lives is a judgement,
-not a reference set — and each one's `notes` records the near-miss files it
-deliberately excludes and why.
+`locate` keys **in the two code sets** are hand-authored — deciding where a behaviour
+lives is a judgement, not a reference set — and each one's `notes` records the
+near-miss files it deliberately excludes and why.
+
+### Doc-side keys (`tasks-docs.json`)
+
+Every key in the docs set, `locate` included, is derived mechanically: the
+documentation carries explicit conventions that a compiler-equivalent reading can
+follow, so nothing there needs hand-authoring. `derive-keys.ts` applies the same two
+rules `scripts/check-docs-corpus.ts` enforces — a heading whose text starts with an
+id **defines** it, and a backticked `src/`, `tests/` or `scripts/` path is a **code
+citation** — through five doc kinds plus a combinator:
+
+| kind | answers |
+|---|---|
+| `docs-id-home` | the single file defining each id — the `locate` answer |
+| `docs-id-refs` | every file mentioning the id — an id's rename-impact set |
+| `docs-cites-code` | files citing a code path, optionally only under one metadata field (`Implemented by`, `Verified by`) or one directory |
+| `docs-decided-in` | the ADRs a design document's `Decided in:` fields name (two hops) |
+| `docs-discrepancy` | the doc paths of named entries in `keys/docs-discrepancies.json` |
+| `union` | set union of the above and the code kinds, for `impact` |
+
+**Doc-side exclusion rule: `docs/traceability.md`, `docs/glossary.md` and every
+`index.md` are never part of a doc key.** `traceability.md` is *generated* from the
+other documents' metadata and the index pages catalogue the corpus, so all three cite
+nearly every id and path; including them would put the same three or four files in
+every answer regardless of the question. It is the doc-side analogue of the
+`tests/**` rule above, and `bench/tasks.test.ts` asserts it.
+
+The discrepancy keys are a **projection of the planted record**, not a fresh reading
+of the documents — the ground truth was fixed when the contradictions were written
+into the corpus, so the key cannot drift toward whatever a later reader happens to
+notice.
 
 ## Bug patches
 

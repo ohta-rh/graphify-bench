@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { captureTranscript, runClaudeP, type ClaudePInvocation } from "./lib/claude-p.js";
-import { applyOverlay, cloneDir } from "./lib/copy.js";
+import { applyOverlay, cloneDir, resolveOverlayChain } from "./lib/copy.js";
 import { REPO_ROOT, readEnv, runDir, runId, type BenchEnv } from "./lib/env.js";
 import type { Task } from "../tasks/tasks.schema.js";
 
@@ -42,6 +42,8 @@ export interface RunMeta {
   finished_at: string;
   corpus_dir: string;
   overlay_dir: string;
+  /** Every overlay applied, base-first. Length > 1 means the condition is a delta overlay. */
+  overlay_chain: string[];
   overlay_files: string[];
   copy_strategy: string | null;
   copy_ms: number | null;
@@ -164,6 +166,7 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     finished_at: startedAt.toISOString(),
     corpus_dir: req.corpusDir,
     overlay_dir: path.join(req.overlaysDir, req.condition),
+    overlay_chain: [],
     overlay_files: [],
     copy_strategy: null,
     copy_ms: null,
@@ -197,7 +200,14 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     meta.timings_ms.copy = copied.durationMs;
 
     // 2. overlay for this condition
-    meta.overlay_files = applyOverlay(meta.overlay_dir, workDir);
+    // A condition may be a delta over another (`.overlay-base`); apply base-first
+    // so the delta's files win on collision.
+    meta.overlay_chain = resolveOverlayChain(req.overlaysDir, req.condition);
+    const written = new Set<string>();
+    for (const dir of meta.overlay_chain) {
+      for (const f of applyOverlay(dir, workDir)) written.add(f);
+    }
+    meta.overlay_files = [...written].sort();
 
     // 3. optional bug patch — after the overlay, identically in both conditions
     if (req.task.patch) {
