@@ -154,35 +154,34 @@ export const PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
 /**
  * Encode a cwd the way Claude Code names its transcript directory.
  *
- * Determined empirically on 2026-09-02 by comparing the entries of
- * ~/.claude/projects with the real paths they correspond to:
+ * Rule determined empirically on 2026-09-02 (Claude Code 2.1.258) by comparing
+ * ~/.claude/projects entries against the real paths that produced them:
  *
  *   /Users/tetsuyaohta/projects/other/graphify-bench
  *     -> -Users-tetsuyaohta-projects-other-graphify-bench
- *   /private/tmp/claude-501/-Users-…-graphify-bench/<uuid>/scratchpad
- *     -> -private-tmp-claude-501--Users-…-graphify-bench-<uuid>-scratchpad
+ *   /private/var/folders/82/dclbn8z5181_3ppf…/T/graphify-bench-scratch/EX1-seat-cap__baseline__r1__203f7b64
+ *     -> -private-var-folders-82-dclbn8z5181-3ppf…-T-graphify-bench-scratch-EX1-seat-cap--baseline--r1--203f7b64
  *
- * i.e. every path separator becomes `-` (the leading `/` producing a leading
- * `-`, and a path segment that itself starts with `-` producing `--`). A `.`
- * is mapped the same way, so `.claude/x` -> `-claude-x`; `encodeCwdCandidates`
- * emits both the dot-mapped and dot-preserved forms because that case was not
- * directly observable on this machine, and `findTranscript` additionally
- * scans every project directory as a backstop.
+ * **`/`, `.` and `_` each become `-`** — equivalently, every character outside
+ * `[A-Za-z0-9-]` is replaced. The leading `/` yields a leading `-`, and runs of
+ * these characters (`__`, or a segment that already starts with `-`) yield runs
+ * of `-`. The `_` case is the one that matters here and was NOT visible in the
+ * project list alone; it showed up only once a run used a macOS temp dir.
+ *
+ * `findTranscript` still scans every project directory as a backstop, because
+ * this rule is an observation about a CLI version, not a documented contract.
  */
-export function encodeCwd(cwd: string, mapDots = true): string {
-  const resolved = path.resolve(cwd);
-  return mapDots ? resolved.replace(/[/.]/g, "-") : resolved.replace(/\//g, "-");
+export function encodeCwd(cwd: string): string {
+  return path.resolve(cwd).replace(/[^A-Za-z0-9-]/g, "-");
 }
 
 export function encodeCwdCandidates(cwd: string): string[] {
   const resolved = path.resolve(cwd);
-  const out = new Set<string>([encodeCwd(resolved, true), encodeCwd(resolved, false)]);
-  // macOS reports /tmp and /var as symlinks into /private.
+  const out = new Set<string>([encodeCwd(resolved)]);
+  // macOS reports /tmp and /var as symlinks into /private; Claude Code records
+  // the resolved form, so try both.
   const real = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
-  if (real !== resolved) {
-    out.add(encodeCwd(real, true));
-    out.add(encodeCwd(real, false));
-  }
+  if (real !== resolved) out.add(encodeCwd(real));
   return [...out];
 }
 
@@ -232,8 +231,17 @@ export function captureTranscript(cwd: string, sessionId: string, dest: string):
     try {
       fs.rmSync(found.source, { force: true });
       removedOriginal = true;
+      // Claude Code also drops a `memory/` directory beside the transcript, so
+      // the project dir is rarely empty. Remove the whole directory, but ONLY
+      // when its name is the one this run's throwaway cwd would have produced —
+      // never a directory belonging to a real project of the user's.
       const dir = path.dirname(found.source);
-      if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      const ours = new Set(encodeCwdCandidates(cwd));
+      if (ours.has(path.basename(dir)) && path.dirname(dir) === PROJECTS_DIR && fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } else if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+        fs.rmdirSync(dir);
+      }
     } catch {
       /* leaving the original behind is not fatal */
     }

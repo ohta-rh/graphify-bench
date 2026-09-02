@@ -144,7 +144,11 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
   const id = runId(req.task.id, req.condition, req.rep);
   const outDir = runDir(id);
   const sessionId = crypto.randomUUID();
-  const workDir = path.join(env.scratch, `${id}__${sessionId.slice(0, 8)}`);
+  // The agent sees its own cwd on every tool call, so the run directory name
+  // must not contain the condition, the task, or the string "graphify" — that
+  // would prime the model differently in each arm. The session uuid alone is
+  // opaque; run.meta.json holds the mapping back to the run id.
+  const workDir = path.join(env.scratch, sessionId);
   const startedAt = new Date();
   const t0 = Date.now();
 
