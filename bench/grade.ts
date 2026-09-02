@@ -251,13 +251,29 @@ function flag(name: string, fallback?: string): string | undefined {
 }
 
 async function main(): Promise<void> {
-  const tasksFile = path.resolve(REPO_ROOT, flag("tasks", "tasks/tasks.json")!);
-  const parsed = parseTaskFile(JSON.parse(fs.readFileSync(tasksFile, "utf8")));
-  const tasks = new Map(parsed.tasks.map((t) => [t.id, t]));
+  // `--tasks a.json,b.json` so a results directory whose runs span both
+  // measurement sets can be graded in one pass, as the structural arms do.
+  const tasksFiles = flag("tasks", "tasks/tasks.json")!
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((f) => path.resolve(REPO_ROOT, f));
+  const tasks = new Map<string, Task>();
+  const tasksDirOf = new Map<string, string>();
+  for (const file of tasksFiles) {
+    const parsed = parseTaskFile(JSON.parse(fs.readFileSync(file, "utf8")));
+    for (const t of parsed.tasks) {
+      if (tasks.has(t.id)) throw new Error(`duplicate task id "${t.id}" across ${tasksFiles.join(", ")}`);
+      tasks.set(t.id, t);
+      tasksDirOf.set(t.id, path.dirname(file));
+    }
+  }
   const only = process.argv.slice(2).filter((a) => !a.startsWith("--") && !a.endsWith(".json"));
   const ids = only.length > 0 ? only : listRunIds();
+  const defaultTasksDir = path.dirname(tasksFiles[0]!);
   for (const id of ids) {
-    const grade = await gradeRun(id, tasks, path.dirname(tasksFile));
+    const taskId = id.split("__")[0] ?? id;
+    const grade = await gradeRun(id, tasks, tasksDirOf.get(taskId) ?? defaultTasksDir);
     fs.writeFileSync(path.join(runDir(id), "grade.json"), `${JSON.stringify(grade, null, 2)}\n`);
     console.log(
       `${id}  grader=${grade.grader}  score=${grade.score === null ? "-" : grade.score.toFixed(3)}  success=${grade.success ?? "-"}${grade.error ? `  ERROR: ${grade.error}` : ""}`,

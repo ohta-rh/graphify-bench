@@ -1,6 +1,6 @@
 /**
- * Rewrite the absolute `graphify` executable path inside
- * `overlays/graphify/.claude/settings.json` to this machine's `which graphify`.
+ * Rewrite the absolute `graphify` executable path inside every graphify-family
+ * overlay's `.claude/settings.json` to this machine's `which graphify`.
  *
  * `graphify install --project` bakes an absolute path into its PreToolUse hook
  * command, so an overlay captured on one machine silently no-ops on another —
@@ -14,7 +14,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { REPO_ROOT } from "../bench/lib/env.js";
 
-const SETTINGS = path.join(REPO_ROOT, "overlays", "graphify", ".claude", "settings.json");
+/**
+ * Every overlay that carries a graphify hook command. `graphify-strict` is a
+ * delta overlay layered on `graphify`, so its settings file must be patched too —
+ * missing it would leave the strict arm pointing at another machine's binary and
+ * silently degrade it into the plain graphify arm.
+ */
+export const SETTINGS_FILES = ["graphify", "graphify-strict"].map((overlay) =>
+  path.join(REPO_ROOT, "overlays", overlay, ".claude", "settings.json"),
+);
 
 function whichGraphify(): string | null {
   try {
@@ -44,9 +52,10 @@ function main(): void {
   const exeFlagIndex = process.argv.indexOf("--exe");
   const exe = exeFlagIndex >= 0 ? process.argv[exeFlagIndex + 1] : whichGraphify();
 
-  if (!fs.existsSync(SETTINGS)) {
+  const present = SETTINGS_FILES.filter((f) => fs.existsSync(f));
+  if (present.length === 0) {
     // Expected before the Phase 2 worker lands the overlay. Not an error.
-    console.log(`[patch-overlay] ${path.relative(REPO_ROOT, SETTINGS)} does not exist yet — nothing to patch.`);
+    console.log(`[patch-overlay] no overlay settings.json exists yet — nothing to patch.`);
     return;
   }
   if (!exe) {
@@ -55,20 +64,28 @@ function main(): void {
     return;
   }
 
-  const before = fs.readFileSync(SETTINGS, "utf8");
-  const { text, replaced } = rewriteGraphifyPaths(before, exe);
-  if (replaced === 0) {
-    console.log(`[patch-overlay] already points at ${exe} (or contains no absolute graphify path).`);
-    return;
+  let stale = 0;
+  for (const settings of present) {
+    const rel = path.relative(REPO_ROOT, settings);
+    const before = fs.readFileSync(settings, "utf8");
+    const { text, replaced } = rewriteGraphifyPaths(before, exe);
+    if (replaced === 0) {
+      console.log(`[patch-overlay] ${rel}: already points at ${exe} (or contains no absolute graphify path).`);
+      continue;
+    }
+    stale += replaced;
+    if (check) {
+      console.error(`[patch-overlay] ${rel}: ${replaced} path(s) do not match ${exe}.`);
+      continue;
+    }
+    JSON.parse(text); // fail loudly rather than write a broken settings.json
+    fs.writeFileSync(settings, text);
+    console.log(`[patch-overlay] ${rel}: rewrote ${replaced} path(s) to ${exe}`);
   }
-  if (check) {
-    console.error(`[patch-overlay] ${replaced} path(s) do not match ${exe}. Re-run without --check to fix.`);
+  if (check && stale > 0) {
+    console.error(`[patch-overlay] ${stale} stale path(s) total. Re-run without --check to fix.`);
     process.exitCode = 1;
-    return;
   }
-  JSON.parse(text); // fail loudly rather than write a broken settings.json
-  fs.writeFileSync(SETTINGS, text);
-  console.log(`[patch-overlay] rewrote ${replaced} path(s) to ${exe}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
