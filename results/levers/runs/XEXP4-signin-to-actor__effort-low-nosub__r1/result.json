@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 48970,
+  "stop_reason": "end_turn",
+  "session_id": "37b44177-4754-415b-bd7f-0f27b32a5608",
+  "total_cost_usd": 0.19973459999999998,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 28168,
+    "cache_read_input_tokens": 207738,
+    "output_tokens": 4437,
+    "output_tokens_details": {
+      "thinking_tokens": 180
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 28168,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2263,
+        "cache_read_input_tokens": 41561,
+        "cache_creation_input_tokens": 2294,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2294
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1042,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001117,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 14,
+      "outputTokens": 4437,
+      "cacheReadInputTokens": 207738,
+      "cacheCreationInputTokens": 28168,
+      "webSearchRequests": 0,
+      "costUSD": 0.1986176,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 180,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 15,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the full picture end-to-end. Here's how it works, in order.\n\n## 1. Credential submission\n\n`LoginForm` (`src/app/(auth)/login/login-form.tsx`) is a client component wired via `useActionState`. On submit it re-validates the fields with `loginSchema` (`src/schemas/auth.ts`) client-side purely for instant field errors, then calls the Server Action `loginAction` in `src/actions/auth/login.ts`.\n\n## 2. Server-side checking of credentials\n\n`loginAction` re-parses the payload with `loginSchema.safeParse` (the client validation is never trusted), then calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")` (`src/lib/rate-limit.ts`) to throttle guessing before touching the database — this action runs before any tenant/actor exists, so it can't go through the normal `withAction()` wrapper.\n\nIt then calls `login(parsed.data)` in `src/server/services/auth-service.ts`, which:\n1. Rate-limits again at the service layer (belt-and-suspenders against direct callers).\n2. `userRepo.findUserByEmail(input.email)` — looks the user up.\n3. `userRepo.findPasswordHash(user.id)` and `verifyPassword(input.password, storedHash)` (`src/lib/hash.ts`) — the stored hash is `scrypt:<saltHex>:<keyHex>`; verification re-derives the key with the stored salt via Node's `scrypt` and compares with `timingSafeEqual`. Both \"no such user\" and \"wrong password\" produce the identical error message, so the endpoint can't be used to enumerate emails.\n4. On success, calls `createSessionToken(user.id)` in `src/server/services/session-service.ts`.\n\n## 3. What's created and what's stored vs. handed to the browser\n\n`createSessionToken` generates a 32-byte random token (`randomToken`, base64url), hashes it with SHA-256 (`hashToken`), and calls `sessionRepo.createSession(userId, tokenHash, expiresAt)` (`src/server/repositories/session-repository.ts`), which inserts a row into the `sessions` table containing only the **hash** of the token, `activeOrgId: null`, and a 30-day expiry — the raw token itself is never persisted, so a database dump can't be replayed as a login.\n\nThe raw token is returned up through `login()` → `loginAction`. Back in `loginAction`, it calls `resolveSession(token)` (which hashes it again and looks the row up via `sessionRepo.findSessionByTokenHash`) to build a `SessionPrincipal`, then `setSessionCookie(token, principal.expiresAt)` in `src/lib/session.ts` writes the **raw token** into an `httpOnly`, `sameSite: lax`, `secure`-in-prod cookie (name from `SESSION_COOKIE_NAME` in `src/schemas/session.ts`). So: hash in the DB, raw token in the browser's cookie jar — the two never coexist in a way that lets one be derived from something an attacker could steal from the other side.\n\n`loginAction` returns the `SessionPrincipal` as the action result; the client's `useEffect` in `LoginForm` sees `state.ok === true` and calls `router.push(props.next)` to land on the workspace.\n\n## 4. Re-establishing identity on a later request\n\nEvery subsequent request reads the cookie via `getSessionToken()` in `src/lib/session.ts` (`cookies()` from `next/headers`, async under Next 16). `getSessionPrincipal()` takes that token, hashes it, and calls `resolveSession` → `sessionRepo.findSessionByTokenHash`, which joins `sessions` to `users` and returns `null` if the hash isn't found *or* if `expiresAt` has already passed in the DB row — expired rows are treated as absent rather than returned for the caller to re-check.\n\n## 5. \"Still signed in\" decision\n\n`getSessionPrincipal` does one more expiry check itself, comparing `principal.expiresAt` (parsed via `parseIso`) against `Date.now()`, so a session that expired between the DB read and the response is still rejected. If there's no cookie, no matching row, or it's expired, it returns `null` — that's the single \"signed out\" signal every caller downstream checks.\n\n## 6. From bare identity to an authorizable `Actor`\n\nA `SessionPrincipal` only carries `userId`, `email`, `activeOrgId`, `expiresAt` — it knows *who*, not *what they can do where*. The tenant layout `src/app/(dashboard)/[orgSlug]/layout.tsx` (and the private helper it mirrors, `loadTenantContext` in `_lib/tenant-context.ts`, used by `getActor`/`tryGetActor` in `src/lib/actor.ts`) does the bridging:\n\n1. `getSessionPrincipal()` — 401s (`UnauthorizedActionError`/`UnauthorizedError`) if null.\n2. `resolveOrgBySlug(orgSlug)` (`organization-service.ts`) — 404s if the org in the URL doesn't exist.\n3. `resolveActorForOrg(principal, orgSlug)` in `src/server/services/session-service.ts` — looks up the org again, then `memberRepo.findMember(org.id, principal.userId)`, requiring `status === \"active\"`; if there's no active membership it returns `null` (treated the same as a missing org — a 404 — so slug existence isn't leaked). If found, it assembles `Actor = { userId, orgId, role: member.role }`, calls `assertOrgScope(actor, org.id)` (`src/lib/tenant.ts`) as a belt-and-suspenders invariant check, and updates `member-repository`'s `touchLastSeen`.\n4. The layout calls `assertOrgScope(actor, org.id)` itself too, then builds the feature-flag snapshot (`snapshotFlags(buildFlagContext(actor, org))`) and loads sidebar data (`listProjects`, `listNotifications`, `checkLimit`) — all of which take the `Actor`, not the principal, so every downstream read/write is already tenant- and role-scoped.\n5. The resulting `Actor` (carrying `role`) is what `DashboardShell`/`OrgProvider` render the role-tailored sidebar from, and what every Server Action's `can()`/tenant-scope checks authorize against from then on.\n\nSo the pipeline is: **cookie → raw token → hash → `sessions` row → `SessionPrincipal` (identity only) → membership lookup for the org in the URL → `Actor` (identity + org + role) → authorization and role-based UI.**",
+  "ttft_ms": 1801,
+  "type": "result",
+  "duration_ms": 48892,
+  "uuid": "8011738e-7593-48f9-a7c7-daf7081e769d",
+  "ttft_stream_ms": 1063,
+  "time_to_request_ms": 17,
+  "queued_turn_count": 0
+}

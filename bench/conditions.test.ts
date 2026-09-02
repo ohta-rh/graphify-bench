@@ -442,7 +442,44 @@ describe("runtime lever arms", () => {
     }
   });
 
-  it("registers all three levers", () => {
-    for (const n of ["effort-medium", "effort-low", "haiku-explore"]) expect(conditionNames()).toContain(n);
+  it("registers all four levers", () => {
+    for (const n of ["effort-medium", "effort-low", "haiku-explore", "effort-low-nosub"])
+      expect(conditionNames()).toContain(n);
+  });
+
+  // Phase 11: the combined arm. It must be the exact conjunction of the two
+  // arms it claims to combine — anything else (a different overlay, a model
+  // override, a third flag) would make the additivity comparison meaningless.
+  it("combines effort-low and baseline-nosub and adds nothing else", () => {
+    const spec = getCondition("effort-low-nosub");
+    const low = getCondition("effort-low");
+    const nosub = getCondition("baseline-nosub");
+    expect(spec.overlays).toEqual(["baseline"]);
+    expect(spec.overlays).toEqual(low.overlays);
+    expect(spec.effort).toBe(low.effort);
+    expect(spec.extraClaudeArgs).toEqual(nosub.extraClaudeArgs);
+    expect(spec.model).toBeUndefined();
+    expect(spec.env).toBeUndefined();
+    expect(spec.mcp).toBeUndefined();
+    expect(spec.corpus).toBe("v1");
+  });
+
+  // Both halves of the treatment live on the command line and nowhere else, so
+  // `claude.argv` in run.meta.json is the only audit trail either one has.
+  it("puts both levers on the command line claude actually receives", () => {
+    const spec = getCondition("effort-low-nosub");
+    const argv = buildArgs({
+      prompt: "p",
+      cwd: "/tmp/x",
+      sessionId: "s",
+      model: "claude-sonnet-5",
+      effort: effectiveEffort(spec, "high"),
+      extraArgs: spec.extraClaudeArgs,
+    });
+    expect(argv.slice(argv.indexOf("--effort"), argv.indexOf("--effort") + 2)).toEqual(["--effort", "low"]);
+    expect(argv.slice(argv.indexOf("--disallowedTools"), argv.indexOf("--disallowedTools") + 2)).toEqual([
+      "--disallowedTools",
+      "Agent",
+    ]);
   });
 });

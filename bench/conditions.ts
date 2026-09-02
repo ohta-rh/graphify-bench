@@ -282,6 +282,19 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     note: "As `effort-medium`, one notch further down: baseline with `--effort low`.",
   },
   {
+    name: "effort-low-nosub",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "low",
+    extraClaudeArgs: ["--disallowedTools", "Agent"],
+    note:
+      "The two strongest runtime levers at once: baseline's overlay byte for byte, invoked with " +
+      "`--effort low` AND `--disallowedTools Agent`. Both levers cut the same resource — total " +
+      "exploration and thinking — so the arm exists to answer whether their savings add up or " +
+      "overlap. Its treatment lives entirely in `claude.argv`; nothing in the corpus copy differs " +
+      "from a `baseline` run.",
+  },
+  {
     name: "haiku-explore",
     overlays: ["haiku-explore"],
     corpus: "v1",

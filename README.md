@@ -42,8 +42,13 @@ MemPalace, measured on the same tasks and graded the same way (differences are `
 | `--effort low`, vs `baseline-nosub` | **−58k [−118k, −0.004k]** | crosses 0 | 80% / 84% | 16 s vs 33 s | same |
 | Explore subagent pinned to Haiku, vs `baseline` | **+270k [+104k, +466k]** | crosses 0 | 80% / 84% | 20 s vs 29 s | same |
 | Explore subagent pinned to Haiku, vs `baseline-nosub` | **+345k [+179k, +526k]** | **+$0.091 [+0.056, +0.132]** | 80% / 84% | 20 s vs 33 s | same |
+| **both levers** (`--effort low` + no subagents), vs `baseline` | **−159k [−217k, −110k]** | **−$0.124 [−0.162, −0.092]** | 84% / 84% | 16 s vs 29 s | same |
+| both levers, vs `baseline-nosub` | **−84k [−136k, −34k]** | **−$0.052 [−0.076, −0.030]** | 84% / 84% | 16 s vs 33 s | same |
+| both levers, vs `--effort low` alone | **−26k [−53k, −2.6k]** | **−$0.037 [−0.050, −0.026]** | 84% / 80% | 16 s vs 16 s | same |
 
 **Lowering reasoning effort is the only lever here that is cheaper *and* faster, but it cannot beat simply banning subagents.** Against plain `baseline`, `--effort low` cuts tokens 25% and cost 26% with CIs clear of zero and roughly halves wall time; the thinking-token share falls monotonically (37% → 20% → 16%), which is what confirms the flag actually took effect rather than the arm merely writing less. Against the fairer `baseline-nosub` reference, `--effort medium` is *more* expensive and `--effort low` wins only on tokens — so `--disallowedTools Agent`, found in Phase 8, remains the strongest single lever measured here. The accuracy cost is two tasks (84% → 80%), both `locate`, and both effort arms lost the same two; at n=45 with one repetition that gap is not separable from noise.
+
+**The two levers stack, but they overlap: together they save about three quarters of what their separate savings would suggest.** Applied at once, `--effort low` plus `--disallowedTools Agent` is the cheapest condition measured anywhere in this repository — 37% fewer tokens and 42% less cost than `baseline`, at the *same* 84% accuracy — yet that −159k is only 76% of the −209k the two arms' individual savings add up to, because both levers cut the same resource and the second one cannot re-cut what the first already removed. Each still earns its place: the combination beats `--effort low` alone by −26k/−$0.037 and `baseline-nosub` alone by −84k/−$0.052, both with CIs clear of zero. The accuracy cost of low effort also disappears here — with no subagent to delegate to, the main session searches for itself and recovers one of the two `locate` tasks `--effort low` alone was losing.
 
 **Pinning exploration to Haiku works mechanically and still loses.** The project-local `.claude/agents/Explore.md` override fired on all 15 runs that delegated to `Explore` (Haiku carried 150k–3.35M tokens each, 54% of the arm's tokens and 28% of its cost, while the main session stayed on Sonnet), but a weak explorer searches inefficiently enough to erase its own price advantage: +59% tokens against `baseline` and +101% against `baseline-nosub`. The 8 runs that chose the `general-purpose` agent instead stayed on Sonnet entirely — the override covers `Explore` only.
 
@@ -122,7 +127,7 @@ nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/t
 # Runtime levers. No index and no MCP server; the code arms need the same
 # docs-free corpus-v1 snapshot the mempalace code arms used.
 nohup env BENCH_RESULTS_DIR=results/levers pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
-  --conditions effort-medium,effort-low,haiku-explore --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/levers/full.log 2>&1 &
+  --conditions effort-medium,effort-low,haiku-explore,effort-low-nosub --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/levers/full.log 2>&1 &
 
 pnpm bench:collect && pnpm bench:grade && pnpm bench:analyze && pnpm bench:report   # per results dir
 pnpm bench:report:combined && pnpm bench:report:structural && pnpm bench:report:docs
@@ -134,7 +139,7 @@ Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`
 ## Layout
 
 ```
-bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 246 tests)
+bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 260 tests)
 corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
 overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace)
 tasks/       three task files, keys/, rubrics, bugs/*.patch, docs-discrepancies.json

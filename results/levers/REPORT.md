@@ -1,6 +1,6 @@
 # graphify-bench results
 
-Generated 2026-09-02T12:10:40.331Z. 405 runs over 45 tasks, conditions: baseline, baseline-nosub, effort-low, effort-medium, graphify, graphify-strict, haiku-baseline, haiku-explore, haiku-graphify.
+Generated 2026-09-02T12:53:50.056Z. 450 runs over 45 tasks, conditions: baseline, baseline-nosub, effort-low, effort-low-nosub, effort-medium, graphify, graphify-strict, haiku-baseline, haiku-explore, haiku-graphify.
 
 ## 1. Environment
 
@@ -20,6 +20,7 @@ The `Model` line above is the harness default; arms that override it are listed 
 |---|---|---|---|---|
 | `baseline-nosub` | `claude-sonnet-5` | `baseline` | `--disallowedTools Agent` | Baseline with the Agent tool removed, so it cannot delegate exploration to a subagent — isolates how much of baseline's efficiency is the subagent rather than the flat search. |
 | `effort-low` | `claude-sonnet-5` | `baseline` | – | As `effort-medium`, one notch further down: baseline with `--effort low`. |
+| `effort-low-nosub` | `claude-sonnet-5` | `baseline` | `--disallowedTools Agent` | The two strongest runtime levers at once: baseline's overlay byte for byte, invoked with `--effort low` AND `--disallowedTools Agent`. Both levers cut the same resource — total exploration and thinking — so the arm exists to answer whether their savings add up or overlap. Its treatment lives entirely in `claude.argv`; nothing in the corpus copy differs from a `baseline` run. |
 | `effort-medium` | `claude-sonnet-5` | `baseline` | – | A RUNTIME LEVER, not a tool: the baseline overlay byte for byte, invoked with `--effort medium` instead of the harness default `high`. Thinking tokens bill as output, so the reduction is arithmetically certain and the open question is entirely about accuracy. |
 | `graphify-strict` | `claude-sonnet-5` | `graphify` + `graphify-strict` | – | Same as `graphify`, but the Read\|Glob hook runs `hook-guard read --strict`: the first raw Read of an indexed in-project source file per session is DENIED and redirected to `graphify query`. |
 | `haiku-baseline` | `claude-haiku-4-5` | `baseline` | – | Baseline run by a weaker explorer. |
@@ -33,6 +34,7 @@ The `Model` line above is the harness default; arms that override it are listed 
 | baseline | 45 | **260,561** (203,616–428,937) | 144,597 | 0.197 | 5.0 | 23 in 23 run(s) | 68 | 0 | 0 | 106 | 0 | 84.4% (38/45) | 393,482 |
 | baseline-nosub | 45 | **230,081** (126,680–378,938) | 229,091 | 0.134 | 8.0 | 0 in 0 run(s) | 170 | 0 | 0 | 232 | 0 | 84.4% (38/45) | 311,808 |
 | effort-low | 45 | **189,614** (132,368–276,765) | 119,589 | 0.132 | 4.0 | 23 in 23 run(s) | 29 | 0 | 0 | 79 | 0 | 80.0% (36/45) | 244,318 |
+| effort-low-nosub | 45 | **142,566** (130,778–229,806) | 141,561 | 0.098 | 6.0 | 0 in 0 run(s) | 82 | 0 | 0 | 206 | 0 | 84.4% (38/45) | 223,500 |
 | effort-medium | 45 | **238,378** (178,164–367,677) | 83,664 | 0.181 | 2.0 | 29 in 29 run(s) | 27 | 0 | 0 | 74 | 0 | 80.0% (36/45) | 307,709 |
 | graphify | 45 | **288,502** (197,852–481,415) | 287,545 | 0.191 | 9.0 | 0 in 0 run(s) | 191 | 0 | 0 | 208 | 83 | 77.8% (35/45) | 429,005 |
 | graphify-strict | 45 | **288,533** (181,403–463,327) | 286,953 | 0.186 | 8.0 | 1 in 1 run(s) | 141 | 0 | 0 | 216 | 83 | 77.8% (35/45) | 414,500 |
@@ -49,6 +51,7 @@ Fixed overhead, reported separately so readers can subtract it (architecture.md 
 | baseline | 10,357 |
 | baseline-nosub | 9,510 |
 | effort-low | 10,363 |
+| effort-low-nosub | 9,515 |
 | effort-medium | 10,360 |
 | graphify | 10,943 |
 | graphify-strict | 10,935 |
@@ -76,6 +79,7 @@ Tasks where every graded run of both conditions succeeded (36/45): `EXP1-issue-c
 | baseline | 36 | **272,542** (213,749–563,188) | 153,413 | 0.203 | 5.0 | 19 in 19 run(s) | 59 | 0 | 0 | 86 | 0 | 100.0% (36/36) | 400,354 |
 | baseline-nosub | 36 | **238,930** (133,843–382,636) | 237,935 | 0.147 | 8.0 | 0 in 0 run(s) | 159 | 0 | 0 | 198 | 0 | 100.0% (36/36) | 315,394 |
 | effort-low | 36 | **191,959** (152,838–300,875) | 119,878 | 0.134 | 4.0 | 20 in 20 run(s) | 22 | 0 | 0 | 61 | 0 | 100.0% (36/36) | 244,318 |
+| effort-low-nosub | 36 | **176,115** (133,712–286,072) | 175,116 | 0.106 | 7.0 | 0 in 0 run(s) | 80 | 0 | 0 | 180 | 0 | 97.2% (35/36) | 231,739 |
 | effort-medium | 36 | **254,137** (213,711–411,862) | 64,557 | 0.192 | 2.0 | 25 in 25 run(s) | 18 | 0 | 0 | 60 | 0 | 100.0% (36/36) | 307,709 |
 | graphify | 36 | **319,452** (191,853–496,443) | 318,448 | 0.205 | 9.0 | 0 in 0 run(s) | 181 | 0 | 0 | 167 | 68 | 94.4% (34/36) | 436,713 |
 | graphify-strict | 36 | **338,812** (204,604–552,570) | 318,492 | 0.194 | 9.0 | 1 in 1 run(s) | 134 | 0 | 0 | 184 | 71 | 94.4% (34/36) | 422,799 |
@@ -146,6 +150,7 @@ Section 5 reports what each category *cost*. This one reports whether it was *an
 | `baseline` | 9/9 · 0.956 | 8/9 · 0.889 | 4/9 · 0.878 | 8/9 · 0.944 | 9/9 · 0.978 |
 | `baseline-nosub` | 9/9 · 0.978 | 9/9 · 1.000 | 4/9 · 0.897 | 7/9 · 0.889 | 9/9 · 0.978 |
 | `effort-low` | 9/9 · 0.956 | 8/9 · 0.889 | 4/9 · 0.878 | 6/9 · 0.852 | 9/9 · 0.987 |
+| `effort-low-nosub` | 9/9 · 0.911 | 9/9 · 1.000 | 4/9 · 0.878 | 7/9 · 0.889 | 9/9 · 0.986 |
 | `effort-medium` | 9/9 · 0.933 | 8/9 · 0.889 | 4/9 · 0.888 | 6/9 · 0.822 | 9/9 · 0.983 |
 | `graphify` | 9/9 · 0.978 | 7/9 · 0.778 | 4/9 · 0.888 | 6/9 · 0.833 | 9/9 · 0.978 |
 | `graphify-strict` | 9/9 · 0.956 | 7/9 · 0.778 | 4/9 · 0.897 | 7/9 · 0.889 | 8/9 · 0.973 |
@@ -379,6 +384,117 @@ Per category (primary metric `uncached_equivalent_all`):
 
 **Verdict.** `haiku-explore` vs `baseline-nosub` over 45 paired tasks: tokens higher by 345,239 (95% CI [178,886, 526,438]); cost higher by 0.0914 (95% CI [0.0562, 0.1318]); turns lower by 4.2 (95% CI [-6.0, -2.7]); accuracy 80.0% vs 84.4% (36/45 vs 38/45).
 
+### `effort-low-nosub` vs `baseline`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | 45 | **260,561** (203,616–428,937) | 144,597 | 0.197 | 5.0 | 23 in 23 run(s) | 68 | 0 | 0 | 106 | 0 | 84.4% (38/45) | 393,482 |
+| effort-low-nosub | 45 | **142,566** (130,778–229,806) | 141,561 | 0.098 | 6.0 | 0 in 0 run(s) | 82 | 0 | 0 | 206 | 0 | 84.4% (38/45) | 223,500 |
+
+Paired difference (`effort-low-nosub` − `baseline`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -159,410.8 | [-216,959.0, -109,874.1] | -36.7% | effort-low-nosub lower |
+| uncached_equivalent | 45 | 29,826.3 | [-26,872.4, 86,997.6] | 90.7% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 45 | -0.1244 | [-0.1616, -0.0919] | -41.5% | effort-low-nosub lower |
+| num_turns | 45 | 2.4 | [0.5, 4.2] | 140.5% | effort-low-nosub higher |
+
+Iso-accuracy subset (37/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 37 | -174,966.8 | [-242,411.2, -114,593.8] | -36.6% | effort-low-nosub lower |
+| uncached_equivalent | 37 | 48,145.6 | [-28,158.1, 114,815.8] | 115.1% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 37 | -0.1373 | [-0.1753, -0.1015] | -42.7% | effort-low-nosub lower |
+| num_turns | 37 | 3.1 | [0.9, 5.1] | 173.2% | effort-low-nosub higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -344,496.0 | [-497,634.8, -187,820.0] | -45.6% | effort-low-nosub lower |
+| fix | 9 | -112,253.3 | [-204,519.6, -35,249.9] | -26.1% | effort-low-nosub lower |
+| impact | 9 | -96,083.3 | [-151,720.4, -52,599.1] | -39.8% | effort-low-nosub lower |
+| locate | 9 | -78,833.4 | [-112,952.5, -45,619.7] | -36.1% | effort-low-nosub lower |
+| reference | 9 | -165,388.0 | [-334,539.5, -55,837.1] | -36.0% | effort-low-nosub lower |
+
+**Verdict.** `effort-low-nosub` vs `baseline` over 45 paired tasks: tokens lower by 159,411 (95% CI [-216,959, -109,874]); cost lower by 0.1244 (95% CI [-0.1616, -0.0919]); turns higher by 2.4 (95% CI [0.5, 4.2]); accuracy 84.4% vs 84.4% (38/45 vs 38/45).
+
+### `effort-low-nosub` vs `baseline-nosub`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline-nosub | 45 | **230,081** (126,680–378,938) | 229,091 | 0.134 | 8.0 | 0 in 0 run(s) | 170 | 0 | 0 | 232 | 0 | 84.4% (38/45) | 311,808 |
+| effort-low-nosub | 45 | **142,566** (130,778–229,806) | 141,561 | 0.098 | 6.0 | 0 in 0 run(s) | 82 | 0 | 0 | 206 | 0 | 84.4% (38/45) | 223,500 |
+
+Paired difference (`effort-low-nosub` − `baseline-nosub`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -84,031.3 | [-136,186.0, -34,253.2] | -10.4% | effort-low-nosub lower |
+| uncached_equivalent | 45 | -84,031.3 | [-136,747.3, -34,626.9] | -10.3% | effort-low-nosub lower |
+| total_cost_usd | 45 | -0.0518 | [-0.0762, -0.0302] | -19.3% | effort-low-nosub lower |
+| num_turns | 45 | -2.6 | [-4.2, -1.2] | -11.2% | effort-low-nosub lower |
+
+Iso-accuracy subset (37/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 37 | -92,171.3 | [-156,625.2, -32,122.0] | -8.9% | effort-low-nosub lower |
+| uncached_equivalent | 37 | -92,171.3 | [-157,692.0, -33,917.2] | -8.8% | effort-low-nosub lower |
+| total_cost_usd | 37 | -0.0560 | [-0.0831, -0.0287] | -18.7% | effort-low-nosub lower |
+| num_turns | 37 | -2.8 | [-4.7, -1.1] | -9.0% | effort-low-nosub lower |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -286,455.4 | [-419,768.7, -158,968.7] | -40.3% | effort-low-nosub lower |
+| fix | 9 | 35,540.9 | [-75,616.1, 152,868.3] | 34.1% | **CI crosses 0 — no detectable difference** |
+| impact | 9 | -118,012.4 | [-173,041.4, -66,068.3] | -43.2% | effort-low-nosub lower |
+| locate | 9 | 5,701.0 | [-16,449.8, 22,566.8] | 13.4% | **CI crosses 0 — no detectable difference** |
+| reference | 9 | -56,930.3 | [-107,326.5, -8,105.7] | -15.9% | effort-low-nosub lower |
+
+**Verdict.** `effort-low-nosub` vs `baseline-nosub` over 45 paired tasks: tokens lower by 84,031 (95% CI [-136,186, -34,253]); cost lower by 0.0518 (95% CI [-0.0762, -0.0302]); turns lower by 2.6 (95% CI [-4.2, -1.2]); accuracy 84.4% vs 84.4% (38/45 vs 38/45).
+
+### `effort-low-nosub` vs `effort-low`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| effort-low | 45 | **189,614** (132,368–276,765) | 119,589 | 0.132 | 4.0 | 23 in 23 run(s) | 29 | 0 | 0 | 79 | 0 | 80.0% (36/45) | 244,318 |
+| effort-low-nosub | 45 | **142,566** (130,778–229,806) | 141,561 | 0.098 | 6.0 | 0 in 0 run(s) | 82 | 0 | 0 | 206 | 0 | 84.4% (38/45) | 223,500 |
+
+Paired difference (`effort-low-nosub` − `effort-low`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -26,072.7 | [-52,910.7, -2,572.4] | -10.8% | effort-low-nosub lower |
+| uncached_equivalent | 45 | 80,023.6 | [31,949.5, 133,311.2] | 217.9% | effort-low-nosub higher |
+| total_cost_usd | 45 | -0.0374 | [-0.0504, -0.0259] | -19.8% | effort-low-nosub lower |
+| num_turns | 45 | 3.7 | [2.1, 5.3] | 305.6% | effort-low-nosub higher |
+
+Iso-accuracy subset (35/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 35 | -14,965.3 | [-46,217.2, 11,099.4] | -5.6% | **CI crosses 0 — no detectable difference** |
+| uncached_equivalent | 35 | 104,256.2 | [48,898.2, 165,523.9] | 273.3% | effort-low-nosub higher |
+| total_cost_usd | 35 | -0.0353 | [-0.0497, -0.0217] | -16.4% | effort-low-nosub lower |
+| num_turns | 35 | 4.6 | [2.6, 6.9] | 380.5% | effort-low-nosub higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | 20,076.8 | [-35,293.7, 77,385.0] | 6.0% | **CI crosses 0 — no detectable difference** |
+| fix | 9 | -49,431.1 | [-146,884.1, 22,317.0] | -13.9% | **CI crosses 0 — no detectable difference** |
+| impact | 9 | -15,330.6 | [-36,323.2, 5,992.5] | -10.4% | **CI crosses 0 — no detectable difference** |
+| locate | 9 | -59,106.4 | [-107,218.1, -18,161.6] | -25.7% | effort-low-nosub lower |
+| reference | 9 | -26,572.1 | [-42,512.5, -4,531.1] | -10.3% | effort-low-nosub lower |
+
+**Verdict.** `effort-low-nosub` vs `effort-low` over 45 paired tasks: tokens lower by 26,073 (95% CI [-52,911, -2,572]); cost lower by 0.0374 (95% CI [-0.0504, -0.0259]); turns higher by 3.7 (95% CI [2.1, 5.3]); accuracy 84.4% vs 80.0% (38/45 vs 36/45).
+
 ### Accuracy by model strength
 
 The token comparisons above are only meaningful alongside accuracy: an arm that answers fewer tasks correctly can always look cheaper. This table puts every arm's accuracy side by side so a Haiku-vs-Sonnet reading is not mistaken for an efficiency result.
@@ -388,6 +504,7 @@ The token comparisons above are only meaningful alongside accuracy: an arm that 
 | `baseline` | 45 | 38 | 84.4% |
 | `baseline-nosub` | 45 | 38 | 84.4% |
 | `effort-low` | 45 | 36 | 80.0% |
+| `effort-low-nosub` | 45 | 38 | 84.4% |
 | `effort-medium` | 45 | 36 | 80.0% |
 | `graphify` | 45 | 35 | 77.8% |
 | `graphify-strict` | 45 | 35 | 77.8% |
@@ -404,6 +521,7 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `baseline` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `baseline-nosub` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `effort-low` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `effort-low-nosub` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `effort-medium` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `graphify` | 45 | 63 (45) | 16 (8) | 4 (3) | **0** | **0** | **0** | **0** | **0** | **0** |
 | `graphify-strict` | 45 | 61 (45) | 18 (12) | 3 (2) | **0** | **0** | **0** | **0** | 2 (2) | **0** |
@@ -416,6 +534,7 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `baseline` | 0 | n/a (no graph) | 0 (0) |
 | `baseline-nosub` | 0 | n/a (no graph) | 0 (0) |
 | `effort-low` | 0 | n/a (no graph) | 0 (0) |
+| `effort-low-nosub` | 0 | n/a (no graph) | 0 (0) |
 | `effort-medium` | 0 | n/a (no graph) | 0 (0) |
 | `graphify` | 4 | 0 | 0 (0) |
 | `graphify-strict` | 7 | 0 | 0 (0) |
@@ -438,6 +557,7 @@ Session timings, median (IQR) in ms:
 | `baseline` | 45 | 29,471 (13,626–50,625) | 51,095 (30,066–103,242) | 1,975 (1,579–2,650) | 18 (6–20) |
 | `baseline-nosub` | 45 | 33,485 (15,536–58,606) | 34,165 (16,084–59,353) | 1,680 (1,543–2,704) | 18 (16–21) |
 | `effort-low` | 45 | 16,220 (10,622–22,799) | 29,324 (17,457–69,160) | 2,129 (1,592–3,076) | 16 (5–18) |
+| `effort-low-nosub` | 45 | 15,654 (11,997–38,715) | 15,824 (12,906–39,308) | 1,875 (1,575–2,405) | 17 (16–20) |
 | `effort-medium` | 45 | 15,734 (7,328–22,575) | 49,319 (24,423–80,047) | 1,954 (1,490–2,532) | 8 (5–17) |
 | `graphify` | 45 | 38,594 (22,199–81,513) | 38,327 (22,605–81,287) | 1,901 (1,519–2,463) | 19 (17–21) |
 | `graphify-strict` | 45 | 44,277 (26,523–83,351) | 48,706 (26,186–85,475) | 2,174 (1,689–3,123) | 18 (17–20) |
@@ -454,6 +574,7 @@ Per-tool-call latency, median (IQR) in ms, pooled over calls:
 | `baseline` | – | 7 (5–11) | 50 (34–102) | 16 (11–63,506) |
 | `baseline-nosub` | – | 5 (4–6) | 45 (31–113) | – |
 | `effort-low` | – | 5 (4–7) | 54 (38–179) | 10 (6–7,182) |
+| `effort-low-nosub` | – | 5 (3–8) | 44 (30–160) | – |
 | `effort-medium` | – | 7 (5–8) | 54 (35–190) | 9 (7–11) |
 | `graphify` | 294 (282–307) | 64 (59–70) | 90 (80–208) | – |
 | `graphify-strict` | 300 (281–329) | 62 (55–66) | 95 (78–201) | 11 (11–11) |
@@ -474,6 +595,7 @@ Thinking tokens are billed as output and are a **subset** of `output_tokens`, no
 | `baseline` | 45 | 38,707 | 104,667 | 37.0% |
 | `baseline-nosub` | 45 | 57,807 | 149,406 | 38.7% |
 | `effort-low` | 45 | 8,153 | 51,571 | 15.8% |
+| `effort-low-nosub` | 45 | 20,251 | 86,633 | 23.4% |
 | `effort-medium` | 45 | 10,292 | 51,167 | 20.1% |
 | `graphify` | 45 | 105,595 | 209,848 | 50.3% |
 | `graphify-strict` | 45 | 91,664 | 184,741 | 49.6% |
@@ -490,6 +612,7 @@ That helper's size is a deterministic function of the task prompt, so every Sonn
 | `baseline` | 44,766 | 16,351,183 | $0.05 | $11.27 |
 | `baseline-nosub` | 44,766 | 12,959,103 | $0.05 | $8.01 |
 | `effort-low` | 44,766 | 10,350,967 | $0.05 | $7.36 |
+| `effort-low-nosub` | 44,766 | 9,177,696 | $0.05 | $5.67 |
 | `effort-medium` | 44,766 | 12,707,212 | $0.05 | $9.06 |
 | `graphify` | 44,766 | 17,795,561 | $0.05 | $10.99 |
 | `graphify-strict` | 44,766 | 17,243,098 | $0.05 | $10.65 |
@@ -502,6 +625,7 @@ That helper's size is a deterministic function of the task prompt, so every Sonn
 - `baseline`: **23** subagent(s) spawned across **23**/45 run(s). T2S all-model 393,482 vs main-session-only 175,246.
 - `baseline-nosub`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 311,808 vs main-session-only 310,813.
 - `effort-low`: **23** subagent(s) spawned across **23**/45 run(s). T2S all-model 244,318 vs main-session-only 123,838.
+- `effort-low-nosub`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 223,500 vs main-session-only 222,505.
 - `effort-medium`: **29** subagent(s) spawned across **29**/45 run(s). T2S all-model 307,709 vs main-session-only 103,201.
 - `graphify`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 429,005 vs main-session-only 428,008.
 - `graphify-strict`: **1** subagent(s) spawned across **1**/45 run(s). T2S all-model 414,500 vs main-session-only 386,497.
@@ -568,9 +692,11 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `XLOC4-session-lifetime__haiku-graphify__r1` | haiku-graphify | XLOC4-session-lifetime | false | completed |
 | `XLOC5-delivery-retry-policy__haiku-baseline__r1` | haiku-baseline | XLOC5-delivery-retry-policy | false | completed |
 | `XLOC5-delivery-retry-policy__haiku-graphify__r1` | haiku-graphify | XLOC5-delivery-retry-policy | false | completed |
+| `IMP2-rename-issue-created__effort-low-nosub__r1` | effort-low-nosub | IMP2-rename-issue-created | false | completed |
 | `IMP2-rename-issue-created__effort-low__r1` | effort-low | IMP2-rename-issue-created | false | completed |
 | `IMP2-rename-issue-created__effort-medium__r1` | effort-medium | IMP2-rename-issue-created | false | completed |
 | `IMP2-rename-issue-created__haiku-explore__r1` | haiku-explore | IMP2-rename-issue-created | false | completed |
+| `LOC2-webhook-plan-cap__effort-low-nosub__r1` | effort-low-nosub | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__effort-low__r1` | effort-low | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__effort-medium__r1` | effort-medium | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__haiku-explore__r1` | haiku-explore | LOC2-webhook-plan-cap | false | completed |
@@ -581,18 +707,23 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `XFIX5-self-notification__effort-low__r1` | effort-low | XFIX5-self-notification | false | completed |
 | `XFIX5-self-notification__effort-medium__r1` | effort-medium | XFIX5-self-notification | false | completed |
 | `XFIX5-self-notification__haiku-explore__r1` | haiku-explore | XFIX5-self-notification | false | completed |
+| `XIMP1-role-union__effort-low-nosub__r1` | effort-low-nosub | XIMP1-role-union | false | completed |
 | `XIMP1-role-union__effort-low__r1` | effort-low | XIMP1-role-union | false | completed |
 | `XIMP1-role-union__effort-medium__r1` | effort-medium | XIMP1-role-union | false | completed |
 | `XIMP1-role-union__haiku-explore__r1` | haiku-explore | XIMP1-role-union | false | completed |
+| `XIMP2-rename-comment-created__effort-low-nosub__r1` | effort-low-nosub | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__effort-low__r1` | effort-low | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__effort-medium__r1` | effort-medium | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__haiku-explore__r1` | haiku-explore | XIMP2-rename-comment-created | false | completed |
+| `XIMP5-plan-id-union__effort-low-nosub__r1` | effort-low-nosub | XIMP5-plan-id-union | false | completed |
 | `XIMP5-plan-id-union__effort-low__r1` | effort-low | XIMP5-plan-id-union | false | completed |
 | `XIMP5-plan-id-union__effort-medium__r1` | effort-medium | XIMP5-plan-id-union | false | completed |
 | `XIMP5-plan-id-union__haiku-explore__r1` | haiku-explore | XIMP5-plan-id-union | false | completed |
+| `XIMP6-limit-check-field__effort-low-nosub__r1` | effort-low-nosub | XIMP6-limit-check-field | false | completed |
 | `XIMP6-limit-check-field__effort-low__r1` | effort-low | XIMP6-limit-check-field | false | completed |
 | `XIMP6-limit-check-field__effort-medium__r1` | effort-medium | XIMP6-limit-check-field | false | completed |
 | `XIMP6-limit-check-field__haiku-explore__r1` | haiku-explore | XIMP6-limit-check-field | false | completed |
+| `XLOC4-session-lifetime__effort-low-nosub__r1` | effort-low-nosub | XLOC4-session-lifetime | false | completed |
 | `XLOC6-menu-entry-visibility__effort-low__r1` | effort-low | XLOC6-menu-entry-visibility | false | completed |
 | `XLOC6-menu-entry-visibility__effort-medium__r1` | effort-medium | XLOC6-menu-entry-visibility | false | completed |
 
@@ -614,11 +745,12 @@ The two task sets were authored separately. Pooling them is only legitimate if t
 | total_cost_usd | 0 | – | [–, –] | – | n too small |
 | num_turns | 0 | – | [–, –] | – | n too small |
 
-### set `levers` — 135 runs over 45 tasks
+### set `levers` — 180 runs over 45 tasks
 
 | condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | effort-low | 45 | **189,614** (132,368–276,765) | 119,589 | 0.132 | 4.0 | 23 in 23 run(s) | 29 | 0 | 0 | 79 | 0 | 80.0% (36/45) | 244,318 |
+| effort-low-nosub | 45 | **142,566** (130,778–229,806) | 141,561 | 0.098 | 6.0 | 0 in 0 run(s) | 82 | 0 | 0 | 206 | 0 | 84.4% (38/45) | 223,500 |
 | effort-medium | 45 | **238,378** (178,164–367,677) | 83,664 | 0.181 | 2.0 | 29 in 29 run(s) | 27 | 0 | 0 | 74 | 0 | 80.0% (36/45) | 307,709 |
 | haiku-explore | 45 | **243,863** (190,645–846,537) | 155,757 | 0.172 | 5.0 | 26 in 23 run(s) | 132 | 0 | 0 | 115 | 0 | 80.0% (36/45) | 687,692 |
 
@@ -663,13 +795,14 @@ The two task sets were authored separately. Pooling them is only legitimate if t
 
 Some tasks were written as **designed zero-advantage controls**: their answer is reproduced exactly by a single literal `grep`, so a structural index has nothing to add and the expected effect is zero or negative. They are marked `DELIBERATELY EASY` in the task notes and are separated out here so they neither flatter nor drag the headline number. Easy tasks: `IMP2-rename-issue-created`, `LOC1-shortcut-match`, `XIMP2-rename-comment-created`, `XLOC1-retry-throttle`, `XREF5-rate-limit-importers`.
 
-### easy (zero-advantage controls) — 45 runs over 5 tasks
+### easy (zero-advantage controls) — 50 runs over 5 tasks
 
 | condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | baseline | 5 | **121,254** (120,997–161,762) | 120,026 | 0.083 | 4.0 | 1 in 1 run(s) | 6 | 0 | 0 | 15 | 0 | 60.0% (3/5) | 237,318 |
 | baseline-nosub | 5 | **80,302** (79,836–107,441) | 79,317 | 0.072 | 4.0 | 0 in 0 run(s) | 6 | 0 | 0 | 14 | 0 | 60.0% (3/5) | 163,665 |
 | effort-low | 5 | **120,560** (120,130–121,733) | 119,589 | 0.080 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 16 | 0 | 60.0% (3/5) | 162,809 |
+| effort-low-nosub | 5 | **104,527** (78,248–105,778) | 103,549 | 0.070 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 14 | 0 | 60.0% (3/5) | 132,848 |
 | effort-medium | 5 | **116,011** (92,140–121,023) | 91,155 | 0.083 | 4.0 | 1 in 1 run(s) | 3 | 0 | 0 | 11 | 0 | 60.0% (3/5) | 145,764 |
 | graphify | 5 | **160,029** (141,551–240,807) | 159,058 | 0.116 | 6.0 | 0 in 0 run(s) | 4 | 0 | 0 | 16 | 6 | 60.0% (3/5) | 226,858 |
 | graphify-strict | 5 | **166,765** (133,014–206,080) | 165,794 | 0.129 | 5.0 | 0 in 0 run(s) | 3 | 0 | 0 | 16 | 5 | 60.0% (3/5) | 194,847 |
@@ -684,13 +817,14 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 | total_cost_usd | 5 | -0.0204 | [-0.0602, 0.0180] | -5.9% | **CI crosses 0 — no detectable difference** |
 | num_turns | 5 | -1.2 | [-3.6, 0.8] | -0.3% | **CI crosses 0 — no detectable difference** |
 
-### rest — 360 runs over 40 tasks
+### rest — 400 runs over 40 tasks
 
 | condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | baseline | 40 | **270,860** (214,951–492,675) | 153,413 | 0.203 | 5.0 | 22 in 22 run(s) | 62 | 0 | 0 | 91 | 0 | 87.5% (35/40) | 406,868 |
 | baseline-nosub | 40 | **233,554** (144,366–382,636) | 232,574 | 0.144 | 8.0 | 0 in 0 run(s) | 164 | 0 | 0 | 218 | 0 | 87.5% (35/40) | 324,506 |
 | effort-low | 40 | **191,959** (152,838–300,875) | 111,311 | 0.137 | 4.0 | 23 in 23 run(s) | 27 | 0 | 0 | 63 | 0 | 82.5% (33/40) | 251,728 |
+| effort-low-nosub | 40 | **164,490** (132,914–248,177) | 163,504 | 0.105 | 6.0 | 0 in 0 run(s) | 80 | 0 | 0 | 192 | 0 | 87.5% (35/40) | 231,271 |
 | effort-medium | 40 | **254,137** (200,344–381,973) | 64,557 | 0.189 | 2.0 | 28 in 28 run(s) | 24 | 0 | 0 | 63 | 0 | 82.5% (33/40) | 322,431 |
 | graphify | 40 | **319,452** (212,223–488,364) | 318,448 | 0.205 | 9.5 | 0 in 0 run(s) | 187 | 0 | 0 | 192 | 77 | 80.0% (32/40) | 447,956 |
 | graphify-strict | 40 | **326,350** (204,604–508,983) | 301,360 | 0.201 | 9.0 | 1 in 1 run(s) | 138 | 0 | 0 | 200 | 78 | 80.0% (32/40) | 435,092 |
@@ -707,7 +841,7 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 
 ## 15. Limitations
 
-- N = 405 runs over 45 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
+- N = 450 runs over 45 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
 - Bootstrap resamples tasks, so the interval reflects task-to-task variation, not within-task run noise.
 - Where a CI crosses zero the honest reading is "no difference detected at this N", not "no difference exists".
 - The fixed ~21k-token system-prompt/tool-definition overhead is included in both arms and not subtracted (see §2).
