@@ -1,5 +1,12 @@
+"use client";
+
 /**
  * One row of `IssueList`; renders the archive control only when permitted.
+ *
+ * A Client Component because the title and the archive control are buttons:
+ * the issues pages render `IssueList` on the server, and a `<button onClick>`
+ * produced there is a render error even when the callback prop is absent —
+ * the inline arrow is still a function on a DOM element.
  *
  * Must call (do not reimplement): can
  */
