@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 61252,
+  "stop_reason": "end_turn",
+  "session_id": "8e31ccc2-5044-4020-ad63-544aeadf9c90",
+  "total_cost_usd": 0.256511,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 41679,
+    "cache_read_input_tokens": 198570,
+    "output_tokens": 4897,
+    "output_tokens_details": {
+      "thinking_tokens": 364
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 41679,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2159,
+        "cache_read_input_tokens": 40823,
+        "cache_creation_input_tokens": 856,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 856
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1013,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001083,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 14,
+      "outputTokens": 4897,
+      "cacheReadInputTokens": 198570,
+      "cacheCreationInputTokens": 41679,
+      "webSearchRequests": 0,
+      "costUSD": 0.255428,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 364,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 16,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the full picture. Here's the pipeline end to end.\n\n## Trigger\n\nTwo independent triggers can start the digest job, both landing on the same function:\n\n1. **External cron** — `POST` on `src/app/api/cron/digest/route.ts` validates the request via `assertCronSecret`, then calls `runDigestEmailJob(new Date())` from `src/server/jobs/digest-email-job.ts`. Calling it more than once per hour is harmless (see below).\n2. **In-process scheduler** — `src/server/jobs/scheduler.ts`'s `tick()` runs every 60s (`TICK_INTERVAL_MS`, started via `startScheduler()` from `src/instrumentation.ts`). Its `CADENCE_MINUTES[\"digest-email\"] = 60` means it only *enqueues* a `\"digest-email\"` job once per hour (`isDue`), then `drain()` (`src/server/jobs/queue.ts`) executes it, which ultimately also calls `runDigestEmailJob`.\n\n## Deciding which orgs are due\n\nInside `runDigestEmailJob` (`src/server/jobs/digest-email-job.ts`):\n\n1. `usageRepo.listOrgIdsForRollup(ORG_BATCH)` (`src/server/repositories/usage-repository.ts:133`) fetches up to 50 org IDs from the `organizationUsage` table, ordered by `measuredAt` — this is a **usage-rollup query being reused as the org list**, so an org only becomes a digest candidate if it has a row in `organizationUsage`, and only the 50 \"stalest\" (oldest `measuredAt`) orgs are considered per tick.\n2. For each org, `orgRepo.findOrgById(orgId)` loads it, then `shouldRunForOrg(org, now)` checks: the org isn't archived (`archivedAt === null`) and `now.getUTCHours() === org.settings.digestHourUtc`. This is what makes repeated calls in the same hour idempotent at the org level.\n3. `isEnabled(\"digest_email\", buildFlagContext(null, org))` (`src/lib/feature-flags.ts`, context built in `src/server/services/feature-flag-service.ts`) gates the whole org — the flag's strategy is `{ kind: \"plan\", minPlan: \"growth\" }` (`src/config/feature-flags.ts:63-69`), overridable per-org via `org.settings.enabledFlagOverrides`. An org below the `growth` plan with no override is skipped entirely.\n\n## Deciding which people are subscribed\n\nFor orgs that pass, `listDigestRecipients(orgId)` (`src/server/services/digest-service.ts`) calls `preferenceRepo.listDigestSubscribers(orgId)` (`src/server/repositories/notification-preference-repository.ts:87`), which does `selectDistinct(userId)` from `notification_preferences` where `digestOnly = true` for that org. Since `notification_preferences` has one row per `(orgId, userId, kind)` (`src/server/db/schema/notifications.ts`), a user is \"subscribed\" the moment they've set `digestOnly` on **any single notification kind** — there's no separate \"digest subscription\" entity.\n\n## Assembling one person's digest\n\nFor each recipient, `buildDigest(orgId, recipientId, windowStart, windowEnd)` (`src/server/services/digest-service.ts`) runs, where `windowEnd = now` and `windowStart = now - 24h` (computed in the job as `MS_PER_DAY`):\n\n1. Re-fetches the org and re-checks `isEnabled(\"digest_email\", ...)` (defense in depth against the flag flipping mid-run).\n2. `notificationRepo.listUnreadSince(orgId, recipientId, windowStart)` (`src/server/repositories/notification-repository.ts:165`) selects notifications for that recipient where `readAt IS NULL` and `createdAt >= windowStart`, newest first.\n3. Filters to `createdAt <= windowEnd`, maps to `DigestEntry` (id/kind/title/href/occurredAt), truncates to `DIGEST_MAX_ENTRIES` (50, `src/config/constants.ts:23`).\n4. If fewer than `MIN_ENTRIES` (1) entries remain, returns `null` (no bundle).\n5. Otherwise returns a `DigestBundle`.\n\nBack in the job: if `bundle` isn't `null`, it loads the recipient via `userRepo.findUserById`, calls `renderDigest(bundle, recipient)` → `renderEmail(\"digest\", {...})` (`src/server/services/email-service.ts`) to produce subject/html/text, then `sendEmail({ to: recipient.email, ...rendered })` (which in this offline corpus just logs `email.sent` rather than delivering mail). Finally, every entry's notification is marked read via `notificationRepo.markRead(orgId, entry.notificationId, windowEnd)` — this is what prevents the same notification from being redigested if the job runs again in the same hour or the next tick overlaps.\n\n## Why a subscribed person can still get no email that day\n\n- Their org isn't in the batch `listOrgIdsForRollup` returns (no `organizationUsage` row yet, or bumped out by the 50-org limit/ordering that tick).\n- The org is archived, or `now.getUTCHours() !== org.settings.digestHourUtc` (wrong hour, or the hour was already handled and this is a duplicate tick within the same hour after a prior success — though re-runs are idempotent by design, not by hour-skipping, so this specifically matters if the *previous* run already sent and marked things read).\n- The org's plan is below `growth` and it has no `digest_email` override in `org.settings.enabledFlagOverrides`.\n- The recipient has zero unread notifications with `createdAt` inside `[windowStart, windowEnd]` — e.g. everything was already read (in-app or from a prior digest run marking them read), or nothing happened in the last 24h for them, even though `digestOnly` is set.\n- `userRepo.findUserById(recipientId)` returns `null` (e.g. user removed) — silently skipped via `continue`.\n- The digest build or send throws for that recipient — caught in the loop, counted in `result.failed`, logged via `logger.error(\"digest failed\", ...)`, and the loop moves on without retrying that recipient in the same run.",
+  "ttft_ms": 3215,
+  "type": "result",
+  "duration_ms": 61658,
+  "uuid": "dfb657b6-fe8d-419d-9e1d-03edadb0ede2",
+  "ttft_stream_ms": 2430,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

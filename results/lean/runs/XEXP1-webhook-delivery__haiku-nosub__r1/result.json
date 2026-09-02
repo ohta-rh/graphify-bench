@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 80676,
+  "stop_reason": "end_turn",
+  "session_id": "f8f83c78-3c84-42f2-8e92-c3a4f9f6442a",
+  "total_cost_usd": 0.1775475,
+  "usage": {
+    "input_tokens": 154,
+    "cache_creation_input_tokens": 39592,
+    "cache_read_input_tokens": 681915,
+    "output_tokens": 5781,
+    "output_tokens_details": {
+      "thinking_tokens": 2066
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39592,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1864,
+        "cache_read_input_tokens": 48988,
+        "cache_creation_input_tokens": 2073,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2073
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001113,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 154,
+      "outputTokens": 5781,
+      "cacheReadInputTokens": 681915,
+      "cacheCreationInputTokens": 39592,
+      "webSearchRequests": 0,
+      "costUSD": 0.17643450000000002,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2066,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 19,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the complete picture of the webhook flow. Here's what happens from when a customer creates an issue to when their webhook endpoint is called:\n\n## The Complete Webhook Delivery Flow\n\n**1. Issue Creation Triggers an Event**\n\nWhen a customer creates an issue in the browser, the request flows through a server action to `createIssue()` in `src/server/services/issue-service.ts:42-81`. After persisting the issue to the database, this function calls `emit(\"issue.created\", {...})` at line 71 with the issue details.\n\n**2. Event Bus Routes to Webhook Listeners**\n\nThe event emission publishes to an in-process event bus defined in `src/lib/event-bus.ts`. When `emit()` is called, it finds all subscribers registered for that event type and calls them with the payload. Handlers run in parallel via `Promise.allSettled()`, and if one handler throws, it's isolated and never blocks other handlers.\n\n**3. Webhook Service Filters and Enqueues**\n\nThe webhook service registered listeners at process startup via `src/server/services/event-registry.ts:33-49`, which calls `registerWebhookListeners()` from `src/server/services/webhook-service.ts:101-139`. This function subscribes to multiple event types including \"issue.created\". When the event fires, the listener calls `enqueueForOrg(orgId, eventType, payload)` at line 104.\n\n`enqueueForOrg()` (lines 141-156) then:\n- Fetches all webhook endpoints for the organization\n- Filters by enabled status and whether the endpoint is subscribed to this event type\n- For each matching endpoint, calls `webhookRepo.enqueueDelivery()` to create a new row in the `webhookDeliveries` table with status \"pending\"\n\n**4. Scheduler Triggers Delivery Job**\n\nThe scheduler in `src/server/jobs/scheduler.ts` runs every 60 seconds. At line 16, the webhook-delivery job cadence is set to 1 minute. When the job is due, `enqueue()` adds a \"webhook-delivery\" job to the in-process queue in `src/server/jobs/queue.ts`. The `drain()` function processes jobs that have reached their `runAt` time, oldest first.\n\n**5. Delivery Job Executes**\n\nThe webhook delivery job in `src/server/jobs/webhook-delivery-job.ts:32-87` runs via `runWebhookDeliveryJob()`. It:\n- Claims up to 25 pending deliveries using `webhookRepo.claimPendingDeliveries()` at line 34\n- For each delivery, verifies:\n  - The organization's plan allows webhooks (line 39)\n  - The delivery hasn't exceeded MAX_ATTEMPTS (6) (line 49)\n  - The endpoint still exists and is enabled (line 59)\n- Computes an HMAC-SHA256 signature by calling `signPayload(endpoint.secret, delivery.payload)` at line 73\n\nThe `signPayload()` function in `src/server/services/webhook-service.ts:92-94` uses Node's crypto module to create an HMAC-SHA256 hash of the payload string with the endpoint's secret. This signature is what proves to the receiver that the delivery came from Taskflow.\n\n- Marks the delivery as \"delivered\" (line 83)\n- Logs the attempt including the first 16 characters of the signature (line 75)\n\n**6. Retry and Backoff on Failure**\n\nWhen a delivery fails (or is retried), the job uses exponential backoff defined in `backoffMs()` at line 90: for attempt 1 it waits 1s, attempt 2 waits 2s, attempt 3 waits 4s, and so on, capped at 5 minutes. After 6 total attempts, the delivery is marked as \"failed\" with the last error message (truncated to 500 chars) stored in `lastError`.\n\n**7. Customer Receives Signed Webhook**\n\nThe actual HTTP delivery itself is simulated (as noted in the comments at line 27): the job computes what the signature would be and logs it. In a real deployment, Taskflow would POST to the customer's endpoint with:\n- The payload as the request body (a JSON string)\n- A header (typically `X-Taskflow-Signature` or similar) containing the hex-encoded HMAC-SHA256 signature\n\nThe customer verifies the webhook came from Taskflow by:\n1. Extracting the signature from the header\n2. Recomputing the HMAC-SHA256 hash using their secret and the raw request body\n3. Comparing their computed signature to the one in the header\n\nThis verification mechanism is demonstrated in the test endpoint at `src/app/api/webhooks/[endpointId]/test/route.ts:59-70`, which returns both the payload and the computed signature so customers can validate their verification logic.\n\n**Retry behavior in code:**\n- The delivery status is tracked in `src/server/db/schema/webhooks.ts:19-38`, with columns for `status`, `attempts`, `lastError`, and `deliveredAt`\n- If a delivery doesn't succeed on the first attempt, it stays in \"pending\" status with an incremented attempt counter, and the scheduler will re-run the job in 1 minute\n- The exponential backoff ensures temporary failures don't overwhelm the customer's endpoint\n- After 6 attempts, the row is marked \"failed\" and never retried again",
+  "ttft_ms": 2388,
+  "type": "result",
+  "duration_ms": 81271,
+  "uuid": "543277be-bf4e-43b3-a2aa-d739c71e8c44",
+  "ttft_stream_ms": 776,
+  "time_to_request_ms": 22,
+  "queued_turn_count": 0
+}

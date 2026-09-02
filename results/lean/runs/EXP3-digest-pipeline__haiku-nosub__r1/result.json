@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 52856,
+  "stop_reason": "end_turn",
+  "session_id": "1a9f7754-0c9e-4285-ab5c-2d0436f3ac5a",
+  "total_cost_usd": 0.09627670000000002,
+  "usage": {
+    "input_tokens": 82,
+    "cache_creation_input_tokens": 23805,
+    "cache_read_input_tokens": 263667,
+    "output_tokens": 4227,
+    "output_tokens_details": {
+      "thinking_tokens": 1228
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 23805,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1913,
+        "cache_read_input_tokens": 34570,
+        "cache_creation_input_tokens": 704,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 704
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1013,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001083,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 82,
+      "outputTokens": 4227,
+      "cacheReadInputTokens": 263667,
+      "cacheCreationInputTokens": 23805,
+      "webSearchRequests": 0,
+      "costUSD": 0.09519369999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1228,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 15,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the full picture. Here's the complete daily digest pipeline:\n\n## The Trigger\n\nThe pipeline is initiated by a scheduler started in **`src/instrumentation.ts`**. When the Next.js server boots, the `register()` function calls `startScheduler()`, which sets up an interval-based scheduler in **`src/server/jobs/scheduler.ts`**. This scheduler runs a `tick()` function every 60 seconds that decides which jobs are due to run based on their `CADENCE_MINUTES`. For digest-email, the cadence is 60 minutes, meaning the job is enqueued at most once per hour.\n\n## Job Enqueueing and Dispatch\n\nEach scheduler tick checks if 60 minutes have passed since the last digest-email run. If so, it enqueues a job via `enqueue()` in **`src/server/jobs/queue.ts`**. The same tick then calls `drain()`, which pulls due jobs from the in-process queue and dispatches them to their handlers. For digest-email, this loads and executes `runDigestEmailJob()` from **`src/server/jobs/digest-email-job.ts`**, passing the current date.\n\n## Organization Selection (Which Orgs Get a Digest)\n\nInside `runDigestEmailJob(now)`, the code batches organizations in groups of 50 by calling `usageRepo.listOrgIdsForRollup()`. For each organization, it:\n\n1. Fetches the full org record with `orgRepo.findOrgById()`\n2. Calls `shouldRunForOrg(org, now)`, which returns true only if:\n   - The org is not archived (`org.archivedAt === null`)\n   - The current UTC hour matches the org's configured digest hour (`now.getUTCHours() === org.settings.digestHourUtc`)\n3. Checks if the feature flag `\"digest_email\"` is enabled for that org via `isEnabled()` and `buildFlagContext()`\n\nOnly organizations passing all three checks proceed further.\n\n## Recipient Selection (Who Inside the Org Gets a Digest)\n\nFor each qualifying org, the code calls `listDigestRecipients(orgId)` from **`src/server/services/digest-service.ts`**, which delegates to `preferenceRepo.listDigestSubscribers()` in **`src/server/repositories/notification-preference-repository.ts`**. This queries the `notificationPreferences` table for distinct users where `digestOnly = true`. A user is a digest subscriber if they have set at least one notification kind to `digestOnly` — opting into the digest suppresses the immediate emails for that kind.\n\n## Building One Person's Digest Content\n\nFor each recipient, `buildDigest()` is called with a time window: `windowStart` (24 hours ago) and `windowEnd` (now). This function:\n\n1. Re-checks the org exists and the `\"digest_email\"` feature flag is enabled (as a safety check)\n2. Calls `notificationRepo.listUnreadSince(orgId, recipientId, windowStart)`, which queries the `notifications` table for this recipient with `readAt IS NULL` and `createdAt >= windowStart`, ordered by newest first\n3. Filters these to only notifications with `createdAt <= windowEnd`\n4. Maps each to a `DigestEntry` containing the notification ID, kind, title, href, and creation time\n5. Caps entries at `DIGEST_MAX_ENTRIES` via `.slice(0, DIGEST_MAX_ENTRIES)`\n6. Returns the `DigestBundle` if it has at least `MIN_ENTRIES` (1 entry); otherwise returns `null`\n\nThe bundle is passed to `renderDigest(bundle, recipient)`, which renders the React Email template in **`src/emails/digest-email.tsx`**, then `sendEmail()` in **`src/server/services/email-service.ts`** logs the sent message.\n\nAfter sending, all notifications in the bundle are marked as read by calling `notificationRepo.markRead()` for each. This is critical: if the same digest run ticks again within the same hour (since the scheduler runs every 60 seconds), the re-marked notifications won't be included again, preventing duplicates.\n\n## Conditions for a Subscribed Person to Receive No Email\n\nEven after being identified as a digest subscriber, a person receives no email that day if:\n\n- Their org is archived\n- The current UTC hour does not match their org's `digestHourUtc` (digests are org-level, not per-user)\n- The `digest_email` feature flag is disabled for their org\n- They have no unread notifications in the 24-hour window (windowStart to windowEnd)\n- All their unread notifications fall outside the window boundaries (created before windowStart or after windowEnd)\n- After filtering, they have fewer than the minimum entry count (`MIN_ENTRIES = 1`), which means they had no eligible notifications at all\n\nIn these cases, `buildDigest()` returns `null`, which the job handler skips — no email is sent, and no notifications are marked read.",
+  "ttft_ms": 2026,
+  "type": "result",
+  "duration_ms": 52317,
+  "uuid": "e03cb34c-053c-417e-9419-99b22718efa3",
+  "ttft_stream_ms": 958,
+  "time_to_request_ms": 14,
+  "queued_turn_count": 0
+}

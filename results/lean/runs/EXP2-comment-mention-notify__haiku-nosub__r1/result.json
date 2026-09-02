@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 107083,
+  "stop_reason": "end_turn",
+  "session_id": "fb52b8c5-77d0-4d14-9917-27ba1da32897",
+  "total_cost_usd": 0.1869872,
+  "usage": {
+    "input_tokens": 194,
+    "cache_creation_input_tokens": 34210,
+    "cache_read_input_tokens": 822762,
+    "output_tokens": 7003,
+    "output_tokens_details": {
+      "thinking_tokens": 2805
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 34210,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 2230,
+        "cache_read_input_tokens": 45175,
+        "cache_creation_input_tokens": 504,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 504
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010819999999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 194,
+      "outputTokens": 7003,
+      "cacheReadInputTokens": 822762,
+      "cacheCreationInputTokens": 34210,
+      "webSearchRequests": 0,
+      "costUSD": 0.18590520000000002,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2805,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 24,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the complete picture. Let me create a comprehensive explanation of the flow.\n\n## How @mentions in Comments Become Notifications\n\nWhen someone writes a comment with `@someone` and it becomes a notification in the mentioned person's inbox, here's the complete journey:\n\n### 1. **Mention Extraction and User Resolution** (`src/lib/mentions.ts` → `src/server/services/comment-service.ts`)\n\nWhen a comment is posted, the comment-service calls `resolveMentionedUsers()` which:\n- Fetches all organization members (up to 100 limit via `memberRepo.listMembers()`)\n- Calls `resolveMentions(body, members)` from `mentions.ts`, which:\n  - Uses a regex pattern to extract all `@handle` mentions from the comment body, ignoring those inside code blocks\n  - Maps each handle to actual userIds by looking up the organization's members: a handle is the local part of a member's email (everything before the `@`), lowercased\n  - Returns only the userIds of members who actually exist; unknown handles are silently dropped (typos won't fail the comment write)\n- The result is stored as `mentionedUserIds` in the comment row in the database via `commentRepo.insertComment()`\n\n### 2. **Event Emission** (`src/server/services/comment-service.ts`)\n\nOnce the comment is stored with its resolved `mentionedUserIds`, the service emits a `\"comment.created\"` event that includes:\n- The org, issue, and comment IDs\n- The `mentionedUserIds` array (the already-resolved user IDs, not the raw handles)\n- The actor ID (person who wrote the comment)\n\n### 3. **Notification Fan-out** (`src/server/services/notification-service.ts`)\n\nAt module load, `registerFanOut()` sets up a subscriber on `\"comment.created\"` events. When the event fires:\n- The handler first notifies watchers (the issue's author and assignee) with kind `\"comment_created\"`\n- If `mentionedUserIds` is non-empty, it calls `notify()` with:\n  - `kind: \"comment_mention\"`\n  - `recipients: payload.mentionedUserIds`\n\n### 4. **Channel Resolution** (Deciding In-App, Email, or Nothing)\n\nThe `notify()` function processes each mentioned user:\n- **Filters self-mentions**: skips if the recipient is the same person who wrote the comment\n- **Loads preferences**: calls `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` to get the user's notification settings for mentions\n  - If no explicit preference row exists, returns `null`\n  - In that case, `notify()` defaults to `[\"in_app\", \"email\"]`\n- **Resolves channels** via `resolveChannels(preference, flags)`:\n  - If preference is `null`: uses `[\"in_app\", \"email\"]`\n  - If preference exists, checks:\n    - `preference.inApp` → includes `\"in_app\"` channel if true\n    - `preference.email` AND (!`preference.digestOnly` OR `digest_email` feature flag is enabled) → includes `\"email\"` channel if both conditions are met\n  - If no channels pass (user muted everything), skips this recipient entirely\n- **Creates notification row**: if any channels are enabled, inserts a row in the `notifications` table with:\n  - `recipientId`: the mentioned user\n  - `kind: \"comment_mention\"`\n  - `channels`: the JSON-serialized list of allowed delivery channels\n  - `title`, `body`, `href`: pre-composed notification content\n\n### 5. **Delivery Execution** (How In-App Rows and Emails Actually Reach the Inbox)\n\n- **In-app channel**: The notification row exists in the database and is immediately visible when the user queries their notification list via the UI (the `notification:read` endpoint returns rows with `in_app` in their channels array)\n- **Email channel**:\n  - If `digestOnly` is false: currently the email channel flag is stored but there's no immediate email sender (infrastructure comment in code suggests this is by design for this offline system)\n  - If `digestOnly` is true: the notification remains unread and is queued for the daily digest\n    - The `digest-email-job` runs once per day at the org's configured UTC hour\n    - It fetches all unread notifications for that user created since the window start via `notificationRepo.listUnreadSince()`\n    - Builds a digest bundle with up to the max number of entries\n    - Renders the digest email template and \"sends\" it (logs the draft, as this system has no real mail transport)\n    - Marks those notification rows as read so they're not included in tomorrow's digest\n\n### Key Points That Control the Outcome\n\nThe decision of whether a mentioned person ends up with **in-app notification**, **email**, **both**, or **nothing** is determined by:\n1. **Handle resolution succeeds** — the typed `@handle` must match someone's email local part in the org\n2. **User's notification preference for `comment_mention`** — checked via `preferenceRepo.getPreference()`:\n   - If no explicit preference, defaults to both in-app and email\n   - If preference exists, the `inApp` and `email` flags control which channels are used\n   - The `digestOnly` flag converts the email channel into a batched digest instead of immediate mail\n3. **Organization plan/feature flags** — the `digest_email` flag must be enabled for the `email` channel to apply",
+  "ttft_ms": 4136,
+  "type": "result",
+  "duration_ms": 108155,
+  "uuid": "6c0f3fab-4192-4e79-8c69-9c11c87cef32",
+  "ttft_stream_ms": 2514,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}

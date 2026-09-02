@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 69363,
+  "stop_reason": "end_turn",
+  "session_id": "1f177bea-6dbf-4667-9c81-cf8b14afc857",
+  "total_cost_usd": 0.12398319999999997,
+  "usage": {
+    "input_tokens": 162,
+    "cache_creation_input_tokens": 18300,
+    "cache_read_input_tokens": 627392,
+    "output_tokens": 4677,
+    "output_tokens_details": {
+      "thinking_tokens": 1315
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 18300,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1592,
+        "cache_read_input_tokens": 42269,
+        "cache_creation_input_tokens": 0,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 0
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 162,
+      "outputTokens": 4677,
+      "cacheReadInputTokens": 627392,
+      "cacheCreationInputTokens": 18300,
+      "webSearchRequests": 0,
+      "costUSD": 0.12288619999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1315,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 20,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have a complete picture of the search system. Let me trace the full flow from both ends.\n\n## The Write Side: Keeping the Index in Sync\n\nWhen someone edits an issue title, the update follows this path:\n\nThe user submits the change through `updateIssueAction()` in `src/actions/issues/update-issue.ts:41`, which calls `updateIssue()` from `src/server/services/issue-service.ts:83`. This service layer:\n\n1. Checks that the actor has permission to update the issue\n2. Calls `issueRepo.updateIssue()` to persist the change to the main database\n3. Emits an `issue.updated` event via `emit(\"issue.updated\", ...)` at line 99\n\nThat event emission is the critical link. Every time an issue changes, this event is broadcast through the in-process event bus defined in `src/lib/event-bus.ts`. The key insight is in the comment at `src/server/services/search-service.ts:132`: \"Every handler re-reads the row rather than trusting the event payload, so a partially-applied write can never be indexed as if it had succeeded.\"\n\nAt process startup, `registerSearchListeners()` at `src/server/services/search-service.ts:137` wires up a subscriber. When the `issue.updated` event fires, the handler at line 143 re-fetches the entire issue from the database using `issueRepo.findIssueById()`, then calls `indexIssue()` at line 145, which in turn calls `searchRepo.upsertSearchDocument()`.\n\n## What Gets Stored\n\nThe search index lives in the `searchIndex` table defined in `src/server/db/schema/webhooks.ts:54`. For each indexed issue, it stores:\n\n- `id`: A unique identifier\n- `orgId`: The organization (tenant filter)\n- `subjectKind`: One of \"issue\", \"comment\", or \"project\"\n- `subjectId`: The ID of the issue being indexed\n- `projectId`: Which project the issue belongs to\n- `content`: A denormalized string formed by concatenating the title and description, separated by a newline (see `src/server/services/search-service.ts:93`)\n- `indexedAt`: A timestamp of when the index entry was last updated\n\nThe `upsertSearchDocument()` function at `src/server/repositories/search-repository.ts:18` is idempotent—it uses a composite key of (org, kind, subject) and updates the existing row if found, or inserts a new one. This is crucial because `indexIssue()` is called on every write, so the operation must be safe to repeat.\n\n## How a Query Gets Answered\n\nWhen someone searches for a term, the request hits `src/app/api/search/route.ts:25`. The GET handler:\n\n1. Extracts `orgSlug` and `q` (query) from URL parameters; if either is missing, it returns a validation failure at line 32\n2. Fetches the actor to establish the searcher's identity\n3. Checks permission with `can(actor, \"org:read\", ...)` at line 37—if denied, returns a forbidden response\n4. Pulls organization metadata and builds a feature flag context for the searcher's plan and role\n5. Checks whether `command_palette` is enabled for this organization (line 44); if not, the entire search endpoint refuses the request\n6. Parses the query through `searchQuerySchema` defined in `src/schemas/search.ts:6`, which validates that `q` is between 1 and 200 characters\n7. Enforces a rate limit bucket per organization at `src/server/services/search-service.ts:53`; if the bucket is exhausted, the search is rejected with the reset time\n8. **Critically**, checks whether the query contains a colon (`:`) at line 69. If it does and the `advanced_search` feature is not enabled for this organization, throws an error: \"Field-scoped search is not included in this plan\"\n\nThis last check is the gating mechanism: queries like `status:done` are only allowed if the organization's plan includes the `advanced_search` feature flag. A query that looks valid—a properly formed string—is rejected not by the schema but by a runtime permission check that examines both the query content and the feature flag state.\n\nFinally, at line 73, the actual search runs by calling `searchRepo.searchDocuments()` from `src/server/repositories/search-repository.ts:83`, which does a simple substring match (`like(searchIndex.content, `%${input.q}%`)`) over the denormalized content column, filtered to the searcher's organization and the requested kinds (issue, comment, project). Results are paginated using keyset pagination and sorted by `indexedAt` descending.\n\nThe entire flow—from title edit to search result—happens in memory through the event bus, with the search index as a denormalized copy that stays in step through subscriber callbacks that re-read from the authoritative database each time.",
+  "ttft_ms": 2735,
+  "type": "result",
+  "duration_ms": 70840,
+  "uuid": "2255ce3c-1a29-4073-99bb-3b55471dc88c",
+  "ttft_stream_ms": 934,
+  "time_to_request_ms": 13,
+  "queued_turn_count": 0
+}

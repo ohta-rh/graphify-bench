@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 106766,
+  "stop_reason": "end_turn",
+  "session_id": "ea25c1d2-9210-422e-ae9d-13dcc685de27",
+  "total_cost_usd": 0.22092059999999997,
+  "usage": {
+    "input_tokens": 234,
+    "cache_creation_input_tokens": 38466,
+    "cache_read_input_tokens": 1022626,
+    "output_tokens": 8080,
+    "output_tokens_details": {
+      "thinking_tokens": 2840
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 38466,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 2549,
+        "cache_read_input_tokens": 48172,
+        "cache_creation_input_tokens": 1763,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1763
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 234,
+      "outputTokens": 8080,
+      "cacheReadInputTokens": 1022626,
+      "cacheCreationInputTokens": 38466,
+      "webSearchRequests": 0,
+      "costUSD": 0.21982859999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2840,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 29,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have a complete picture of how search indexing works. Let me provide the explanation.\n\n---\n\n## How Issue Title Updates Stay Searchable\n\nWhen someone edits an issue title, two separate systems work in concert: the write path that records the change in the canonical data store, and the read path that queries a denormalized search index. The event bus wires them together.\n\n### The Write Path: Editing the Title\n\nThe flow begins in `src/actions/issues/update-issue.ts`, where `updateIssueAction()` validates and delegates to `updateIssue()` in `src/server/services/issue-service.ts`. The service function:\n\n1. Reads the old issue from the database via `issueRepo.findIssueById()` to check permissions\n2. Calls `issueRepo.updateIssue()` which executes a SQL UPDATE against the `issues` table (from `src/server/db/schema/issues.ts`)\n3. The repository function returns the updated row immediately via `.returning().get()`\n4. Control returns to the service, which emits an `\"issue.updated\"` event with the list of changed field names\n\nAt this point the database write is complete—the new title is persistent. But the search index is still stale.\n\n### Keeping the Index in Step: The Event Listener\n\nThe event listener bridge lives in `src/server/services/search-service.ts`. At process startup—via `src/instrumentation.ts` calling `registerEventHandlers()` from `src/server/services/event-registry.ts`—the function `registerSearchListeners()` runs and subscribes to the `\"issue.updated\"` event. \n\nWhen the event fires, the listener handler:\n\n1. Re-reads the entire issue from the database via `issueRepo.findIssueById()`, rather than trusting the event payload\n2. Calls `indexIssue()`, which concatenates the title and description as a single string\n3. Passes this content to `searchRepo.upsertSearchDocument()` from `src/server/repositories/search-repository.ts`\n\nThe `upsertSearchDocument()` function updates the `searchIndex` table (defined in `src/server/db/schema/webhooks.ts`). The table is keyed by the tuple `(org, kind, subjectId)` and stores denormalized documents:\n\n```\nsearchIndex row: {\n  id: <unique id>,\n  orgId: <tenant isolation>,\n  subjectKind: \"issue\",\n  subjectId: <issue id>,\n  projectId: <issue's project>,\n  content: \"<title>\\n<description>\",\n  indexedAt: <current timestamp>\n}\n```\n\nIf a row with that (org, kind, subjectId) already exists, it's updated; otherwise inserted. The upsert is idempotent—if the listener fires twice, the second call is wasted work but produces the same result.\n\nThe event bus (`src/lib/event-bus.ts`) runs all handlers for `\"issue.updated\"` via `Promise.allSettled()`, so the search listener is one of several—activity logging, notifications, and webhooks also subscribe. The update resolves once every handler settles; a failed handler never fails the emit itself or its siblings.\n\n### The Query Path: Searching for the New Wording\n\nA colleague searching for the new title calls `searchAction()` from `src/actions/search/search.ts`, which invokes `search()` in `src/server/services/search-service.ts`. Before querying, the search function:\n\n1. Enforces tenant scope: `assertOrgScope(actor, input.orgId)`\n2. Checks read permission: `assertCan(actor, \"issue:read\", orgResource(input.orgId))`\n3. Consumes a token from the rate-limit bucket for `\"search:query\"` via `consumeRateLimit()` from `src/lib/rate-limit.ts`\n4. Checks the `\"advanced_search\"` feature flag if the query contains a colon\n\nThen it calls `searchRepo.searchDocuments(input)`, which queries the `searchIndex` table with a simple substring match: `LIKE '%' || <query> || '%'` against the denormalized `content` column. It returns a page of results ordered by `indexedAt DESC` with keyset-based pagination for stability.\n\nFor each hit, `searchService.search()` extracts the title (first line of content), snippets around the match, and href, then returns them as `SearchHit` objects.\n\n### What Keeps Them in Sync\n\nThe event-driven listener model ensures index freshness by:\n\n- **Subscribing at startup**: The listener is attached once at process initialization, not lazily on first search.\n- **Re-reading, not trusting the event**: The listener fetches the full row from the canonical store rather than indexing whatever fields the event payload carried. If an update partially fails mid-transaction, the listener sees the committed state, never a half-applied write.\n- **Idempotent upsertion**: Even if the listener fires twice (or event delivery retries in the future), `upsertSearchDocument()` diffs by (org, kind, subjectId), so the second call harmlessly replaces the same row.\n\n### When a Query Is Refused\n\nA syntactically valid search query can still fail under these circumstances:\n\n1. **Rate limit exceeded** (`src/lib/rate-limit.ts`): The org's search bucket holds 120 tokens initially and refills at 60/minute. Once exhausted, `consumeRateLimit()` returns `{ allowed: false, resetAt: <timestamp> }` and the search throws an error like \"Search rate limit reached; try again after ...\".\n\n2. **Field-scoped syntax without feature access** (`src/server/services/search-service.ts` line 69–71): If the query contains a colon (e.g., `\"status:done\"`) and the org's plan does not have `\"advanced_search\"` enabled, the query is rejected with \"Field-scoped search is not included in this plan\" before it reaches the database.\n\n3. **Missing permission or org scope**: If the actor lacks `\"issue:read\"` permission or is outside the org's tenant boundary, the service throws before querying.\n\nThe search index itself is never the bottleneck; it's a simple denormalized table with one index on `(org, kind)` for org-scoped filtering. The real guards are permissions, tenant isolation, and feature flags.",
+  "ttft_ms": 1871,
+  "type": "result",
+  "duration_ms": 106447,
+  "uuid": "767a7cc9-fe22-47f7-b34b-babb450bcf59",
+  "ttft_stream_ms": 887,
+  "time_to_request_ms": 15,
+  "queued_turn_count": 0
+}

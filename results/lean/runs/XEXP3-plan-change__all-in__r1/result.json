@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 153186,
+  "stop_reason": "end_turn",
+  "session_id": "02977ba1-43d0-470d-b11c-fbd99b5cc22d",
+  "total_cost_usd": 0.37681880000000006,
+  "usage": {
+    "input_tokens": 306,
+    "cache_creation_input_tokens": 59323,
+    "cache_read_input_tokens": 1999998,
+    "output_tokens": 11354,
+    "output_tokens_details": {
+      "thinking_tokens": 3921
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 59323,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1990,
+        "cache_read_input_tokens": 72705,
+        "cache_creation_input_tokens": 726,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 726
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 306,
+      "outputTokens": 11354,
+      "cacheReadInputTokens": 1999998,
+      "cacheCreationInputTokens": 59323,
+      "webSearchRequests": 0,
+      "costUSD": 0.37572180000000005,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 3921,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 44,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Based on my analysis of the codebase, here's how the system handles a plan downgrade:\n\n## Authorization\n\nOnly users with the **owner** role can make plan changes. This is enforced in `src/lib/permissions.ts:29` where the `ROLE_MATRIX` specifies that `\"org:manage_billing\"` requires the `\"owner\"` role. The `changePlanAction` in `src/actions/billing/change-plan.ts:31-33` checks this permission before proceeding.\n\n## Pre-Validation: Current Usage vs Target Plan\n\nBefore accepting the downgrade, `assertPlanFitsCurrentUsage()` in `src/actions/billing/change-plan.ts:49-67` compares live usage against the **target** plan's quotas. It reads:\n- Current usage via `getUsage()` (seats, projects, storage in MB)\n- Target plan limits via `getPlanLimits(input.plan)` from `src/config/plan-limits.ts`\n- Calls `wouldExceedLimit()` for each resource with a requested delta of zero\n\nIf any resource exceeds the target plan's limit, it throws a `PlanLimitError` and rejects the downgrade. For example, downgrading from \"growth\" (50 seats) to \"starter\" (10 seats) would fail if 40 seats are currently in use.\n\n## Storage and Authority\n\nThe **subscriptions** table (in `src/server/db/schema/billing.ts:4-27`) holds the authoritative plan via `subscriptions.plan`. When `changePlan()` in `src/server/services/billing-service.ts:126-157` executes, it calls `subscriptionRepo.updateSubscriptionPlan()` (in `src/server/repositories/subscription-repository.ts:61-76`) to update this row and set `status: \"active\"` to end any trial period.\n\nThe `organizations.plan` column serves as a denormalized display convenience only and is never updated by plan changes. All quota decisions read from the subscription first via `planFor()` in `src/server/services/billing-service.ts:211-221`, which looks at subscriptions first and falls back to organizations only if no subscription exists.\n\n## Immediate Consequences\n\nAfter the plan is recorded in the subscription table, `changePlan()` emits a `\"billing.plan_changed\"` domain event (line 150) with `from` and `to` plan IDs. This triggers two listeners:\n\n1. **Activity Service** (`src/server/services/activity-service.ts:225-232`) records it in the audit trail with the summary `\"Plan {from} → {to}\"`, displayed as \"changed the plan\" in `src/components/domain/activity/activity-labels.ts:30`.\n\n2. **Webhook Service** (`src/server/services/webhook-service.ts:127-130`) delivers the event to any configured outgoing webhooks.\n\nThe action also calls `revalidateTagged()` to clear caches, so the dashboard immediately reflects the new state.\n\n## Feature Behavior Changes\n\nMultiple parts of the product change behavior based on the new plan:\n\n**Feature Flags** (in `src/config/feature-flags.ts`) gate capabilities by plan:\n- **\"kanban_board\"** requires `starter`\n- **\"activity_feed\"** requires `growth`  \n- **\"webhooks\"** requires `growth`\n- **\"csv_export\"** requires `starter`\n- **\"digest_email\"** requires `growth`\n- **\"public_projects\"** requires `enterprise`\n- **\"advanced_search\"** requires `enterprise`\n\nThese are evaluated in `src/lib/feature-flags.ts:36` via `planAtLeast(ctx.plan, strategy.minPlan)` using the organization's plan. UI components like forms and navigation menus check `isEnabled()` and conditionally render features.\n\n**Quota Enforcement** (in `src/server/services/billing-service.ts`) immediately tightens. Creating projects (`src/actions/projects/create-project.ts`), issues (`src/actions/issues/create-issue.ts`), or webhooks (`src/actions/webhooks/create-webhook.ts`) now checks limits against the new plan's numbers from `src/config/plan-limits.ts`:\n\n| Plan | Seats | Projects | Issues/Project | Storage MB | Webhooks |\n|------|-------|----------|---|---|----------|\n| free | 3 | 2 | 100 | 100 | 0 |\n| starter | 10 | 10 | 1,000 | 2,000 | 2 |\n| growth | 50 | 100 | 10,000 | 20,000 | 10 |\n| enterprise | ∞ | ∞ | ∞ | 500,000 | ∞ |\n\nFor instance, if an org downgrades from growth to starter, inviting an 11th member throws an error (`src/actions/members/invite-member.ts` checks `canInviteMore()`), and attempts to use data retention beyond 90 days or exceed 2 webhooks fail immediately.",
+  "ttft_ms": 2489,
+  "type": "result",
+  "duration_ms": 152949,
+  "uuid": "8eaf26ee-42d2-444e-899d-f1ebda7b0ea5",
+  "ttft_stream_ms": 878,
+  "time_to_request_ms": 17,
+  "queued_turn_count": 0
+}
