@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 70428,
+  "stop_reason": "end_turn",
+  "session_id": "b14c774c-e7ac-4129-84dc-7819ae7e0cfd",
+  "total_cost_usd": 0.134845,
+  "usage": {
+    "input_tokens": 124,
+    "cache_creation_input_tokens": 32490,
+    "cache_read_input_tokens": 429980,
+    "output_tokens": 5127,
+    "output_tokens_details": {
+      "thinking_tokens": 2513
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 32490,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 2240,
+        "cache_read_input_tokens": 45312,
+        "cache_creation_input_tokens": 960,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 960
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001108,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 124,
+      "outputTokens": 5127,
+      "cacheReadInputTokens": 429980,
+      "cacheCreationInputTokens": 32490,
+      "webSearchRequests": 0,
+      "costUSD": 0.133737,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2513,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 13,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the complete flow. Let me write the explanation based on what I've found.\n\n## Complete Flow: Overdue Issue Notification\n\n**1. What starts the check:**\nThe path begins with a cron trigger at `src/app/api/cron/overdue/route.ts`. This endpoint is called on a schedule (via an external cron service) and calls `runOverdueIssueJob(new Date())`, passing the current timestamp.\n\n**2. How issues that count are narrowed down:**\nIn `src/server/jobs/overdue-issue-job.ts`, the `runOverdueIssueJob()` function:\n- Calls `usageRepo.listOrgIdsForRollup(ORG_BATCH)` to batch 50 organizations at a time (the job iterates over all orgs)\n- For each org, calls `issueRepo.listOverdueIssues(orgId, stamp)`, which queries the database for issues where:\n  - `dueAt < now` (the due date has passed)\n  - Status is one of: `backlog`, `todo`, `in_progress`, `in_review` (open states only)\n  - Not archived\n  - Has a non-null `dueAt` (actually due)\n\n**3. What the checking component does and does not take responsibility for:**\nThe job **only announces the fact** that an issue is overdue—it emits a `\"issue.overdue\"` event with the issue and assignee details. It takes no responsibility for storing notifications, determining delivery channels, or sending emails; those concerns are handled by subscribers. It explicitly owns only two things: finding overdue issues and announcing them via the event bus.\n\n**4. What stops re-announcement:**\nDuplicate notifications are prevented by a module-level `reported` Set in `overdue-issue-job.ts`. The first time an issue is found overdue, its ID is emitted and added to `reported`. On every subsequent scan during that process's lifetime, the same issue is skipped because `reported.has(issue.id)` returns true. This prevents the same issue from being announced repeatedly during repeated job runs within a single deployed process. (If the process restarts, `reported` resets, but the database ensures the row is only created once per run via deduplication at the notification level.)\n\n**5. How the alert reaches the person through their chosen channels:**\nThe event bus in `src/lib/event-bus.ts` is the hub. When `runOverdueIssueJob()` calls `emit(\"issue.overdue\", {...})`, it triggers the subscriber registered in `src/server/services/notification-service.ts` at module load via `registerFanOut()`.\n\nThat subscriber calls the `notify()` function with:\n- The assignee ID as the sole recipient (skips if `assigneeId === null`)\n- Kind: `\"issue_overdue\"`\n- Payload: title, body, href, actorId\n\nThe `notify()` function then:\n- Looks up each recipient's `NotificationPreference` via `preferenceRepo.getPreference(orgId, recipientId, \"issue_overdue\")`\n- Calls `resolveChannels(preference, flags)` to determine which channels the recipient enabled for this notification type (defaults to `[\"in_app\", \"email\"]` if they've never set preferences; returns an empty array if they've muted all channels)\n- Skips recipients who disabled all channels entirely\n- Creates one notification row per recipient with the resolved channels embedded\n\nThese rows are inserted into the database by `notificationRepo.insertNotifications()`, which stores each notification with:\n- The recipient ID, kind, title, body, href\n- A `channels` field (JSON array: `\"in_app\"`, `\"email\"`, or `\"webhook\"`) indicating which delivery mechanisms are active for this notification\n- `readAt: null` (unread initially)\n\nThe channels array is the contract—downstream delivery systems (the in-app UI, the digest-email job, webhook dispatcher) read the notification row and only deliver via the channels in that array. A user who set `email: false` in their preferences won't have `\"email\"` in the channels array, so no email is sent. A user who never set preferences gets both channels by default. The in-app notification appears immediately in the notification list; an email may go out immediately or be batched into a digest depending on the `digestOnly` preference flag and the `digest_email` plan feature flag.",
+  "ttft_ms": 3233,
+  "type": "result",
+  "duration_ms": 70958,
+  "uuid": "2d2460e8-2331-46ff-b300-8f1bbcaf595c",
+  "ttft_stream_ms": 981,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

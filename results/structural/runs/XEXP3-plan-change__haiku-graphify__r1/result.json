@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 111843,
+  "stop_reason": "end_turn",
+  "session_id": "c631b52a-f859-46d2-a861-a659200eba7b",
+  "total_cost_usd": 0.25917650000000003,
+  "usage": {
+    "input_tokens": 226,
+    "cache_creation_input_tokens": 56183,
+    "cache_read_input_tokens": 1141775,
+    "output_tokens": 6262,
+    "output_tokens_details": {
+      "thinking_tokens": 2037
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 56183,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 2151,
+        "cache_read_input_tokens": 68588,
+        "cache_creation_input_tokens": 1377,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1377
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 226,
+      "outputTokens": 6262,
+      "cacheReadInputTokens": 1141775,
+      "cacheCreationInputTokens": 56183,
+      "webSearchRequests": 0,
+      "costUSD": 0.2580795,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2037,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 25,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## Plan Downgrade Explained\n\nWhen an organization owner switches their workspace from a bigger plan to a smaller one, the system enforces a strict safeguard: **the downgrade is refused if the org's current usage would breach the new plan's limits**. Here's the complete flow:\n\n### Authorization: Owner Only\n\nOnly users with the **`owner`** role can perform this action. The permission check happens in `src/lib/permissions.ts:L29`, which maps `\"org:manage_billing\"` to the `\"owner\"` role. This is validated at the start of `src/actions/billing/change-plan.ts:L31` via the `can()` function, and again in `src/server/services/billing-service.ts:L131` via `assertCan()`.\n\n### Pre-Downgrade Validation: Current Usage vs. New Limits\n\nBefore any database update, `src/actions/billing/change-plan.ts:L49-67` calls `assertPlanFitsCurrentUsage()`, which performs the critical comparison:\n\n1. **Fetches current usage** via `getUsage(actor, input.orgId)` from `src/server/services/usage-service.ts`, which counts:\n   - `seatsUsed`: active members\n   - `projectsUsed`: existing projects\n   - `storageMbUsed`: total file storage\n\n2. **Loads the target plan's limits** via `getPlanLimits(input.plan)` from `src/config/plan-limits.ts:L107`. The PLAN_LIMITS definition (lines 29–97) declares fixed quotas for each plan dimension (seats, projects, issues per project, storage, API requests, webhooks, retention days, included feature flags).\n\n3. **Checks each resource** against the new plan's limits using `wouldExceedLimit(input.plan, resource, used, 0)` — the zero delta means \"would the *current* usage breach the limit if we switch now?\" If any resource exceeds (e.g., 40 seats on a plan with a 10-seat limit), a `PlanLimitError` is thrown immediately, and the downgrade is rejected.\n\n### Plan Storage: Subscription Table is Authoritative\n\nThe plan is stored in the **`subscriptions`** table, updated in `src/server/repositories/subscription-repository.ts:L61-76` via `updateSubscriptionPlan()`:\n\n```typescript\nconst row = getDb()\n  .update(subscriptions)\n  .set({ plan, interval, status: \"active\", updatedAt: stamp })\n  .where(orgPredicate(subscriptions.orgId, orgId))\n  .returning()\n  .get();\n```\n\nThe subscription row is the **single source of truth** for which plan an org is on (per `src/server/services/billing-service.ts:L207-220, planFor()`). Every quota decision reads from the subscription first; the denormalized `organizations.plan` column is a read-only display convenience.\n\n### Event Emission: `billing.plan_changed`\n\nOnce the subscription table is updated, `src/server/services/billing-service.ts:L150-154` emits a typed event:\n\n```typescript\nawait emit(\"billing.plan_changed\", {\n  ...actorEnvelope(actor),\n  from: currentPlan,\n  to: input.plan,\n});\n```\n\nThis event is wired at process start in `src/server/services/event-registry.ts:L33-48` and triggers two subscriber chains:\n\n**1. Activity Service** (`src/server/services/activity-service.ts:L225-232`): Records an audit log row with:\n- Subject: the subscription\n- Summary: \"Plan {from} → {to}\"\n- This entry is visible in the org's activity feed and exportable as CSV/JSON (gated by the `csv_export` flag).\n\n**2. Webhook Service** (`src/server/services/webhook-service.ts:L127-133`): For each webhook endpoint in the org that is enabled and subscribed to `billing.plan_changed` events, enqueues a signed delivery to the endpoint's configured URL, allowing external systems to react to the downgrade in real time.\n\n### Behavioral Changes Across the Product\n\nOnce the new plan is active, the system immediately enforces the new limits everywhere:\n\n1. **Resource Creation Guards** (`src/server/services/billing-service.ts:L100-120, checkLimit()`):\n   - Inviting new team members, creating projects, uploading files, and adding webhooks all call `assertWithinLimit()` first, which compares current usage against the *new* plan's limits.\n\n2. **Feature Flag Gating** (`src/lib/feature-flags.ts:L21-43, isEnabled()`):\n   - Features are gated by `includedFlags` in the plan definition (e.g., `kanban_board`, `csv_export`, `activity_feed`, `webhooks`, `issue_templates`, `advanced_search`, `public_projects`, `ai_issue_summary`).\n   - UI components check `isEnabled(\"feature_name\", { plan, ... })` — if the new plan does not include that flag, the feature hides immediately.\n   - The flag evaluation uses `planAtLeast(ctx.plan, strategy.minPlan)` to determine if the org's plan reaches the required tier.\n\n3. **Billing Page** (`src/app/(dashboard)/[orgSlug]/settings/billing/page.tsx`):\n   - Displays the new plan name and updated seat count (from the subscription row).\n   - Shows updated usage meters with the new limits via `usageMeter.tsx`, `usage-panel.tsx`.\n   - Recalculates upcoming invoice based on `limits.priceCentsPerSeatMonthly * subscription.seats * (interval === \"annual\" ? 12 : 1)`.\n\n4. **Webhook Endpoint Limit** (`src/server/services/webhook-service.ts:L57-64`):\n   - When creating a new webhook, `wouldExceedLimit(org.plan, \"webhooks\", used)` is checked; if the org is now downgraded to a plan with fewer webhook slots, `createWebhook()` will reject new endpoints.\n\n5. **Data Retention** (encoded in `retentionDays` in plan-limits.ts):\n   - The new plan's retention window applies to activity logs, though existing data outside the window is not purged immediately; the retention gates which data is *visible* in queries.\n\n6. **API Rate Limits** (via `apiRequestsPerHour` in the plan):\n   - The hourly API quota is read from the active plan; existing tokens keep their session-level window, but new requests are rate-limited under the new plan's quota.\n\nThe downgrade is atomic at the subscription level, so either the entire change succeeds (plan stored, event emitted, listeners triggered) or it fails and throws, leaving the org on the original plan.",
+  "ttft_ms": 3511,
+  "type": "result",
+  "duration_ms": 113339,
+  "uuid": "456a3d07-c531-4914-b6b5-538ff977fdff",
+  "ttft_stream_ms": 1863,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

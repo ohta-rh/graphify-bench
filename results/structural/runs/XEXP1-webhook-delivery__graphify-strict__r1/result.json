@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 118669,
+  "stop_reason": "end_turn",
+  "session_id": "b8362f42-8fd8-4260-b916-45ea05a4af32",
+  "total_cost_usd": 0.3760414,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 46682,
+    "cache_read_input_tokens": 611647,
+    "output_tokens": 6583,
+    "output_tokens_details": {
+      "thinking_tokens": 1061
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 46682,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2501,
+        "cache_read_input_tokens": 63905,
+        "cache_creation_input_tokens": 1536,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1536
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001098,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 28,
+      "outputTokens": 6583,
+      "cacheReadInputTokens": 611647,
+      "cacheCreationInputTokens": 46682,
+      "webSearchRequests": 0,
+      "costUSD": 0.3749434000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1061,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 22,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the full, concrete picture of the pipeline. Here's the walkthrough.\n\n## 1. The browser action creates the issue\n\nThe user submits the issue form, which calls the server action `createIssueAction` in `src/actions/issues/create-issue.ts`. That's a thin wrapper (built with `withAction`) around `assertProjectHasRoom` (a plan-quota check) and a call into the domain service: `createIssue(actor, input)` in `src/server/services/issue-service.ts`.\n\n`createIssue` does the actual work: `assertOrgScope`, loads the project, `assertCan(actor, \"issue:create\", ...)`, checks the org's plan quota via `wouldExceedLimit`, allocates a number, and inserts the row through `issueRepo.insertIssue`. The very last thing it does — after the row is committed — is:\n\n```ts\nawait emit(\"issue.created\", { ...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority });\n```\n\n`emit` is exported from `src/lib/event-bus.ts`. This is what \"puts the delivery in motion\": the issue service doesn't know or care about webhooks, it just publishes a domain event on the in-process pub/sub bus and awaits every subscriber via `Promise.allSettled` (one throwing handler can't fail the emit or its siblings).\n\n## 2. Wiring: who's listening for `issue.created`\n\nAll subscribers are attached once per server process by `registerEventHandlers()` in `src/server/services/event-registry.ts`, which is invoked from `register()` in `src/instrumentation.ts` (Next.js's instrumentation hook, run before any request is served). Among the listener groups it wires up is `registerWebhookListeners()` from `src/server/services/webhook-service.ts`.\n\n`registerWebhookListeners` subscribes to several event types, including `issue.created`:\n\n```ts\nsubscribe(\"issue.created\", async (payload) => {\n  await enqueueForOrg(payload.orgId, \"issue.created\", JSON.stringify(payload));\n});\n```\n\nSo when `issue-service.ts` emits `issue.created`, this handler fires as one of the `emit()` subscribers.\n\n## 3. Working out which endpoints should hear about it\n\n`enqueueForOrg` (same file) is the fan-out logic: it calls `webhookRepo.listEndpoints(orgId)` (`src/server/repositories/webhook-repository.ts`) to get every webhook endpoint row for that org, then for each one checks `endpoint.enabled` and parses `endpoint.eventTypes` (a JSON array column) to see if `\"issue.created\"` is in the list the customer subscribed to. Only endpoints that are enabled *and* subscribed get a row written via `webhookRepo.enqueueDelivery(orgId, endpoint.id, eventType, payload)`, which inserts a `webhookDeliveries` row with `status: \"pending\", attempts: 0`. This is a durable, per-endpoint fan-out table, not a direct send — delivery is decoupled from the request/event that triggered it.\n\n## 4. What actually performs the send\n\nNothing sends synchronously from the event handler — a background job drains the table. `src/server/jobs/scheduler.ts` runs `tick()` every 60s (`TICK_INTERVAL_MS`, started by `startScheduler()` from `instrumentation.ts`), and per its `CADENCE_MINUTES` map, `\"webhook-delivery\"` is due every 1 minute. When due, it enqueues a `webhook-delivery` job into the in-process queue (`src/server/jobs/queue.ts`) and calls `drain()`, which dispatches it via `runHandler` to `runWebhookDeliveryJob(now)` in `src/server/jobs/webhook-delivery-job.ts`.\n\nThat job calls `webhookRepo.claimPendingDeliveries(CLAIM_BATCH)` — a claim that atomically bumps `attempts` on each claimed row so a crashed worker can't retry forever — then for each claimed delivery: checks the org's plan still allows webhooks (`orgAllowsWebhooks`, gated by `getPlanLimits` + the `webhooks` feature flag via `isEnabled`), checks the endpoint still exists and is enabled, then computes `signPayload(endpoint.secret, delivery.payload)` and logs the delivery. Notably, per the code's own comment, Taskflow's corpus runs offline — there's no real outbound `fetch` here; \"delivery\" is computing the signature and logging it, then calling `webhookRepo.markDelivered`.\n\n## 5. What happens when it doesn't succeed the first time\n\nTwo separate retry layers exist:\n- **Job-queue level** (`src/server/jobs/queue.ts`, `drain()`): if a job handler throws, the whole job (not an individual delivery) is re-enqueued with exponential backoff (`backoffMs`, 1s/2s/4s… capped at 60s) up to `MAX_ATTEMPTS = 5`, after which it's dropped with a log line.\n- **Delivery-row level** (`webhook-delivery-job.ts`): each delivery row carries its own `attempts` counter, bumped on every claim. If `delivery.attempts > MAX_ATTEMPTS` (6), the row is marked permanently `\"failed\"` via `webhookRepo.markDeliveryFailed` instead of being retried again. Rows that fail for other reasons (plan no longer allows webhooks, endpoint missing/disabled) are also marked `\"failed\"` immediately rather than retried. A `backoffMs(attempts)` helper (1s, 2s, 4s… capped at 5 minutes) is computed and logged per attempt, describing the intended pacing between retries, though since there's no real HTTP call in this build, every claimed row that passes the plan/endpoint checks is marked delivered on that same pass — an unclaimed row only stays `\"pending\"` between the fixed 1-minute scheduler cadence, not because of a simulated network failure.\n\n## 6. How the receiver verifies authenticity\n\nThe signature is HMAC-SHA256, computed in `signPayload(secret, payload)` in `src/server/services/webhook-service.ts`:\n\n```ts\nexport function signPayload(secret: string, payload: string): string {\n  return createHmac(\"sha256\", secret).update(payload, \"utf8\").digest(\"hex\");\n}\n```\n\n`secret` is the 32-byte token minted once at endpoint creation (`createWebhook` → `randomToken(SECRET_BYTES)`, stored on the `webhookEndpoints` row and never rotated/regenerated — rotation means deleting and recreating the endpoint). The customer's receiver is expected to recompute the same HMAC over the exact raw JSON body it received, using the shared secret, and compare it to the signature Taskflow sent — that hex digest is \"the only thing proving the delivery came from Taskflow\" (per the comment in `webhook-service.ts`), so the payload string must be signed byte-for-byte as sent, before any reformatting.\n\nYou can see this same signing primitive reused outside the retry path in `src/app/api/webhooks/[endpointId]/test/route.ts` — a \"send test webhook\" endpoint that builds a `webhook.test` payload, signs it with `signPayload`, and returns the `{ payload, signature }` pair directly in the API response so a customer can verify their own verification logic against a known-good pair without waiting for a real event to fire.",
+  "ttft_ms": 2543,
+  "type": "result",
+  "duration_ms": 119253,
+  "uuid": "bfa12dab-bbd6-4f36-b5fc-76daafdcea11",
+  "ttft_stream_ms": 1793,
+  "time_to_request_ms": 22,
+  "queued_turn_count": 0
+}

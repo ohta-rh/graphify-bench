@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 95090,
+  "stop_reason": "end_turn",
+  "session_id": "7b2c8d16-7862-43f1-97ed-3bfb5bc3a138",
+  "total_cost_usd": 0.3271246,
+  "usage": {
+    "input_tokens": 20,
+    "cache_creation_input_tokens": 43658,
+    "cache_read_input_tokens": 388228,
+    "output_tokens": 7369,
+    "output_tokens_details": {
+      "thinking_tokens": 2445
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 43658,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4215,
+        "cache_read_input_tokens": 58635,
+        "cache_creation_input_tokens": 3782,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3782
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1042,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001117,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 20,
+      "outputTokens": 7369,
+      "cacheReadInputTokens": 388228,
+      "cacheCreationInputTokens": 43658,
+      "webSearchRequests": 0,
+      "costUSD": 0.3260076,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2445,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 20,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## From keystroke to authorized sidebar\n\n**1. The form (client).** `LoginForm` in `src/app/(auth)/login/login-form.tsx` is a client component wired to React's `useActionState`. On submit it re-parses the fields with `loginSchema` (from `src/schemas/auth`) purely so it can show inline field errors without a round trip, then hands the parsed `{email, password, rememberMe}` to the server action `loginAction`.\n\n**2. The server action validates and rate-limits.** `loginAction` in `src/actions/auth/login.ts` runs `\"use server\"`. It re-validates with `loginSchema.safeParse` — the client validation is a convenience, this is the actual enforcement. It then calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")`. Because no tenant is known yet, this failed/successful attempt is billed against a sentinel anonymous bucket rather than a real org, which is also why this action can't go through the normal `withAction()` wrapper used elsewhere.\n\n**3. Credential check.** `loginAction` calls `login()` in `src/server/services/auth-service.ts`. That function re-checks the same rate limit bucket (defense in depth), looks the user up by email with `userRepo.findUserByEmail`, fetches the stored hash with `userRepo.findPasswordHash`, and verifies the submitted password with `verifyPassword` from `src/lib/hash.ts`. `verifyPassword` derives an scrypt key from the input using the stored salt and compares it to the stored key with `timingSafeEqual`. A missing user and a wrong password both throw the identical \"Those credentials did not match\" error, so failure doesn't leak which one was wrong.\n\n**4. Session minting.** On success, `login()` calls `createSessionToken(user.id)` in `src/server/services/session-service.ts`. This generates a 32-byte random token via `randomToken` (`lib/hash.ts`, base64url), computes a 30-day expiry, and stores only `hashToken(token)` (SHA-256, no salt needed since the token is already high-entropy) plus `userId`/`expiresAt` in the `sessions` table via `sessionRepo.createSession` (`src/server/repositories/session-repository.ts`). Crucially: the **raw token never touches the database** — only its hash does — while the **raw token is what gets returned** up the call chain, destined for the browser.\n\n**5. Turning the token into a principal, then a cookie.** Back in `loginAction`, the raw token is passed to `resolveSession(token)` (`session-service.ts`), which hashes it again and calls `sessionRepo.findSessionByTokenHash` to look up the row and build a `SessionPrincipal` (`userId`, `email`, `activeOrgId`, `expiresAt` — no role, no org membership yet). `loginAction` then calls `setSessionCookie(token, principal.expiresAt)` in `src/lib/session.ts`, which writes the **raw token** into an `httpOnly`, `sameSite=lax`, prod-only-`secure` cookie (`SESSION_COOKIE_NAME`, whose flags/lifetime live in that one module by design). `loginAction` finally returns the `SessionPrincipal` to the client; `LoginForm`'s effect sees `state.ok === true` and does `router.push(props.next)` to navigate into the app.\n\n**Re-establishing identity on the next request.** Any later server-rendered request reads the cookie via `getSessionToken()` in `src/lib/session.ts` (`cookies()` from `next/headers`). `getSessionPrincipal()` takes that token, calls `resolveSession()` (which hashes the token and hits `sessionRepo.findSessionByTokenHash` again — the DB never sees or needs the raw token, only its hash), and additionally re-checks `expiresAt` against `Date.now()` before trusting it. A missing cookie, an unknown hash, or an expired row all collapse to `null` — that's \"how the app decides you're still signed in\": a live, non-expired row whose hash matches the cookie's token.\n\n**From bare identity to an authorizable `Actor`.** A `SessionPrincipal` alone carries no role and no proof of membership in any particular org — it's identity, not authorization. The workspace route `src/app/(dashboard)/[orgSlug]/layout.tsx` (`Layout()`) is where the two meet: it awaits `orgSlug` from the URL params, calls `getSessionPrincipal()` (throwing `UnauthorizedActionError` if null), resolves the `Organization` with `resolveOrgBySlug`, and then calls `resolveActorForOrg(principal, orgSlug)` in `session-service.ts`. That function looks up the caller's `Member` row for that org (`memberRepo.findMember`), requires `status === \"active\"`, and only then constructs the `Actor` — `{ userId, orgId, role: member.role }` — the object every permission check in the app actually accepts. It calls `assertOrgScope` (`src/lib/tenant.ts`) as a final invariant check, touches `lastSeenAt`, and returns the `Actor`. The layout calls `assertOrgScope` again itself before proceeding. (The equivalent single entry point for Server Actions and nested pages is `getActor()`/`tryGetActor()` in `src/lib/actor.ts`, used e.g. by `loadTenantContext()` in `[orgSlug]/_lib/tenant-context.ts`; `requireActorFor()` handles the case where a Route Handler only has an `orgId`, not a slug.)\n\n**Authorizing the sidebar.** With the `Actor` in hand, `Layout()` builds a feature-flag snapshot (`buildFlagContext`/`snapshotFlags`) and passes `actor`, `org`, and `flags` into `DashboardShell`/`OrgProvider`. The sidebar itself never branches on `actor.role` directly: `src/config/nav.ts` defines `SIDEBAR_NAV`/`SETTINGS_NAV` as declarative trees where each item names a `PermissionAction` and optionally a feature flag, and `visibleNav()` filters that tree per-request by calling `can(actor, action, resource)` (`src/lib/permissions.ts`) and consulting the flag snapshot. That's the mechanism by which two users hitting the same workspace page end up with visibly different sidebars — one `Actor.role` passes more `can()` checks than another.",
+  "ttft_ms": 3905,
+  "type": "result",
+  "duration_ms": 95401,
+  "uuid": "62a6dca1-007c-499a-b400-ae8c8fa2fc68",
+  "ttft_stream_ms": 3007,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

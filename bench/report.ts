@@ -257,6 +257,9 @@ export function conditionsBlock(rows: RunRow[]): string | null {
     }
   }
   if (specs.size === 0) return null;
+  // Notes are free text and legitimately contain `|` (matchers like "Read|Glob"),
+  // which would otherwise split the markdown cell and shift every later column.
+  const cell = (s: string): string => s.replace(/\|/g, "\\|");
   const lines = [
     "| condition | model | overlays | extra `claude` args | what it isolates |",
     "|---|---|---|---|---|",
@@ -265,7 +268,7 @@ export function conditionsBlock(rows: RunRow[]): string | null {
     const s = specs.get(name)!;
     const args = s.extraClaudeArgs?.length ? `\`${s.extraClaudeArgs.join(" ")}\`` : "–";
     lines.push(
-      `| \`${name}\` | \`${s.effective_model ?? "?"}\` | ${(s.overlays ?? []).map((o) => `\`${o}\``).join(" + ") || "–"} | ${args} | ${s.note ?? "–"} |`,
+      `| \`${name}\` | \`${s.effective_model ?? "?"}\` | ${(s.overlays ?? []).map((o) => `\`${o}\``).join(" + ") || "–"} | ${cell(args)} | ${cell(s.note ?? "–")} |`,
     );
   }
   return lines.join("\n");
@@ -428,6 +431,23 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
       );
     }
     out.push("");
+    // The strict arm's whole premise is that the block fires. If it never did,
+    // saying so is the finding — otherwise the arm reads as "strict changes
+    // nothing", when the truth is "strict never engaged".
+    const strictArms = usage.filter((u) => resolveCondition(u.condition).overlays.includes("graphify-strict"));
+    const inertStrict = strictArms.filter((u) => u.runs > 0 && u.strict_denials_total === 0);
+    if (inertStrict.length > 0) {
+      out.push(
+        `> **The strict block never fired.** Across ${inertStrict.map((u) => `${u.runs} \`${u.condition}\``).join(" and ")} ` +
+          "runs the hook denied **zero** reads, confirmed three ways: no `permissionDecision` in any transcript, no deny " +
+          "text, and `permission_denials` = 0 in every `result.json`. The cause is in graphify's own guard " +
+          "(`cli.py::_query_stamp_fresh`): strict suppresses its block while a query/explain/path ran within the last " +
+          "30 minutes, and the overlay's `CLAUDE.md` already steers the agent to `graphify query` **before** its first " +
+          "raw `Read`. The soft nudge wins the race every time, so the strict flag is inert under this overlay — " +
+          "`graphify-strict` vs `graphify` is therefore a null result about a knob that never engaged, **not** " +
+          "evidence that forcing graph-first exploration does nothing.\n",
+      );
+    }
     out.push(
       "> **Cross-session memory was never measured.** `save-result`, `reflect` and `affected` are the " +
         "mechanisms by which graphify is supposed to compound across sessions, and they were invoked **zero " +

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 115357,
+  "stop_reason": "end_turn",
+  "session_id": "63de0305-0070-46ad-8d2c-16eb32fdf992",
+  "total_cost_usd": 0.37037640000000005,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 42984,
+    "cache_read_input_tokens": 570337,
+    "output_tokens": 8322,
+    "output_tokens_details": {
+      "thinking_tokens": 3587
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 42984,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2188,
+        "cache_read_input_tokens": 55508,
+        "cache_creation_input_tokens": 3163,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3163
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 28,
+      "outputTokens": 8322,
+      "cacheReadInputTokens": 570337,
+      "cacheCreationInputTokens": 42984,
+      "webSearchRequests": 0,
+      "costUSD": 0.36927940000000004,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3587,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 21,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the full picture. Here's what happens when an org owner downgrades a workspace plan.\n\n## Who may do it\n\nThe mutation is `changePlanAction` in `src/actions/billing/change-plan.ts`, which wraps a handler with `withAction(changePlanSchema, ...)` (`src/actions/_lib/with-action.ts`). `withAction` first resolves the `Actor` (`getActor`/`requireActorFor`, `src/lib/actor.ts`) from the session and the `orgId`/`orgSlug` in the input, then hands control to the handler, which immediately calls `can(actor, \"org:manage_billing\", { kind: \"billing\", orgId })` (`src/lib/permissions.ts`). `ROLE_MATRIX[\"org:manage_billing\"]` requires role `\"owner\"`, so `explain()` only returns `granted_by_role` for an owner (or a platform-staff bypass). If the check fails, `changePlanAction` throws `ForbiddenActionError` before anything else runs. The service layer (`changePlan` in `src/server/services/billing-service.ts`) re-asserts the same rule with `assertCan`, so the owner-only gate is enforced twice — once in the action, once in the service — independent of which caller invokes it.\n\n## What is compared before the downgrade is accepted\n\nInside `changePlanAction`, after the permission check, `assertPlanFitsCurrentUsage(actor, input)` runs: it calls `getUsage(actor, orgId)` (`src/server/services/usage-service.ts`, backed by `usageRepo.getUsage`) to get today's `seatsUsed`/`projectsUsed`/`storageMbUsed`, and `getPlanLimits(input.plan)` (`src/config/plan-limits.ts`) for the **target** (smaller) plan's ceilings. For each resource it calls `wouldExceedLimit(input.plan, resource, used, 0)` — a zero-delta check, i.e. \"does what's already in use still fit the new plan?\" If any resource would overflow, it throws `PlanLimitError` and the action stops before touching the database. The service function `changePlan` in `billing-service.ts` repeats the same loop over `SUMMARY_RESOURCES` (`seats`, `projects`, `storageMb`, `webhooks`) as a second, defensive gate.\n\n## Where the plan is recorded, and which value is authoritative\n\nOnly after both checks pass does `changePlan` call `subscriptionRepo.updateSubscriptionPlan(orgId, plan, interval)` (`src/server/repositories/subscription-repository.ts`), which updates the `subscriptions` row (`src/server/db/schema/billing.ts`) — setting `plan`, `interval`, and forcing `status` back to `\"active\"` (a plan change also ends any trial).\n\nThere is a second, separate `plan` column on the `organizations` table (`src/server/db/schema/organizations.ts`), set once at creation in `organization-repository.ts`. The comment in `billing-service.ts` (`planFor()`) asserts that the `subscriptions` row is \"the authority\" and `organizations.plan` is \"only a display convenience.\" That's true for the handful of call sites that go through `billing-service.ts`'s `planFor()`/`checkLimit()` (the billing summary page, `assertWithinLimit`). **It is not true for the rest of the app.** I checked every other consumer of a plan value, and they all read `org.plan` straight off `orgRepo.findOrgById()` — the `organizations` table column — never the subscription: `project-service.createProject`, `issue-service` (issues-per-project quota), `webhook-service` (both the `webhooks` quota and the `isEnabled(\"webhooks\", …)` flag gate), `attachment-service` (storage quota), `invitation-service` and the `invite-member`/`accept-invitation`/`create-project`/`create-issue`/`create-webhook`/`update-seats` actions, `feature-flag-service.buildFlagContext` (feeds `plan: org?.plan`), `usage-service.recomputeUsage`, and the `cleanup-archived-job`/`webhook-delivery-job` retention/webhook jobs.\n\nCrucially, **`changePlan()` never writes to `organizations.plan`** — no code path does; I grepped every `orgRepo.updateOrg` call site and none of them touch `plan`. So a downgrade updates the authoritative-sounding `subscriptions` row but leaves the denormalized `organizations.plan` column exactly as it was.\n\n## What happens afterward\n\n`changePlan` emits `billing.plan_changed` via the event bus (`src/lib/event-bus.ts`). Two subscribers react: `activity-service.ts` records an activity-log entry (\"Plan X → Y\"), and `webhook-service.ts` enqueues an outbound webhook delivery for the org's endpoints. Back in the action, `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` invalidates cached data tagged for that org so `getBillingSummary` (which does read the subscription correctly) shows the new plan and usage meters immediately.\n\n## What behaves differently away from the billing pages — and what doesn't\n\nBecause of the split above, the billing page itself is correct (it reads `subscriptions` via `planFor`), but everything that reads `organizations.plan` keeps enforcing the **old, bigger** plan's limits and feature set after a downgrade: project/issue/seat/storage quotas in `project-service.ts`, `issue-service.ts`, `invitation-service.ts`, `attachment-service.ts` still allow the old ceilings; `webhook-service.ts` still treats webhooks as enabled/at the old quota; and `feature-flag-service.buildFlagContext` still evaluates plan-gated flags (`isEnabled` with a `\"plan\"` strategy, via `planAtLeast` in `plan-limits.ts`) against the pre-downgrade plan, so features like `activity_feed`/`digest_email`/`webhooks`/`issue_templates` (growth-and-up) or `advanced_search`/`ai_issue_summary` (enterprise-only) stay lit up for a downgraded org everywhere except the billing screen. Separately, the plan-aware rate limiter (`src/lib/rate-limit.ts`) is unaffected either way in practice, since its `setOrgPlan()` setter is never called anywhere in the codebase, so it always falls back to the `\"free\"` bucket size regardless of plan.",
+  "ttft_ms": 2745,
+  "type": "result",
+  "duration_ms": 114577,
+  "uuid": "27fbf974-6917-4961-81bd-881cc4ef9086",
+  "ttft_stream_ms": 1997,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

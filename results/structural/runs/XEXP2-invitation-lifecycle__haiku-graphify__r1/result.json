@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 187905,
+  "stop_reason": "end_turn",
+  "session_id": "4aab6b0a-32de-49f0-a611-d5b50ef310de",
+  "total_cost_usd": 0.4404435999999999,
+  "usage": {
+    "input_tokens": 446,
+    "cache_creation_input_tokens": 67641,
+    "cache_read_input_tokens": 2377436,
+    "output_tokens": 13177,
+    "output_tokens_details": {
+      "thinking_tokens": 5626
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 67641,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 2648,
+        "cache_read_input_tokens": 79656,
+        "cache_creation_input_tokens": 1767,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1767
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 446,
+      "outputTokens": 13177,
+      "cacheReadInputTokens": 2377436,
+      "cacheCreationInputTokens": 67641,
+      "webSearchRequests": 0,
+      "costUSD": 0.4393565999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 5626,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 45,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the complete picture. Here's the membership invitation lifecycle:\n\n## Creating the Invitation\n\nWhen an admin types a colleague's email into the members settings page, **src/actions/members/invite-member.ts:inviteMemberAction** is called. Before creating anything, it enforces three gates: it calls `can(actor, \"member:invite\", ...)` to verify permission, consumes a rate-limit bucket via `consumeRateLimit()` to prevent spam, and checks the plan limits by calling `getPlanLimits()` and verifying that pending invitations plus active members don't exceed the seat quota.\n\nIf those checks pass, it delegates to **src/server/services/invitation-service.ts:inviteMember**, which is a wrapper around the bulk `inviteMembers` function. The real work happens in `inviteMembers` (lines 46–111):\n\n1. It asserts scope and permissions again via `assertOrgScope()` and `assertCan()`\n2. It re-checks the rate limit and seat quota\n3. For each email address, it calls `randomToken(32)` (in **src/lib/hash.ts**) to generate a cryptographically random 32-byte token, encoded as URL-safe base64\n4. It immediately hashes that raw token with `hashToken(token)`, which performs a one-way SHA256 digest\n5. Only the hash is stored in the database via **src/server/repositories/invitation-repository.ts:insertInvitation**, which writes to the `invitations` table with columns: `id`, `orgId`, `email`, `role`, `invitedBy`, `tokenHash` (not the raw token), `expiresAt`, `acceptedAt` (null), `revokedAt` (null), and timestamps\n\nThe raw token is lost at this point—it exists only in memory during the function execution.\n\n## What Gets Stored and Returned\n\nThe database stores only the `tokenHash` column; the raw token never persists. When `insertInvitation` returns, it calls **src/server/repositories/_mappers.ts:toInvitation**, which maps the database row to an `Invitation` domain object. The mapper maps `row.tokenHash` to the `token` field (line 165), so the returned Invitation object contains the hash, not the raw token. The Invitation object has these fields: `id`, `orgId`, `email`, `role`, `invitedBy`, `token` (the hash), `expiresAt`, `acceptedAt` (null), `revokedAt` (null), and timestamps.\n\nAfter creating the row, `inviteMembers` emits a `\"member.invited\"` event via **src/lib/event-bus.ts:emit()** (lines 101–107). The event payload contains the `orgId`, `actorId` (who invited), `occurredAt`, `email`, and `role`, but notably **not the raw token**. The only listener registered for this event is in **src/server/services/activity-service.ts** (line 207), which records it in the audit log for compliance. **There is no email sender listening to this event**—the current codebase does not send the email; that mechanism is missing.\n\nIn a complete implementation, the email would need to be sent before the token is hashed, or the raw token would need to be returned separately so it can be embedded in an acceptUrl parameter passed to **src/emails/invite-email.tsx**, which renders the HTML and text body. The email template expects an `acceptUrl` prop (line 18), which should be something like `/invite/{raw-token}`.\n\n## Accepting the Invitation\n\nWhen the colleague receives the email and clicks the link (hypothetically `/invite/{raw-token}`), the page **src/app/(auth)/invite/[token]/page.tsx** is rendered. It validates the token format via `invitationTokenSchema.safeParse()` (line 35), and if the visitor is not signed in, redirects to `/login?next=/invite/{token}`.\n\nOnce signed in, **src/app/(auth)/invite/[token]/invite-accept-form.tsx** renders an accept button with the raw token in a hidden form field. Clicking it calls **src/actions/members/accept-invitation.ts:acceptInvitationAction**, which:\n\n1. Validates the input schema via `acceptInvitationTokenSchema.safeParse()`\n2. Gets the current user's session via `getSessionPrincipal()` (must be signed in)\n3. Calls **src/server/services/invitation-service.ts:acceptInvitation** with the `userId` and `{token: raw-token}`\n\nThe `acceptInvitation` function (lines 117–161) is the critical verification point:\n\n1. It hashes the raw token again via `hashToken(input.token)`\n2. Looks it up in the database via `invitationRepo.findInvitationByTokenHash(tokenHash)` (line 122)—this is why only the hash is stored; the hash is the lookup key\n3. Checks three conditions (lines 127–135):\n   - `invitation.revokedAt !== null` → the admin may have revoked it\n   - `invitation.acceptedAt !== null` → someone may have already accepted it\n   - `invitation.expiresAt <= now` → the token has a 14-day expiry (DEFAULT_EXPIRY_DAYS in line 26)\n4. Checks if the user is already a member (line 137); if so, returns the existing member\n5. Creates a new `members` row via `insertMember()` with the role and `invitedBy` from the invitation record\n6. Marks the invitation as accepted via `markInvitationAccepted()`, setting `acceptedAt` to the current timestamp\n7. Emits `\"member.joined\"` event with the new member's details\n\n## What the Rest of the System Learns\n\nAfter acceptance, the `member.joined` event (emitted at line 153 in invitation-service.ts) is heard by **src/server/services/notification-service.ts** (lines 231–243), which notifies the organization owner with an in-app notification and (depending on their settings) an email.\n\nThe invitation record remains in the database with `acceptedAt` set, serving as an audit trail. The new membership is now active in the `members` table with the invited user's `userId`, the role they were invited for, and `invitedBy` tracking who sent the invitation. The seat is now consumed and counts against the plan limit.",
+  "ttft_ms": 2799,
+  "type": "result",
+  "duration_ms": 190634,
+  "uuid": "8d902776-648a-455b-957f-10504a3233f9",
+  "ttft_stream_ms": 865,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}
