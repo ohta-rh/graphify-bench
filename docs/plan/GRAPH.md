@@ -151,6 +151,13 @@ hook 実証の総支出: **$0.263**（graphify $0.126 + baseline $0.137）。
 
 ## 5. パイロット
 
+> **訂正（2026-09-02、本計測後）**: 本節の表と結論（「条件 B の方がトークンを多く使っている」「uncached_equivalent +159,465 [137,345, 181,585]」）は
+> 結果 JSON の `usage.*`（**主セッションのみ**）から算出したもので、baseline 側がサブエージェントを起動したランの消費が抜けている。
+> `modelUsage` 全モデル合計で数え直すと FIX1-baseline は 132,082 ではなく 672,492 で、パイロットの CI は 0 をまたぐ。
+> 本計測 30 ラン（baseline 15 ラン中 10 ランがサブエージェント使用、graphify 0 ラン）でも同じ構図で、
+> 正しい指標 `uncached_equivalent_all` では差は検出されなかった。数値は [results/REPORT.md](../../results/REPORT.md) を正とし、本節は経緯の記録として残す。
+
+
 タスク 2 件 × 条件 2 × 1 反復 = 4 ラン。
 `BENCH_RESULTS_DIR=results/pilot`、model `claude-sonnet-5`、effort `high`、
 `--max-turns 60`、`--max-budget-usd 4`。**4 ラン全て `terminal_reason: completed`、エラー 0。**
