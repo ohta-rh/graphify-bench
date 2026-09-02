@@ -48,7 +48,7 @@ rather than here, following this corpus's file split.
 
 | name | columns | unique | why it exists |
 |---|---|---|---|
-| `issues_project_number_idx` | `project_id, number` | yes | REQ-061's per-project, never-reused numbering |
+| `issues_project_number_idx` | `org_id, number` | yes | REQ-061's never-reused numbering, enforced per organization so a number is unique across the whole tenant |
 | `issues_org_status_idx` | `org_id, status` | no | the board view's grouping predicate (`listBoardColumns`) |
 | `issues_org_assignee_idx` | `org_id, assignee_id` | no | "my issues" and assignee-filtered listings, REQ-077 |
 | `issues_org_archived_idx` | `org_id, archived_at` | no | default live-only listings and the quota count over all rows |

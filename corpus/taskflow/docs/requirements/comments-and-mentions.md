@@ -43,6 +43,13 @@ Markdown-aware pass rather than a regex over raw text, which is exactly why it i
 implemented against the same tokenizer `renderMarkdown` uses rather than as an independent
 string search.
 
+Commenting is the one write in the product that is open to every role: `comment:create`
+carries a `viewer` minimum in `ROLE_MATRIX`, so a read-only collaborator brought into an
+organization to review work can still reply on a thread without being promoted to `member`.
+This was a deliberate product call — the alternative, promoting reviewers to `member` just
+so they could answer a question, handed them project and issue write access nobody wanted
+them to have.
+
 Comment creation goes through the `comment:create` rate-limit bucket
 (`consumeRateLimit(orgId, 'comment:create', ...)`, capacity 60, refill 20/minute) before the
 write happens, protecting the mention fan-out and the search index from a burst of automated

@@ -183,6 +183,7 @@ every other table in this directory is owned by exactly one repository file.
 | name | columns | unique | why it exists |
 |---|---|---|---|
 | `search_index_org_kind_idx` | `org_id, subject_kind` | no | scoping a search to specific subject kinds within an org |
+| `search_index_org_updated_idx` | `org_id, updated_at` | no | letting the reindex job find the stalest documents first without a full scan |
 
 **Invariants**
 

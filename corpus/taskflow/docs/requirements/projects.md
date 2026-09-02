@@ -174,6 +174,12 @@ archived-but-restorable state on a plan sized for a much smaller working set.
 - **Status:** implemented
 - **Related:** REQ-071, REQ-046, DES-040
 
+Because the cascade is destructive to other people's working views, `project:archive` is
+gated at `owner` in `ROLE_MATRIX` — the same minimum as `project:delete`. An admin can
+invite, remove and change roles, but cannot sweep a project's issues out from under the
+team; that escalation was deliberate after the second time a departing admin archived an
+active project on their last day.
+
 `archiveProject` in `project-service.ts` calls
 `issue-repository.ts#archiveIssuesForProject(orgId, projectId)` in the same operation, so an
 archived project never leaves open issues visible in cross-project issue lists or on other

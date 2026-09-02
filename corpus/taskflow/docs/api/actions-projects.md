@@ -27,7 +27,8 @@ the project's *current* `visibility` and `leadId`, which the schema payload does
 - **Events emitted:** `project.created` (via `createProject()`)
 - **Cache tags revalidated:** `orgTag(input.orgId)`, `projectTag(project.id)`,
   `CACHE_PROFILES.minutes`
-- **Errors:** `validation_failed`, `forbidden`, `plan_limit_exceeded`, `internal_error`
+- **Errors:** `validation_failed`, `forbidden`, `plan_limit_exceeded`, `rate_limited`,
+  `internal_error`
 - **Satisfies:** REQ-040, REQ-041, REQ-042, REQ-043, REQ-053
 - **Design:** DES-108, DES-233
 

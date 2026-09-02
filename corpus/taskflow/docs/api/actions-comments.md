@@ -23,7 +23,7 @@ the same ownership-escalation pattern issues use — `authorId` compared against
 - **Returns:** `ActionResult<Comment>`
 - **Permission:** `comment:create` (minimum role member; see DES-043)
 - **Feature flag:** none
-- **Rate limit bucket:** `comment:create` (capacity 60, refill 20/min)
+- **Rate limit bucket:** `comment:create` (capacity 60, refill 10/min)
 - **Plan limit:** none
 - **Events emitted:** `comment.created` with mentioned user ids (via `createComment()`)
 - **Cache tags revalidated:** `issueTag(input.issueId)`, `CACHE_PROFILES.seconds`

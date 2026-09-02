@@ -163,6 +163,11 @@ invite a replacement after offboarding someone.
 - **Implemented by:** `src/server/services/billing-service.ts` — `checkLimit`, `assertWithinLimit`
 - **Verified by:** `tests/services/billing-service.test.ts`, `tests/contract/plan-limits.test.ts`
 
+The ladder for this particular quota is 3 projects on `free`, 10 on `starter`, 100 on
+`growth` and unlimited on `enterprise`. The free tier's allowance was picked to be enough
+for a team to model a real workflow — a project each for the product, the platform and the
+website — without giving away enough capacity to serve a working agency.
+
 This document is the canonical statement of the rule `REQ-043` in `projects.md` implements:
 `checkLimit(orgId, 'projects', used)` must return a non-exceeding verdict before
 `insertProject` runs, using `countProjects` with its default scope that includes archived

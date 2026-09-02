@@ -83,7 +83,7 @@ accrue a billed period in the first place.
 - **Files:** `src/app/(dashboard)/[orgSlug]/settings/flags/page.tsx`, list in
   `src/app/(dashboard)/[orgSlug]/settings/flags/flag-toggle-list.tsx`
 - **Server or client:** Server Component shell, interactive toggle list
-- **Permission required:** `org:manage_flags` (admin and above) — 404 otherwise
+- **Permission required:** `org:manage_flags` (member and above) — 404 otherwise
 - **Feature flag:** n/a — this page *is* the flag-management surface, not something a flag
   gates
 - **Data loaded:** no service call beyond tenant context; the ten rows are built in-memory from

@@ -33,7 +33,7 @@ Sessions are opaque tokens (`ADR-020`), not JWTs: `createSessionToken(userId)` i
 to the caller once, for the cookie. `resolveSession(token)` hashes the incoming cookie value
 and looks up the hash, so a database compromise never exposes usable session tokens
 directly — the same defensive pattern invitation tokens use (`REQ-029`). Sessions expire
-after `SESSION_TTL_DAYS = 30`, defined in `session-service.ts` itself rather than in
+after `SESSION_TTL_DAYS = 14`, defined in `session-service.ts` itself rather than in
 `src/config/constants.ts`, since it is specifically a session concern, not a general
 cross-cutting constant.
 

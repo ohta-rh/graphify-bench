@@ -94,7 +94,7 @@ The ten flags and their strategies:
 | flag | strategy | overridable |
 |---|---|---|
 | `kanban_board` | plan >= starter | yes |
-| `ai_issue_summary` | percentage rollout (25%) | yes |
+| `ai_issue_summary` | percentage rollout (50%) | yes |
 | `command_palette` | always on | **no** |
 | `activity_feed` | plan >= growth | yes |
 | `public_projects` | plan >= enterprise | yes |

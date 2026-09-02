@@ -39,7 +39,7 @@ The daily digest is a distinct concern layered on top: `digest-service.ts#buildD
 gathers every unread notification for a recipient inside a bounded window
 (`digestWindow()` from `src/lib/date.ts`) and hands the bundle to `renderDigest`, which
 produces an email via `renderEmail(template, props)` in `email-service.ts`. The digest job
-(`digest-email-job.ts`) runs on the `digest-email` cadence (every 60 minutes,
+(`digest-email-job.ts`) runs on the `digest-email` cadence (every 1440 minutes — once a day,
 `CADENCE_MINUTES`), calling `shouldRunForOrg(org, now)` to decide whether this tick is the
 org's digest hour before doing any real work — most ticks for most orgs are a no-op check,
 not a digest send. `sendEmail` never performs network egress in this codebase; it writes the
