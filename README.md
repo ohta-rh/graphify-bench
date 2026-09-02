@@ -1,75 +1,94 @@
 # graphify-bench
 
-Claude Code エージェントが中規模 Next.js コードベースで作業するとき、[graphify](https://github.com/Graphify-Labs/graphify)（AST 由来の知識グラフ）の有無でトークン消費がどう変わるかを、実セッションの計測値で比較するベンチマーク。
+Does [graphify](https://github.com/Graphify-Labs/graphify) (an AST-derived code knowledge graph with a `graphify query` CLI) reduce the tokens a Claude Code agent spends on a mid-size Next.js codebase? This repository measures it with real headless Claude Code sessions instead of graphify's own synthetic `graphify benchmark` estimate.
 
-## ドキュメント
+## Headline result (15 tasks × 2 conditions, 1 run each, claude-sonnet-5)
 
-| ドキュメント | 内容 |
+**No detectable difference in total tokens; graphify used more turns and no subagents, baseline used fewer turns and spawned a subagent in 10 of 15 runs.**
+
+| condition | tokens, all models, median | cost, median | turns, median | subagent runs | accuracy |
+|---|---|---|---|---|---|
+| baseline | 259,513 | $0.208 | 4 | 10 / 15 | 13 / 15 |
+| graphify | 288,502 | $0.184 | 10 | 0 / 15 | 12 / 15 |
+
+Paired difference (graphify − baseline), bootstrap 95% CI over tasks:
+
+| metric | mean diff | 95% CI | reading |
+|---|---|---|---|
+| tokens (all models) | +30,228 | [−52,259, +125,341] | crosses 0 |
+| cost | −$0.026 | [−0.064, +0.010] | crosses 0 |
+| turns | +8.4 | [+4.5, +12.6] | graphify higher |
+| cost, iso-accuracy subset (12 tasks) | −$0.039 | [−0.081, −0.001] | graphify lower |
+
+By category the picture splits: **explain** tasks were 28% cheaper with graphify (CI excludes 0), **fix** tasks used 40% more tokens with graphify (CI excludes 0), and locate / reference / impact showed no detectable difference.
+
+One measurement lesson is worth stating up front. The result JSON's `usage` block covers the main session only. On that metric graphify looks +350% worse, because baseline's subagent tokens go uncounted. Summing `modelUsage` across all models removes the artifact and the effect disappears. The report keeps both rows so the distortion is visible.
+
+Full numbers, per-category tables, and every raw transcript: [`results/REPORT.md`](results/REPORT.md), [`results/summary.csv`](results/summary.csv), [`results/runs/`](results/runs/). A second 30-task set and a combined 45-task analysis are in progress.
+
+## What is compared
+
+| Condition | What the agent gets |
 |---|---|
-| [docs/plan/architecture.md](docs/plan/architecture.md) | 設計書（比較条件、メトリクス、タスク設計、リスク） |
-| [docs/plan/implementation-plan.md](docs/plan/implementation-plan.md) | 実施計画（Phase 0〜6、ファイル一覧、検証ゲート） |
-| [docs/plan/research-token-measurement.md](docs/plan/research-token-measurement.md) | `claude -p` / JSONL / OTel / count_tokens によるトークン計測手法の調査 |
-| [docs/plan/research-graphify.md](docs/plan/research-graphify.md) | graphify の仕様（`benchmark` の実体、hook の挙動、TS/TSX 抽出）の調査 |
-| [docs/plan/research-experiment-design.md](docs/plan/research-experiment-design.md) | 先行研究（arXiv:2608.13568 等）、タスク分類、統計、コスト試算 |
-| [docs/plan/research-nextjs-corpus.md](docs/plan/research-nextjs-corpus.md) | 被験 Next.js アプリ "Taskflow" のバージョン固定と構成 |
-| [docs/plan/appendix-claude-p-json-sample.md](docs/plan/appendix-claude-p-json-sample.md) | `claude -p --output-format json` の実出力スキーマ |
-| [docs/plan/VERSIONS.md](docs/plan/VERSIONS.md) | 計測環境のバージョン固定記録 |
+| `baseline` | Plain Claude Code. `--setting-sources project` hides the user-level graphify skill; the project `CLAUDE.md` carries only the shared answer-format contract. |
+| `graphify` | Exactly what `graphify install --project` produces: the `## graphify` section in `CLAUDE.md`, the PreToolUse nudge hooks on `Bash|Grep` and `Read|Glob`, the project-local skill, plus a prebuilt, frozen `graphify-out/` (graph.json, GRAPH_REPORT.md, labeled communities). No `memory/` or `LESSONS.md` carry-over: every run starts from a fresh copy of the corpus. |
 
-## ベンチマークの実行
+Both arms run `claude -p --output-format json` with the same model, effort `high`, the same turn and budget caps, and a shuffled task order. Metrics come from the result JSON (`usage`, `modelUsage`, `total_cost_usd`, `num_turns`) and the JSONL transcript (tool calls by name, tool-result bytes, whether `graph.json` was read directly, whether the skill fired).
 
-### 準備
+## The corpus: Taskflow
+
+An original, LLM-generated multi-tenant project/issue-management SaaS built for this benchmark so that the model cannot know it from training data.
+
+| | |
+|---|---|
+| Stack | Next.js 16.3.4 (App Router, Server Actions, `proxy.ts`), React 19.2.8, TypeScript 5.9.3, Tailwind 4, Drizzle ORM + better-sqlite3, Zod 4, Vitest 4 |
+| Size | 477 source and test files, 40,944 lines, frozen at tag `corpus-v1` (tree hash in [`docs/plan/CORPUS.md`](docs/plan/CORPUS.md)) |
+| Structure | Contract-first: types, Zod schemas, Drizzle schema, and the cross-cutting hubs (`can()` permissions, event bus, feature flags, plan limits, tenant scoping, soft delete) were written first, then five workers filled disjoint directories against that contract |
+| Gates | `tsc`, `eslint`, 617 Vitest tests, `next build`, and a runtime smoke over all 34 routes pass |
+| Graph | 2,545 nodes, 10,202 edges, 120 labeled communities, built in 4.6 s with no LLM |
+
+## Tasks
+
+15 tasks, 3 per category, in [`tasks/tasks.json`](tasks/tasks.json). Keys for reference and impact tasks are derived mechanically with ts-morph (`pnpm keys:derive --check` reproduces them).
+
+| Category | Grader | Example |
+|---|---|---|
+| locate | set F1 vs key files | "Where is a webhook refused because the plan's quota is used up?" |
+| reference | set F1, exhaustive callers | every file calling `assertCan()` |
+| explain | blind LLM judge (Haiku) with a 5-element rubric | issue creation → permission → repository → event bus → notification fan-out |
+| impact | set F1, files that must change | adding a field to `PlanLimits` |
+| fix | injected bug, Vitest spec must go red → green | tenant-scope predicate dropped from `findIssueById` |
+
+Two tasks are deliberately grep-trivial so the report can show where tool value vanishes. Token savings are only claimed on the iso-accuracy subset (both arms correct), following [arXiv:2608.13568](https://arxiv.org/html/2608.13568).
+
+## Running it
 
 ```bash
-pnpm install                                              # ハーネスの依存
-(cd corpus/taskflow && pnpm install --frozen-lockfile)    # 被験コードベース（Phase 1 以降）
-pnpm exec tsx scripts/patch-overlay.ts                    # hook の graphify 絶対パスを実行機に合わせる
+pnpm install
+(cd corpus/taskflow && pnpm install --frozen-lockfile)
+pnpm exec tsx scripts/patch-overlay.ts        # point the hook at this machine's graphify
+
+pnpm bench:pilot -- --only REF1-assertcan-callers,FIX1-issue-tenant-leak
+nohup pnpm bench:full > results/full.log 2>&1 &   # resumable; one dir per run
+pnpm bench:collect && pnpm bench:grade && pnpm bench:analyze && pnpm bench:report
 ```
 
-### 実行
+Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53` (`uv tool install graphifyy==0.9.53`). Key environment variables: `BENCH_MODEL`, `BENCH_EFFORT`, `BENCH_REPS`, `BENCH_MAX_BUDGET_USD`, `BENCH_RESULTS_DIR`. See [`docs/plan/implementation-plan.md`](docs/plan/implementation-plan.md) §9. The committed 30-run set cost $7.93 and took 22 minutes at concurrency 2.
 
-```bash
-pnpm bench:pilot                     # 反復 1 回。--only でタスクを絞れる
-nohup pnpm bench:full > results/full.log 2>&1 &   # 本計測は必ず背景実行
-pnpm bench:collect                   # result.json + transcript.jsonl → metrics.json
-pnpm bench:grade                     # → grade.json
-pnpm bench:analyze                   # ペア差分・bootstrap CI → results/analysis.json
-pnpm bench:report                    # → results/summary.csv, results/REPORT.md
-pnpm test && pnpm typecheck          # ハーネス自身の検証
+## Layout
+
+```
+bench/       harness: run / matrix / collect / grade / analyze / report (TypeScript, vitest-tested)
+corpus/      the frozen Taskflow app (corpus-v1)
+overlays/    per-condition files copied onto a fresh corpus clone before each run
+tasks/       tasks.json, keys/, rubrics, bugs/*.patch
+results/     raw result.json + transcript.jsonl per run, summary.csv, REPORT.md
+docs/plan/   design, implementation plan, research notes (Japanese)
 ```
 
-`bench:pilot` / `bench:full` は 1 ラン完了ごとに `results/runs/<run-id>/` を書き、
-`metrics.json` があるランは次回スキップする（中断しても再開できる）。
-`--` の後ろのフラグはそのまま `bench/matrix.ts` に渡る。
+## Caveats
 
-| フラグ | 既定 | 説明 |
-|---|---|---|
-| `--tasks <file>` | `tasks/tasks.json` | タスク定義ファイル |
-| `--corpus <dir>` | `corpus/taskflow` | 複製元の被験コードベース |
-| `--conditions <a,b>` | `baseline,graphify` | 実行する条件 |
-| `--reps <n>` | `BENCH_REPS`（pilot は 1） | 反復数 |
-| `--only <id,...>` | 全件 | タスクを絞る |
-| `--seed <s>` | `graphify-bench-v1` | 実行順シャッフルの seed |
-| `--concurrency <n>` | 1（最大 3） | 並列ラン数 |
-| `--dry-run` / `--force` | off | 実行計画の表示 / 完了済みランの再実行 |
-| `--allow-placeholder` | off | `placeholder: true` のタスクの実行を許可 |
-
-### 環境変数
-
-| 変数 | 既定 | 説明 |
-|---|---|---|
-| `BENCH_MODEL` | `claude-sonnet-5` | 実行モデル |
-| `BENCH_EFFORT` | `high` | effort（両条件で固定すること） |
-| `BENCH_MAX_BUDGET_USD` | `4` | 1 ランの支出上限 |
-| `BENCH_MAX_TURNS` | `60` | ターン上限 |
-| `BENCH_SCRATCH` | OS の一時ディレクトリ配下 | ランごとの複製先。リポジトリ外に置く（`--setting-sources project` が本リポジトリの `.claude/` を拾わないため） |
-| `BENCH_RESULTS_DIR` | `results/` | 成果物の出力先。**動作確認ランは必ずここを別ディレクトリに向ける**（`analyze.ts` は `runs/` 配下を全件集計するため、捨てランが本計測に混ざる） |
-| `BENCH_REPS` | `3` | 反復数 |
-| `BENCH_KEEP_WORKDIR` | 未設定 | `1` でラン用ディレクトリを消さない（デバッグ用） |
-| `GRAPHIFY_HOOK_STRICT` | 未設定 | 条件 C のとき `1` |
-| `ANTHROPIC_API_KEY` | 未設定 | `count_tokens` 補助計測のみ。`claude -p` は既存ログインを使う |
-
-## 要点
-
-- graphify 自身の `graphify benchmark` は合成推定であり、実エージェントの消費を測っていない。本ベンチは `claude -p --output-format json` と JSONL transcript から実測する。
-- 比較は iso-accuracy（正答したランのみ）で行い、削減率と正答率をセットで報告する。
-- 被験コードベースは学習データ汚染を避けるためオリジナル生成（Next.js 16.3.4 / TypeScript 5.9.3 / Drizzle + better-sqlite3、約 350 ファイル）。
+- One corpus, one model, one repetition per task. Bootstrap CIs over 15 paired differences are wide; treat the direction, not the magnitude, as the finding.
+- The two arms differ in more than the graph: the graphify arm also carries the skill text and per-tool nudges in context, and it never spawned subagents. Both are part of what a real user gets, so they are not subtracted.
+- Two graphify runs opened `graph.json` (4.6 MB) directly; the nudge hooks do not guard `graphify-out/`.
+- `graphify benchmark` numbers such as "70x fewer tokens" are synthetic estimates from node counts and fixed sample questions. They are not comparable to these measurements.
