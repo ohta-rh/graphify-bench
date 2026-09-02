@@ -1,17 +1,47 @@
 /**
  * Thin wrappers turning a Zod parse into an `AppErrorShape` without throwing.
  *
- * STUB — owner E. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
- *
- * Must call (do not reimplement): fieldErrorsFromZod
+ * Server Actions parse `FormData` with `safeParse()` so a validation failure
+ * comes back as a `Result` the form layer can render; pages parse
+ * `searchParams` with `parseSearchParams()`, which never fails because a
+ * hand-edited URL must not produce an error boundary.
  */
 import type { Result } from "@/types/api";
+import { err, ok } from "@/types/api";
 import type { ZodType } from "zod";
-export function safeParse<TSchema extends ZodType>(schema: TSchema, raw: unknown): Result<unknown> {
-  throw new Error("stub: src/lib/validation.ts");
+import { fieldErrorsFromZod } from "./errors";
+
+/** Parses without throwing; failures carry Zod's field errors verbatim. */
+export function safeParse<TSchema extends ZodType>(
+  schema: TSchema,
+  raw: unknown,
+): Result<unknown> {
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return ok<unknown>(parsed.data);
+
+  return err<unknown>({
+    code: "validation_failed",
+    message: "Please correct the highlighted fields.",
+    fieldErrors: fieldErrorsFromZod(parsed.error),
+  });
 }
 
-export function parseSearchParams<TSchema extends ZodType>(schema: TSchema, raw: Readonly<Record<string, string | string[] | undefined>>): unknown {
-  throw new Error("stub: src/lib/validation.ts");
+/**
+ * Normalises a Next `searchParams` record (values may be repeated, and are
+ * always strings) and parses it. Because the pagination and sort schemas use
+ * `.catch()` defaults, a malformed query string degrades to the defaults
+ * rather than failing the render; a schema without catches will still throw,
+ * which is the correct signal that the route needs one.
+ */
+export function parseSearchParams<TSchema extends ZodType>(
+  schema: TSchema,
+  raw: Readonly<Record<string, string | string[] | undefined>>,
+): unknown {
+  const normalized: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === undefined) continue;
+    normalized[key] = value;
+  }
+
+  return schema.parse(normalized);
 }
