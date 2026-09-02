@@ -230,3 +230,54 @@ describe("thinking tokens and model mix", () => {
     expect(buildReport(a, rs, { modelMix: true })).toContain("| `baseline` | 1 | 0 | 0 | – |");
   });
 });
+
+describe("token decomposition", () => {
+  // 6,000-token fixed prefix × 5 turns = 30,000 fixed; 100,000 total leaves
+  // 70,000 moving and a 30% fixed share. Chosen so every cell is checkable by
+  // hand — the section's whole value is that a reader can redo the arithmetic.
+  const rs = (): RunRow[] => [
+    row({
+      task_id: "T1",
+      condition: "lean",
+      uncached_equivalent: 100_000,
+      num_turns: 5,
+      first_turn_cache_creation: 6_000,
+    }),
+    row({
+      task_id: "T1",
+      condition: "fat",
+      uncached_equivalent: 100_000,
+      num_turns: 10,
+      first_turn_cache_creation: 6_000,
+    }),
+  ];
+
+  it("stays out of the report unless asked for", () => {
+    const rows = rs();
+    const a = analyze(rows, "s", 20, { treatment: "lean" });
+    expect(buildReport(a, rows)).not.toContain("Where the remaining tokens go");
+    expect(buildReport(a, rows, { tokenDecomposition: true })).toContain("Where the remaining tokens go");
+  });
+
+  it("splits uncached_all into fixed = first-turn × turns and the rest", () => {
+    const rows = rs();
+    const a = analyze(rows, "s", 20, { treatment: "lean" });
+    const md = buildReport(a, rows, { tokenDecomposition: true });
+    expect(md).toContain("| `lean` | 1 | 100,000 | 5 | 6,000 | 30,000 | 70,000 | 30.0% |");
+    // Same total, twice the turns: the fixed half doubles and the moving half
+    // absorbs the difference. That is the whole point of the section — two arms
+    // can land on one `uncached_all` for completely different reasons.
+    expect(md).toContain("| `fat` | 1 | 100,000 | 10 | 6,000 | 60,000 | 40,000 | 60.0% |");
+  });
+
+  it("skips arms whose runs lack the inputs rather than printing a wrong split", () => {
+    const rows = [
+      row({ task_id: "T1", condition: "lean", uncached_equivalent: 100_000, num_turns: 5, first_turn_cache_creation: 6_000 }),
+      row({ task_id: "T1", condition: "unknown", uncached_equivalent: 100_000, num_turns: null, first_turn_cache_creation: null }),
+    ];
+    const a = analyze(rows, "s", 20, { treatment: "lean" });
+    const md = buildReport(a, rows, { tokenDecomposition: true });
+    expect(md).toContain("| `lean` |");
+    expect(md).not.toMatch(/\| `unknown` \| \d/);
+  });
+});

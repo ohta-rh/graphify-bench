@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { analyze, loadRowsFromSources, resolveCli, TREATMENT, type Analysis, type ComparisonResult, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
+import { analyze, loadRowsFromSources, median, resolveCli, TREATMENT, type Analysis, type ComparisonResult, type ConditionSummary, type PairedResult, type RunRow, type SubgroupResult } from "./analyze.js";
 import { resolveCondition } from "./conditions.js";
 import { TRACKED_SUBCOMMANDS } from "./features.js";
 import { REPO_ROOT } from "./lib/env.js";
@@ -564,6 +564,75 @@ export function modelMixBlock(a: Analysis): string[] {
   return out;
 }
 
+/**
+ * Where an arm's tokens actually went: fixed context re-sent every turn, versus
+ * everything else.
+ *
+ * By Phase 12 the cheapest arms are close enough to the floor that "reduce
+ * tokens" stops being actionable advice unless the reader can see which half is
+ * left. The split is arithmetic on two quantities each run already records:
+ *
+ *   fixed  = first_turn_cache_creation × num_turns
+ *   moving = uncached_equivalent_all − fixed
+ *
+ * `first_turn_cache_creation` is the system prompt plus the tool definitions —
+ * the block that is identical on turn 1 and turn 12 — and every turn re-sends
+ * it, as a cache read rather than a fresh write but still as tokens the
+ * `uncached_equivalent_all` definition counts at face value. So `fixed` is the
+ * cost of merely *having* a session of that length, and `moving` is the file
+ * contents, tool results and reasoning that are actually about the task.
+ *
+ * Two honest caveats, stated here rather than in the prose because they bound
+ * what the numbers can be used for:
+ *  - `uncached_equivalent_all` covers subagents while `first_turn_cache_creation`
+ *    and `num_turns` are main-session only, so on a delegating arm `fixed` is an
+ *    UNDER-estimate. On the arms this section exists for (`--disallowedTools
+ *    Agent` throughout) there are no subagents and the two agree.
+ *  - Cache reads bill at a tenth of fresh input, so `fixed` is a share of
+ *    information volume, not of dollars. It is deliberately not converted.
+ *
+ * The medians are taken per run and then over runs, not as a ratio of medians,
+ * so each run contributes one observation of its own split.
+ */
+export function tokenDecompositionBlock(rows: RunRow[], conditions: readonly string[]): string[] {
+  const out: string[] = [];
+  out.push(
+    "`uncached_all` is one number; this section splits it in two, because at this end of the range the " +
+      "remaining question is no longer *how much* an arm spends but *on what*. **fixed = " +
+      "`first_turn_cache_creation` × `num_turns`** — the system prompt and tool definitions, re-sent on " +
+      "every single turn — and **moving = `uncached_all` − fixed**, which is the file contents, tool " +
+      "results and reasoning that are actually about the task. Both are per-run medians, so the two " +
+      "columns need not sum to the `uncached_all` median exactly.\n\n" +
+      "Caveats that bound the reading: `first_turn_cache_creation` and `num_turns` are main-session only " +
+      "while `uncached_all` counts subagents too, so on a delegating arm `fixed` is an under-estimate " +
+      "(the arms below spawn none). And cache reads bill at a tenth of fresh input, so this is a split of " +
+      "**information volume, not of dollars** — a 60% fixed share does not mean 60% of the bill.\n",
+  );
+  out.push("| condition | runs | uncached_all (med) | turns (med) | first-turn fixed | fixed = ft×turns (med) | moving (med) | fixed share |");
+  out.push("|---|---|---|---|---|---|---|---|");
+  for (const cond of conditions) {
+    const own = rows.filter(
+      (r) =>
+        r.condition === cond &&
+        r.uncached_equivalent_all !== null &&
+        r.num_turns !== null &&
+        r.first_turn_cache_creation !== null,
+    );
+    if (own.length === 0) continue;
+    const fixed = own.map((r) => (r.first_turn_cache_creation as number) * (r.num_turns as number));
+    const moving = own.map((r, i) => (r.uncached_equivalent_all as number) - (fixed[i] as number));
+    const shares = own.map((r, i) => (fixed[i] as number) / (r.uncached_equivalent_all as number));
+    out.push(
+      `| \`${cond}\` | ${own.length} | ${fmt(median(own.map((r) => r.uncached_equivalent_all as number)))} | ` +
+        `${fmt(median(own.map((r) => r.num_turns as number)))} | ` +
+        `${fmt(median(own.map((r) => r.first_turn_cache_creation as number)))} | ` +
+        `${fmt(median(fixed))} | ${fmt(median(moving))} | ${pct(median(shares) ?? 0)} |`,
+    );
+  }
+  out.push("");
+  return out;
+}
+
 export interface ReportOptions {
   /**
    * Corpus generation the runs were measured against, printed in §1. It is a
@@ -583,6 +652,12 @@ export interface ReportOptions {
    * regenerates byte for byte.
    */
   modelMix?: boolean;
+  /**
+   * Split each arm's `uncached_all` into fixed per-turn context and the rest.
+   * Off by default and behind its own flag, for the same reason `modelMix` is:
+   * the six reports written before Phase 12 must regenerate byte for byte.
+   */
+  tokenDecomposition?: boolean;
   /** A second analysis to line this one up against, and the name to print for it. */
   vs?: { label: string; ownLabel: string; analysis: Analysis } | null;
 }
@@ -856,6 +931,11 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
     out.push(...modelMixBlock(a));
   }
 
+  if (opts.tokenDecomposition) {
+    out.push(sec("Where the remaining tokens go"));
+    out.push(...tokenDecompositionBlock(rows, a.conditions));
+  }
+
   out.push(sec("Counter-productive cases and subagent use"));
   const cp = a.counter_productive;
   for (const s of a.by_condition) {
@@ -985,6 +1065,7 @@ async function main(): Promise<void> {
       qualityByCategory: argv.includes("--quality-by-category"),
       speed: argv.includes("--speed"),
       modelMix: argv.includes("--model-mix"),
+      tokenDecomposition: argv.includes("--token-decomposition"),
       vs,
     }),
   );

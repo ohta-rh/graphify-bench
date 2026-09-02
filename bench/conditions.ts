@@ -111,6 +111,38 @@ export interface ConditionSpec {
 export const HAIKU_MODEL = "claude-haiku-4-5";
 
 /**
+ * The built-in tools the `lean-tools` family leaves in the request.
+ *
+ * `--tools` is an *allowlist that replaces the built-in set*, and it is the only
+ * flag in Claude Code 2.1.258 that removes a tool's schema from the API request
+ * rather than refusing the call after the model has already been told the tool
+ * exists. `--allowedTools` is a permission filter and changes nothing about the
+ * request; `--disallowedTools` removes a bare tool name but cannot express "keep
+ * only these five". Measured on this host with a one-word prompt in an empty
+ * directory (whole cached prefix = cache_creation + cache_read, because a warm
+ * cache moves tokens between the two columns):
+ *
+ *   default (no flag)                  21,138
+ *   --disallowedTools Agent            18,235
+ *   --tools Read,Grep,Glob,Bash,Edit   18,854   (reproduced: 18,858)
+ *   --tools Read                       14,143
+ *   --tools ""                         13,457   <- system prompt, no tools
+ *
+ * The floor at `--tools ""` is the proof that the flag really strips schemas.
+ * The number that matters for this experiment is the third line: restricting to
+ * five tools makes the fixed prefix **larger**, not smaller, than simply removing
+ * `Agent`. So `lean-tools` is not a fixed-overhead lever on this host; whatever
+ * it buys has to come from the agent having fewer ways to spend a turn.
+ *
+ * `Edit` is in the list because the `fix` category is graded by running the test
+ * suite, and an arm that cannot edit cannot pass it.
+ */
+export const LEAN_TOOLS = ["Read", "Grep", "Glob", "Bash", "Edit"] as const;
+
+/** `LEAN_TOOLS` as the CLI argument pair, so no arm spells the list out twice. */
+export const LEAN_TOOLS_ARGS: readonly string[] = ["--tools", LEAN_TOOLS.join(",")];
+
+/**
  * Absolute path to `mempalace-mcp` on this host.
  *
  * Host-specific in exactly the way graphify's hook command is, and maintained
@@ -303,6 +335,57 @@ export const CONDITIONS: readonly ConditionSpec[] = [
       "Claude Code's built-in `Explore` subagent (project agents outrank built-ins) so delegated " +
       "exploration runs on Haiku while the main session stays on Sonnet. Its `CLAUDE.md` is byte-identical " +
       "to baseline's — the arm changes who explores, not what the agent is told.",
+  },
+  {
+    name: "lean-tools",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "low",
+    extraClaudeArgs: [...LEAN_TOOLS_ARGS, "--disallowedTools", "Agent"],
+    note:
+      "`effort-low-nosub` plus `--tools Read,Grep,Glob,Bash,Edit`, which REMOVES every other built-in " +
+      "tool's schema from the request rather than merely denying it at permission time (proved in " +
+      "docs/plan/LEAN.md §3). `Edit` is kept so `fix` tasks stay solvable. `--disallowedTools Agent` is " +
+      "redundant — `Agent` is already outside the allowlist — and is retained only so the arm's lineage " +
+      "from `effort-low-nosub` is legible in `claude.argv`.",
+  },
+  {
+    name: "few-turns",
+    overlays: ["few-turns"],
+    corpus: "v1",
+    effort: "low",
+    extraClaudeArgs: ["--disallowedTools", "Agent"],
+    note:
+      "`effort-low-nosub` with one instruction change: `overlays/few-turns/CLAUDE.md` is baseline's file " +
+      "byte for byte plus a `## Working economy` section (locate with `Grep -n`, read line ranges, batch " +
+      "independent calls into one turn, never re-read, stop when the evidence suffices). The answer-format " +
+      "contract is untouched, so the arm varies how many turns are spent, not what is answered.",
+  },
+  {
+    name: "haiku-nosub",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: HAIKU_MODEL,
+    extraClaudeArgs: ["--disallowedTools", "Agent"],
+    note:
+      "`baseline-nosub` on the cheap model: Haiku 4.5 with the Agent tool removed. It carries NO " +
+      "`--effort` override — Haiku 4.5 does not honour `--effort` (measured: thinking tokens 202 at " +
+      "`low`, 172 at `max`, 690 with the flag absent; Sonnet 5 on the same prompt goes 0 -> 192), so " +
+      "declaring one here would record a treatment that never ran. It therefore takes the harness " +
+      "default exactly as `haiku-baseline` does, which is what makes that pair a single-variable " +
+      "comparison.",
+  },
+  {
+    name: "all-in",
+    overlays: ["few-turns"],
+    corpus: "v1",
+    model: HAIKU_MODEL,
+    extraClaudeArgs: [...LEAN_TOOLS_ARGS, "--disallowedTools", "Agent"],
+    note:
+      "Every lever this repository has found at once: the cheap model, no subagents, the lean tool " +
+      "allowlist and the turn-economy CLAUDE.md. Like `haiku-nosub` it declares no `--effort`, because " +
+      "Haiku ignores it. The arm answers whether the levers still compose once the model itself is the " +
+      "variable being cut.",
   },
 ] as const;
 

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import {
   CONDITIONS,
   HAIKU_MODEL,
+  LEAN_TOOLS,
+  LEAN_TOOLS_ARGS,
   assertRegistryMatchesDisk,
   conditionNames,
   effectiveEffort,
@@ -481,5 +483,127 @@ describe("runtime lever arms", () => {
       "--disallowedTools",
       "Agent",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 12: the lean arms. Three axes — fixed per-turn overhead (`lean-tools`),
+// turn count (`few-turns`) and model price (`haiku-nosub`) — plus their union
+// (`all-in`). Each arm's treatment must be exactly the axis it names, because
+// the whole point of measuring them separately is attribution.
+// ---------------------------------------------------------------------------
+describe("phase 12 lean arms", () => {
+  it("registers all four", () => {
+    for (const n of ["lean-tools", "few-turns", "haiku-nosub", "all-in"])
+      expect(conditionNames()).toContain(n);
+  });
+
+  it("keeps Edit in the lean tool allowlist so `fix` tasks stay solvable", () => {
+    // The `fix` category is graded by running the corpus test suite against the
+    // agent's edit. An allowlist without Edit would score 0/9 by construction and
+    // the arm would be measuring nothing but its own misconfiguration.
+    expect([...LEAN_TOOLS]).toEqual(["Read", "Grep", "Glob", "Bash", "Edit"]);
+    expect(LEAN_TOOLS_ARGS).toEqual(["--tools", "Read,Grep,Glob,Bash,Edit"]);
+  });
+
+  it("uses --tools (which strips schemas) rather than --allowedTools (which does not)", () => {
+    for (const name of ["lean-tools", "all-in"]) {
+      const spec = getCondition(name);
+      expect(spec.extraClaudeArgs?.[0]).toBe("--tools");
+      expect(spec.extraClaudeArgs).not.toContain("--allowedTools");
+    }
+  });
+
+  it("makes lean-tools effort-low-nosub plus the tool allowlist and nothing else", () => {
+    const spec = getCondition("lean-tools");
+    const combo = getCondition("effort-low-nosub");
+    expect(spec.overlays).toEqual(combo.overlays);
+    expect(spec.effort).toBe(combo.effort);
+    expect(spec.model).toBeUndefined();
+    expect(spec.extraClaudeArgs).toEqual([...LEAN_TOOLS_ARGS, ...(combo.extraClaudeArgs ?? [])]);
+  });
+
+  it("makes few-turns effort-low-nosub plus one overlay and nothing else", () => {
+    const spec = getCondition("few-turns");
+    const combo = getCondition("effort-low-nosub");
+    expect(spec.overlays).toEqual(["few-turns"]);
+    expect(spec.effort).toBe(combo.effort);
+    expect(spec.extraClaudeArgs).toEqual(combo.extraClaudeArgs);
+    expect(spec.model).toBeUndefined();
+  });
+
+  it("keeps the few-turns CLAUDE.md a strict superset of baseline's, contract untouched", () => {
+    const base = fs.readFileSync(path.join(OVERLAYS, "baseline", "CLAUDE.md"), "utf8");
+    const lean = fs.readFileSync(path.join(OVERLAYS, "few-turns", "CLAUDE.md"), "utf8");
+    // Byte-for-byte prefix: if the appended section had been allowed to reword
+    // any part of the answer-format contract, the arm would be measuring the
+    // grader's input rather than the agent's turn count.
+    expect(lean.startsWith(base)).toBe(true);
+    expect(lean.length).toBeGreaterThan(base.length);
+    const appended = lean.slice(base.length);
+    expect(appended).toMatch(/## Working economy/);
+    expect(appended).not.toMatch(/ANSWER:/);
+    expect(appended).not.toMatch(/graphify/i);
+  });
+
+  // Haiku 4.5 does not honour `--effort` (measured: thinking tokens 202 at low,
+  // 172 at max, 690 with no flag at all; Sonnet 5 on the same prompt moves
+  // 0 -> 192). Declaring one would put a treatment in `run.meta.json` that never
+  // reached the model — the single fatal failure mode this registry exists to
+  // prevent (LEVERS.md §2.1). The arms therefore take the harness default, which
+  // is also what `haiku-baseline` took, keeping that pair single-variable.
+  it("declares no effort override on the haiku arms", () => {
+    for (const name of ["haiku-nosub", "all-in"]) {
+      const spec = getCondition(name);
+      expect(spec.effort).toBeUndefined();
+      expect(spec.model).toBe(HAIKU_MODEL);
+      expect(effectiveEffort(spec, "high")).toBe("high");
+      expect(effectiveEffort(spec, "high")).toBe(effectiveEffort(getCondition("haiku-baseline"), "high"));
+    }
+  });
+
+  it("makes haiku-nosub the exact conjunction of haiku-baseline and baseline-nosub", () => {
+    const spec = getCondition("haiku-nosub");
+    expect(spec.overlays).toEqual(getCondition("haiku-baseline").overlays);
+    expect(spec.model).toBe(getCondition("haiku-baseline").model);
+    expect(spec.extraClaudeArgs).toEqual(getCondition("baseline-nosub").extraClaudeArgs);
+    expect(spec.corpus).toBe("v1");
+    expect(spec.mcp).toBeUndefined();
+  });
+
+  it("makes all-in the union of the other three lean arms and adds no fourth thing", () => {
+    const spec = getCondition("all-in");
+    expect(spec.overlays).toEqual(getCondition("few-turns").overlays);
+    expect(spec.model).toBe(getCondition("haiku-nosub").model);
+    expect(spec.extraClaudeArgs).toEqual(getCondition("lean-tools").extraClaudeArgs);
+    expect(spec.env).toBeUndefined();
+    expect(spec.mcp).toBeUndefined();
+    expect(spec.corpus).toBe("v1");
+  });
+
+  it("puts the tool allowlist on the command line claude actually receives", () => {
+    for (const name of ["lean-tools", "all-in"]) {
+      const spec = getCondition(name);
+      const argv = buildArgs({
+        prompt: "p",
+        cwd: "/tmp/x",
+        sessionId: "s",
+        model: effectiveModel(spec, "claude-sonnet-5"),
+        effort: effectiveEffort(spec, "high"),
+        extraArgs: spec.extraClaudeArgs,
+      });
+      const i = argv.indexOf("--tools");
+      expect(i).toBeGreaterThan(argv.indexOf("--session-id"));
+      expect(argv[i + 1]).toBe("Read,Grep,Glob,Bash,Edit");
+    }
+  });
+
+  it("leaves every pre-existing arm's spec untouched", () => {
+    // Phase 12 must not perturb the arms the earlier reports were generated
+    // from; those REPORT.md files are regenerated from the same registry.
+    expect(getCondition("effort-low-nosub").extraClaudeArgs).toEqual(["--disallowedTools", "Agent"]);
+    expect(getCondition("baseline").extraClaudeArgs).toBeUndefined();
+    expect(getCondition("haiku-baseline").extraClaudeArgs).toBeUndefined();
+    expect(getCondition("baseline").overlays).toEqual(["baseline"]);
   });
 });
