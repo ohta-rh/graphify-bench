@@ -73,7 +73,11 @@ export function IssueCard(props: IssueCardProps): ReactElement | null {
 
         {assignee !== null ? (
           <Avatar name={assignee.name} src={assignee.avatarUrl} size="sm" />
-        ) : null}
+        ) : (
+          <Badge tone="neutral" size="sm">
+            Unassigned
+          </Badge>
+        )}
       </div>
     </Card>
   );

@@ -149,87 +149,87 @@ export async function exportActivity(
 export function registerActivityListeners(): Unsubscribe {
   const offs: Unsubscribe[] = [
     subscribe("project.created", (payload) =>
-      void record(payload.orgId, "project.created", {
+      record(payload.orgId, "project.created", {
         actorId: payload.actorId,
         subjectKind: "project",
         subjectId: payload.projectId,
         projectId: payload.projectId,
         summary: `Created project ${payload.name}`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("project.archived", (payload) =>
-      void record(payload.orgId, "project.archived", {
+      record(payload.orgId, "project.archived", {
         actorId: payload.actorId,
         subjectKind: "project",
         subjectId: payload.projectId,
         projectId: payload.projectId,
         summary: `Archived project with ${payload.issuesArchived} issues`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("issue.created", (payload) =>
-      void record(payload.orgId, "issue.created", {
+      record(payload.orgId, "issue.created", {
         actorId: payload.actorId,
         subjectKind: "issue",
         subjectId: payload.issueId,
         projectId: payload.projectId,
         summary: `Created issue "${payload.title}"`,
         metadata: { priority: payload.priority },
-      }),
+      }).then(() => undefined),
     ),
     subscribe("issue.status_changed", (payload) =>
-      void record(payload.orgId, "issue.status_changed", {
+      record(payload.orgId, "issue.status_changed", {
         actorId: payload.actorId,
         subjectKind: "issue",
         subjectId: payload.issueId,
         projectId: payload.projectId,
         summary: `Status ${payload.from} → ${payload.to}`,
         metadata: { from: payload.from, to: payload.to },
-      }),
+      }).then(() => undefined),
     ),
     subscribe("issue.assigned", (payload) =>
-      void record(payload.orgId, "issue.assigned", {
+      record(payload.orgId, "issue.assigned", {
         actorId: payload.actorId,
         subjectKind: "issue",
         subjectId: payload.issueId,
         projectId: payload.projectId,
         summary: `Assigned to ${payload.assigneeId}`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("comment.created", (payload) =>
-      void record(payload.orgId, "comment.created", {
+      record(payload.orgId, "comment.created", {
         actorId: payload.actorId,
         subjectKind: "comment",
         subjectId: payload.commentId,
         projectId: null,
         summary: `Commented on issue ${payload.issueId}`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("member.invited", (payload) =>
-      void record(payload.orgId, "member.invited", {
+      record(payload.orgId, "member.invited", {
         actorId: payload.actorId,
         subjectKind: "member",
         subjectId: payload.email,
         projectId: null,
         summary: `Invited ${payload.email} as ${payload.role}`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("member.role_changed", (payload) =>
-      void record(payload.orgId, "member.role_changed", {
+      record(payload.orgId, "member.role_changed", {
         actorId: payload.actorId,
         subjectKind: "member",
         subjectId: payload.memberId,
         projectId: null,
         summary: `Role ${payload.from} → ${payload.to}`,
-      }),
+      }).then(() => undefined),
     ),
     subscribe("billing.plan_changed", (payload) =>
-      void record(payload.orgId, "billing.plan_changed", {
+      record(payload.orgId, "billing.plan_changed", {
         actorId: payload.actorId,
         subjectKind: "subscription",
         subjectId: payload.orgId,
         projectId: null,
         summary: `Plan ${payload.from} → ${payload.to}`,
-      }),
+      }).then(() => undefined),
     ),
   ];
 

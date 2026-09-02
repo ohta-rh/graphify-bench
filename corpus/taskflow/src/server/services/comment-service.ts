@@ -1,11 +1,12 @@
 /**
  * Comment creation, edit window enforcement, mention extraction and soft delete.
  *
- * Must call (do not reimplement): assertCan, assertOrgScope, emit, archivePatch
+ * Must call (do not reimplement): assertCan, assertOrgScope, emit, archivePatch, consumeRateLimit
  */
 import { emit } from "@/lib/event-bus";
 import { resolveMentions } from "@/lib/mentions";
 import { assertCan } from "@/lib/permissions";
+import { consumeRateLimit } from "@/lib/rate-limit";
 import { archivePatch, assertNotArchived } from "@/lib/soft-delete";
 import { assertOrgScope } from "@/lib/tenant";
 import * as commentRepo from "@/server/repositories/comment-repository";
@@ -32,6 +33,9 @@ const EDIT_WINDOW_MS = 15 * 60 * 1000;
 /** How many members are scanned when resolving `@handle` mentions. */
 const MENTION_LOOKUP_LIMIT = 100;
 
+/** Token bucket protecting the comment thread from burst posting. */
+const COMMENT_CREATE_BUCKET = "comment:create";
+
 /**
  * Posts a comment on a live issue. Mentions written as `@handle` in the body
  * are resolved against the org's members here, so the stored row and the
@@ -51,6 +55,13 @@ export async function createComment(
   );
   assertCan(actor, "comment:create", issueResource(issue));
   assertNotArchived("Issue", issue.id, issue);
+
+  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+  if (!verdict.allowed) {
+    throw new Error(
+      `Comment rate limit reached; try again after ${verdict.resetAt}`,
+    );
+  }
 
   const mentionedUserIds = await resolveMentionedUsers(
     input.orgId,

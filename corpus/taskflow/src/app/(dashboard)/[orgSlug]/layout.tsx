@@ -13,9 +13,11 @@
 
 import { notFound } from "next/navigation";
 import type { ReactNode } from "react";
+import type { LimitedResource } from "@/types/billing";
 import { snapshotFlags } from "@/lib/feature-flags";
 import { getSessionPrincipal } from "@/lib/session";
 import { assertOrgScope } from "@/lib/tenant";
+import { checkLimit } from "@/server/services/billing-service";
 import { buildFlagContext } from "@/server/services/feature-flag-service";
 import { listNotifications } from "@/server/services/notification-service";
 import { resolveOrgBySlug } from "@/server/services/organization-service";
@@ -30,6 +32,12 @@ type LayoutParams = { orgSlug: string };
 export const dynamic = "force-dynamic";
 
 const SIDEBAR_PROJECT_LIMIT = 12;
+
+/** The quota dimensions the shell's usage meters read. */
+const SHELL_LIMIT_RESOURCES: readonly LimitedResource[] = [
+  "seats",
+  "projects",
+];
 
 export default async function Layout(props: {
   children: ReactNode;
@@ -59,7 +67,7 @@ export default async function Layout(props: {
 
   const flags = snapshotFlags(buildFlagContext(actor, org));
 
-  const [projects, notifications] = await Promise.all([
+  const [projects, notifications, limitChecks] = await Promise.all([
     listProjects(actor, { orgId: org.id, limit: SIDEBAR_PROJECT_LIMIT }),
     listNotifications(actor, {
       orgId: org.id,
@@ -67,10 +75,20 @@ export default async function Layout(props: {
       unreadOnly: true,
       limit: 1,
     }),
+    // Evaluated once per navigation so `usePlanLimits()` in the client tree
+    // reads a real measurement instead of falling back to "no data".
+    Promise.all(
+      SHELL_LIMIT_RESOURCES.map((resource) => checkLimit(org.id, resource, 0)),
+    ),
   ]);
 
   return (
-    <OrgProvider org={org} actor={actor} flags={flags}>
+    <OrgProvider
+      org={org}
+      actor={actor}
+      flags={flags}
+      limitChecks={limitChecks}
+    >
       <DashboardShell
         org={org}
         actor={actor}

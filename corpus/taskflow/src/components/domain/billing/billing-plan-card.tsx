@@ -1,5 +1,12 @@
+"use client";
+
 /**
  * One plan tile rendering quotas straight from `PlanLimits`.
+ *
+ * The tile owns a click handler, so it has to be a Client Component: the
+ * billing page is a Server Component, and a `<button onClick>` returned from
+ * the server is a render error. `onSelect` is the page's inline Server
+ * Action, which crosses this boundary legally.
  *
  * Must call (do not reimplement): getPlanLimits, can
  */

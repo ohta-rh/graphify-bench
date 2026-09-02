@@ -8,6 +8,7 @@
  */
 import { getSessionPrincipal } from "@/lib/session";
 import { assertOrgScope } from "@/lib/tenant";
+import { findOrgById } from "@/server/repositories/organization-repository";
 import { resolveActorForOrg } from "@/server/services/session-service";
 import type { OrgId } from "@/types/common";
 import type { Actor } from "@/types/member";
@@ -60,16 +61,20 @@ export async function tryGetActor(orgSlug: string): Promise<Actor | null> {
  * that receive an `orgId` in the payload rather than a slug in the path. The
  * session's active org must match, which `assertOrgScope()` enforces.
  *
- * `resolveActorForOrg` accepts either an org slug or an org id as its second
- * argument — both are opaque lookup keys to it.
+ * `resolveActorForOrg` keys off the org *slug*, so the id is translated here
+ * with a single repository lookup rather than by widening that signature —
+ * the slug is the only handle the session layer knows.
  */
 export async function requireActorFor(orgId: OrgId): Promise<Actor> {
   const principal = await getSessionPrincipal();
   if (principal === null) throw new UnauthorizedError();
   if (principal.activeOrgId === null) throw new NoMembershipError(orgId);
 
-  const actor = await resolveActorForOrg(principal, orgId);
-  if (actor === null) throw new NoMembershipError(orgId);
+  const org = await findOrgById(orgId);
+  if (org === null) throw new NoMembershipError(orgId);
+
+  const actor = await resolveActorForOrg(principal, org.slug);
+  if (actor === null) throw new NoMembershipError(org.slug);
 
   assertOrgScope(actor, orgId);
   return actor;

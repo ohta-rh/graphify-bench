@@ -4,6 +4,7 @@
  * Must call (do not reimplement): uniqueSlug, getPlanLimits
  */
 import { getPlanLimits } from "@/config/plan-limits";
+import { hashPassword } from "@/lib/hash";
 import { idFactory } from "@/lib/id";
 import { uniqueSlug } from "@/lib/slug";
 import { getDb } from "@/server/db";
@@ -37,6 +38,13 @@ export type SeedSummary = {
  */
 const EPOCH = Date.UTC(2026, 0, 5, 9, 0, 0);
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * The password every seeded account shares. Sign in as
+ * `owner@northwind.test` (or admin/member/viewer, and the same four on
+ * `acme.test`) with this.
+ */
+export const SEED_PASSWORD = "taskflow-dev";
 
 /** Ids come from a seeded generator, so the whole fixture is reproducible. */
 const nextId = idFactory(20_260_105);
@@ -111,6 +119,14 @@ export async function seedDatabase(
 
   clear();
 
+  // Hashed once and shared by all eight accounts: `verifyPassword` only
+  // accepts the `scrypt:<salt>:<key>` shape this produces, so a literal
+  // placeholder here would leave every seeded user unable to sign in. The
+  // salt is random, which is the one field of the fixture that is not
+  // reproducible across runs — deliberately, since a fixed salt in a seed is
+  // the kind of thing that gets copied into a deployment.
+  const seedPasswordHash = await hashPassword(SEED_PASSWORD);
+
   const takenSlugs: string[] = [];
 
   for (const [orgIndex, spec] of ORG_SPECS.entries()) {
@@ -128,7 +144,7 @@ export async function seedDatabase(
           id: userId,
           email: `${roleSpec.role}@${slug}.test`,
           name: roleSpec.name,
-          passwordHash: `seed$${roleSpec.role}`,
+          passwordHash: seedPasswordHash,
           avatarUrl: null,
           timezone: "UTC",
           emailVerifiedAt: created,

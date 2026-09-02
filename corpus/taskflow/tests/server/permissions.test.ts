@@ -7,11 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/id", () => import("./_support/doubles/id"));
 vi.mock("@/lib/logger", async () => (await import("./_support/doubles/misc")).loggerModule);
-vi.mock("@/lib/hash", async () => (await import("./_support/doubles/misc")).hashModule);
-vi.mock("@/lib/rate-limit", async () => (await import("./_support/doubles/misc")).rateLimitModule);
-vi.mock("@/lib/mentions", async () => (await import("./_support/doubles/misc")).mentionsModule);
 
 import { PermissionDeniedError } from "@/lib/permissions";
 import * as commentService from "@/server/services/comment-service";

@@ -1,43 +1,36 @@
 "use client";
 
 /**
- * Client context provider seeded with the org, actor and flag snapshot.
+ * Client context provider seeded with the org, actor, flag snapshot and the
+ * quota checks the layout already computed.
  *
- * Owner D. The tenant layout resolves all three on the server once per
- * navigation and hands them down as plain serialisable values; `useOrg`,
- * `usePermission` and `useFeatureFlag` read them from here. Nothing in the
- * client tree ever re-derives them, which is why a flag can be evaluated in a
- * component without a round trip.
+ * Owner D. This file is a thin adapter over the single context definition in
+ * `@/hooks/org-context` — it exists only so the layout can spread the four
+ * values as props instead of building the context object itself. There is
+ * deliberately no second `createContext()` here: `useOrg`, `usePermission`
+ * and `usePlanLimits` read the context this renders, and two providers would
+ * mean the hooks silently saw `null`.
  */
 
-import { createContext, type ReactNode } from "react";
-import type { FeatureFlagSnapshot } from "@/types/feature-flag";
-import type { Actor } from "@/types/member";
-import type { Organization } from "@/types/organization";
+import type { ReactElement, ReactNode } from "react";
+import {
+  OrgProvider as OrgContextProvider,
+  type OrgContextValue,
+} from "@/hooks/org-context";
 
-export type OrgContextValue = {
-  readonly org: Organization;
-  readonly actor: Actor;
-  readonly flags: FeatureFlagSnapshot;
-};
+export { OrgContext, type OrgContextValue } from "@/hooks/org-context";
 
-/**
- * `null` means "rendered outside the tenant subtree" — the hooks throw on it
- * rather than inventing a default org, because a wrong tenant is worse than a
- * crash.
- */
-export const OrgContext = createContext<OrgContextValue | null>(null);
+export type OrgProviderProps = Omit<OrgContextValue, "limitChecks"> &
+  Partial<Pick<OrgContextValue, "limitChecks">> & {
+    children?: ReactNode;
+  };
 
-export type OrgProviderProps = OrgContextValue & {
-  children?: ReactNode;
-};
-
-export function OrgProvider(props: OrgProviderProps) {
-  const { org, actor, flags, children } = props;
+export function OrgProvider(props: OrgProviderProps): ReactElement {
+  const { org, actor, flags, limitChecks = [], children } = props;
 
   return (
-    <OrgContext.Provider value={{ org, actor, flags }}>
+    <OrgContextProvider value={{ org, actor, flags, limitChecks }}>
       {children}
-    </OrgContext.Provider>
+    </OrgContextProvider>
   );
 }

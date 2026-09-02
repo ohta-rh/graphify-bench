@@ -7,9 +7,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/id", () => import("./_support/doubles/id"));
 vi.mock("@/lib/logger", async () => (await import("./_support/doubles/misc")).loggerModule);
-vi.mock("@/lib/hash", async () => (await import("./_support/doubles/misc")).hashModule);
+// The only double left in this suite. `@/lib/rate-limit` is real everywhere
+// else, but these cases need to *choose* the verdict — the seat-quota refusal
+// has to be provably about seats and not about a bucket the previous case
+// happened to drain, and the throttling case needs a guaranteed denial.
 vi.mock("@/lib/rate-limit", async () => (await import("./_support/doubles/misc")).rateLimitModule);
 
 import { getPlanLimits } from "@/config/plan-limits";
