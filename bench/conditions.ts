@@ -78,6 +78,20 @@ export interface ConditionSpec {
   corpus?: "v1" | "v2";
   /** Model id override; unset means the harness default (`BENCH_MODEL`). */
   model?: string;
+  /**
+   * Reasoning-effort override for `claude -p --effort`; unset means the harness
+   * default (`BENCH_EFFORT`, `high`).
+   *
+   * This is a *runtime lever* rather than a treatment installed into the corpus:
+   * nothing about the agent's working directory changes, only how much thinking
+   * it is authorised to spend. It lives beside `model` because it is the same
+   * kind of knob — a property of the invocation, not of the files — and because
+   * `run.meta.json` must record the effort that actually ran, exactly as it
+   * records the model that actually ran. Reading `env.effort` out of a run
+   * directory is the only way a reader can tell an `effort-low` run from a
+   * `baseline` one after the fact, since the two ship an identical overlay.
+   */
+  effort?: string;
   /** Extra `claude -p` arguments appended after the harness's own. */
   extraClaudeArgs?: string[];
   /** Extra environment for the `claude` child process. */
@@ -250,6 +264,33 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     mcp: mempalaceMcp("v2"),
     note: "`mempalace-v2` run by a weaker explorer — its reference arm is `haiku-baseline`.",
   },
+  {
+    name: "effort-medium",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "medium",
+    note:
+      "A RUNTIME LEVER, not a tool: the baseline overlay byte for byte, invoked with " +
+      "`--effort medium` instead of the harness default `high`. Thinking tokens bill as output, so the " +
+      "reduction is arithmetically certain and the open question is entirely about accuracy.",
+  },
+  {
+    name: "effort-low",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "low",
+    note: "As `effort-medium`, one notch further down: baseline with `--effort low`.",
+  },
+  {
+    name: "haiku-explore",
+    overlays: ["haiku-explore"],
+    corpus: "v1",
+    note:
+      "Baseline plus one file: `.claude/agents/Explore.md` declaring `model: haiku`, which overrides " +
+      "Claude Code's built-in `Explore` subagent (project agents outrank built-ins) so delegated " +
+      "exploration runs on Haiku while the main session stays on Sonnet. Its `CLAUDE.md` is byte-identical " +
+      "to baseline's — the arm changes who explores, not what the agent is told.",
+  },
 ] as const;
 
 const BY_NAME = new Map(CONDITIONS.map((c) => [c.name, c]));
@@ -295,6 +336,19 @@ export function overlayDirs(spec: ConditionSpec, overlaysRoot: string): string[]
 /** The model this arm actually runs, given the harness default. */
 export function effectiveModel(spec: ConditionSpec, defaultModel: string): string {
   return spec.model ?? defaultModel;
+}
+
+/**
+ * The reasoning effort this arm actually runs, given the harness default.
+ *
+ * The twin of `effectiveModel`, and load-bearing for the same reason: the
+ * `effort-*` arms ship the *baseline overlay*, so a run directory in which
+ * `env.effort` still read `high` would be indistinguishable from a `baseline`
+ * run, and an arm that silently failed to apply its only treatment would be an
+ * expensive re-measurement of baseline wearing another name.
+ */
+export function effectiveEffort(spec: ConditionSpec, defaultEffort: string): string {
+  return spec.effort ?? defaultEffort;
 }
 
 /** The token `run.ts` replaces with this run's private index directory. */

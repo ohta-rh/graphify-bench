@@ -16,6 +16,9 @@ function row(over: Partial<RunRow> & Pick<RunRow, "task_id" | "condition">): Run
     num_turns: 10,
     output_tokens_all: null,
     output_tokens: 100,
+    thinking_tokens: null,
+    model_tokens: {},
+    model_cost: {},
     subagents_spawned: 0,
     duration_ms: 1000,
     first_turn_cache_creation: 7000,
@@ -163,5 +166,67 @@ describe("headline arm and corpus label", () => {
     const other = analyze(rows, "s", 20, { treatment: "haiku-baseline" });
     const md = buildReport(own, rows, { vs: { label: "code-45", ownLabel: "docs-20", analysis: other } });
     expect(md).toContain("### haiku-baseline / graphify-v2 − baseline (headline)");
+  });
+});
+
+describe("thinking tokens and model mix", () => {
+  const rows = (): RunRow[] => [
+    row({
+      task_id: "T1",
+      condition: "baseline",
+      output_tokens: 1000,
+      thinking_tokens: 400,
+      model_tokens: { "claude-sonnet-5": 90_000, "claude-haiku-4-5": 1_000 },
+      model_cost: { "claude-sonnet-5": 0.5, "claude-haiku-4-5": 0.001 },
+    }),
+    row({
+      task_id: "T1",
+      condition: "effort-low",
+      output_tokens: 1000,
+      thinking_tokens: 50,
+      model_tokens: { "claude-sonnet-5": 40_000, "claude-haiku-4-5": 1_000 },
+      model_cost: { "claude-sonnet-5": 0.2, "claude-haiku-4-5": 0.001 },
+    }),
+  ];
+
+  // Rendered only behind the flag, so every report authored before these arms
+  // existed regenerates byte for byte from the same analysis.
+  it("stays out of the report unless asked for", () => {
+    const rs = rows();
+    const a = analyze(rs, "s", 20, { treatment: "effort-low" });
+    expect(buildReport(a, rs)).not.toContain("Thinking tokens and model mix");
+    expect(buildReport(a, rs, { modelMix: true })).toContain("Thinking tokens and model mix");
+  });
+
+  it("states thinking as a share of main-session output, per arm", () => {
+    const rs = rows();
+    const a = analyze(rs, "s", 20, { treatment: "effort-low" });
+    const base = a.by_condition.find((s) => s.condition === "baseline")!;
+    const low = a.by_condition.find((s) => s.condition === "effort-low")!;
+    expect(base.thinking_tokens_total).toBe(400);
+    expect(base.thinking_share).toBeCloseTo(0.4);
+    expect(low.thinking_share).toBeCloseTo(0.05);
+    const md = buildReport(a, rs, { modelMix: true });
+    expect(md).toContain("| `baseline` | 1 | 400 | 1,000 | 40.0% |");
+    expect(md).toContain("| `effort-low` | 1 | 50 | 1,000 | 5.0% |");
+  });
+
+  it("splits tokens and cost by model so a delegated-to-Haiku arm is auditable", () => {
+    const rs = rows();
+    const a = analyze(rs, "s", 20, { treatment: "effort-low" });
+    expect(a.by_condition.find((s) => s.condition === "baseline")!.model_tokens).toEqual({
+      "claude-sonnet-5": 90_000,
+      "claude-haiku-4-5": 1_000,
+    });
+    const md = buildReport(a, rs, { modelMix: true });
+    expect(md).toContain("| `baseline` | 1,000 | 90,000 | $0.00 | $0.50 |");
+  });
+
+  it("leaves the share null when no run reported a thinking count", () => {
+    const rs = [row({ task_id: "T1", condition: "baseline", thinking_tokens: null })];
+    const a = analyze(rs, "s", 20);
+    expect(a.by_condition[0]!.thinking_share).toBeNull();
+    expect(a.by_condition[0]!.thinking_output_tokens).toBe(0);
+    expect(buildReport(a, rs, { modelMix: true })).toContain("| `baseline` | 1 | 0 | 0 | – |");
   });
 });

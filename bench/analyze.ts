@@ -5,6 +5,7 @@ import { featureUsageForRun, summarizeFeatureUsage, type ConditionFeatureUsage }
 import { REPO_ROOT, RESULTS_DIR, RUNS_DIR, runDir } from "./lib/env.js";
 import { mulberry32 } from "./lib/rng.js";
 import type { Metrics } from "./collect.js";
+import type { ClaudeModelUsage } from "./lib/claude-p.js";
 import type { Grade } from "./grade.js";
 
 export const BASELINE = "baseline";
@@ -35,6 +36,22 @@ export interface RunRow {
   num_turns: number | null;
   output_tokens_all: number | null;
   output_tokens: number | null;
+  /**
+   * `usage.output_tokens_details.thinking_tokens` — main session only, and the
+   * quantity the `--effort` lever is supposed to move. It is a SUBSET of
+   * `output_tokens`, not an addition to it, which is why the report states it
+   * as a share rather than a total.
+   */
+  thinking_tokens: number | null;
+  /**
+   * Per-model information volume and cost, keyed by canonical model id
+   * (`claude-sonnet-5`, `claude-haiku-4-5`). Derived from `modelUsage`, the only
+   * field that sees subagent traffic, so it is what makes "the main session
+   * stayed on Sonnet while exploration ran on Haiku" a measurement rather than
+   * an assumption.
+   */
+  model_tokens: Record<string, number>;
+  model_cost: Record<string, number>;
   subagents_spawned: number | null;
   duration_ms: number | null;
   first_turn_cache_creation: number | null;
@@ -127,6 +144,29 @@ export interface ConditionSummary {
   /** Runs that spawned at least one subagent, and the total spawned. */
   subagent_runs: number;
   subagents_spawned_total: number;
+  /**
+   * Thinking tokens summed over the arm's runs, and their share of the arm's
+   * main-session output tokens.
+   *
+   * A share rather than a count because thinking is billed *inside*
+   * `output_tokens`: the absolute figure moves with how much the arm wrote as
+   * well as how much it thought, and only the ratio isolates the `--effort`
+   * lever. Main-session only, since `usage.output_tokens_details` is; a
+   * subagent's thinking is invisible here and shows up only in that model's
+   * `model_tokens` row.
+   */
+  thinking_tokens_total: number;
+  /**
+   * The denominator the share is actually taken over: main-session output
+   * tokens of exactly those runs that reported a thinking count. Stored rather
+   * than recomputed in the report so the printed share is arithmetic the reader
+   * can check against the two columns beside it.
+   */
+  thinking_output_tokens: number;
+  thinking_share: number | null;
+  /** Per-canonical-model token and cost totals over the arm's runs. */
+  model_tokens: Record<string, number>;
+  model_cost: Record<string, number>;
   metrics: Record<string, { median: number | null; q1: number | null; q3: number | null; mean: number | null; n: number }>;
   tool_calls: Record<string, number>;
   tool_result_bytes: Record<string, number>;
@@ -224,6 +264,31 @@ export interface Analysis {
   feature_usage?: ConditionFeatureUsage[];
 }
 
+/**
+ * Fold `modelUsage` into per-canonical-model token and cost totals.
+ *
+ * Claude Code keys `modelUsage` by the *dated* model id it actually called
+ * (`claude-haiku-4-5-20251001`) while `--model` takes the undated alias, so
+ * grouping by the entry's own `canonicalModel` is what keeps an arm's rows
+ * poolable across a model refresh. The token figure matches
+ * `uncached_equivalent_all`'s definition — input + cache read + cache creation —
+ * so the per-model numbers sum to the arm's headline volume rather than to some
+ * other quantity that merely resembles it.
+ */
+export function splitModelUsage(
+  modelUsage: Record<string, ClaudeModelUsage> | null | undefined,
+): { model_tokens: Record<string, number>; model_cost: Record<string, number> } {
+  const model_tokens: Record<string, number> = {};
+  const model_cost: Record<string, number> = {};
+  for (const [key, u] of Object.entries(modelUsage ?? {})) {
+    const name = typeof u?.canonicalModel === "string" && u.canonicalModel ? u.canonicalModel : key;
+    const tokens = (u?.inputTokens ?? 0) + (u?.cacheReadInputTokens ?? 0) + (u?.cacheCreationInputTokens ?? 0);
+    model_tokens[name] = (model_tokens[name] ?? 0) + tokens;
+    model_cost[name] = (model_cost[name] ?? 0) + (u?.costUSD ?? 0);
+  }
+  return { model_tokens, model_cost };
+}
+
 function sumInto(target: Record<string, number>, source: Record<string, number> | undefined): void {
   for (const [k, v] of Object.entries(source ?? {})) target[k] = (target[k] ?? 0) + v;
 }
@@ -245,10 +310,20 @@ export function summarizeCondition(condition: string, rows: RunRow[]): Condition
   }
   const toolCalls: Record<string, number> = {};
   const toolBytes: Record<string, number> = {};
+  const modelTokens: Record<string, number> = {};
+  const modelCost: Record<string, number> = {};
   for (const r of own) {
     sumInto(toolCalls, r.tool_calls);
     sumInto(toolBytes, r.tool_result_bytes);
+    sumInto(modelTokens, r.model_tokens);
+    sumInto(modelCost, r.model_cost);
   }
+  // Only runs that reported BOTH numbers enter the share, so an older run
+  // directory missing `thinking_tokens` dilutes neither the numerator nor the
+  // denominator — it is excluded from both.
+  const withThinking = own.filter((r) => typeof r.thinking_tokens === "number" && typeof r.output_tokens === "number");
+  const thinkingTotal = withThinking.reduce((a, r) => a + (r.thinking_tokens as number), 0);
+  const outputForThinking = withThinking.reduce((a, r) => a + (r.output_tokens as number), 0);
   return {
     condition,
     runs: own.length,
@@ -260,6 +335,11 @@ export function summarizeCondition(condition: string, rows: RunRow[]): Condition
     t2s_main: successes.length === 0 ? null : tokensOfSuccessesMain.reduce((a, b) => a + b, 0) / successes.length,
     subagent_runs: own.filter((r) => (r.subagents_spawned ?? 0) > 0).length,
     subagents_spawned_total: own.reduce((a, r) => a + (r.subagents_spawned ?? 0), 0),
+    thinking_tokens_total: thinkingTotal,
+    thinking_output_tokens: outputForThinking,
+    thinking_share: outputForThinking === 0 ? null : thinkingTotal / outputForThinking,
+    model_tokens: modelTokens,
+    model_cost: modelCost,
     metrics,
     tool_calls: toolCalls,
     tool_result_bytes: toolBytes,
@@ -577,6 +657,8 @@ export function loadRows(
       num_turns: m.num_turns,
       output_tokens_all: m.output_tokens_all ?? null,
       output_tokens: m.output_tokens,
+      thinking_tokens: m.thinking_tokens ?? null,
+      ...splitModelUsage(m.modelUsage),
       subagents_spawned: m.subagents_spawned ?? null,
       duration_ms: m.duration_ms,
       first_turn_cache_creation: m.first_turn_cache_creation,

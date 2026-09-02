@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { captureTranscript, runClaudeP, type ClaudePInvocation } from "./lib/claude-p.js";
 import {
+  effectiveEffort,
   effectiveModel,
   expandPalace,
   overlayDirs,
@@ -349,7 +350,14 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
   const dirs = overlayDirs(spec, req.overlaysDir);
   // The arm's model override wins over BENCH_MODEL, and `env.model` is what the
   // report reads, so it must carry the model that actually ran — not the default.
-  const env: BenchEnv = { ...base, model: effectiveModel(spec, base.model) };
+  // `effort` is resolved the same way and for the same reason: `run.meta.json`
+  // must state the effort that was actually passed to `claude -p`, since the
+  // `effort-*` arms are otherwise byte-identical to `baseline`.
+  const env: BenchEnv = {
+    ...base,
+    model: effectiveModel(spec, base.model),
+    effort: effectiveEffort(spec, base.effort),
+  };
   const id = runId(req.task.id, req.condition, req.rep);
   const outDir = runDir(id);
   const sessionId = crypto.randomUUID();

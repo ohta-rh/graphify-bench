@@ -508,6 +508,58 @@ export function speedBlock(rows: RunRow[]): string[] {
   return out;
 }
 
+/**
+ * Where each arm's thinking and each arm's tokens actually went.
+ *
+ * The two halves answer the two runtime levers directly. `--effort` is supposed
+ * to move thinking tokens, which bill as output but are invisible in every
+ * other table in this report; the share column is the lever's own dose–response
+ * curve, and an `effort-low` arm whose share did not fall would mean the flag
+ * never took effect. The per-model split is the audit for `haiku-explore`: the
+ * arm's claim is that exploration moved to Haiku while the main session stayed
+ * on Sonnet, and `modelUsage` is the only field that sees a subagent's traffic
+ * at all, so this is the difference between a measurement and an assumption.
+ */
+export function modelMixBlock(a: Analysis): string[] {
+  const out: string[] = [];
+  const models = [...new Set(a.by_condition.flatMap((s) => Object.keys(s.model_tokens ?? {})))].sort();
+  out.push(
+    "Thinking tokens are billed as output and are a **subset** of `output_tokens`, not an addition to it, so " +
+      "the share is the honest reading of an effort change: an arm that merely wrote less prose would move the " +
+      "absolute count without touching the lever. The figure is main-session only — `usage.output_tokens_details` " +
+      "does not see a subagent — so an arm that delegates reports the *parent's* thinking, and its explorer's " +
+      "thinking appears only as tokens against that explorer's model in the second table.\n",
+  );
+  out.push("| condition | runs | thinking tokens | main-session output | thinking share |");
+  out.push("|---|---|---|---|---|");
+  for (const s of a.by_condition) {
+    out.push(
+      `| \`${s.condition}\` | ${s.runs} | ${fmt(s.thinking_tokens_total ?? null)} | ${fmt(s.thinking_output_tokens ?? null)} | ` +
+        `${s.thinking_share === null || s.thinking_share === undefined ? "–" : pct(s.thinking_share)} |`,
+    );
+  }
+  out.push("");
+  if (models.length > 0) {
+    out.push(
+      "**Which model spent the tokens.** Summed from `modelUsage` over every run of the arm, on the same " +
+        "definition as `uncached_equivalent_all` (input + cache read + cache creation), so the row totals " +
+        "reconcile with the headline volume rather than describing some adjacent quantity. Note that a " +
+        "~1k-token Haiku entry appears in **every** arm, including plain `baseline`: that is Claude Code's own " +
+        "background helper call, not delegated exploration. Only an arm whose Haiku row is orders of magnitude " +
+        "larger than that has actually moved work onto Haiku.\n",
+    );
+    out.push(`| condition | ${models.map((m) => `\`${m}\` tokens`).join(" | ")} | ${models.map((m) => `\`${m}\` cost`).join(" | ")} |`);
+    out.push(`|---|${models.map(() => "---").join("|")}|${models.map(() => "---").join("|")}|`);
+    for (const s of a.by_condition) {
+      const tokens = models.map((m) => fmt(s.model_tokens?.[m] ?? 0));
+      const cost = models.map((m) => fmt(s.model_cost?.[m] ?? 0, 2));
+      out.push(`| \`${s.condition}\` | ${tokens.join(" | ")} | ${cost.map((c) => `$${c}`).join(" | ")} |`);
+    }
+    out.push("");
+  }
+  return out;
+}
+
 export interface ReportOptions {
   /**
    * Corpus generation the runs were measured against, printed in §1. It is a
@@ -520,6 +572,13 @@ export interface ReportOptions {
   qualityByCategory?: boolean;
   /** Wall-clock and per-tool-call latency. Off by default, and secondary. */
   speed?: boolean;
+  /**
+   * Thinking-token share and the per-model split of tokens and cost. Off by
+   * default and behind its own flag rather than folded into the headline
+   * table, so every report written before the runtime-lever arms existed
+   * regenerates byte for byte.
+   */
+  modelMix?: boolean;
   /** A second analysis to line this one up against, and the name to print for it. */
   vs?: { label: string; ownLabel: string; analysis: Analysis } | null;
 }
@@ -788,6 +847,11 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
     out.push(...speedBlock(rows));
   }
 
+  if (opts.modelMix) {
+    out.push(sec("Thinking tokens and model mix"));
+    out.push(...modelMixBlock(a));
+  }
+
   out.push(sec("Counter-productive cases and subagent use"));
   const cp = a.counter_productive;
   for (const s of a.by_condition) {
@@ -855,6 +919,7 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
 
 async function main(): Promise<void> {
   const { sources, easy, outDir, comparisons, featureUsage, treatment, corpusLabel } = resolveCli(process.argv.slice(2));
+  const wantsModelMix = process.argv.includes("--model-mix");
   const rows = loadRowsFromSources(sources, easy);
   if (rows.length === 0) {
     console.log(`no metrics under ${sources.map((s) => s.dir).join(", ")} — run bench:collect first`);
@@ -874,6 +939,10 @@ async function main(): Promise<void> {
     stored !== null &&
     (comparisons.length === 0 || (stored.comparisons?.length ?? 0) >= comparisons.length) &&
     (!featureUsage || (stored.feature_usage?.length ?? 0) > 0) &&
+    // An analysis.json written before the runtime-lever arms carries no
+    // per-model split, so reusing it under `--model-mix` would print an empty
+    // table instead of the audit the flag was asked for.
+    (!wantsModelMix || stored.by_condition.every((s) => s.model_tokens !== undefined)) &&
     // A stored analysis computed against a different headline arm answers a
     // different question; reusing it would print `treatment` in the heading over
     // numbers paired against something else.
@@ -911,6 +980,7 @@ async function main(): Promise<void> {
       corpusLabel,
       qualityByCategory: argv.includes("--quality-by-category"),
       speed: argv.includes("--speed"),
+      modelMix: argv.includes("--model-mix"),
       vs,
     }),
   );

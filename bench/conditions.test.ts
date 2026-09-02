@@ -7,6 +7,7 @@ import {
   HAIKU_MODEL,
   assertRegistryMatchesDisk,
   conditionNames,
+  effectiveEffort,
   effectiveModel,
   expandPalace,
   getCondition,
@@ -350,5 +351,98 @@ describe("renderMcpConfig", () => {
   it("omits env entirely when the arm declares none", () => {
     const bare = renderMcpConfig({ ...spec, envTemplate: undefined }, "/p");
     expect(bare.mcpServers.mempalace!.env).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10: runtime levers (no index, no tool — only how the CLI is invoked)
+// ---------------------------------------------------------------------------
+
+describe("runtime lever arms", () => {
+  it("changes nothing but the effort flag on the effort-* arms", () => {
+    for (const [name, effort] of [
+      ["effort-medium", "medium"],
+      ["effort-low", "low"],
+    ] as const) {
+      const spec = getCondition(name);
+      expect(spec.overlays).toEqual(["baseline"]);
+      expect(spec.effort).toBe(effort);
+      expect(spec.model).toBeUndefined();
+      expect(spec.extraClaudeArgs).toBeUndefined();
+      expect(spec.env).toBeUndefined();
+      expect(spec.mcp).toBeUndefined();
+      expect(spec.corpus).toBe("v1");
+    }
+  });
+
+  // The arms ship baseline's overlay, so `env.effort` in run.meta.json is the
+  // ONLY thing separating an effort-low run directory from a baseline one.
+  it("resolves the arm's effort over the harness default, and leaves other arms alone", () => {
+    expect(effectiveEffort(getCondition("effort-medium"), "high")).toBe("medium");
+    expect(effectiveEffort(getCondition("effort-low"), "high")).toBe("low");
+    expect(effectiveEffort(getCondition("baseline"), "high")).toBe("high");
+    expect(effectiveEffort(getCondition("haiku-explore"), "high")).toBe("high");
+    // A harness default other than `high` still shows through for an arm that
+    // declares no override — the override is the arm's value, not a constant.
+    expect(effectiveEffort(getCondition("baseline"), "low")).toBe("low");
+  });
+
+  it("puts the resolved effort on the command line claude actually receives", () => {
+    const argv = buildArgs({
+      prompt: "p",
+      cwd: "/tmp/x",
+      sessionId: "s",
+      model: "claude-sonnet-5",
+      effort: effectiveEffort(getCondition("effort-low"), "high"),
+    });
+    expect(argv.slice(argv.indexOf("--effort"), argv.indexOf("--effort") + 2)).toEqual(["--effort", "low"]);
+  });
+
+  it("gives haiku-explore its own overlay and no CLI override at all", () => {
+    const spec = getCondition("haiku-explore");
+    expect(spec.overlays).toEqual(["haiku-explore"]);
+    expect(spec.model).toBeUndefined();
+    expect(spec.effort).toBeUndefined();
+    expect(spec.extraClaudeArgs).toBeUndefined();
+    expect(spec.corpus).toBe("v1");
+  });
+
+  // The arm's whole claim is "same instructions, different explorer". A single
+  // added word in CLAUDE.md would make it an instruction experiment instead.
+  it("ships baseline's instruction text byte for byte", () => {
+    expect(fs.readFileSync(path.join(OVERLAYS, "haiku-explore", "CLAUDE.md"), "utf8")).toBe(
+      fs.readFileSync(path.join(OVERLAYS, "baseline", "CLAUDE.md"), "utf8"),
+    );
+  });
+
+  // Project agents outrank Claude Code's built-ins, so the frontmatter `name`
+  // must be the built-in's name and the model must be haiku — get either wrong
+  // and the arm silently re-measures baseline with an extra unused agent file.
+  it("overrides the built-in Explore agent onto haiku, read-only", () => {
+    const agent = fs.readFileSync(path.join(OVERLAYS, "haiku-explore", ".claude", "agents", "Explore.md"), "utf8");
+    const frontmatter = agent.split("---")[1] ?? "";
+    expect(frontmatter).toMatch(/^name:\s*Explore$/m);
+    expect(frontmatter).toMatch(/^model:\s*haiku$/m);
+    // Read-only: an exploration agent that could Edit would change what the arm
+    // measures from "who explores" to "who does the work".
+    const tools = /^tools:\s*(.+)$/m.exec(frontmatter)?.[1] ?? "";
+    expect(tools.split(",").map((t) => t.trim()).sort()).toEqual(["Bash", "Glob", "Grep", "Read"]);
+    expect(agent).not.toMatch(/graphify/i);
+  });
+
+  it("lands the agent definition inside the corpus copy where --setting-sources project finds it", () => {
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), "levers-overlay-"));
+    try {
+      const written = applyOverlay(path.join(OVERLAYS, "haiku-explore"), dest);
+      expect(written).toContain(path.join(".claude", "agents", "Explore.md"));
+      expect(fs.existsSync(path.join(dest, ".claude", "agents", "Explore.md"))).toBe(true);
+      expect(fs.existsSync(path.join(dest, "CLAUDE.md"))).toBe(true);
+    } finally {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  it("registers all three levers", () => {
+    for (const n of ["effort-medium", "effort-low", "haiku-explore"]) expect(conditionNames()).toContain(n);
   });
 });
