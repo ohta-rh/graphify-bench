@@ -29,7 +29,7 @@ const corpusRoot = join(repoRoot, "corpus", "taskflow");
 const docsRoot = join(corpusRoot, "docs");
 
 /** Files the checker deliberately ignores: review scratch that is not part of the corpus. */
-const IGNORED_BASENAMES = new Set(["docs-discrepancies.json (tasks/keys)"]);
+const IGNORED_BASENAMES = new Set<string>([]);
 
 type Located = { file: string; line: number };
 
