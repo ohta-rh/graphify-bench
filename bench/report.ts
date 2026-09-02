@@ -5,6 +5,7 @@ import { analyze, loadRowsFromSources, resolveCli, TREATMENT, type Analysis, typ
 import { resolveCondition } from "./conditions.js";
 import { TRACKED_SUBCOMMANDS } from "./features.js";
 import { REPO_ROOT } from "./lib/env.js";
+import { TOOL_GROUPS, speedForRun, summarizeSpeed, type ConditionSpeed, type Spread } from "./speed.js";
 
 const CSV_COLUMNS = [
   "run_id",
@@ -423,6 +424,90 @@ function crossSetBlock(own: Analysis, other: Analysis, otherLabel: string, ownLa
   return out;
 }
 
+/** `12,345` with an interquartile range, or an em dash when nothing was measured. */
+function spreadCell(s: Spread | undefined, digits = 0): string {
+  if (!s || s.median === null) return "–";
+  return `${fmt(s.median, digits)} (${fmt(s.q1, digits)}–${fmt(s.q3, digits)})`;
+}
+
+/**
+ * Wall-clock and per-call latency, reported as a clearly secondary result.
+ *
+ * The section leads with its own caveat because the caveat is load-bearing: the
+ * whole matrix ran three-at-a-time on one laptop, so a session duration is
+ * partly a statement about CPU contention. Per-tool-call latency survives that
+ * much better — a call's duration is dominated by the tool, and the arms
+ * interleave throughout the run so contention lands on all of them alike — and
+ * it is the number that actually answers "is querying an index faster than
+ * reading files".
+ */
+export function speedBlock(rows: RunRow[]): string[] {
+  const summaries = summarizeSpeed(
+    rows.map((r) => ({ condition: r.condition, speed: speedForRun(r.run_dir) })),
+  );
+  const out: string[] = [];
+  out.push(
+    "> **Secondary, and noisy.** Every run in every set was measured at **concurrency 3** on a single " +
+      "machine, so session wall-clock includes contention this harness never controlled for and cannot " +
+      "quantify. Tokens and cost are properties of the measurement; durations are not. Read the session " +
+      "rows as an order of magnitude only.\n",
+  );
+  out.push("Session timings, median (IQR) in ms:\n");
+  out.push("| condition | runs | wall `duration_ms` | API `duration_api_ms` | `ttft_ms` | pre-request `time_to_request_ms` |");
+  out.push("|---|---|---|---|---|---|");
+  for (const s of summaries) {
+    out.push(
+      `| \`${s.condition}\` | ${s.runs} | ${spreadCell(s.duration_ms)} | ${spreadCell(s.duration_api_ms)} | ` +
+        `${spreadCell(s.ttft_ms)} | ${spreadCell(s.time_to_request_ms)} |`,
+    );
+  }
+  out.push("");
+  out.push(
+    "`time_to_request_ms` covers everything before the first API request, which is where **MCP server " +
+      "startup lands**: it is the only column in which an arm that must spawn and handshake with a server " +
+      "can differ from one that does not. The transcript itself cannot show that cost — Claude Code " +
+      "connects its configured servers *before* writing the first transcript entry, so the delay between " +
+      "the first entry and the one advertising the server's tools collapses to a few milliseconds of " +
+      "bookkeeping rather than measuring the spawn.\n",
+  );
+  const announced = summaries.filter((s) => s.mcp_announce_ms.median !== null);
+  if (announced.length > 0) {
+    out.push(
+      `For the record, that bookkeeping delay was ${announced
+        .map((s) => `\`${s.condition}\` ${fmt(s.mcp_announce_ms.median)} ms`)
+        .join(", ")} — reported so it is not mistaken for the startup cost.\n`,
+    );
+  }
+
+  const groups = TOOL_GROUPS.filter((g) => summaries.some((s) => s.tools[g]));
+  if (groups.length > 0) {
+    out.push("Per-tool-call latency, median (IQR) in ms, pooled over calls:\n");
+    out.push(`| condition | ${groups.map((g) => `\`${g}\``).join(" | ")} |`);
+    out.push(`|---|${groups.map(() => "---").join("|")}|`);
+    for (const s of summaries) {
+      out.push(`| \`${s.condition}\` | ${groups.map((g) => spreadCell(s.tools[g])).join(" | ")} |`);
+    }
+    out.push("");
+    out.push(
+      "Each cell is timed from the transcript entry carrying the `tool_use` block to the entry carrying " +
+        "its matching `tool_result`, both written locally by the same process. Calls whose result never " +
+        "arrived — a run that hit its turn cap mid-call — are absent rather than counted as zero. `n` per " +
+        "cell is the number of calls, not the number of runs, so an arm that called a tool once " +
+        "contributes one observation.\n",
+    );
+  }
+
+  out.push(
+    "**Index build cost, for scale.** graphify v1: **4.6 s** total (`update` 3.4 s + `cluster-only` " +
+      "1.2 s, AST-only, no API calls). graphify v2: a comparable AST pass plus roughly **35 min** of " +
+      "LLM-backed document extraction. MemPalace v1: **49 s**; v2: **97 s** (embedding + indexing, " +
+      "`--no-llm`, no API calls). All are one-off costs paid before any run, and none is included in any " +
+      "figure above — they are listed only so a per-query latency can be read against what producing the " +
+      "index cost in the first place.\n",
+  );
+  return out;
+}
+
 export interface ReportOptions {
   /**
    * Corpus generation the runs were measured against, printed in §1. It is a
@@ -433,6 +518,8 @@ export interface ReportOptions {
   corpusLabel?: string;
   /** Per-(arm × category) accuracy and mean grader score. Off by default. */
   qualityByCategory?: boolean;
+  /** Wall-clock and per-tool-call latency. Off by default, and secondary. */
+  speed?: boolean;
   /** A second analysis to line this one up against, and the name to print for it. */
   vs?: { label: string; ownLabel: string; analysis: Analysis } | null;
 }
@@ -696,6 +783,11 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
     );
   }
 
+  if (opts.speed) {
+    out.push(sec("Speed"));
+    out.push(...speedBlock(rows));
+  }
+
   out.push(sec("Counter-productive cases and subagent use"));
   const cp = a.counter_productive;
   for (const s of a.by_condition) {
@@ -815,7 +907,12 @@ async function main(): Promise<void> {
   }
   fs.writeFileSync(
     mdPath,
-    buildReport(analysis, rows, { corpusLabel, qualityByCategory: argv.includes("--quality-by-category"), vs }),
+    buildReport(analysis, rows, {
+      corpusLabel,
+      qualityByCategory: argv.includes("--quality-by-category"),
+      speed: argv.includes("--speed"),
+      vs,
+    }),
   );
   console.log(`wrote ${csvPath} (${rows.length} rows) and ${mdPath}`);
 }
