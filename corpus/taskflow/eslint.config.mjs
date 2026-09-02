@@ -1,12 +1,12 @@
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { FlatCompat } from "@eslint/eslintrc";
+import nextCoreWebVitals from "eslint-config-next/core-web-vitals";
+import nextTypeScript from "eslint-config-next/typescript";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const compat = new FlatCompat({ baseDirectory: __dirname });
-
+/**
+ * Flat config for ESLint 10 + eslint-config-next 16. Both entry points already
+ * export flat config arrays, so no `FlatCompat` shim is needed.
+ *
+ * Note: `next lint` was removed in Next 16 — run `pnpm lint` (`eslint .`).
+ */
 const config = [
   {
     ignores: [
@@ -17,13 +17,17 @@ const config = [
       "next-env.d.ts",
     ],
   },
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
+  ...nextCoreWebVitals,
+  ...nextTypeScript,
   {
+    // eslint-plugin-react's runtime version sniffing uses an API ESLint 10
+    // removed, so pin the version explicitly instead of letting it detect.
+    settings: { react: { version: "19.2.8" } },
     rules: {
       "@typescript-eslint/no-unused-vars": [
         "error",
         {
-          argsIgnorePattern: "^_",
+          args: "none",
           varsIgnorePattern: "^_",
           caughtErrorsIgnorePattern: "^_",
         },

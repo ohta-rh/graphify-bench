@@ -41,3 +41,5 @@ export type OrganizationSettingsInput = z.infer<
 >;
 export type CreateOrganizationInput = z.infer<typeof createOrganizationSchema>;
 export type UpdateOrganizationInput = z.infer<typeof updateOrganizationSchema>;
+export type DeleteOrganizationInput = z.infer<typeof deleteOrganizationSchema>;
+export type TransferOwnershipInput = z.infer<typeof transferOwnershipSchema>;

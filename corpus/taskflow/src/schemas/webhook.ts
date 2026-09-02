@@ -42,4 +42,5 @@ export const inboundWebhookSchema = z.object({
 
 export type CreateWebhookInput = z.infer<typeof createWebhookSchema>;
 export type UpdateWebhookInput = z.infer<typeof updateWebhookSchema>;
+export type DeleteWebhookInput = z.infer<typeof deleteWebhookSchema>;
 export type InboundWebhookInput = z.infer<typeof inboundWebhookSchema>;
