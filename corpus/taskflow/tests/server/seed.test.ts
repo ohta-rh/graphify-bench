@@ -8,7 +8,6 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/id", () => import("./_support/doubles/id"));
 vi.mock("@/lib/logger", async () => (await import("./_support/doubles/misc")).loggerModule);
 
 import { seedDatabase } from "@/server/db/seed";

@@ -8,9 +8,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/id", () => import("./_support/doubles/id"));
 vi.mock("@/lib/logger", async () => (await import("./_support/doubles/misc")).loggerModule);
-vi.mock("@/lib/mentions", async () => (await import("./_support/doubles/misc")).mentionsModule);
 
 import { subscribe } from "@/lib/event-bus";
 import * as commentService from "@/server/services/comment-service";
