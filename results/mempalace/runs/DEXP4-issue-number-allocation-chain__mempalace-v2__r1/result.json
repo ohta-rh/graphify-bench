@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 88229,
+  "stop_reason": "end_turn",
+  "session_id": "4da63b44-4f9e-4cdf-8432-f2807fbc90ad",
+  "total_cost_usd": 0.45510399999999995,
+  "usage": {
+    "input_tokens": 30,
+    "cache_creation_input_tokens": 53495,
+    "cache_read_input_tokens": 843525,
+    "output_tokens": 7128,
+    "output_tokens_details": {
+      "thinking_tokens": 2950
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 53495,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1736,
+        "cache_read_input_tokens": 70105,
+        "cache_creation_input_tokens": 2149,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2149
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1009,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010789999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 30,
+      "outputTokens": 7128,
+      "cacheReadInputTokens": 843525,
+      "cacheCreationInputTokens": 53495,
+      "webSearchRequests": 0,
+      "costUSD": 0.454025,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2950,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 21,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How an issue gets its number\n\n**The requirement that defines the scope.** `REQ-061` in `docs/requirements/issues.md` (\"Issue numbers are allocated per project and never reused\") is explicit that the counter is scoped to the *project*, not the organization: `nextIssueNumber(orgId, projectId)` returns \"a monotonically increasing integer scoped to the project,\" and numbers are never recycled even after an issue is archived or moved away, \"because `ENG-142` having meant two different things at different points in the project's history would break every saved link, comment permalink and search result referencing it.\" The glossary (`docs/glossary.md`) and `docs/requirements/issues.md`'s context section restate the same thing: the number is \"unique only within its project.\"\n\n**The design element that documents the mechanism.** `DES-183` in `docs/design/repository-issue-and-comment.md` (\"Issue number allocation is a read-then-write race, mitigated but not eliminated\") describes `nextIssueNumber`/`insertIssue` in `src/server/repositories/issue-repository.ts` as computing `max(issues.number) + 1` scoped to `(orgId, projectId)`, deliberately including archived rows so the never-reused guarantee survives archiving. It also flags that the read (`SELECT max(...)`) and the write (`INSERT`) are two separate statements — not one atomic operation — so two concurrent creates against the same project could in principle race and collide; the doc notes this is only safe today because the app runs `better-sqlite3` synchronously in a single Node process, which is a property of the deployment, not something the function signature guarantees.\n\n**The database constraint that actually enforces it.** In `src/server/db/schema/issues.ts:39`, the `issues` table declares `uniqueIndex(\"issues_project_number_idx\").on(table.projectId, table.number)` — a unique index on `(project_id, number)`. That's the real backstop: even if the read-then-write race in `nextIssueNumber` ever let two concurrent inserts compute the same number, this index would reject the second insert rather than silently allowing a duplicate.\n\n**What the code does at creation time.** `IssueService.createIssue` in `src/server/services/issue-service.ts` runs `assertOrgScope`, loads and checks the project isn't archived, calls `assertCan(actor, \"issue:create\", ...)`, then checks the `issuesPerProject` quota via `countIssues` (deliberately *after* the permission check, so an unauthorized caller gets a permission error rather than a quota error, and *before* number allocation, so a rejected request never consumes a number). Only then does it call `issueRepo.nextIssueNumber(input.orgId, input.projectId)` (`issue-repository.ts:292`), which does `SELECT max(number) WHERE org_id = ? AND project_id = ?` and returns `(max ?? 0) + 1`, and immediately passes that number into `issueRepo.insertIssue(input, actor.userId, number)` (`issue-repository.ts:306`), which inserts the row with that explicit number.\n\n**What verifies it.** `tests/repositories/issue-repository.test.ts` exercises `nextIssueNumber`/`insertIssue` directly — e.g. the `insertIssue` test helper (lines 34-44) and the filter/pagination tests (lines 97-158) each call `nextIssueNumber` before every `insertIssue` and get sequentially increasing numbers back. `docs/test/traceability-req-to-test.md` marks REQ-061's coverage as \"direct\" via that file, though there's no single test titled specifically \"never reused\" or \"monotonic\" — the guarantee is exercised incidentally by every test that inserts more than one issue in a project, and DES-183 itself is candid that only sequential, non-concurrent allocation is actually covered, not the race it describes.\n\n**The documents do not agree on the constraint.** `docs/db/tables-issues.md`'s index table (around line 51) lists `issues_project_number_idx` with columns `org_id, number`, described as unique \"enforced per organization so a number is unique across the whole tenant.\" That is wrong on two counts: the index is actually declared on `(project_id, number)` in the schema, and every other document — REQ-061, DES-183, the glossary, `docs/design/service-issue.md`, and `docs/ui/screen-issue-detail.md` (which stresses that `findIssueByNumber` is called with *both* `org.id` and `project.id` specifically because \"the number is only unique within a project\") — agrees the scope is per-project, not per-organization. `tables-issues.md` even contradicts itself later in the same file, in its own \"Invariants\" section: \"Because `number` is only unique within `(project_id, number)`, moving `project_id` to a different project requires computing a fresh `number`...\" So the misdescription is confined to that one index-table row; the rest of the corpus, and the actual code, are consistent in treating the project as the uniqueness boundary.",
+  "ttft_ms": 2699,
+  "type": "result",
+  "duration_ms": 87586,
+  "uuid": "3c0d89f9-09b0-427a-8a0b-3a386752fd9a",
+  "ttft_stream_ms": 2065,
+  "time_to_request_ms": 14,
+  "queued_turn_count": 0
+}

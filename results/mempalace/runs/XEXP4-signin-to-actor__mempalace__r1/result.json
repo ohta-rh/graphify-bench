@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 90980,
+  "stop_reason": "end_turn",
+  "session_id": "6e9ff5e3-c04e-4859-bd92-fe4f22e8fc1b",
+  "total_cost_usd": 0.4960896,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 80271,
+    "cache_read_input_tokens": 433233,
+    "output_tokens": 8721,
+    "output_tokens_details": {
+      "thinking_tokens": 4880
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 80271,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4907,
+        "cache_read_input_tokens": 91551,
+        "cache_creation_input_tokens": 7479,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 7479
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1042,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001117,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 16,
+      "outputTokens": 8721,
+      "cacheReadInputTokens": 433233,
+      "cacheCreationInputTokens": 80271,
+      "webSearchRequests": 0,
+      "costUSD": 0.4949726,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 4880,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 15,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## From keystrokes to workspace: the full path\n\n**1. The client form validates optimistically, then hands off to the server.**\n`LoginForm` in `src/app/(auth)/login/login-form.tsx` is a client component driven by `useActionState`. On submit it runs `loginSchema` (from `src/schemas/auth.ts`) against the form data purely to show inline field errors without a round trip, then calls the server action `loginAction`. The schema check here is explicitly *not* the enforcement point — it's re-run server-side.\n\n**2. `loginAction` (`src/actions/auth/login.ts`) is the server-side entry point.** It re-parses the raw input with `loginSchema.safeParse` (the real enforcement), then calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")` from `src/lib/rate-limit.ts`. This runs before any tenant/session exists, so it's billed to a sentinel anonymous bucket rather than an org. It then calls `login(parsed.data)` in `src/server/services/auth-service.ts`.\n\n**3. `login()` checks the credentials.** It calls `consumeRateLimit` again (against its own `ANONYMOUS_ORG` sentinel) — so the rate limit is actually charged twice per attempt, once in the action and once in the service — before the password is even looked at, so a brute-force run is throttled regardless of whether a guess is correct. It then looks the user up via `userRepo.findUserByEmail` (`src/server/repositories/user-repository.ts`); a miss throws `\"Those credentials did not match\"`. It fetches the password hash through the narrow `userRepo.findPasswordHash(user.id)` accessor — the hash deliberately never rides on the `User` domain type — and checks it with `verifyPassword` from `src/lib/hash.ts` (scrypt-based). A bad password throws the exact same generic message as a missing user, so failure doesn't leak which case occurred. On success it calls `createSessionToken(user.id)` in `src/server/services/session-service.ts`.\n\n**4. What's created vs. what's stored vs. what's handed to the browser.** `createSessionToken` generates a 32-byte random value with `randomToken` (`src/lib/hash.ts`), computes a 30-day expiry, and calls `sessionRepo.createSession(userId, hashToken(token), expiresAt)` (`src/server/repositories/session-repository.ts`). Only the **hash** of the token is written to the `sessions` table — the raw token is never persisted, so a database dump can't be replayed as a login. That raw token is what flows back up through `login()` and `loginAction`.\n\nBack in `loginAction`, the fresh token is immediately passed to `resolveSession(token)` (`session-service.ts`) to fetch the corresponding `SessionPrincipal` for the response payload, then `setSessionCookie(token, principal.expiresAt)` in `src/lib/session.ts` writes the raw token into an `httpOnly`, `sameSite: lax` cookie named `taskflow_session` (`SESSION_COOKIE_NAME` in `src/schemas/session.ts`), `secure` in production. **The browser gets only the opaque token in a cookie it can't read from JS**; the `ActionResult` returned to `LoginForm` carries a `SessionPrincipal` (`userId`, `email`, `activeOrgId`, `expiresAt`) — never the token, never the password hash. `LoginForm`'s effect then does `router.push(props.next)` to land on a workspace route.\n\n**5. Re-establishing identity on later requests.** Every request first hits `src/proxy.ts` (Next.js 16's renamed `middleware.ts` — the exported function itself is renamed `proxy`, and Next 16 silently no-ops the old names). This is a cheap, DB-less gate: `isPublicPath` short-circuits marketing/auth routes, and for everything else it just checks whether `request.cookies.get(SESSION_COOKIE_NAME)` exists, redirecting to `/login` if not. It cannot reach the database, so presence of a cookie is all it verifies.\n\n**6. Deciding \"are they still signed in\" for real** happens in `src/app/(dashboard)/layout.tsx`, the one place that owns the signed-in/signed-out decision for the whole dashboard tree. It calls `getSessionPrincipal()` in `src/lib/session.ts`, which reads the cookie via `getSessionToken()` (Next 16's `cookies()` is async), calls `resolveSession(token)` (`session-service.ts` → `sessionRepo.findSessionByTokenHash(hashToken(token))`), and additionally checks `parseIso(principal.expiresAt).getTime() > Date.now()` — so an expired-but-not-yet-swept session row is still treated as signed out. `null` here throws/redirects to `/login`.\n\n**7. Turning the bare identity into something workspace pages can authorize against.** `SessionPrincipal` only knows *who* is logged in (`userId`, `email`), not what they can do in a given organization. The tenant shell `src/app/(dashboard)/[orgSlug]/layout.tsx` is the seam: after confirming the principal, it resolves the org from the URL slug via `resolveOrgBySlug`, then calls `resolveActorForOrg(principal, orgSlug)` (`session-service.ts`). That function looks up the org, finds the membership row (`memberRepo.findMember`), and — only if it's `active` — builds an `Actor { userId, orgId, role }`, running `assertOrgScope(actor, org.id)` as an invariant check and touching `memberRepo.touchLastSeen`. No membership resolves to `null`, and the layout maps that to `notFound()` (a 404, not a 401, so a non-member can't distinguish \"no such org\" from \"not your org\").\n\n**8. The workspace renders around that `Actor`.** With the `Actor` in hand, the layout builds a feature-flag snapshot (`snapshotFlags`/`buildFlagContext`), fetches org-scoped data (`listProjects`, `listNotifications`), and renders `DashboardShell` (`_components/dashboard-shell.tsx`), which renders `AppSidebar` (`src/components/domain/nav/app-sidebar.tsx`) with `org`, `actor`, `flags`, `projects`. `AppSidebar` never branches on `actor.role` directly; it calls `visibleNav(SIDEBAR_NAV, actor, flags)` (`src/config/nav.ts`), which filters the declarative nav tree through `can(actor, action, resource)` in `src/lib/permissions.ts` — the single authorization entry point for the app, whose decision order is a cross-tenant guard, a platform-staff bypass, a role-matrix lookup, then ownership escalations. Nav items whose gating permission the actor's role fails are simply absent from the array `AppSidebar` maps over — that's how the sidebar ends up tailored to the signed-in user's role.",
+  "ttft_ms": 2725,
+  "type": "result",
+  "duration_ms": 90336,
+  "uuid": "07f4e828-3237-44a6-8ef2-dc7cc5606273",
+  "ttft_stream_ms": 1324,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

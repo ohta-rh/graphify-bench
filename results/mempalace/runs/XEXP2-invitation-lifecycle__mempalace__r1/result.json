@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 105066,
+  "stop_reason": "end_turn",
+  "session_id": "3e53815c-e772-45a2-8999-8b20be1163cc",
+  "total_cost_usd": 0.6422136,
+  "usage": {
+    "input_tokens": 32,
+    "cache_creation_input_tokens": 83291,
+    "cache_read_input_tokens": 1113168,
+    "output_tokens": 8526,
+    "output_tokens_details": {
+      "thinking_tokens": 3568
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 83291,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2320,
+        "cache_read_input_tokens": 99874,
+        "cache_creation_input_tokens": 2176,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2176
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 32,
+      "outputTokens": 8526,
+      "cacheReadInputTokens": 1113168,
+      "cacheCreationInputTokens": 83291,
+      "webSearchRequests": 0,
+      "costUSD": 0.6411216000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3568,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 23,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the full picture. Here's the lifecycle, file by file.\n\n## 1. Before the invitation is created\n\nThe admin submits the invite form (`src/components/domain/member/invite-member-form.tsx`), which posts to the server action **`inviteMemberAction`** in `src/actions/members/invite-member.ts`. That action:\n\n1. Parses input against `inviteMemberSchema` (`src/schemas/member.ts`) — validates `orgId`, `email`, and an `invitableRoleSchema`-constrained `role`.\n2. Calls `can(actor, \"member:invite\", {...})` from `src/lib/permissions.ts`. `ROLE_MATRIX[\"member:invite\"]` requires at least `admin`; `can()` first checks the cross-tenant guard (`actor.orgId === resource.orgId`) before consulting the matrix.\n3. Calls `consumeRateLimit(orgId, \"member:invite\")` (`src/lib/rate-limit.ts`) — a token bucket (`capacity: 20, refillPerMinute: 2`), scaled by plan.\n4. Reads `getOrganizationSummary` and compares `usage.seatsUsed + 1` against `getPlanLimits(plan).seats`, throwing `PlanLimitError` if the org is full.\n5. Only then calls **`inviteMember`** → **`inviteMembers`** in `src/server/services/invitation-service.ts`, which *re-does* the authorization/rate-limit/seat checks at the service layer (`assertOrgScope`, `assertCan`, `consumeRateLimit`, `wouldExceedLimit` against `countActiveMembers` + `countPendingInvitations` — pending invites hold a seat too, so a batch of invites can't oversell seats).\n\nInside `inviteMembers`, for each invite: a raw token is minted with `randomToken(32)` (`src/lib/hash.ts`, `crypto.randomBytes(32).toString(\"base64url\")`), and `invitationRepo.insertInvitation` is called with `hashToken(token)` (SHA-256 hex digest) — never the raw token.\n\n## 2. Stored vs. what travels in the link\n\n`insertInvitation` (`src/server/repositories/invitation-repository.ts`) writes a row into the `invitations` table (`src/server/db/schema/members.ts`): `email`, `role`, `invitedBy`, `tokenHash`, `expiresAt` (`DEFAULT_EXPIRY_DAYS = 14`), `acceptedAt: null`, `revokedAt: null`. **Only the SHA-256 hash is persisted** — the raw token exists only in the local variable inside `inviteMembers` and is never written to the database, logged, or returned: `toInvitation()` (`src/server/repositories/_mappers.ts:158`) maps `token: row.tokenHash` onto the returned `Invitation` object, so even the value handed back to the caller is the hash, not the secret.\n\nThe raw token is what's meant to travel to the invitee, embedded as `acceptUrl` in the `InviteEmail` react-email template (`src/emails/invite-email.tsx`, rendered by `src/emails/render.ts`). Notably, in this codebase I could not find any call site that actually renders and sends that email for an invite — `sendEmail`/`renderTemplate(\"invite\", ...)` is exercised only in `tests/emails/render.test.ts`; `inviteMembers` only does `emit(\"member.invited\", {...})`, and the only subscriber to that event is `activity-service.ts` (audit log), not the notification/email fan-out. So the wiring from \"invite created\" to \"email actually dispatched\" is not present in the current source — the mailer step is effectively a gap in this snapshot.\n\nRegardless of how it's delivered, the link's contract is: URL path `/invite/[token]` carries the **raw** token as a route param, and everything downstream is keyed off `hashToken(token)`.\n\n## 3. What's checked when the link is used\n\n`src/app/(auth)/invite/[token]/page.tsx` first runs `invitationTokenSchema.safeParse(token)` (shape/length only — the page explicitly never resolves the token itself, \"only `InvitationService` may look one up, and only when it is being consumed\"). If there's no session, it redirects to `/login?next=/invite/[token]`; otherwise it renders `InviteAcceptForm` (`invite-accept-form.tsx`), a client component that on submit calls the server action **`acceptInvitationAction`** (`src/actions/members/accept-invitation.ts`).\n\nThat action requires `getSessionPrincipal()` to be non-null, then calls **`acceptInvitation(userId, { token })`** in `invitation-service.ts`, which runs unauthenticated with respect to org scope (the comment notes: \"the token is the credential, so there is no `Actor` to scope against and every check has to come off the stored row\"):\n\n1. `invitationRepo.findInvitationByTokenHash(hashToken(token))` — the one repository read not filtered by `orgId`.\n2. Rejects if `revokedAt !== null`, `acceptedAt !== null`, or `expiresAt <= now`.\n3. If the user is already a member (`memberRepo.findMember`), returns the existing membership idempotently.\n4. Otherwise `memberRepo.insertMember(orgId, userId, invitation.role, invitation.invitedBy)` creates the row, `invitationRepo.markInvitationAccepted` stamps the invitation, and `emit(\"member.joined\", {...})` fires.\n\nBack in the action, `assertSeatAvailable` re-resolves an `Actor` (only possible now that the membership exists) and re-checks `seatsUsed` against `getPlanLimits`, since the org could have filled up during the days between invite and accept.\n\n## 4. What the rest of the system learns once membership exists\n\n`member.joined` (defined in `src/types/event.ts`) has two subscribers registered at module load:\n- **`activity-service.ts`** — records `\"member.invited\"` at invite time and would also record membership changes into the append-only activity table for the org's audit trail.\n- **`notification-service.ts`** (`registerFanOut`, `src/server/services/notification-service.ts:231`) — on `member.joined`, calls `notify(orgId, \"member_joined\", [org.ownerId], {...})`, writing an in-app/email notification row (channel resolved via `resolveChannels()` against the owner's `NotificationPreference`) telling the org owner someone joined.\n\nBoth handlers are isolated by the event bus (`src/lib/event-bus.ts`): a throwing handler is reported to error sinks but never fails the emit or the sibling handler. The client-side effect in `InviteAcceptForm` then redirects the browser into `/${orgSlug}` (or `/orgs` if no slug was in the query string) once `acceptInvitationAction` returns `{ ok: true }`.",
+  "ttft_ms": 1564,
+  "type": "result",
+  "duration_ms": 104723,
+  "uuid": "7c8bcf98-e560-4d7f-9247-dbdcd009d1c6",
+  "ttft_stream_ms": 953,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}

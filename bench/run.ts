@@ -296,7 +296,15 @@ export function provisionMcp(
  * never called did not connect, which is the case the sanity check must catch.
  */
 export function mcpToolsFromTranscript(jsonl: string, prefix: string): { count: number; connected: boolean } {
-  const names = new Set<string>();
+  // Announced and called are tracked apart because they answer different
+  // questions. `count` is what the SERVER offered, so it must come from the
+  // announcement: a model can call a name the server never had — Haiku
+  // misspelled `mempalace_search` as `memplacem_search` in one run — and
+  // counting the union would report a 46-tool server that does not exist.
+  // `connected` is the looser test, since either signal proves the server came
+  // up, and a run whose tools were advertised but never used still connected.
+  const announced = new Set<string>();
+  const called = new Set<string>();
   for (const line of jsonl.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || !trimmed.includes(prefix)) continue;
@@ -308,18 +316,21 @@ export function mcpToolsFromTranscript(jsonl: string, prefix: string): { count: 
     }
     const attachment = row.attachment as { addedNames?: unknown } | undefined;
     for (const n of Array.isArray(attachment?.addedNames) ? attachment.addedNames : []) {
-      if (typeof n === "string" && n.startsWith(prefix)) names.add(n);
+      if (typeof n === "string" && n.startsWith(prefix)) announced.add(n);
     }
     const content = (row.message as { content?: unknown } | undefined)?.content;
     if (!Array.isArray(content)) continue;
     for (const rawBlock of content) {
       const block = rawBlock as { type?: unknown; name?: unknown };
       if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith(prefix)) {
-        names.add(block.name);
+        called.add(block.name);
       }
     }
   }
-  return { count: names.size, connected: names.size > 0 };
+  return {
+    count: announced.size > 0 ? announced.size : called.size,
+    connected: announced.size > 0 || called.size > 0,
+  };
 }
 
 function writeJson(file: string, value: unknown): void {

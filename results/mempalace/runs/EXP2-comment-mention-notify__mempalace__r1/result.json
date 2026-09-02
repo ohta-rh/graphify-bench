@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 129856,
+  "stop_reason": "end_turn",
+  "session_id": "09a9f366-b20b-45cc-8f21-0059bca90448",
+  "total_cost_usd": 0.7127546000000001,
+  "usage": {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 110935,
+    "cache_read_input_tokens": 802823,
+    "output_tokens": 10731,
+    "output_tokens_details": {
+      "thinking_tokens": 6395
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 110935,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4278,
+        "cache_read_input_tokens": 122775,
+        "cache_creation_input_tokens": 6919,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 6919
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 24,
+      "outputTokens": 10731,
+      "cacheReadInputTokens": 802823,
+      "cacheCreationInputTokens": 110935,
+      "webSearchRequests": 0,
+      "costUSD": 0.7116626,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 6395,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 22,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How `@someone` in a comment becomes a notification\n\n**1. Typing — cosmetic only, not authoritative**\n\nWhile the author types, `src/components/domain/comment/mention-textarea.tsx` (`MentionTextarea`) uses `src/components/domain/comment/mention-query.ts` (`findMentionQuery`, `matchMembers`, `applyMention`) to drive the `@`-autocomplete dropdown. On every keystroke it also calls `resolveMentions` (see below) against the org's already-loaded member list purely to report an optimistic `mentionedUserIds` list up to the parent form. Nothing here is trusted by the server — it exists so the UI can show \"you're about to mention Bob\" before the comment is even submitted.\n\n**2. Handle → user id resolution logic**\n\n`src/lib/mentions.ts` owns the actual parsing rules:\n- `extractMentions(body)` runs `MENTION_PATTERN` (`/(^|[\\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi`) over the body with code spans/fences stripped (`withoutCode`), returning distinct lowercased handles in first-appearance order. This is what stops `alice@example.com` from being read as a mention.\n- `handleOf(member)` defines a handle as the lowercased local-part of a member's email.\n- `resolveMentions(body, members)` builds a `handle → UserId` map from the member list and maps each extracted handle through it; unknown handles (typos) are silently dropped rather than erroring.\n\n**3. Server-side truth: `comment-service.ts` → `createComment`**\n\nWhen the comment is actually posted, `src/server/services/comment-service.ts`'s `createComment` runs authorization (`assertOrgScope`, `assertCan(actor, \"comment:create\", ...)`, `assertNotArchived`) and rate limiting (`consumeRateLimit`), then calls its own private `resolveMentionedUsers(orgId, body, clientProvided)`. That refetches up to 100 org members via `memberRepo.listMembers` and reruns `resolveMentions` server-side — the client's optimistic list is only unioned in after being filtered to ids that are still known members, and the server's parse wins on disagreement. The result is persisted via `commentRepo.insertComment`, and then `createComment` calls `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` through `src/lib/event-bus.ts`'s typed pub/sub `emit`.\n\n**4. Fan-out picks it up**\n\n`src/server/services/notification-service.ts` subscribes to `\"comment.created\"` inside `registerFanOut()`, which runs once at module load (importing the module is what wires it — noted in the file's own comment). That import chain is forced at process start by `src/server/services/event-registry.ts`'s `registerEventHandlers()`, called once from `src/instrumentation.ts`. The `\"comment.created\"` handler first notifies the issue's author/assignee with kind `\"comment_created\"`, then, if `mentionedUserIds.length > 0`, calls `notify(orgId, \"comment_mention\", mentionedUserIds, { title: \"You were mentioned\", ... })`.\n\n**5. `notify()` decides channels and writes the row**\n\nInside `notify()`: recipients are de-duped via a `Set`, the actor is skipped (no self-notification), and for each remaining recipient it loads that user's `NotificationPreference` via `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` and calls `resolveChannels(preference, flags)`:\n- No preference row at all (never touched settings) → `DEFAULT_CHANNELS = [\"in_app\", \"email\"]`.\n- Otherwise: `in_app` is included iff `preference.inApp`; `email` is included iff `preference.email` is true **and** either `!preference.digestOnly` or the org's `digest_email` plan flag is enabled (`isEnabled(\"digest_email\", flags)`).\n- If both come out false, `channels.length === 0` and that recipient is skipped entirely — no row is written for someone who's muted everything.\n\nThe surviving rows are bulk-inserted by `notificationRepo.insertNotifications` (`src/server/repositories/notification-repository.ts`), which is the row that actually lands \"in the inbox\" — `listNotifications`/`countUnread` in that same repository (gated by `assertCan(actor, \"notification:read\", ...)` in `listNotifications`/`markRead`) is what the bell/inbox UI reads.\n\n**6. What \"email\" on that row actually leads to**\n\nThis is the subtle part worth calling out: `notify()` never itself calls `sendEmail`. The `\"email\"` value is just a tag on the row. The only code path that turns a notification into an actual outbound email is the scheduled `runDigestEmailJob` in `src/server/jobs/digest-email-job.ts` (driven by `scheduler.ts`'s interval tick, gated by `shouldRunForOrg`/the org's `digestHourUtc`), which only processes recipients from `preferenceRepo.listDigestSubscribers` (i.e., people who set `digestOnly: true` on at least one kind). It bundles their still-unread notifications (`digest-service.ts`'s `buildDigest`/`notificationRepo.listUnreadSince`) into one combined `\"digest\"`-template email and marks them read afterward. A `\"mention\"` `EmailTemplate` and a dedicated `MentionEmail` component (`src/emails/mention-email.tsx`, wired into `src/emails/render.ts`'s `elementFor`/`subjectFor`) exist and are unit-tested (`tests/emails/render.test.ts`), but no production call site invokes `renderEmail(\"mention\", ...)`/`sendEmail` for an individual mention — so, as wired today, a mention reliably produces an in-app row, and reliably reaches email only if the recipient is a digest subscriber (via the generic digest email); `sendEmail` itself is a stub that only logs (`\"Taskflow has no outbound mail transport by design\"`), consistent with this being an offline corpus.",
+  "ttft_ms": 1443,
+  "type": "result",
+  "duration_ms": 129155,
+  "uuid": "51ef7820-5007-4333-812b-a3c43be38e49",
+  "ttft_stream_ms": 957,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

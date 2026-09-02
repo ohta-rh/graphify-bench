@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 52759,
+  "stop_reason": "end_turn",
+  "session_id": "b414816b-6a4e-4768-a225-c4d78b3b65e4",
+  "total_cost_usd": 0.1469112,
+  "usage": {
+    "input_tokens": 108,
+    "cache_creation_input_tokens": 41494,
+    "cache_read_input_tokens": 455072,
+    "output_tokens": 3442,
+    "output_tokens_details": {
+      "thinking_tokens": 854
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 41494,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1692,
+        "cache_read_input_tokens": 53618,
+        "cache_creation_input_tokens": 1658,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1658
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001098,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 108,
+      "outputTokens": 3442,
+      "cacheReadInputTokens": 455072,
+      "cacheCreationInputTokens": 41494,
+      "webSearchRequests": 0,
+      "costUSD": 0.1458132,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 854,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "When a customer creates an issue in the browser, here's what happens to trigger and deliver their webhook:\n\n## The Trigger: Issue Creation Emits an Event\n\nThe creation flow starts in the browser sending a request that reaches `src/server/services/issue-service.ts:createIssue()`. After validating permissions and quota, the service calls `issueRepo.insertIssue()` to persist the issue to the database. Then it immediately calls `emit(\"issue.created\", {...})` at line 71, publishing the event to the in-process event bus (`src/lib/event-bus.ts`).\n\n## The Event Bus Fans Out\n\nThe `emit()` function in `src/lib/event-bus.ts` is synchronous and awaits all subscribers. It calls every registered handler for the \"issue.created\" event in parallel using `Promise.allSettled()`, ensuring that if one handler fails, the others still run. The handlers are isolated: errors in one subscriber never propagate to the event emitter or sibling subscribers.\n\n## Webhook Listeners Queue Deliveries\n\nOne of those subscribers is `registerWebhookListeners()` from `src/server/services/webhook-service.ts` (line 101), which was registered at application startup. The handler for \"issue.created\" calls the internal function `enqueueForOrg()` (line 110–112), passing the org ID, event type string, and the full payload serialized as JSON.\n\n`enqueueForOrg()` (lines 141–156) is where the app decides which endpoints should hear about the event. It fetches all webhook endpoints for the organization from `webhookRepo.listEndpoints()`, then iterates through them:\n- Skips any endpoint where `enabled` is false\n- Parses the `eventTypes` JSON array stored on that endpoint\n- Checks if the endpoint subscribed to \"issue.created\"\n- Calls `webhookRepo.enqueueDelivery()` once per matching endpoint\n\n## Delivery Rows are Persisted\n\nEach call to `enqueueDelivery()` (lines 107–131 in webhook-repository.ts) inserts a single row into the `webhookDeliveries` table with status \"pending\", attempt count 0, and the payload as a string. The row includes the endpoint ID, so the delivery job can later find and validate the endpoint. This happens synchronously within the `emit()` await, but the HTTP send is not performed yet—the mutation that created the issue has already returned to the browser by now.\n\n## A Cron Job Drains the Queue\n\nPeriodically (on a cron schedule), a request arrives at `src/app/api/cron/webhook-delivery/route.ts` with a secret header. This route calls `runWebhookDeliveryJob()` from `src/server/jobs/webhook-delivery-job.ts`.\n\nThe job (lines 32–87) follows a reliable delivery pattern:\n1. Claims a batch of 25 pending deliveries using `claimPendingDeliveries()`, which bumps the `attempts` counter on each row atomically so a crashed worker cannot retry infinitely\n2. For each claimed delivery, it validates the delivery is still viable:\n   - The org's plan includes webhooks (checked via `getPlanLimits()`)\n   - The attempt count has not exceeded `MAX_ATTEMPTS` (6)\n   - The endpoint still exists and is enabled\n3. If any validation fails, the delivery is marked failed permanently via `markDeliveryFailed()`\n\n## The Signature is Computed and Sent\n\nFor deliveries that pass validation, the job calls `signPayload(endpoint.secret, delivery.payload)` (from webhook-service.ts, line 92). This computes an HMAC-SHA256 signature over the exact JSON bytes using the endpoint's secret. The comment at lines 87–91 emphasizes this is critical: \"the receiving end recomputes this from the same secret — it is the only thing proving the delivery came from Taskflow, so the payload string must be signed byte-for-byte as sent.\"\n\nThe job then logs the delivery attempt with the delivery ID, endpoint URL, event type, the first 16 hex characters of the signature, and the backoff delay (`backoffMs()`). In the full application (not the offline test corpus), this log message would typically precede an actual HTTP POST to the endpoint URL with the payload and signature in the headers.\n\n## Retries Use Exponential Backoff\n\nIf a delivery fails (e.g., the endpoint is down or times out), the row remains in the delivery table. On the next cron run, `claimPendingDeliveries()` will select it again, increment `attempts` again, and attempt redelivery. The backoff increases exponentially: attempt 1 retries immediately (0ms), attempt 2 waits 1 second, attempt 3 waits 2 seconds, attempt 4 waits 4 seconds, and so on, capped at 5 minutes. After 6 attempts, the delivery is marked permanently failed with the last error message.\n\n## How the Receiver Verifies Authenticity\n\nThe customer's endpoint receives the JSON payload plus an `X-Taskflow-Signature` header (or similar) containing the hex-encoded HMAC-SHA256. To verify the message really came from Taskflow, the receiver:\n1. Retrieves its stored secret (which Taskflow generated when the endpoint was registered and showed only once to the customer)\n2. Recomputes `HMAC-SHA256(secret, request_body)` in hex\n3. Compares it to the header; if they match, the message is authentic and has not been tampered with\n\nThis design ensures that even if an endpoint URL is compromised, an attacker cannot forge messages without the secret.",
+  "ttft_ms": 2789,
+  "type": "result",
+  "duration_ms": 52155,
+  "uuid": "30c59c07-adee-40d1-8665-b7c550a5510a",
+  "ttft_stream_ms": 841,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}

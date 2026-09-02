@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 88105,
+  "stop_reason": "end_turn",
+  "session_id": "878efa3d-c292-4c8b-aaa2-a96dd5e679e4",
+  "total_cost_usd": 0.23272539999999997,
+  "usage": {
+    "input_tokens": 164,
+    "cache_creation_input_tokens": 61653,
+    "cache_read_input_tokens": 797484,
+    "output_tokens": 5684,
+    "output_tokens_details": {
+      "thinking_tokens": 2472
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 61653,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 1906,
+        "cache_read_input_tokens": 71638,
+        "cache_creation_input_tokens": 3797,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3797
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1027,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010869999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 164,
+      "outputTokens": 5684,
+      "cacheReadInputTokens": 797484,
+      "cacheCreationInputTokens": 61653,
+      "webSearchRequests": 0,
+      "costUSD": 0.23163839999999997,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 2472,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 18,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Based on the codebase, here's what happens when an organization owner downgrades from a larger plan to a smaller one:\n\n## Who Can Make the Change\n\nOnly organization **owners** can change plans. This is enforced through the `can()` function in `src/lib/permissions.ts:ROLE_MATRIX`, which restricts the `\"org:manage_billing\"` action to the \"owner\" role. The action `changePlanAction` in `src/actions/billing/change-plan.ts:line 31` checks this permission before proceeding.\n\n## What Is Compared Before Acceptance\n\nThe system prevents downgrades that would breach usage quotas. In `src/actions/billing/change-plan.ts:lines 49-67`, the `assertPlanFitsCurrentUsage()` function:\n- Retrieves the target plan's limits via `getPlanLimits(input.plan)` from `src/config/plan-limits.ts`\n- Retrieves current usage via `getUsage(actor, input.orgId)` from `src/server/services/usage-service.ts`, which returns `seatsUsed`, `projectsUsed`, and `storageMbUsed`\n- For each of these three resources, calls `wouldExceedLimit(input.plan, resource, used, 0)` with a delta of zero—essentially asking \"does what's already in use still fit?\"\n- Throws `PlanLimitError` if any resource exceeds the target plan's limits\n\nFor example, an org on \"growth\" (which allows 40 seats) with 37 people cannot downgrade to \"free\" (1 seat limit) or \"starter\" (5 seats).\n\n## Where the Plan Is Stored and Which Is Authoritative\n\nThe **subscription table is the authority**. In `src/server/services/billing-service.ts:lines 207-221`, the `planFor()` function:\n- First checks the `subscriptions` table via `subscriptionRepo.findSubscription(orgId)`\n- Falls back to `organizations.plan` only if no subscription row exists\n\nThe `organizations.plan` column is explicitly called a \"denormalised display convenience\" in the comment at line 207. It is never updated after subscription creation—quotas always read from the subscription row.\n\n## How the Plan Change Is Actually Recorded\n\nThe change happens in `src/server/repositories/subscription-repository.ts:lines 61-76`, in `updateSubscriptionPlan()`:\n- Updates the `subscriptions` table, setting `plan`, `interval`, and `status` to \"active\" (ending any trial)\n- Sets the `updatedAt` timestamp\n- Returns the updated subscription\n\nThen, in `src/server/services/billing-service.ts:lines 150-154`, an event is emitted:\n```typescript\nawait emit(\"billing.plan_changed\", {\n  ...actorEnvelope(actor),\n  from: currentPlan,\n  to: input.plan,\n});\n```\n\nFinally, in `src/actions/billing/change-plan.ts:line 38`, the cache is invalidated:\n```typescript\nrevalidateTagged([orgTag(input.orgId)], CACHE_PROFILES.hours);\n```\n\nThis ensures the next read of the organization's data sees the new plan.\n\n## What Happens as a Consequence\n\n**Activity logging**: The `ActivityService` in `src/server/services/activity-service.ts` subscribes to `\"billing.plan_changed\"` and records it in the audit log with the summary `\"Plan ${payload.from} → ${payload.to}\"`.\n\n**Webhooks**: The `WebhookService` in `src/server/services/webhook-service.ts` subscribes to the same event and enqueues it for delivery to any registered webhook endpoints.\n\n## Which Product Behavior Changes\n\nThe plan change immediately affects **plan-gated feature flags**. The system evaluates flags through `isEnabled()` in `src/lib/feature-flags.ts:lines 21-44`, which checks the organization's current plan. Flags defined in `src/config/feature-flags.ts` with strategy `{ kind: \"plan\", minPlan: \"X\" }` become enabled or disabled based on the new plan:\n\n- **\"starter\" plan enables**: kanban_board, csv_export\n- **\"growth\" plan enables** (in addition): activity_feed, webhooks, digest_email\n- **\"enterprise\" plan enables** (in addition): public_projects, advanced_search\n\nWhen the organization is loaded for a request, `buildFlagContext()` in `src/server/services/feature-flag-service.ts:lines 22-33` builds a context with `plan: org.plan`, and `snapshotFlags()` evaluates every flag against that plan. The dashboard layout in `src/app/(dashboard)/[orgSlug]/layout.tsx` serializes this snapshot into the client via `FeatureFlagProvider`, so UI components using `useFeatureFlag()` immediately see the new availability without a round trip.\n\nNavigation that filters on feature flags (e.g., the settings sidebar in `src/config/nav.ts`) recomputes visibility in `visibleNav()`, so menu items gated on \"growth\" or \"enterprise\" disappear. Any attempt to use a feature behind a disabled flag throws `FeatureDisabledError` from the client-side or server-side guards, preventing access.\n\nThe plan also affects storage and quota checks: any later call to `checkLimit()` or `assertWithinLimit()` in the billing service reads the new plan, so the org's available \"room\" under each quota dimension is recalculated.",
+  "ttft_ms": 2462,
+  "type": "result",
+  "duration_ms": 86854,
+  "uuid": "aa7e73fa-a170-49c9-a56a-a6fc32819626",
+  "ttft_stream_ms": 1095,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

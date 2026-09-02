@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 63888,
+  "stop_reason": "end_turn",
+  "session_id": "39655b1b-21e7-4cfc-98d9-30ab0a41912c",
+  "total_cost_usd": 0.1915607,
+  "usage": {
+    "input_tokens": 140,
+    "cache_creation_input_tokens": 52527,
+    "cache_read_input_tokens": 647887,
+    "output_tokens": 4094,
+    "output_tokens_details": {
+      "thinking_tokens": 1537
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 52527,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 1701,
+        "cache_read_input_tokens": 63623,
+        "cache_creation_input_tokens": 2686,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2686
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001108,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 140,
+      "outputTokens": 4094,
+      "cacheReadInputTokens": 647887,
+      "cacheCreationInputTokens": 52527,
+      "webSearchRequests": 0,
+      "costUSD": 0.1904527,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1537,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 15,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Based on my exploration of the codebase, here's the complete path for how an overdue issue gets announced once:\n\n## What starts the check\n\nA cron endpoint at `src/app/api/cron/overdue/route.ts` receives periodic POST requests with a valid cron secret. It calls `runOverdueIssueJob()` from `src/server/jobs/overdue-issue-job.ts`.\n\n## How the set is narrowed down\n\n`runOverdueIssueJob()` processes organizations in batches of 50 (ORG_BATCH constant). For each organization, it calls `issueRepo.listOverdueIssues(orgId, stamp)`, which queries the database for a specific, filtered set:\n- Live (not archived) issues only\n- With a non-null `dueAt` field\n- Where `dueAt < now` (comparing timestamps)\n- Excluding closed issues — only backlog, todo, in_progress, and in_review statuses qualify\n\nThis database query is the primary filter. The repository function in `src/server/repositories/issue-repository.ts` returns only genuinely overdue, open issues.\n\n## What the job owns and doesn't own\n\nThe job in `src/server/jobs/overdue-issue-job.ts` is deliberately minimal:\n- **Owns**: Finding overdue issues and emitting `issue.overdue` events\n- **Owns**: Preventing re-emission within a single process lifetime via the `reported` Set (line 28)\n- **Does not own**: Notification logic, email sending, or user preferences — it purely announces the fact\n\nEach time it finds an issue that hasn't yet been reported in this process's lifetime, it adds it to the `reported` Set before emitting. If the job runs again in the same process and finds the same still-open, still-overdue issue, the `if (reported.has(issue.id)) continue;` check (line 55) skips it.\n\n## What prevents repeated announcements\n\nThe deduplication works in layers:\n\n1. **Within a process run**: The `reported` Set in memory stops the same issue being emitted twice.\n\n2. **Across runs**: The notification service subscribes to `issue.overdue` at module load time (in `src/server/services/notification-service.ts`, line 193). When the event fires, the subscriber calls `notify()`, which creates a database row in the notifications table via `notificationRepo.insertNotifications()` (line 88 of notification-service.ts). \n\n3. **For digest delivery**: If the recipient prefers digest-only emails, the notification row is created with the \"email\" channel but sits in the database marked unread. The digest email job (`src/server/jobs/digest-email-job.ts`) runs once per day at the org's configured digest hour (line 36, checking `shouldRunForOrg()`). It calls `buildDigest()` from `src/server/services/digest-service.ts`, which queries only unread notifications from the past 24 hours (via `notificationRepo.listUnreadSince()`, which filters `WHERE read_at IS NULL`). After the digest is rendered and sent, the job marks every notification in that digest as read (lines 62–64 in digest-email-job.ts). The next time the digest job runs, those same notifications won't be included because the query requires `read_at IS NULL`.\n\n## How the alert reaches the person through their channels\n\nWhen `notify()` is called with the assignee's ID:\n1. It fetches that user's preference for `issue_overdue` (line 68 of notification-service.ts)\n2. Calls `resolveChannels()` (line 73), which checks:\n   - `preference.inApp` → adds \"in_app\" channel\n   - `preference.email && (!digestOnly || digest_email flag enabled)` → adds \"email\" channel\n3. Writes a notification row to the database with those channels and the notification kind, title, body, and href\n4. If the channel list is empty, the row is not created at all\n\nThe in-app channel is read by the frontend via `listNotifications()` action (shown in the notification bell icon). The \"email\" channel either:\n- Triggers an immediate email send (if `digestOnly` is false), or\n- Queues the entry for inclusion in the next digest (if `digestOnly` is true)\n\nThe digest job ensures only one email per day per recipient by only processing during that org's configured UTC hour and by marking entries read after sending.",
+  "ttft_ms": 2626,
+  "type": "result",
+  "duration_ms": 63391,
+  "uuid": "719a1e73-db99-4bfa-8328-490496959eae",
+  "ttft_stream_ms": 919,
+  "time_to_request_ms": 28,
+  "queued_turn_count": 0
+}

@@ -138,6 +138,20 @@ describe("mcpToolsFromTranscript", () => {
     expect(mcpToolsFromTranscript(jsonl, "mcp__mempalace__").count).toBe(2);
   });
 
+  // Observed: Haiku called `mcp__mempalace__memplacem_search`, transposing the
+  // server's name. Counting the union of announced and called would report a
+  // 46-tool server that never existed, so `count` is what was ADVERTISED.
+  it("ignores a called tool the server never advertised", () => {
+    const jsonl = [
+      line({ attachment: { addedNames: ["mcp__mempalace__mempalace_search"] } }),
+      line({
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "t", name: "mcp__mempalace__memplacem_search" }] },
+      }),
+    ].join("\n");
+    expect(mcpToolsFromTranscript(jsonl, "mcp__mempalace__").count).toBe(1);
+  });
+
   // The failure this exists to catch: a run whose server never came up looks
   // exactly like a successful run except that no tool is ever mentioned.
   it("reports not-connected when the server contributed nothing", () => {

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 63837,
+  "stop_reason": "end_turn",
+  "session_id": "fd3cd348-9b48-4d7a-8868-3d49ae0f7c3c",
+  "total_cost_usd": 0.1696442,
+  "usage": {
+    "input_tokens": 132,
+    "cache_creation_input_tokens": 42668,
+    "cache_read_input_tokens": 614342,
+    "output_tokens": 4329,
+    "output_tokens_details": {
+      "thinking_tokens": 1584
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 42668,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 1900,
+        "cache_read_input_tokens": 55939,
+        "cache_creation_input_tokens": 511,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 511
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010969999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 132,
+      "outputTokens": 4329,
+      "cacheReadInputTokens": 614342,
+      "cacheCreationInputTokens": 42668,
+      "webSearchRequests": 0,
+      "costUSD": 0.16854719999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1584,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 15,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the complete picture. Let me explain how search indexing stays in sync with issue edits and how queries work.\n\n## How Issue Title Edits Stay Searchable\n\n**The Write Side: Keeping the Index Current**\n\nWhen someone edits an issue title, the flow is:\n\n1. The user submits via `updateIssueAction` (src/actions/issues/update-issue.ts:48-50), which calls `updateIssue()` in src/server/services/issue-service.ts:83-109. This function first reads the issue from the database to check permissions (line 89-90), then persists the updated fields (line 97), and crucially, emits an `issue.updated` event (lines 99-106) carrying the issueId, projectId, and which fields changed.\n\n2. That event reaches src/server/services/search-service.ts, where `registerSearchListeners()` has subscribed to `issue.updated` during server startup (src/instrumentation.ts calls registerEventHandlers, which wires up search listeners at line 37-38 of event-registry.ts). The handler at lines 143-146 of search-service.ts re-reads the fresh issue row from the database and passes it to `indexIssue()`.\n\n3. `indexIssue()` at lines 88-96 constructs the searchable content by joining the new title and description with a newline, then calls `searchRepo.upsertSearchDocument()`.\n\n4. In src/server/repositories/search-repository.ts, `upsertSearchDocument()` (lines 18-59) checks if a row exists for that (org, subjectKind, subjectId) tuple. If it does, it updates the `content`, `projectId`, and `indexedAt` columns in place (lines 40-45). If not, it inserts a new row. This is idempotent: if the indexer runs twice, the second write overwrites the first.\n\n**What Gets Stored**\n\nThe searchIndex table holds:\n- `orgId`, `subjectKind` (e.g., \"issue\"), `subjectId` — the identity of the document\n- `content` — for an issue, this is `[issue.title, issue.description ?? \"\"].join(\"\\n\")`, so the title appears first\n- `projectId`, `indexedAt` timestamp for filtering and sorting\n\n**The Query Side: Finding It Moments Later**\n\nWhen a colleague searches, they call `searchAction()` in src/actions/search/search.ts. This triggers the `search()` function in src/server/services/search-service.ts:46-86:\n\n1. **Permission checks**: It verifies `issue:read` permission on the org (lines 50-51) via `assertCan()`.\n\n2. **Rate limiting**: Line 53 calls `consumeRateLimit()` on the `search:query` bucket. If the bucket is exhausted, the query is rejected with an error message including the `resetAt` time (lines 54-58).\n\n3. **Feature gate for field-scoped queries**: Lines 60-71 check whether the user's plan includes `advanced_search`. If the query string contains a colon (e.g., `status:done`), and `advanced_search` is disabled, the query is refused with \"Field-scoped search is not included in this plan\" (lines 69-71).\n\n4. **Substring search**: Line 73 calls `searchRepo.searchDocuments()`, which issues a SQL query with `like(searchIndex.content, '%${input.q}%')` — a simple substring match on the denormalized content column (search-repository.ts:91).\n\n5. **Result mapping**: The raw rows are transformed into SearchHit objects (search-service.ts:76-82), extracting the title from the first line of content and creating a context snippet around the match.\n\n**Why It Works So Fast**\n\nThe entire path from `issue.updated` emission to indexing happens synchronously in the same request — all handlers attached to the event bus settle before the update action returns (see event-bus.ts:54-72, where `emit()` awaits all handlers). So the searchIndex table is updated before the browser refreshes, and a query moments later finds the new title because it's already in the denormalized `content` column, searchable by simple substring matching.\n\n**Circumstances That Refuse a Query**\n\nA perfectly valid-looking query gets refused if:\n- The search rate limit is exhausted (token bucket for `search:query`)\n- The query contains `:` but the user's org/plan doesn't have `advanced_search` enabled\n- The actor lacks `org:read` or `issue:read` permission",
+  "ttft_ms": 2869,
+  "type": "result",
+  "duration_ms": 63232,
+  "uuid": "083398c7-e8fe-427b-9658-fc4992afb9d2",
+  "ttft_stream_ms": 895,
+  "time_to_request_ms": 13,
+  "queued_turn_count": 0
+}

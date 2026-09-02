@@ -214,10 +214,192 @@ mempalace が入っていないホストでは `--check` を失敗させない�
 
 ## 5. 実行
 
-<!-- RUN-STATS -->
+```
+BENCH_RESULTS_DIR=results/mempalace
+# block 1: corpus-v1 スナップショット (docs/ を除いた corpus/taskflow)
+--tasks tasks/tasks.json,tasks/tasks-ext.json --conditions mempalace,haiku-mempalace       # 90 runs
+# block 2: corpus/taskflow (corpus-v2)
+--tasks tasks/tasks-docs.json --conditions mempalace-v2,haiku-mempalace-v2                 # 40 runs
+```
+
+reps=1、concurrency=3、`claude -p --output-format json`、effort `high`、
+`--max-turns 60`、`--max-budget-usd 4`。他の計測セットと同一の設定である。
+
+| | |
+|---|---|
+| runs | **130 / 130** 成功 |
+| harness エラー | **0** |
+| MCP 接続失敗 | **0**（130 run すべて `connected: true`, `tool_count: 45`） |
+| ブロック1 (code-45 × 2 arms) | 90 runs / 約 36 分 |
+| ブロック2 (docs-20 × 2 arms) | 40 runs / 16.6 分 |
+| API 実費 | **$36.09** |
+| 成果物 | 130 run すべてに `result.json` / `transcript.jsonl` / `metrics.json` / `run.meta.json` / `grade.json` |
+
+### 5.1 corpus-v1 の再現
+
+code-45 のアームは `results/runs` / `results/ext` / `results/structural` の
+既存アームと対になるので、**docs/ を含まないコーパス**で走らせる必要がある。
+`corpus/taskflow` は現在 corpus-v2（635 追跡ファイル）なので、リポジトリ外に
+`docs/` を除いたスナップショット（496 追跡ファイル）を作り `--corpus` で渡した。
+docs レイヤを足したコミット群は `src`/`tests` を一切変更していないことを
+git で確認済みで、`scripts/freeze-corpus.sh` の tree hash
+`4148d9b26fb31b95ab8424af1f88cfc7741bb655b3ad3bbb557a8c3c516c12da`（477 ファイル）
+も動いていない。
+
+### 5.2 観測された異常 2 件
+
+- **`mempalace_search` を一度も呼ばなかった run が 2 件**（いずれも
+  `haiku-mempalace`、45 中 2）。CLAUDE.md の指示を無視して直接 grep/read した
+  もので、実質 baseline である。トークンはアームに算入したままなので、
+  アームの効果はその分だけ薄まっている（graphify 側の
+  「nudge を無視した run」と同じ扱い）。
+- **Haiku が 1 回だけツール名を打ち間違えた**:
+  `mcp__mempalace__memplacem_search`（`mempalace` の綴りが転倒）。サーバが
+  持たないツールなので呼び出しは失敗している。当初 `tool_count` を
+  「広告された ∪ 呼ばれた」で数えていたため 1 run だけ 46 と記録されたので、
+  `tool_count` は**広告されたツール数**を意味するよう修正した（`connected` は
+  従来どおり両方を見る緩い判定のまま）。
 
 ---
 
 ## 6. 結果
 
-<!-- RESULTS -->
+`results/mempalace/REPORT.md` が全文。9 つの比較の判定は以下のとおり。
+
+### 6.1 アーム別の中央値
+
+| arm | runs | tokens (all) | cost | turns | subagent | `mempalace_search` 呼び出し | fixed overhead | accuracy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` | 65 | 272,782 | $0.212 | 5 | 33 in 31 runs | – | 10,357 | 80.0% |
+| `baseline-nosub` | 45 | 230,081 | $0.134 | 8 | 0 | – | 9,510 | 84.4% |
+| `graphify` | 45 | 288,502 | $0.191 | 9 | 0 | – | 10,943 | 77.8% |
+| **`mempalace`** | 45 | **456,481** | **$0.360** | 11 | 1 | 241 (中央値 4/run, 45/45 runs) | **11,108** | 80.0% |
+| `haiku-baseline` | 65 | 526,174 | $0.131 | 14 | 3 in 2 runs | – | 8,013 | 80.0% |
+| `haiku-graphify` | 45 | 327,185 | $0.103 | 10 | 0 | – | 8,438 | 82.2% |
+| **`haiku-mempalace`** | 45 | 497,712 | $0.154 | 12 | 2 | 155 (中央値 2/run, 43/45 runs) | 8,627 | 75.6% |
+| `graphify-v2` | 20 | 443,863 | $0.283 | 12 | 0 | – | 10,936 | 80.0% |
+| **`mempalace-v2`** | 20 | 385,812 | **$0.372** | 11 | 1 | 131 (中央値 6.5/run, 20/20 runs) | 11,124 | **60.0%** |
+| `haiku-graphify-v2` | 20 | 440,614 | $0.127 | 12 | 0 | – | 8,430 | 75.0% |
+| **`haiku-mempalace-v2`** | 20 | 430,576 | $0.133 | 10 | 0 | 68 (中央値 2.5/run, 20/20 runs) | 8,640 | **55.0%** |
+
+### 6.2 9 つの判定（paired mean diff, 95% bootstrap CI over tasks）
+
+| # | 比較 | tasks | tokens | cost | accuracy |
+|---|---|---:|---|---|---|
+| 1 | `mempalace` − `baseline` | 45 | **+170,329 [+65,640, +287,807]** | **+$0.1365 [+0.0782, +0.2045]** | 80.0% vs 84.4% |
+| 2 | `mempalace` − `graphify` | 45 | **+138,232 [+30,901, +254,588]** | **+$0.1428 [+0.0844, +0.2117]** | 80.0% vs 77.8% |
+| 3 | `mempalace` − `baseline-nosub` | 45 | **+245,709 [+157,438, +355,429]** | **+$0.2090 [+0.1524, +0.2698]** | 80.0% vs 84.4% |
+| 4 | `haiku-mempalace` − `haiku-baseline` | 45 | 差を検出せず | **+$0.0348 [+0.0098, +0.0624]** | 75.6% vs 80.0% |
+| 5 | `haiku-mempalace` − `haiku-graphify` | 45 | **+220,215 [+74,728, +378,332]** | **+$0.0511 [+0.0264, +0.0803]** | 75.6% vs 82.2% |
+| 6 | `mempalace-v2` − `baseline` | 20 | 差を検出せず | 差を検出せず | 60.0% vs 70.0% |
+| 7 | `mempalace-v2` − `graphify-v2` | 20 | 差を検出せず | **+$0.0857 [+0.0092, +0.1639]** | 60.0% vs 80.0% |
+| 8 | `haiku-mempalace-v2` − `haiku-baseline` | 20 | 差を検出せず | 差を検出せず | 55.0% vs 80.0% |
+| 9 | `haiku-mempalace-v2` − `haiku-graphify-v2` | 20 | 差を検出せず | 差を検出せず | 55.0% vs 75.0% |
+
+**9 比較のうち、MemPalace が有意に優れた指標は 1 つも無い。** 有意差が出た
+6 つはすべて MemPalace 側が高コストで、残り 3 つは差を検出できなかった。
+
+### 6.3 §1 の問いへの答え
+
+Phase 2〜8 の null result は「prebuilt index という発想が効かない」のか
+「graphify の作り方が効かない」のか、という問いだった。
+
+**答えは前者寄りである。** 埋め込み + BM25 という全く別の索引方式でも、
+Sonnet のコードタスクでは baseline より **+170k トークン / +$0.14** 悪化し、
+graphify よりもさらに悪い（比較 2）。索引の作り方を変えても効かなかった以上、
+このベンチが測っている範囲では「事前構築インデックスを検索してから読む」という
+形そのものが、Claude Code の素の探索に勝てていない。
+
+**理由は subagent と検索の粒度の二つに分かれる。**
+
+1. **baseline は Explore subagent に委譲する。** 65 run 中 31 run で
+   subagent を使う一方、`mempalace` は 45 run 中 1 run しか使わなかった
+   （graphify は 255 run 中 0）。ツールを与えられたエージェントは自分で
+   検索してしまい、並列探索を捨てる。より公平な `baseline-nosub` に対しても
+   MemPalace は **+246k / +$0.21** 悪い（比較 3）ので、これは委譲だけでは
+   説明しきれない。
+2. **意味検索の 1 ヒットが小さすぎる。** `mempalace_search` は 4,004,248 バイト
+   （`mempalace` アーム 241 呼び出し）を返しており、1 呼び出しあたり約 16.6 KB。
+   チャンクは断片なので、エージェントは結局そのファイルを `Read` で開き直す。
+   検索コストが読み込みコストに**上乗せ**され、置き換えにならない。
+
+### 6.4 doc↔code タスクでは精度が落ちる
+
+corpus-v2 の 20 タスクで `mempalace-v2` の accuracy は **60.0%**、
+`haiku-mempalace-v2` は **55.0%** で、graphify-v2 (80.0% / 75.0%) と
+baseline (70.0% / 80.0%) の双方を下回る。トークンとコストで差が出ない一方、
+**精度だけがはっきり悪い**のがこのセットの特徴である。
+
+内訳（`successes/graded · 平均スコア`）:
+
+| arm | discrepancy | reference | impact | locate | explain |
+|---|---|---|---|---|---|
+| `graphify-v2` | **4/4 · 0.938** | 3/4 · 0.917 | 1/4 · 0.602 | 4/4 · 1.000 | 4/4 · 0.900 |
+| `baseline` (docs) | 2/4 · 0.681 | 12/13 · 0.959 | 5/13 · 0.789 | 12/13 · 0.962 | 13/13 · 0.954 |
+| `mempalace-v2` | 2/4 · 0.588 | **2/4 · 0.783** | **0/4 · 0.536** | 4/4 · 1.000 | 4/4 · 0.950 |
+| `haiku-mempalace-v2` | 2/4 · 0.575 | **1/4 · 0.430** | 1/4 · 0.589 | 3/4 · 0.917 | 4/4 · 0.850 |
+
+崩れているのは `reference`（ある識別子を参照している全ファイルの列挙）と
+`impact`（変更の影響範囲）で、`locate`（1 ファイルを特定）は 4/4 で無傷である。
+**これは意味検索の設計そのものの帰結である**: 「この概念に最も似た上位 k 件」を
+返す仕組みは、「この記号を参照する全件」という**網羅性の質問**に構造的に
+答えられない。graphify のグラフは辺を辿って全件を列挙できる。
+`discrepancy` は両者とも 2/4 で、graphify-v2 の 4/4 に届かない。
+
+### 6.5 fixed overhead — 45 個のツール定義
+
+`mempalace` アームの first-turn `cache_creation` 中央値は **11,108**
+（`graphify` 10,943 / `baseline` 10,357 / `baseline-nosub` 9,510）。
+Haiku 側は 8,627 対 8,438（graphify）/ 8,013（baseline）。
+MCP サーバのツール定義は 45 個・約 32 KB の JSON で、生スキーマなら 8k トークン
+規模になるはずだが、**実際の増分は baseline 比で +750 トークン程度**にとどまる。
+
+理由は Claude Code が MCP ツールを **deferred（名前だけ提示し、スキーマは
+`ToolSearch` で取りに行かせる）** として扱っているためで、実際 130 run すべてで
+エージェントは `ToolSearch` を 1〜2 回呼んでから `mempalace_search` に到達して
+いる。**45 ツールという数はトークン面ではほぼ無害だった** — ただし
+`ToolSearch` の往復が 1 ターン増える形で turn 数に乗る。
+
+**非対称の注記**: mempalace アームだけが `--strict-mcp-config` で走るので、
+計測ホストの個人的な MCP サーバ（Google Calendar 等）を積んでいない。他アームは
+それらを deferred な名前として積んでいる。fixed overhead の比較はこの差を
+含んだ上での数字である。
+
+### 6.6 速度（副次的・concurrency 3 のノイズ込み）
+
+per-call レイテンシは並列実行のノイズに比較的強く、ここが最も読める。
+
+| | `mempalace_search` | `graphify query` 等 (`Bash(graphify)`) | `Read` |
+|---|---:|---:|---:|
+| `mempalace` | **43 ms** (36–63) | – | 6 ms (4–8) |
+| `graphify` | – | **294 ms** (282–307) | **64 ms** (59–70) |
+| `baseline` | – | – | 6 ms (5–9) |
+
+二つ読み取れる。
+
+- **`mempalace_search` は `graphify query` の約 7 倍速い**（43 ms 対 294 ms）。
+  ChromaDB のローカル検索は graphify の CLI 起動より軽い。
+- **graphify の PreToolUse フックは全 `Read` に約 55 ms を課している**
+  （64 ms 対 baseline / mempalace の 6 ms）。これは graphify overlay の副作用で
+  あって MemPalace とは無関係だが、この節を作って初めて見えた。
+
+ただし **`mempalace_search` が `Read` の 7 倍遅い**（43 ms 対 6 ms）ことも同時に
+真であり、§6.3 の結論と整合する: 検索が読み込みを置き換えないなら、
+検索は純粋な追加コストである。
+
+インデックス構築コスト（1 回だけ払う）: graphify v1 **4.6 秒**、
+graphify v2 は同等の AST パス + 約 **35 分**の LLM 抽出、
+MemPalace v1 **49 秒** / v2 **97 秒**（API コスト 0）。
+
+### 6.7 この結果が言っていないこと
+
+- **MemPalace の本来の用途を測っていない。** これは会話記憶システムであり、
+  ここではプロジェクトファイル索引という副次機能をコード探索に転用している。
+  公表値 96.6% R@5 は LongMemEval の会話記憶タスクの数字で、無関係である。
+- **セッション横断の記憶ループを測っていない。** 各 run は新しいコーパスコピー
+  上の新しいセッションなので、`mempalace_diary_*` や継続的な mine といった
+  MemPalace の中核機能は一度も動いていない。45 ツールのうち実際に呼ばれたのは
+  `mempalace_search` **1 つだけ**である。graphify 側の `save-result` / `reflect`
+  が測れていないのと全く同じ限界である。
+- **N=1 反復。** タスク×条件あたり 1 回なので、個々のタスクの差は run ノイズで
+  ありうる。CI はタスク間のばらつきのみを反映する。
