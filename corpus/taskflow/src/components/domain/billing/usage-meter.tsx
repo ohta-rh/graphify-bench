@@ -35,12 +35,14 @@ export function UsageMeter(props: UsageMeterProps): ReactElement | null {
         </span>
       </div>
 
-      <Progress
-        value={unlimited ? 0 : check.used}
-        max={unlimited ? 1 : check.limit}
-        tone={usageTone(check)}
-        label={label ?? check.resource}
-      />
+      {unlimited ? null : (
+        <Progress
+          value={check.used}
+          max={check.limit}
+          tone={usageTone(check)}
+          label={label ?? check.resource}
+        />
+      )}
 
       {check.exceeded ? (
         <p className="text-xs text-red-600">

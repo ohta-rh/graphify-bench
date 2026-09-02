@@ -69,6 +69,11 @@ export function AppSidebar(props: AppSidebarProps): ReactElement | null {
         >
           {item.label}
         </Link>
+        {item.children !== undefined && item.children.length > 0 ? (
+          <ul className="ml-3 mt-0.5 space-y-0.5">
+            {item.children.map(renderItem)}
+          </ul>
+        ) : null}
       </li>
     );
   }
