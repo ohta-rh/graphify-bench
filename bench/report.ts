@@ -308,6 +308,37 @@ function accuracyTable(summaries: ConditionSummary[]): string {
   return lines.join("\n");
 }
 
+/**
+ * Answer quality per (arm × category): how often each arm cleared the task's
+ * own success threshold, and the mean grader score behind that verdict.
+ *
+ * §5 reports what each category cost, not whether it was answered. That was
+ * adequate while every gradeable category shared a 0.9 threshold and the
+ * interesting variation was in tokens. The docs set breaks both assumptions:
+ * `discrepancy` passes at 0.6, so a success there means something different
+ * from a success elsewhere, and its whole point is whether an arm *finds* the
+ * planted contradictions. A pass/fail count alone would hide the difference
+ * between a near miss and nothing at all, so the mean score is printed beside
+ * it — for a `set-f1` category that score is the set-F1 against the key.
+ */
+function qualityByCategoryTable(rows: RunRow[]): string {
+  const cats = [...new Set(rows.map((r) => r.category).filter((c): c is string => !!c))].sort();
+  const arms = [...new Set(rows.map((r) => r.condition))].sort();
+  const lines = [`| condition | ${cats.map((c) => `**${c}**`).join(" | ")} |`, `|---|${cats.map(() => "---").join("|")}|`];
+  for (const arm of arms) {
+    const cells = cats.map((c) => {
+      const own = rows.filter((r) => r.condition === arm && r.category === c && r.success !== null);
+      if (own.length === 0) return "–";
+      const ok = own.filter((r) => r.success === true).length;
+      const scores = own.map((r) => r.score).filter((v): v is number => v !== null);
+      const meanScore = scores.length === 0 ? null : scores.reduce((a, b) => a + b, 0) / scores.length;
+      return `${ok}/${own.length} · ${meanScore === null ? "–" : meanScore.toFixed(3)}`;
+    });
+    lines.push(`| \`${arm}\` | ${cells.join(" | ")} |`);
+  }
+  return lines.join("\n");
+}
+
 /** Render one named subgroup (a measurement set, or the easy/rest split). */
 function subgroupBlock(g: SubgroupResult, label: string): string[] {
   const out: string[] = [];
@@ -321,6 +352,77 @@ function subgroupBlock(g: SubgroupResult, label: string): string[] {
   return out;
 }
 
+/** One arm pair to line up across two measurement sets. */
+interface CrossSetPair {
+  label: string;
+  /** Comparison name in the *other* analysis, or null to use its headline pair. */
+  other: string | null;
+  /** Comparison name in *this* analysis, or null to use its headline pair. */
+  own: string | null;
+}
+
+/**
+ * Put this report's paired differences beside another analysis's, arm pair by
+ * arm pair.
+ *
+ * A reader looking at the docs set alone cannot tell whether a result is a
+ * property of the documentation layer or just what this harness always
+ * produces. The only way to answer that is to show the same comparison on the
+ * other task set at the same time — so the two columns are the whole point of
+ * the section, and it renders nothing at all unless a second analysis was
+ * supplied.
+ */
+function crossSetBlock(own: Analysis, other: Analysis, otherLabel: string, ownLabel: string): string[] {
+  const pick = (a: Analysis, name: string | null): { paired: PairedResult[]; n: number } | null => {
+    if (name === null) return { paired: a.paired, n: a.n_tasks };
+    const c = (a.comparisons ?? []).find((x) => x.name === name);
+    return c ? { paired: c.paired, n: c.n_tasks } : null;
+  };
+  const ownTreat = own.paired[0]?.treatment_condition ?? TREATMENT;
+  const otherTreat = other.paired[0]?.treatment_condition ?? TREATMENT;
+  const pairs: CrossSetPair[] = [
+    {
+      // The two sides need not name the same arm — the code set's treatment is
+      // `graphify` and this one's is `graphify-v2` — so the heading names both
+      // rather than borrowing one column's label for the other.
+      label:
+        ownTreat === otherTreat
+          ? `${ownTreat} − baseline (headline)`
+          : `${otherTreat} / ${ownTreat} − baseline (headline)`,
+      other: null,
+      own: null,
+    },
+    {
+      label: "haiku graphify − haiku baseline",
+      other: `haiku-graphify vs haiku-baseline`,
+      own: `haiku-graphify-v2 vs haiku-baseline`,
+    },
+  ];
+  const cell = (p: PairedResult | undefined, digits: number): string => {
+    if (!p) return "–";
+    const { point, lo, hi, crossesZero } = p.ci;
+    return `${fmt(point, digits)} [${fmt(lo, digits)}, ${fmt(hi, digits)}]${crossesZero ? " — crosses 0" : ""}`;
+  };
+
+  const out: string[] = [];
+  for (const pr of pairs) {
+    const o = pick(other, pr.other);
+    const s = pick(own, pr.own);
+    if (!o || !s) continue;
+    out.push(`### ${pr.label}\n`);
+    out.push(`| metric | ${otherLabel} (n=${o.n}) | ${ownLabel} (n=${s.n}) |`);
+    out.push("|---|---|---|");
+    for (const m of ["uncached_equivalent_all", "total_cost_usd", "num_turns"] as const) {
+      const d = m === "total_cost_usd" ? 4 : 1;
+      out.push(
+        `| \`${m}\` | ${cell(o.paired.find((p) => p.metric === m), d)} | ${cell(s.paired.find((p) => p.metric === m), d)} |`,
+      );
+    }
+    out.push("");
+  }
+  return out;
+}
+
 export interface ReportOptions {
   /**
    * Corpus generation the runs were measured against, printed in §1. It is a
@@ -329,6 +431,10 @@ export interface ReportOptions {
    * appears in a corpus-v1 and a corpus-v2 measurement alike.
    */
   corpusLabel?: string;
+  /** Per-(arm × category) accuracy and mean grader score. Off by default. */
+  qualityByCategory?: boolean;
+  /** A second analysis to line this one up against, and the name to print for it. */
+  vs?: { label: string; ownLabel: string; analysis: Analysis } | null;
 }
 
 export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {}): string {
@@ -420,6 +526,42 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
     out.push("|---|---|---|---|---|---|");
     for (const p of cat.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
     out.push("");
+  }
+
+  if (opts.qualityByCategory) {
+    out.push(sec("Answer quality by category"));
+    out.push(
+      "Section 5 reports what each category *cost*. This one reports whether it was *answered*: each cell is " +
+        "`successes/graded · mean grader score`. The two are not interchangeable — an arm that gives up early " +
+        "looks cheap in section 5 and is exposed here.\n",
+    );
+    out.push(qualityByCategoryTable(rows));
+    out.push("");
+    const disc = rows.filter((r) => r.category === "discrepancy" && r.success !== null);
+    if (disc.length > 0) {
+      const tasks = new Set(disc.map((r) => r.task_id)).size;
+      out.push(
+        `**\`discrepancy\` — the doc-vs-code contradiction hunt.** ${tasks} tasks partition the ` +
+          "**12** contradictions planted into corpus-v2 when it was written and recorded in " +
+          "`tasks/keys/docs-discrepancies.json`. The prompts name no document, path or id: each describes a " +
+          "domain in prose and asks which documents the code contradicts. Its `success_threshold` is **0.6**, " +
+          "not the 0.9 the other set categories use — finding two of three planted contradictions is a " +
+          "genuinely useful result, and at 0.9 the category would report an almost uniform zero and measure " +
+          "nothing. A success here therefore means something weaker than a success elsewhere, which is why " +
+          "the mean score is printed beside it rather than the pass count alone.\n",
+      );
+    }
+  }
+
+  if (opts.vs) {
+    out.push(sec("This set beside the other one"));
+    out.push(
+      "The same arm pairs, measured on both task sets. One set alone cannot separate a property of the " +
+        "corpus under test from a property of the harness; two columns can. Both sides are paired mean " +
+        "differences with a 95% percentile bootstrap CI over tasks, computed by the same code — only the " +
+        "tasks, and on this side the documentation layer, differ.\n",
+    );
+    out.push(...crossSetBlock(a, opts.vs.analysis, opts.vs.label, opts.vs.ownLabel));
   }
 
   const comparisons = a.comparisons ?? [];
@@ -602,7 +744,31 @@ async function main(): Promise<void> {
   const csvPath = path.join(outDir, "summary.csv");
   const mdPath = path.join(outDir, "REPORT.md");
   fs.writeFileSync(csvPath, buildCsv(rows));
-  fs.writeFileSync(mdPath, buildReport(analysis, rows, { corpusLabel }));
+  // `--vs "code-45=results/structural/analysis.json"` lines this report's arm
+  // pairs up against an analysis produced by an earlier measurement set.
+  const argv = process.argv.slice(2);
+  const vsFlagIndex = argv.indexOf("--vs");
+  const vsSpec = vsFlagIndex >= 0 && vsFlagIndex + 1 < argv.length ? argv[vsFlagIndex + 1] : undefined;
+  let vs: { label: string; ownLabel: string; analysis: Analysis } | null = null;
+  if (vsSpec) {
+    const eq = vsSpec.indexOf("=");
+    if (eq < 0) throw new Error(`--vs must be "label=path/to/analysis.json", got ${JSON.stringify(vsSpec)}`);
+    const label = vsSpec.slice(0, eq);
+    const file = path.resolve(REPO_ROOT, vsSpec.slice(eq + 1));
+    // Fail loudly: a silently-skipped comparison would leave the section absent
+    // and look like the report simply chose not to print it.
+    if (!fs.existsSync(file)) throw new Error(`--vs analysis not found: ${file}`);
+    const ownLabelFlag = argv.indexOf("--vs-own-label");
+    vs = {
+      label,
+      ownLabel: ownLabelFlag >= 0 && ownLabelFlag + 1 < argv.length ? argv[ownLabelFlag + 1]! : "this set",
+      analysis: JSON.parse(fs.readFileSync(file, "utf8")) as Analysis,
+    };
+  }
+  fs.writeFileSync(
+    mdPath,
+    buildReport(analysis, rows, { corpusLabel, qualityByCategory: argv.includes("--quality-by-category"), vs }),
+  );
   console.log(`wrote ${csvPath} (${rows.length} rows) and ${mdPath}`);
 }
 

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 68998,
+  "stop_reason": "end_turn",
+  "session_id": "799815aa-7362-426d-9320-ce3e18762625",
+  "total_cost_usd": 0.3295752,
+  "usage": {
+    "input_tokens": 18,
+    "cache_creation_input_tokens": 49502,
+    "cache_read_input_tokens": 367981,
+    "output_tokens": 5684,
+    "output_tokens_details": {
+      "thinking_tokens": 1884
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 49502,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2731,
+        "cache_read_input_tokens": 62194,
+        "cache_creation_input_tokens": 6067,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 6067
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1035,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010949999999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 18,
+      "outputTokens": 5684,
+      "cacheReadInputTokens": 367981,
+      "cacheCreationInputTokens": 49502,
+      "webSearchRequests": 0,
+      "costUSD": 0.3284802,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1884,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How a daily digest actually gets sent, end to end\n\n**Governing requirements.** The digest is defined by a cluster of requirements in `docs/requirements/notifications-and-digests.md`: REQ-119 (\"digest email batches unread notifications into one message,\" implemented by `digest-service.ts#buildDigest`/`renderDigest`), REQ-120 (\"digest is available only on plans that include it,\" implemented by `shouldRunForOrg` + `isEnabled`), REQ-121 (\"the digest window is bounded... [partial status],\" implemented by `src/lib/date.ts` — though in practice the job computes the window inline rather than calling a `digestWindow` helper), REQ-122 (\"an empty digest is not sent,\" `buildDigest` returning `null`), REQ-123 (`digest.due` emitted before rendering) and REQ-124 (rendering separated from delivery, `email-service.ts`).\n\n**Design/architecture basis.** Two design documents carry the actual mechanics: `docs/design/background-jobs.md` (DES-060 through DES-065, the scheduler/queue/cadence architecture) and `docs/design/service-digest-and-email.md` (DES-128 through DES-134, the digest/email split). The architectural decision behind cadence is `ADR-016`, which explicitly *narrows* the earlier `ADR-005` framing: cadence is a **dispatch throttle**, not a correctness guarantee, a distinction hashed out in `docs/ops/notes-2026-03-04-digest-cadence-review.md` after a digest-storm incident. That review is exactly what separates the two numbers this question is asking about.\n\n**What decides the job is due at all (eligibility).** `src/server/jobs/scheduler.ts` runs `tick(now)` every 60 seconds (`TICK_INTERVAL_MS`), and for each `JobKind` calls the local `isDue(kind, now)`, which checks `now - lastRunAt[kind] >= CADENCE_MINUTES[kind] * 60_000`. `CADENCE_MINUTES[\"digest-email\"]` is **60** — i.e. the digest job becomes eligible for dispatch once an hour, the same cadence as `overdue-issues`. When due, `tick()` enqueues a minute-bucketed job id and calls `drain()` in `queue.ts`, which runs `runHandler()` → `runJob(\"digest-email\", ...)` (`src/server/jobs/types.ts`) → `runDigestEmailJob(now)` in `src/server/jobs/digest-email-job.ts`.\n\n**What decides it's due *for this workspace* (per-org).** Inside `runDigestEmailJob`, after pulling candidate org ids from `usageRepo.listOrgIdsForRollup`, each org is checked by `shouldRunForOrg(org, now)` (`digest-email-job.ts:84`): `true` only if the org isn't archived and `now.getUTCHours() === org.settings.digestHourUtc`. That's the real per-workspace gate — since it only matches one specific UTC hour out of 24, an hourly-eligible job still produces exactly one attempt per org per day. `isEnabled(\"digest_email\", buildFlagContext(null, org))` (REQ-120, plan gate) is checked next, then the job computes a rolling 24-hour window (`MS_PER_DAY`) and calls `buildDigest(orgId, recipientId, windowStart, windowEnd)` in `digest-service.ts` per recipient from `listDigestRecipients`. `buildDigest` returns `null` (send nothing) if the plan gate fails or if fewer than `MIN_ENTRIES` (1) notifications survive the window filter — collapsing REQ-120 and REQ-122 into one signal per DES-128. A non-null bundle goes through `renderDigest` → `email-service.ts#renderEmail` → `sendEmail`, and the job then calls `notificationRepo.markRead` per entry, which is what stops the *next* tick inside the same UTC hour from re-sending (DES-063's idempotence story for this job kind).\n\n**The eligibility-vs-delivery distinction, and which number the docs describe.** These are genuinely two different cadences: `CADENCE_MINUTES[\"digest-email\"] = 60` (in `scheduler.ts`) governs how often the *job as a whole* is even allowed to be dispatched — once an hour, a dispatch throttle per ADR-016, not a promise about delivery frequency. `shouldRunForOrg`'s UTC-hour match is what actually produces \"once per organization per day,\" and it does so *despite* the hourly eligibility, by rejecting 23 of the 24 hourly attempts as no-ops for any given org. `docs/design/background-jobs.md` states this cleanly in DES-065: \"one org gets exactly one digest attempt per day even though the cadence table's 60-minute value would otherwise permit up to 24.\" However, `docs/requirements/notifications-and-digests.md` (in its Context section, around line 42) misattributes this: it says the job \"runs on the `digest-email` cadence (every 1440 minutes — once a day, `CADENCE_MINUTES`)\" — that's factually wrong against the code. `CADENCE_MINUTES[\"digest-email\"]` is 60 in `scheduler.ts`; 1440 is the cadence value for `search-reindex` and `cleanup-archived`, not `digest-email`. The requirements doc's \"1440\" is really describing the *per-workspace delivery outcome* (once a day) that `shouldRunForOrg` produces, mislabeled as if it were the `CADENCE_MINUTES` constant itself — conflating the two numbers this question distinguishes.\n\n**Verification.** `tests/jobs/digest-email-job.test.ts` covers `runDigestEmailJob` end to end against a temporary database: hour-matching (`shouldRunForOrg`'s \"skips an org whose digest hour has not arrived\"), the plan gate, the empty-window no-send case, the `DIGEST_MAX_ENTRIES` cap, and same-window resend suppression via `markRead`. `tests/lib/date.test.ts` covers window arithmetic, and `tests/emails/render.test.ts` verifies `renderEmail`/`sendEmail` (HTML escaping, plain-text derivation) independent of the job. There is no dedicated `tests/services/digest-service.test.ts` — `buildDigest`/`listDigestRecipients`/`renderDigest` are exercised only indirectly through the job test, as `service-digest-and-email.md`'s \"Test coverage\" section notes.",
+  "ttft_ms": 1491,
+  "type": "result",
+  "duration_ms": 69175,
+  "uuid": "0ed1e1fa-ec72-4bf9-9570-31f277547532",
+  "ttft_stream_ms": 888,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 98474,
+  "stop_reason": "end_turn",
+  "session_id": "4b2aee8c-d48b-44ed-93a1-d49809dc4f49",
+  "total_cost_usd": 0.1941027,
+  "usage": {
+    "input_tokens": 160,
+    "cache_creation_input_tokens": 49383,
+    "cache_read_input_tokens": 661567,
+    "output_tokens": 5585,
+    "output_tokens_details": {
+      "thinking_tokens": 1041
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 49383,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 2580,
+        "cache_read_input_tokens": 57682,
+        "cache_creation_input_tokens": 5483,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5483
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1035,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010949999999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 160,
+      "outputTokens": 5585,
+      "cacheReadInputTokens": 661567,
+      "cacheCreationInputTokens": 49383,
+      "webSearchRequests": 0,
+      "costUSD": 0.19300769999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1041,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 17,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have the full picture of how daily digest emails work. Let me explain this comprehensively.\n\n---\n\n## How a Daily Digest Email Comes to Be Sent for One Workspace\n\n### The Governing Requirement\n\n**REQ-119** in `docs/requirements/notifications-and-digests.md` (\"Digest email batches unread notifications into one message\") is the primary requirement governing digest delivery. It specifies that digest emails collect unread notifications inside a bounded time window and render them as one message, and it is part of a broader set of requirements (REQ-110 through REQ-124) that collectively define the notification and digest system. The digest is explicitly gated by **REQ-120**, which states it is available only on plans that include it (`growth` and `enterprise` by default, overridable via feature flags).\n\n### The Architectural Foundations\n\nThe digest system rests on three foundational architecture decisions:\n\n1. **ADR-016** (\"An interval scheduler with per-kind cadence\") establishes a single 60-second timer (`TICK_INTERVAL_MS` in `src/server/jobs/scheduler.ts`) that ticks once per minute, rather than seven independent timers per job kind. The `CADENCE_MINUTES` table declares that `digest-email` is eligible to run every 60 minutes—but eligibility is a *dispatch throttle*, not a frequency guarantee, a distinction formalized in the ops notes from 2026-03-04 (`docs/ops/notes-2026-03-04-digest-cadence-review.md`). This means every job must be idempotent under more-frequent-than-cadence execution.\n\n2. **DES-065** and **DES-063** (in `docs/design/background-jobs.md`) establish that the digest job's idempotence rests on marking notifications as read immediately after sending them. The job's own comment in `src/server/jobs/digest-email-job.ts` (lines 59–64) makes this explicit: \"Once digested, these notifications are no longer 'unread'—this is what keeps a later run inside the same window from sending the same digest twice.\"\n\n3. **ADR-012** (referenced in `docs/design/service-digest-and-email.md`'s DES-130) ties digest recipients to the notification preference system: a user is a digest recipient purely by having set `digestOnly: true` on any `NotificationPreference` row, which simultaneously suppresses their immediate email for that notification kind.\n\n### What Decides the Job is Due and Due for That Workspace\n\nThe job is controlled at two levels:\n\n**Level 1: Global scheduler cadence** — In `src/server/jobs/scheduler.ts`, the `tick(now)` function runs once per minute and checks `isDue(\"digest-email\", now)` by comparing `now.getTime() - lastRunAt.get(\"digest-email\")` against `CADENCE_MINUTES[\"digest-email\"]` (60 minutes). The job becomes eligible to run again 60 minutes after its last successful run. When due, the scheduler enqueues a job with id `${kind}:${Math.floor(now.getTime() / 60_000)}` (a minute-bucketed id) and calls `drain()` to run whatever is pending.\n\n**Level 2: Per-organization UTC hour matching** — This is the critical gating that ensures a workspace receives exactly one digest per day, not up to 24. In `src/server/jobs/digest-email-job.ts` (lines 84–87), the exported `shouldRunForOrg` function:\n\n```typescript\nexport function shouldRunForOrg(org: Organization, now: Date): boolean {\n  if (org.archivedAt !== null) return false;\n  return now.getUTCHours() === org.settings.digestHourUtc;\n}\n```\n\nThis is called at line 36 inside `runDigestEmailJob(now)` for every organization. The `digestHourUtc` is an integer (0–23) stored in `organizations.digest_hour_utc` (default 7) and represents the UTC hour when that workspace's digest should fire. Because the scheduler ticks every minute, `shouldRunForOrg` will match exactly once per day—during the 60-minute window between that hour's start (e.g., 7:00 UTC) and the next tick at or after the hour boundary.\n\nOnce a workspace passes the `shouldRunForOrg` check:\n\n1. Line 38 checks `isEnabled(\"digest_email\", buildFlagContext(null, org))` to gate on the feature flag (REQ-120).\n2. Lines 40–41 compute a 24-hour window: `windowStart` is `now - 24 hours`, `windowEnd` is `now` (both as ISO timestamps).\n3. Line 43 calls `listDigestRecipients(orgId)` to fetch every user who has opted into digest-only delivery (from `notification-preference-repository.ts`'s `listDigestSubscribers`).\n4. For each recipient, `buildDigest(orgId, recipientId, windowStart, windowEnd)` (in `src/server/services/digest-service.ts`, lines 27–58) collects unread notifications created within that window.\n\n### How `buildDigest` Decides What to Include\n\n`buildDigest` filters notifications in two stages:\n\n- **Repository query** (line 38 in digest-service.ts): `notificationRepo.listUnreadSince(orgId, recipientId, windowStart)` fetches every unread notification from `windowStart` forward (open-ended on the lower bound).\n- **Service-layer filtering** (lines 44–53): The function maps notifications to `DigestEntry` objects, filters by `notification.createdAt <= windowEnd` to close the upper bound, then slices to `DIGEST_MAX_ENTRIES` (50, from `src/config/constants.ts`). If the resulting array has fewer than `MIN_ENTRIES` (1), it returns `null`; otherwise, it returns the `DigestBundle`.\n\nThe window computation itself is handled by `digestWindow(digestHourUtc, reference)` in `src/lib/date.ts` (lines 90–117), which computes a 24-hour window ending at the org's configured `digestHourUtc` on the current or previous day—ensuring that if the job runs even minutes before the digest hour, it still computes yesterday's window rather than an early partial one.\n\n### Rendering, Sending, and Idempotence\n\nOnce a non-null bundle is built:\n\n1. Line 56 calls `renderDigest(bundle, recipient)`, which delegates to `email-service.ts`'s `renderEmail(\"digest\", props)` and returns a `RenderedEmail` with `subject`, `html`, and `text`.\n2. Line 57 calls `sendEmail({to: recipient.email, ...rendered})`, which writes a structured log entry (no actual SMTP; see DES-132).\n3. **Lines 62–64 are critical for idempotence**: The job then marks every notification in the bundle as read via `notificationRepo.markRead(orgId, entry.notificationId, windowEnd)`. This is what prevents duplicate sends: if the job runs again inside the same window (due to a restart, for example, or if `shouldRunForOrg` somehow matched twice), `listUnreadSince` will not return the already-marked-read notifications, so `buildDigest` will return `null` or a smaller bundle, and the loop continues without sending a duplicate.\n\n### What Verifies the System\n\nThe test file `tests/jobs/digest-email-job.test.ts` contains the authoritative verification:\n\n- It tests `shouldRunForOrg` directly (in isolation, without a database) to ensure hour matching works correctly across boundary conditions.\n- It tests the end-to-end `runDigestEmailJob` flow with a temporary test database, verifying that:\n  - Digests are built and \"sent\" for orgs whose hour has arrived.\n  - Empty digests are not sent (REQ-122).\n  - Notifications are marked read after sending, preventing duplicates.\n  - The job increments `result.processed` for successful sends and `result.failed` for exceptions.\n\n`tests/emails/render.test.ts` separately verifies `email-service.ts`'s `renderEmail` function, including HTML escaping (DES-134) and plain-text derivation (DES-133).\n\n### The Critical Distinction: Cadence vs. Frequency Per Workspace\n\nThis is the distinction the ops notes explicitly clarify:\n\n- **Cadence in `CADENCE_MINUTES[\"digest-email\"] = 60`**: The job is eligible to run every 60 minutes globally. The scheduler checks this constraint exactly once per minute.\n- **Frequency per workspace**: Each workspace receives exactly one digest per day, enforced by `shouldRunForOrg` matching only during that workspace's configured UTC hour (a 60-minute window out of every 24 hours).\n\nDocumentation describing \"the digest runs hourly\" (the scheduler's cadence) would be misleading if read as \"each workspace gets a digest every hour\" (the actual per-workspace frequency). The `CADENCE_MINUTES` table documents the job's *global eligibility*, not the per-workspace send rate. The per-workspace send rate is governed by `digestHourUtc` and the 24-hour window, which together guarantee one send per day per workspace (barring failure and retry, which may produce an extra attempt on the next eligible tick).\n\nThis design, documented in ADR-016's Consequences section, also explains why a process restart resets `lastRunAt` to `undefined` (line 52 in scheduler.ts): every job kind looks due on the next tick after a restart, which is why the 2026-03-02 digest storm incident happened (documented in `docs/ops/postmortem-2026-03-02-digest-storm.md`). The fix was not to persist scheduler state to the database, but to make `digest-email` itself idempotent via the `markRead` sequence—a design choice confirmed in the 2026-03-04 ops notes.",
+  "ttft_ms": 2399,
+  "type": "result",
+  "duration_ms": 98872,
+  "uuid": "07055c58-3a25-422f-bf5f-b2256a3146cc",
+  "ttft_stream_ms": 803,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 95473,
+  "stop_reason": "end_turn",
+  "session_id": "c7dfee00-828a-411b-a0d9-27cef9b7c40f",
+  "total_cost_usd": 0.2390499,
+  "usage": {
+    "input_tokens": 208,
+    "cache_creation_input_tokens": 54680,
+    "cache_read_input_tokens": 934079,
+    "output_tokens": 6999,
+    "output_tokens_details": {
+      "thinking_tokens": 3129
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 54680,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 10,
+        "output_tokens": 2885,
+        "cache_read_input_tokens": 67394,
+        "cache_creation_input_tokens": 1068,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1068
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1009,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010789999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 208,
+      "outputTokens": 6999,
+      "cacheReadInputTokens": 934079,
+      "cacheCreationInputTokens": 54680,
+      "webSearchRequests": 0,
+      "costUSD": 0.2379709,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 3129,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 22,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Based on my exploration of the codebase, here's how issue numbers are allocated and made unique end-to-end:\n\n## Requirement: The Scope of Uniqueness\n\n**REQ-061** in `docs/requirements/issues.md` (lines 87-109) defines the requirement: \"Issue numbers are allocated per project and never reused.\" The acceptance criteria state that `nextIssueNumber` never returns a value already used by a live or archived issue in that project, that concurrent calls for the same project never get the same number, and that deleting the highest-numbered issue does not cause reuse.\n\n## Database Constraint: The Enforcement Mechanism\n\nThe constraint is enforced by a UNIQUE index in `src/server/db/schema/issues.ts` (line 39):\n```typescript\nuniqueIndex(\"issues_project_number_idx\").on(table.projectId, table.number),\n```\n\nThis creates a unique constraint on the composite key `(projectId, number)`, ensuring no two issues in the same project can share a number. The index is defined in the issues table schema alongside four other indexes on different dimensional queries (org+status, org+assignee, org+archived, org+due).\n\n## Code at Issue Creation Time\n\nWhen an issue is created, `createIssue()` in `src/server/services/issue-service.ts` (lines 42-81) runs four gates before allocating a number:\n\n1. **Line 46**: `assertOrgScope(actor, input.orgId)` — verifies the actor belongs to the correct organization\n2. **Lines 48-54**: Checks that the project exists, is not archived, and the actor has `issue:create` permission\n3. **Lines 56-66**: Verifies the organization exists and that creating this issue would not exceed the plan's per-project `issuesPerProject` quota (counted via `issueRepo.countIssues`)\n4. After all gates pass, **line 68**: `nextIssueNumber(input.orgId, input.projectId)` is called\n\nThe `nextIssueNumber()` function in `src/server/repositories/issue-repository.ts` (lines 292-304) executes a simple read:\n```typescript\nconst row = getDb()\n  .select({ value: sql<number | null>`max(${issues.number})` })\n  .from(issues)\n  .where(and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)))\n  .get();\nreturn (row?.value ?? 0) + 1;\n```\n\nThis deliberately reads over every row—live or archived—because archived issues must retain their numbers permanently. The number is then passed explicitly to `insertIssue()` (line 69), which inserts the row with that number. The UNIQUE index on `(projectId, number)` will reject any insertion that violates the constraint.\n\n## What Verifies the Behavior\n\n**`tests/repositories/issue-repository.test.ts`** exercises the repository functions directly against an in-memory database. The test helper `insertIssue()` (lines 34-44) explicitly calls `nextIssueNumber` then `insertIssue` to show they are two separate steps.\n\n**`tests/services/issue-service.test.ts`** exercises the behavior through the service boundary, where the four gates and the allocation are all tested together.\n\n**`docs/design/repository-issue-and-comment.md`** (DES-183, lines 133-151) documents the race condition explicitly: \"two concurrent creates against the same project could, in principle, both read the same `max` and attempt to insert the same `number`.\" The document acknowledges this is \"a read-then-write race, mitigated but not eliminated\" by the single Node process and synchronous SQLite mode, but notes that \"a reviewer reading `issue-repository.ts` in isolation should not assume atomicity it does not structurally guarantee.\"\n\n## Consistency Across Documents: **Inconsistency Found**\n\nThe documents do **not** all describe the constraint consistently:\n\n- **`docs/requirements/issues.md` (REQ-061)** correctly states: \"scoped to the project\" \n- **`docs/design/repository-issue-and-comment.md` (DES-183)** correctly states: scoped to `(orgId, projectId)`, taken over every row\n- **`src/server/db/schema/issues.ts` (line 39)** correctly implements: `uniqueIndex(...).on(table.projectId, table.number)`\n- **`docs/db/tables-issues.md` (line 51)** incorrectly states: the index is on `org_id, number` with the explanation \"enforced per organization so a number is unique across the whole tenant\"\n\nThe database documentation in `tables-issues.md` is wrong. The actual index is on `(projectId, number)`, not `(orgId, number)`, and the constraint is per-project, not per-organization. The code, the requirements, and the design documents all agree on per-project uniqueness, but the schema documentation contradicts them.",
+  "ttft_ms": 2852,
+  "type": "result",
+  "duration_ms": 97232,
+  "uuid": "6de3ec20-1b9f-4e4b-a15d-7243d8809d10",
+  "ttft_stream_ms": 812,
+  "time_to_request_ms": 21,
+  "queued_turn_count": 0
+}

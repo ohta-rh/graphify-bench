@@ -95,3 +95,73 @@ describe("buildReport", () => {
     expect(md).toContain("Cross-session memory was never measured");
   });
 });
+
+describe("headline arm and corpus label", () => {
+  /** Rows for three arms so a non-default treatment has something to pair against. */
+  function threeArmRows(): RunRow[] {
+    const out: RunRow[] = [];
+    for (const t of ["T1", "T2", "T3"]) {
+      out.push(row({ task_id: t, condition: "baseline", uncached_equivalent: 1000, num_turns: 4 }));
+      out.push(row({ task_id: t, condition: "graphify-v2", uncached_equivalent: 1500, num_turns: 9 }));
+      out.push(row({ task_id: t, condition: "haiku-baseline", uncached_equivalent: 2000, num_turns: 12 }));
+    }
+    return out;
+  }
+
+  it("pairs the headline sections against the requested arm, not a hardcoded `graphify`", () => {
+    const rows = threeArmRows();
+    const a = analyze(rows, "s", 20, { treatment: "graphify-v2" });
+    expect(a.paired[0]!.treatment_condition).toBe("graphify-v2");
+    // 1500 − 1000, over three tasks that all differ by the same amount.
+    expect(a.paired.find((p) => p.metric === "uncached_equivalent")!.ci.point).toBeCloseTo(500, 5);
+    expect(buildReport(a, rows)).toContain("Paired difference (graphify-v2 − baseline), all tasks");
+  });
+
+  it("defaults to `graphify`, which is what keeps the earlier reports reproducible", () => {
+    const a = analyze(threeArmRows(), "s", 20, {});
+    expect(a.paired[0]!.treatment_condition).toBe("graphify");
+    // No `graphify` arm in these rows, so the pairing has nothing to difference.
+    expect(a.paired[0]!.ci.point).toBeNull();
+  });
+
+  it("names the headline arm from the analysis, so a stored one cannot be mislabelled", () => {
+    const rows = threeArmRows();
+    const a = analyze(rows, "s", 20, { treatment: "haiku-baseline" });
+    expect(buildReport(a, rows)).toContain("Paired difference (haiku-baseline − baseline), all tasks");
+  });
+
+  it("prints the stated corpus label, and the docs-layer hash only when it is not v1", () => {
+    const rows = threeArmRows();
+    const a = analyze(rows, "s", 20, { treatment: "graphify-v2" });
+    const v1 = buildReport(a, rows);
+    expect(v1).toContain("- Corpus: `corpus-v1`, tree hash (sha256)");
+    expect(v1).not.toContain("its addition is the `docs/` layer");
+    const v2 = buildReport(a, rows, { corpusLabel: "corpus-v2" });
+    expect(v2).toContain("- Corpus: `corpus-v2`, tree hash (sha256)");
+    expect(v2).toMatch(/its addition is the `docs\/` layer, hashed the same way: `[0-9a-f]{64}`/);
+  });
+
+  it("keeps the quality-by-category table and the cross-set block opt-in", () => {
+    const rows = threeArmRows();
+    const a = analyze(rows, "s", 20, { treatment: "graphify-v2" });
+    expect(buildReport(a, rows)).not.toContain("Answer quality by category");
+    expect(buildReport(a, rows)).not.toContain("This set beside the other one");
+
+    const withQuality = buildReport(a, rows, { qualityByCategory: true });
+    expect(withQuality).toContain("Answer quality by category");
+    // successes/graded · mean score, for the one category these fixtures carry.
+    expect(withQuality).toContain("| `graphify-v2` | 3/3 · 1.000 |");
+
+    const withVs = buildReport(a, rows, { vs: { label: "code-45", ownLabel: "docs-20", analysis: a } });
+    expect(withVs).toContain("This set beside the other one");
+    expect(withVs).toContain("| metric | code-45 (n=3) | docs-20 (n=3) |");
+  });
+
+  it("names both arms in the cross-set heading when the two sets tested different ones", () => {
+    const rows = threeArmRows();
+    const own = analyze(rows, "s", 20, { treatment: "graphify-v2" });
+    const other = analyze(rows, "s", 20, { treatment: "haiku-baseline" });
+    const md = buildReport(own, rows, { vs: { label: "code-45", ownLabel: "docs-20", analysis: other } });
+    expect(md).toContain("### haiku-baseline / graphify-v2 − baseline (headline)");
+  });
+});

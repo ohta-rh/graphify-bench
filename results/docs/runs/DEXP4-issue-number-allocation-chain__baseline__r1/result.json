@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 74044,
+  "stop_reason": "end_turn",
+  "session_id": "e8b94f82-7816-4133-85ea-e2a334ba8d23",
+  "total_cost_usd": 0.35631159999999995,
+  "usage": {
+    "input_tokens": 36,
+    "cache_creation_input_tokens": 35743,
+    "cache_read_input_tokens": 752568,
+    "output_tokens": 6168,
+    "output_tokens_details": {
+      "thinking_tokens": 2086
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 35743,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2271,
+        "cache_read_input_tokens": 53193,
+        "cache_creation_input_tokens": 1309,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1309
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1009,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010739999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 36,
+      "outputTokens": 6168,
+      "cacheReadInputTokens": 752568,
+      "cacheCreationInputTokens": 35743,
+      "webSearchRequests": 0,
+      "costUSD": 0.35523759999999993,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2086,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 24,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How an issue gets its number\n\n**Requirement (scope of uniqueness).** `docs/requirements/issues.md`, **REQ-061 — \"Issue numbers are allocated per project and never reused\"** (lines 87–108), is the authority here. It states plainly that the issue number is \"a human-facing number that is unique only within its project\" (line 32), allocated by `issue-repository.ts#nextIssueNumber`, and never recycled — even after archival or deletion the number stays retired, so `ENG-142` always means the same issue for the life of the project. Its acceptance criteria (lines 102–106) spell out three things a passing implementation must guarantee: `nextIssueNumber` never returns a value already used by a live or archived issue in that project; two concurrent `createIssue` calls never collide; deleting the highest-numbered issue doesn't free its number for reuse.\n\n**Design element enforcing it.** `docs/design/repository-issue-and-comment.md`, **DES-183 — \"Issue number allocation is a read-then-write race, mitigated but not eliminated\"**, documents the mechanism: `nextIssueNumber` computes `max(issues.number) + 1` scoped to `(orgId, projectId)`, deliberately over *every* row including archived ones, because REQ-061 requires the max to survive archiving. It returns a plain number; the caller — `IssueService.createIssue` — then calls `insertIssue` with that number as a separate step. DES-183 is explicit that there is no separate sequence object, and that this two-statement pattern is a real (if practically unlikely) TOCTOU race, not a database-level guarantee by itself.\n\n**Database constraint.** The actual enforcement is the unique index in `src/server/db/schema/issues.ts:39`:\n```ts\nuniqueIndex(\"issues_project_number_idx\").on(table.projectId, table.number)\n```\nThis is a `(project_id, number)` composite unique index — the database backstop that makes a collision in the race DES-183 describes fail loudly (a constraint violation) rather than silently corrupting data.\n\n**What the code does at creation time.** `IssueService.createIssue` in `src/server/services/issue-service.ts:42-81` runs four gates in order — tenant scope (`assertOrgScope`), that the parent project exists and isn't archived (`assertNotArchived`), the `issue:create` permission (`assertCan`), and the plan's per-project issue quota (`wouldExceedLimit` against `issueRepo.countIssues`). Only after all four pass does it call `issueRepo.nextIssueNumber(input.orgId, input.projectId)` (`issue-repository.ts:292-304`, `SELECT max(number) WHERE org_id=? AND project_id=?`, `+1`), then `issueRepo.insertIssue(input, actor.userId, number)` (`issue-repository.ts:306-...`), which inserts the row with that explicit number. This ordering is deliberate per `docs/design/service-issue.md`'s **DES-101**: putting the quota/permission checks before allocation means a rejected request never consumes a number, avoiding visible gaps. The action wrapper, `src/actions/issues/create-issue.ts`, does its own redundant `can()` check and quota pre-check (`assertProjectHasRoom`) before calling the service's `createIssue`, but the number itself is allocated only inside the service/repository pair, never in the action.\n\n**What verifies the behaviour.** Two test files carry this, not one:\n- `tests/repositories/issue-repository.test.ts` exercises `nextIssueNumber`/`insertIssue` generally (tenant isolation, filtering, pagination) and is the file `docs/test/traceability-req-to-test.md:101` cites for REQ-061 as a \"direct\" test.\n- The specific *never-reused* guarantee, though, is actually tested in `tests/server/soft-delete.test.ts:109-113`, `it(\"keeps its issue number reserved\", ...)`, which archives an issue and asserts `nextIssueNumber` still returns the next value rather than the archived one's slot. The traceability doc's citation is incomplete: it points only at `issue-repository.test.ts`, which covers allocation mechanics but not the archived-number-retention scenario that is REQ-061's actual distinguishing claim.\n\n## Do all the documents agree?\n\nNo — there is a real, verifiable inconsistency in `docs/db/tables-issues.md` itself. Its index table (line 51) states:\n\n> `issues_project_number_idx` | `org_id, number` | yes | REQ-061's never-reused numbering, **enforced per organization so a number is unique across the whole tenant**\n\nThat is wrong on two counts. First, it contradicts the actual schema: `src/server/db/schema/issues.ts:39` defines the index on `(table.projectId, table.number)`, not `(org_id, number)`. Second, it contradicts the *rest of the same document* — the Invariants section a few lines down (lines 64-66) says \"Because `number` is only unique within `(project_id, number)`, moving `project_id` to a different project requires computing a fresh `number`...\" — and it contradicts `docs/requirements/issues.md` (line 32, \"unique only within its project\") and `docs/design/repository-issue-and-comment.md`'s DES-183 (scoped to `(orgId, projectId)`). The requirements doc, the design doc, and the code all agree numbering is unique per project; only the index-table row in `tables-issues.md` misdescribes it as org-wide, which is a stale/incorrect line in that one table cell rather than a genuine ambiguity in the system's behavior.",
+  "ttft_ms": 1867,
+  "type": "result",
+  "duration_ms": 73500,
+  "uuid": "0e093db2-74d6-4c97-8b1b-c613e5fdd5c4",
+  "ttft_stream_ms": 1213,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 40087,
+  "stop_reason": "end_turn",
+  "session_id": "905de098-9be7-459e-8e4f-087ee6dd8a2e",
+  "total_cost_usd": 0.24655419999999997,
+  "usage": {
+    "input_tokens": 12,
+    "cache_creation_input_tokens": 40269,
+    "cache_read_input_tokens": 242176,
+    "output_tokens": 3593,
+    "output_tokens_details": {
+      "thinking_tokens": 862
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 40269,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1821,
+        "cache_read_input_tokens": 56298,
+        "cache_creation_input_tokens": 2730,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2730
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1014,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001089,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 12,
+      "outputTokens": 3593,
+      "cacheReadInputTokens": 242176,
+      "cacheCreationInputTokens": 40269,
+      "webSearchRequests": 0,
+      "costUSD": 0.24546519999999997,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 862,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 13,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## The chain, end to end\n\n**What the screen spec claims.** `docs/ui/screen-settings-billing-flags-webhooks.md`, section `SCR-022 — Feature flags`, states the permission required to open `/{orgSlug}/settings/flags` is `org:manage_flags` \"(member and above) — 404 otherwise.\"\n\n**What the requirement and design docs say about that same permission.** `docs/requirements/feature-flags.md` (`REQ-192 — Toggling a flag requires admin and emits flag.toggled`) says plainly: `toggleFlag(actor, input)` requires `org:manage_flags`, \"whose `ROLE_MATRIX` minimum is `admin`.\" The requirements doc's own Context section repeats this: \"`toggleFlag` — the only mutator — requires `org:manage_flags`, whose `ROLE_MATRIX` minimum is `admin`.\" The design doc `docs/design/service-feature-flag-and-support.md` (`DES-177`) backs this up at the implementation level: `toggleFlag` \"checks `org:manage_flags` (minimum `admin`, REQ-192's 'toggling a flag requires admin') first, then loads the org…\" and even makes the point that no role can bypass it — an `owner` toggling a non-overridable flag fails the same way an `admin` would, but the permission gate itself is `admin`, not `member`.\n\n**Where the decision is actually made in code.** Two independent call sites enforce this, both ultimately reading the same table:\n\n1. **Page-level (view gate).** `src/app/(dashboard)/[orgSlug]/settings/flags/page.tsx` loads tenant context via `loadTenantContext(orgSlug)`, then calls `can(actor, \"org:manage_flags\", { kind: \"organization\", orgId: org.id })` from `src/lib/permissions.ts`. If `can()` returns `false`, the page calls Next's `notFound()` and nothing else renders — no flag rows, no `FlagToggleList`.\n2. **Action-level (mutation gate).** The toggle switch posts to `toggleFeatureFlagAction` in `src/actions/flags/toggle-flag.ts`, which itself calls `can(actor, \"org:manage_flags\", …)` and throws `ForbiddenActionError` if it fails, before ever calling the service. Even if that check were skipped, `toggleFlag` in `src/server/services/feature-flag-service.ts` calls `assertCan(actor, \"org:manage_flags\", orgResource(input.orgId))` as its first line — the throwing variant of `can()` — so the mutation path is gated a second time at the service layer regardless of what the Server Action does.\n\nBoth `can()` and `assertCan()` are thin wrappers around `explain()` in `src/lib/permissions.ts`, which is where the actual decision is made: it looks up `ROLE_MATRIX[\"org:manage_flags\"]` and compares `ROLE_RANK[actor.role] >= ROLE_RANK[required]`. In `src/lib/permissions.ts`, line 30, the table entry reads:\n\n```\n\"org:manage_flags\": \"admin\",\n```\n\nThat's the single source of truth for the minimum role, and it says `admin`, not `member`.\n\n**What happens to a user who fails the check.**\n- Hitting the URL directly as a `member`: `can()` returns `false` in `page.tsx`, `notFound()` fires, and the user gets a plain Next.js 404 — indistinguishable from the route not existing at all.\n- Somehow reaching the toggle action anyway (e.g. a stale page or crafted request) as a sub-admin role: `toggleFeatureFlagAction` throws `ForbiddenActionError`, and if that were bypassed, `feature-flag-service.ts`'s `toggleFlag` throws `PermissionDeniedError`, which `docs/design/service-feature-flag-and-support.md`'s failure-modes table maps to a `forbidden` (403) `ActionResult` — the UI's flag-toggle controls are simply \"hidden below `admin`.\"\n\n## Does the spec's stated minimum match the code?\n\nNo. `docs/ui/screen-settings-billing-flags-webhooks.md` says the flags screen is open to \"member and above,\" but the actual gate — `ROLE_MATRIX[\"org:manage_flags\"]` in `src/lib/permissions.ts`, enforced by `can()` in `page.tsx` and by `can()`/`assertCan()` in `toggle-flag.ts`/`feature-flag-service.ts` — requires `admin`. This directly contradicts the requirements doc (`REQ-192`) and the design doc (`DES-177`), both of which correctly describe the code as requiring `admin`. The UI spec document is the odd one out here; it appears to be stale relative to the requirement, design, and implementation, which are all mutually consistent at `admin`.",
+  "ttft_ms": 2009,
+  "type": "result",
+  "duration_ms": 39409,
+  "uuid": "bec0c084-6c9d-476b-b0bf-5e89ff125662",
+  "ttft_stream_ms": 896,
+  "time_to_request_ms": 17,
+  "queued_turn_count": 0
+}

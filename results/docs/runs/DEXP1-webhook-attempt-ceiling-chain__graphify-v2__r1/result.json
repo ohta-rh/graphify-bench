@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 92483,
+  "stop_reason": "end_turn",
+  "session_id": "874bc6b5-65c9-4406-a184-01c78446c8e9",
+  "total_cost_usd": 0.355854,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 39130,
+    "cache_read_input_tokens": 569880,
+    "output_tokens": 8421,
+    "output_tokens_details": {
+      "thinking_tokens": 3985
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39130,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2626,
+        "cache_read_input_tokens": 54515,
+        "cache_creation_input_tokens": 3374,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3374
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1017,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 28,
+      "outputTokens": 8421,
+      "cacheReadInputTokens": 569880,
+      "cacheCreationInputTokens": 39130,
+      "webSearchRequests": 0,
+      "costUSD": 0.354762,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3985,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 17,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the full chain, traced from requirement through to test:\n\n**Requirement.** `docs/requirements/webhooks.md` — `REQ-157: A delivery is abandoned after a fixed attempt ceiling`. It states `MAX_ATTEMPTS = 6`, says implementation lives in `runWebhookDeliveryJob` (`src/server/jobs/webhook-delivery-job.ts`) reading `WEBHOOK_MAX_ATTEMPTS` from `src/config/constants.ts`, and lists `tests/server/jobs.test.ts` as the verifier. Its own acceptance criterion 3 is explicit: *\"`MAX_ATTEMPTS` is read from `WEBHOOK_MAX_ATTEMPTS` in `src/config/constants.ts`, not hardcoded separately in `webhook-delivery-job.ts`.\"*\n\n**Design.** The element that actually specifies the ceiling is `DES-064 — webhook-delivery-job: claim, sign, retry, abandon` in `docs/design/background-jobs.md` (the service-level doc, `docs/design/service-webhook.md`, explicitly disclaims owning this — it says retry backoff and attempt-ceiling logic \"live in `webhook-delivery-job.ts`, which this document references but does not design\"). DES-064 correctly describes three ordered gates the job runs per claimed delivery: plan/flag check, `MAX_ATTEMPTS` check, endpoint-enabled check. Crucially, DES-064 says the `MAX_ATTEMPTS` of 6 is \"local to this file\" — and `background-jobs.md` has its own \"Known rough edges\" section that flags, in plain language, that `WEBHOOK_MAX_ATTEMPTS` in `constants.ts` is \"dead code for this purpose.\"\n\n**Code.** `src/server/jobs/webhook-delivery-job.ts` defines an unexported local constant `const MAX_ATTEMPTS = 6` (line 22) — it does **not** import `WEBHOOK_MAX_ATTEMPTS` from `@/config/constants` at all. `runWebhookDeliveryJob(now)` (line 32) claims deliveries via `webhookRepo.claimPendingDeliveries(CLAIM_BATCH)`, then for each one checks `delivery.attempts > MAX_ATTEMPTS` (line 49); on breach it calls `webhookRepo.markDeliveryFailed(orgId, delivery.id, \"giving up after ${delivery.attempts} attempts\")` and increments `result.failed`, ending the retry loop for that row. Meanwhile `src/config/constants.ts` separately exports `WEBHOOK_MAX_ATTEMPTS: number = 5` — a different number, and a symbol I confirmed via grep is referenced nowhere else in `src/` or `tests/`. It's genuinely unused.\n\n**Verification.** `tests/server/jobs.test.ts` does contain a test tied to this area, `\"backs delivery attempts off exponentially, with a ceiling\"`, but it only exercises the exported `backoffMs()` helper (REQ-156's backoff schedule and its 300,000ms cap) — not the abandonment branch. I grepped the test directory for `runWebhookDeliveryJob` and got zero matches: the function is never invoked by any test, so the actual `attempts > MAX_ATTEMPTS` gate and the resulting terminal `markDeliveryFailed` call have no test coverage at all, despite REQ-157 listing that file as its verifier.\n\n**Does the documentation's account match the code?** Partly, and it's worth separating which doc you mean. `DES-064` in `background-jobs.md` matches the code correctly and even self-reports the inconsistency in its \"Known rough edges\" section. But `REQ-157` in `webhooks.md` does not match: its acceptance criterion 3 asserts the ceiling is read from `WEBHOOK_MAX_ATTEMPTS` in `constants.ts`, and the code violates that outright — it hardcodes a separate local `MAX_ATTEMPTS = 6`, leaving the config constant (`= 5`, a different value besides) as dead code. There's also a stale cross-reference: `REQ-157` lists `DES-180` as related, but `DES-180` is actually about issue-repository predicate filtering (`docs/design/repository-issue-and-comment.md`) and has nothing to do with webhooks — the correct design pointer is `DES-064`. And the \"Verified by\" claim overstates coverage: only the backoff curve is tested, not the ceiling/abandonment behavior itself.",
+  "ttft_ms": 1571,
+  "type": "result",
+  "duration_ms": 92935,
+  "uuid": "859376d0-eab9-459a-b7c0-12d047ab4ab5",
+  "ttft_stream_ms": 1011,
+  "time_to_request_ms": 21,
+  "queued_turn_count": 0
+}
