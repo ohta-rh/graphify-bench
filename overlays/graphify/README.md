@@ -1,22 +1,44 @@
 # overlays/graphify
 
 Overlay for condition **B (graphify)**. Files here are copied over a fresh corpus
-copy before each run.
+copy before each run. Built 2026-09-02 against graphifyy **0.9.53**, corpus `corpus-v1`.
 
-Present:
+`applyOverlay` drops this top-level `README.md`, so the agent never sees it.
 
-- `CLAUDE.md` — the shared instruction text (identical to `overlays/baseline/CLAUDE.md`)
-  plus the `## graphify` section **verbatim** as `graphify install --project` writes it
-  (source: `graphify/always_on/claude-md.md`, graphifyy 0.9.53).
+## Contents
 
-Still to be produced by the Phase 2 worker (do not hand-write these):
+| Path | Origin |
+|---|---|
+| `CLAUDE.md` | shared instruction text + the `## graphify` section **verbatim** as `graphify install --project` writes it (byte-identical to 0.9.53's output — re-verified 2026-09-02) |
+| `.claude/CLAUDE.md` | written by `graphify install --project`; three lines pointing at the project skill |
+| `.claude/settings.json` | the two PreToolUse nudge hooks (`Bash\|Grep` → `hook-guard search`, `Read\|Glob` → `hook-guard read`) |
+| `.claude/skills/graphify/**` | project-scoped skill, `SKILL.md` + 8 `references/*.md` (0.9.53) |
+| `graphify-out/` | the frozen graph — see below |
 
-- `.claude/settings.json` — the PreToolUse hook. Its `command` contains an absolute
-  path to the `graphify` executable; run `pnpm exec tsx scripts/patch-overlay.ts`
-  after copying it in, to rewrite that path for the current machine.
-- `.claude/skills/graphify/` — the project-scoped skill.
-- `graphify-out/` — the frozen graph: `graph.json`, `GRAPH_REPORT.md`,
-  `.graphify_analysis.json`, `.graphify_labels.json`, `manifest.json`,
-  `.graphify_python`, `.graphify_root`.
-  **Must not include** `memory/`, `reflections/`, or `graph.html` — carrying those
-  across runs would leak session-to-session learning (architecture.md §8).
+`graphify-out/` holds exactly `graph.json`, `GRAPH_REPORT.md`,
+`.graphify_analysis.json`, `.graphify_labels.json`, `manifest.json`,
+`.graphify_python`, `.graphify_root`.
+It **must not** gain `memory/`, `reflections/`, `graph.html`, `cache/` or
+`.vocab.txt` — carrying session state across runs would leak session-to-session
+learning (architecture.md §8).
+
+## Maintenance
+
+`graphify install --project` in 0.9.53 writes the hook command as a bare
+`graphify` (it no longer bakes in an absolute path). The overlay deliberately
+stores it as an **absolute** path instead, so the hook cannot silently no-op
+when the spawned `claude` process has a PATH that omits `~/.local/bin` — a
+fail-open hook would quietly degrade condition B into condition A.
+
+That absolute path is machine-specific. Run
+
+```bash
+pnpm exec tsx scripts/patch-overlay.ts        # rewrite for this host
+pnpm exec tsx scripts/patch-overlay.ts --check # verify without writing
+```
+
+after refreshing the overlay and on any new host before measuring.
+
+`.graphify_python` is likewise a machine-specific absolute path. It is only a
+probe for graphify's *git* hooks, not for the PreToolUse guard, so a stale value
+does not affect measurement.
