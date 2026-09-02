@@ -103,7 +103,7 @@ DES は基本設計 DES-001–077、サービス詳細 DES-100–179、リポジ
 検出系タスクの素材として、**ちょうど 12 箇所**だけドキュメントがコードと食い違うように
 仕込んである。それ以外はすべて正確であることを意図している。
 
-- **記録先: `corpus/taskflow/docs/.review-notes.json`**
+- **記録先: `tasks/keys/docs-discrepancies.json`**
 - `index.md` からはリンクしておらず、名前も中立（レビュー用メモに見える）
 - 拡張子が `.json` なので `check-docs-corpus.ts` の走査対象（`*.md`）から外れる。加えて
   スクリプト側でも `IGNORED_BASENAMES` に明示的に入れてある
@@ -205,7 +205,7 @@ Director が実ソースを直接読んで裏取りした主なもの:
   記録済み
 - **UI の実挙動と設計意図のズレ**を 1 件、正直に書いてある（フラグ off 時に
   `WebhookManager` ごと描画されないため、ダウングレード後に削除導線が無い）。これは
-  仕込みではなく実コードの性質で、`.review-notes.json` には含めていない
+  仕込みではなく実コードの性質で、`docs-discrepancies.json (tasks/keys)` には含めていない
 - `traceability.md` は**再生成可能**。要求や設計にフィールドを足したら作り直せば追随する
 
 ---
