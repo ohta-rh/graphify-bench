@@ -73,6 +73,10 @@ A measurement lesson worth stating up front: the result JSON's `usage` block cov
 | `baseline-nosub` | Baseline with `--disallowedTools Agent`. |
 | `effort-medium`, `effort-low` | Baseline's overlay byte for byte, invoked with `--effort medium` / `low` instead of the default `high`. Nothing in the corpus copy differs, so `run.meta.json` records the effort that actually ran. |
 | `haiku-explore` | Baseline's `CLAUDE.md` byte for byte plus one `.claude/agents/Explore.md` declaring `model: haiku`. A project agent named `Explore` overrides Claude Code's built-in, so delegated exploration runs on Haiku while the main session stays on Sonnet. No instruction text changes — the arm varies *who explores*, not what the agent is told. |
+| `lean-tools` | `effort-low-nosub` plus `--tools Read,Grep,Glob,Bash,Edit`. `--tools` is an allowlist that *replaces* the built-in set and removes the other tools' schemas from the request, unlike `--allowedTools`, which only filters permissions. `Edit` stays because `fix` tasks are graded by running the test suite. |
+| `few-turns` | `effort-low-nosub` with one overlay change: `CLAUDE.md` is baseline's file byte for byte plus a `## Working economy` section (locate with `Grep -n`, read line ranges, batch independent calls into one turn, never re-read, stop when the evidence suffices). The answer-format contract is untouched. |
+| `haiku-nosub` | `baseline-nosub` on `claude-haiku-4-5`. No `--effort` override: Haiku 4.5 does not honour the flag (measured), so declaring one would record a treatment that never ran. |
+| `all-in` | The union of the three above: Haiku, no subagents, the lean tool allowlist and the turn-economy `CLAUDE.md`. |
 | `mempalace` / `mempalace-v2` | MemPalace 3.9.0: a `## mempalace` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `mempalace-mcp` server reached via `--mcp-config --strict-mcp-config`, exposing `mempalace_search` over a prebuilt ChromaDB index. The index is built once per corpus generation and **cloned into a private temp directory per run**, never into the corpus copy. v1 indexes the code, v2 the code and `docs/`. |
 | `haiku-*` | The same overlays with `claude-haiku-4-5`. |
 
@@ -129,9 +133,15 @@ nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/t
 nohup env BENCH_RESULTS_DIR=results/levers pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
   --conditions effort-medium,effort-low,haiku-explore,effort-low-nosub --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/levers/full.log 2>&1 &
 
+# Leaner still: tool allowlist, turn economy, the cheap model, and all of them
+# at once. `scripts/run-lean.sh` is exactly this invocation.
+nohup env BENCH_RESULTS_DIR=results/lean pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions lean-tools,few-turns,haiku-nosub,all-in --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/lean/full.log 2>&1 &
+
 pnpm bench:collect && pnpm bench:grade && pnpm bench:analyze && pnpm bench:report   # per results dir
 pnpm bench:report:combined && pnpm bench:report:structural && pnpm bench:report:docs
 pnpm bench:analyze:levers && pnpm bench:report:levers
+pnpm bench:analyze:lean && pnpm bench:report:lean && python3 scripts/sanity-lean.py
 ```
 
 Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`. Conditions are declared in `bench/conditions.ts`. Environment variables: `BENCH_MODEL`, `BENCH_EFFORT`, `BENCH_REPS`, `BENCH_MAX_BUDGET_USD`, `BENCH_RESULTS_DIR`.
@@ -139,7 +149,7 @@ Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`
 ## Layout
 
 ```
-bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 260 tests)
+bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 274 tests)
 corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
 overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace)
 tasks/       three task files, keys/, rubrics, bugs/*.patch, docs-discrepancies.json
