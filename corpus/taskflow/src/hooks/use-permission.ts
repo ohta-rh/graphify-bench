@@ -3,12 +3,20 @@
 /**
  * Client-side `can()` for the current actor. Never re-implements the matrix.
  *
- * STUB — owner B. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
- *
  * Must call (do not reimplement): can
  */
+import { useMemo } from "react";
+import { can } from "@/lib/permissions";
 import type { PermissionAction, PermissionResource } from "@/types/permission";
-export function usePermission(action: PermissionAction, resource: PermissionResource): boolean {
-  throw new Error("stub: src/hooks/use-permission.ts");
+import { useOrg } from "./use-org";
+
+export function usePermission(
+  action: PermissionAction,
+  resource: PermissionResource,
+): boolean {
+  const { actor } = useOrg();
+  return useMemo(
+    () => can(actor, action, resource),
+    [actor, action, resource],
+  );
 }
