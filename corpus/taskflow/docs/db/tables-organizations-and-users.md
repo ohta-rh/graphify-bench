@@ -3,7 +3,7 @@ title: Organizations and users
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [REQ-001, REQ-002, REQ-003, REQ-006, REQ-008, REQ-009, REQ-010, REQ-200, REQ-202, REQ-203, REQ-204, REQ-208, REQ-209, ADR-006, ADR-020, DES-ORG-REPO, DES-AUTH-SESSION]
+related: [REQ-001, REQ-002, REQ-003, REQ-006, REQ-008, REQ-009, REQ-010, REQ-200, REQ-202, REQ-203, REQ-204, REQ-208, REQ-209, ADR-006, ADR-020, DES-194, DES-168]
 ---
 
 ## Purpose

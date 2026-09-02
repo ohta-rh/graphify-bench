@@ -68,6 +68,8 @@ can distinguish "you did something wrong" from "you need to pay for more."
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-003, REQ-006, DES-160
+- **Implemented by:** `src/server/repositories/subscription-repository.ts` — `findSubscription`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 `subscription-repository.ts#findSubscription(orgId)` assumes at most one row per
 organization, seeded as `free` at organization creation (`REQ-003`) and never left absent
@@ -88,6 +90,8 @@ a "no subscription yet" branch.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-141, ADR-010
+- **Implemented by:** `src/config/plan-limits.ts` — `PLAN_ORDER`
+- **Verified by:** `tests/config/plan-limits.test.ts`
 
 `PLAN_ORDER` in `src/config/plan-limits.ts` fixes `free < starter < growth < enterprise`,
 and `planAtLeast(plan, threshold)` is the comparison every plan-gated feature flag
@@ -132,6 +136,8 @@ does not know the number "100" for `free`'s `issuesPerProject`; it only knows to
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-032, REQ-006
+- **Implemented by:** `src/server/repositories/member-repository.ts` — `countActiveMembers`, `src/server/services/billing-service.ts` — `checkLimit`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 `countActiveMembers(orgId)` in `member-repository.ts` excludes soft-deleted (removed)
 members, and this is exactly the count `checkLimit(orgId, 'seats', ...)` compares against
@@ -154,6 +160,8 @@ invite a replacement after offboarding someone.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-043, REQ-044
+- **Implemented by:** `src/server/services/billing-service.ts` — `checkLimit`, `assertWithinLimit`
+- **Verified by:** `tests/services/billing-service.test.ts`, `tests/contract/plan-limits.test.ts`
 
 This document is the canonical statement of the rule `REQ-043` in `projects.md` implements:
 `checkLimit(orgId, 'projects', used)` must return a non-exceeding verdict before
@@ -175,6 +183,8 @@ projects (`REQ-044`).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-064, ADR-010
+- **Implemented by:** `src/server/services/billing-service.ts` — `checkLimit`, `src/server/repositories/issue-repository.ts` — `countIssues`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 Mirrors `REQ-064` from the billing side: `issuesPerProject` is enforced per project, not
 per organization, so `checkLimit`'s `used` argument for this resource is
@@ -195,6 +205,8 @@ the org.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-150, REQ-152
+- **Implemented by:** `src/server/services/webhook-service.ts` — `createWebhook`, `src/config/plan-limits.ts` — `wouldExceedLimit`
+- **Verified by:** `tests/contract/plan-limits.test.ts`
 
 `PlanLimits.webhooks` is 0 for `free`, 2 for `starter`, 10 for `growth`, and unlimited for
 `enterprise` — note that `free` and `starter` both technically have a nonzero-or-zero
@@ -215,6 +227,8 @@ creation entirely before the count check would ever matter.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-008, REQ-132, DES-160
+- **Implemented by:** `src/config/plan-limits.ts` — `wouldExceedLimit`, `src/lib/format.ts` — `formatLimit`
+- **Verified by:** `tests/config/plan-limits.test.ts`, `tests/lib/format.test.ts`
 
 `UNLIMITED` is `Number.POSITIVE_INFINITY`, used for `enterprise`'s `seats`, `projects` and
 `issuesPerProject` fields (`storageMb` and `apiRequestsPerHour` are large finite numbers
@@ -259,6 +273,8 @@ what lets the client render a specific upsell prompt rather than a generic error
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-138, REQ-220
+- **Implemented by:** `src/server/services/billing-service.ts` — `checkLimit`, `src/server/services/activity-service.ts` — `record`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 Beyond the synchronous error returned to the caller, a quota breach also emits
 `billing.limit_exceeded` on the event bus, which the activity service records — so an admin
@@ -279,6 +295,8 @@ message.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-025, REQ-142, DES-071
+- **Implemented by:** `src/server/services/billing-service.ts` — `changePlan`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 `changePlan` emits `billing.plan_changed` with the previous and new plan, consumed by the
 activity service and by anything that needs to react to a plan transition — most notably
@@ -298,6 +316,8 @@ than caching it.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-131, REQ-138, DES-160
+- **Implemented by:** `src/server/services/billing-service.ts` — `changePlan`
+- **Verified by:** `tests/services/billing-service.test.ts`
 
 `changePlan` checks the org's current usage against every field of the target plan's
 `PlanLimits` before committing a downgrade; if seats, projects, issues in any project, or
@@ -319,6 +339,8 @@ over its new limits.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-140, ADR-016
+- **Implemented by:** `src/server/jobs/trial-expiry-job.ts` — `runTrialExpiryJob`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `runTrialExpiryJob(now)` in `trial-expiry-job.ts` runs on the `trial-expiry` cadence (every
 360 minutes) and calls `listTrialsEndingBefore(now)` in `subscription-repository.ts`; any
@@ -341,6 +363,8 @@ at its recorded date and the org lands on `free`.
 - **Priority:** could
 - **Status:** partial
 - **Related:** REQ-130, DES-170
+- **Implemented by:** `src/server/repositories/invoice-repository.ts` — `insertInvoice`, `listInvoices`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `invoice-repository.ts#insertInvoice` and `listInvoices` exist and back the invoices page
 (`src/app/(dashboard)/[orgSlug]/settings/billing/invoices/page.tsx`), but there is no
@@ -362,6 +386,8 @@ in this corpus.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-008, ADR-016
+- **Implemented by:** `src/server/jobs/usage-rollup-job.ts` — `runUsageRollupJob`, `src/server/repositories/usage-repository.ts` — `recomputeUsage`, `listOrgIdsForRollup`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `runUsageRollupJob(now)` calls `recomputeUsage(orgId)` for orgs returned by
 `listOrgIdsForRollup(limit)`, on the `usage-rollup` cadence (every 15 minutes) — the

@@ -33,8 +33,9 @@ records (`ADR-###`) that live alongside it in this corpus.
 | Auth and sessions | `auth-and-sessions.md` | REQ-200 – REQ-213 | 14 |
 | Audit and activity | `audit-and-activity.md` | REQ-220 – REQ-231 | 12 |
 
-The gaps in the numbering — REQ-015 through REQ-019, REQ-035 through REQ-039, and similar
-bands between every domain — are reserved headroom, not missing requirements; a working
+The gaps in the numbering — the unused band at the top of every domain's range, between the
+last id a domain actually defines and the first id of the next domain — are reserved
+headroom, not missing requirements; a working
 convention across this corpus is that every domain gets at least a few unused ids at the top
 of its range so a future addition to, say, organizations does not have to be squeezed in as
 `REQ-014a` or spill into membership's range and force a renumbering of ids other documents

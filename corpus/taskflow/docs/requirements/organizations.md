@@ -65,6 +65,8 @@ client).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** DES-001, ADR-006, REQ-010
+- **Implemented by:** `src/server/db/schema/_shared.ts`, `src/server/repositories/organization-repository.ts`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 Every object a user can see or mutate in Taskflow — projects, issues, comments, members,
 webhooks, invoices — is reachable only through an organization. There is no cross-org view of
@@ -88,6 +90,8 @@ field is immutable for the lifetime of that request.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-008, REQ-041, DES-010
+- **Implemented by:** `src/lib/slug.ts` — `assertValidSlug`, `uniqueSlug`
+- **Verified by:** `tests/lib/slug.test.ts`, `tests/contract/slug.test.ts`
 
 The slug is what appears in the URL (`/[orgSlug]/...`) and therefore has to be unique across
 every organization on the instance, not just within some parent scope — there is no parent
@@ -109,6 +113,8 @@ similar route segments that would otherwise collide with the app's own top-level
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-006, REQ-020, DES-011
+- **Implemented by:** `src/server/services/organization-service.ts` — `createOrganization`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `createOrganization` in `src/server/services/organization-service.ts` is transactional in
 effect even though the underlying store is SQLite accessed synchronously: it inserts the
@@ -129,6 +135,8 @@ organization without an owner member attached in the same call.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-024, REQ-034
+- **Implemented by:** `src/server/services/organization-service.ts` — `updateOrganization`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `updateOrganization` requires `org:update`, whose minimum role in `ROLE_MATRIX` is `admin`.
 Unlike the owner-only actions (`REQ-007`, `REQ-025`), routine profile edits are not
@@ -149,6 +157,8 @@ the person who keeps its description current.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-191, REQ-192, DES-020
+- **Implemented by:** `src/server/services/feature-flag-service.ts` — `buildFlagContext`, `getSnapshot`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `Organization` carries a `settings` structure that includes a flag-override map, read by
 `buildFlagContext` in `src/server/services/feature-flag-service.ts` and consulted by
@@ -169,6 +179,8 @@ tenant without a deploy.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-003, REQ-031, DES-011
+- **Implemented by:** `src/server/services/member-service.ts` — `assertLastOwnerRetained`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 This is the invariant `assertLastOwnerRetained` in `src/server/services/member-service.ts`
 exists to protect, even though the invariant is defined here at the organization level: at
@@ -190,6 +202,8 @@ independent "co-owner" state.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-025, REQ-048, DES-030
+- **Implemented by:** `src/server/services/organization-service.ts` — `deleteOrganization`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `deleteOrganization` requires `org:delete`, whose `ROLE_MATRIX` minimum is `owner`, the
 strictest gate in the product alongside `org:manage_billing`. Deletion is a soft delete —
@@ -211,6 +225,8 @@ plan's `retentionDays` window like everything else.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-132, REQ-144, DES-040
+- **Implemented by:** `src/server/services/organization-service.ts` — `getOrganizationSummary`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `getOrganizationSummary` composes the organization row, its subscription and its usage
 counters into one `OrganizationSummary` for the org's landing page and the billing screen.
@@ -231,6 +247,8 @@ currently holds, which is refreshed both incrementally (on writes, via
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-213, DES-041
+- **Implemented by:** `src/server/services/session-service.ts` — `switchActiveOrg`, `src/actions/organizations/switch-org.ts` — `switchOrgAction`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `switchActiveOrg` in `src/server/services/session-service.ts`, invoked by
 `switchOrgAction`, is the only way the session's active organization changes. There is no
@@ -252,6 +270,8 @@ explicit action.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-006, REQ-011, DES-001
+- **Implemented by:** `src/server/db/schema/_shared.ts`
+- **Verified by:** `tests/server/tenant-scope.test.ts`
 
 This is the schema-level restatement of `REQ-001`. `src/server/db/schema/_shared.ts` defines
 the shared column helpers every tenant table's schema module composes, and `org_id` is one of
@@ -299,6 +319,8 @@ observability wraps `explain()`, even though it is not itself an activity-feed r
 - **Priority:** should
 - **Status:** partial
 - **Related:** REQ-121, REQ-070, DES-050
+- **Implemented by:** `src/lib/date.ts` — `digestWindow`, `isOverdue`
+- **Verified by:** `tests/lib/date.test.ts`
 
 Organizations conceptually operate in one timezone for the purpose of "what day is this
 digest for" and "is this issue overdue yet." In practice `digestWindow()` in
@@ -321,6 +343,8 @@ delivers (a UTC hour).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-074, DES-051
+- **Implemented by:** `src/server/services/label-service.ts`, `src/server/repositories/label-repository.ts` — `listLabels`, `deleteLabel`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 Labels are not scoped to a project; `label-repository.ts` and `label-service.ts` both key
 purely on `orgId`. A label created while looking at one project's issue list is immediately
@@ -342,6 +366,8 @@ table would create.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-040, REQ-053
+- **Implemented by:** `src/server/services/organization-service.ts` — `createOrganization`, `src/actions/auth/register.ts` — `registerAction`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `createOrganization` does not stop at the owner member and the free subscription; the
 onboarding flow that calls it also creates a starter project so a brand-new organization is

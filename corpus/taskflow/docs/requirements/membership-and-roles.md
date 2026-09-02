@@ -61,6 +61,8 @@ writes a pending invitation row it would have to clean up later.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-003, REQ-021, DES-011
+- **Implemented by:** `src/types/member.ts` — `ROLE_RANK`, `hasRoleAtLeast`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`, `tests/schemas/member.schema.test.ts`
 
 `ROLE_RANK` in `src/types/member.ts` orders the four roles `owner > admin > member >
 viewer`, and every "minimum role" check in the product — `ROLE_MATRIX`, `hasRoleAtLeast`,
@@ -105,6 +107,8 @@ without ever reaching the ownership-escalation step.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-020, REQ-181, REQ-224
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/components/domain/permission/permission-gate.tsx`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`, `tests/components/permission-gate.test.tsx`
 
 `viewer` is the minimum role for every `*:read` action in `ROLE_MATRIX` —
 `org:read`, `member:read`, `project:read`, `issue:read`, `comment:read`,
@@ -126,6 +130,8 @@ would be denied server-side even if a viewer forged the request.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-060, REQ-090, REQ-040
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/actions/issues/create-issue.ts`, `src/actions/projects/create-project.ts`, `src/actions/comments/create-comment.ts`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `member` is the `ROLE_MATRIX` minimum for `project:create`, `project:update`,
 `issue:create`, `issue:update`, `issue:assign`, `issue:archive`, `comment:create` and
@@ -148,6 +154,8 @@ running a project and triaging issues, without the organizational authority of `
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-028, REQ-192, REQ-045
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `admin` is the `ROLE_MATRIX` minimum for `member:invite`, `member:update_role`,
 `member:remove`, `org:manage_flags`, `org:update`, `project:archive`, `issue:delete`,
@@ -167,6 +175,8 @@ the two owner-only actions (`org:delete`, `org:manage_billing`).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-007, REQ-140, DES-021
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/actions/billing/change-plan.ts`, `src/actions/billing/update-seats.ts`, `src/actions/billing/cancel-subscription.ts`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `org:delete` and `org:manage_billing` are the only two actions whose `ROLE_MATRIX` minimum
 is `owner`. Every billing action — `changePlanAction`, `updateSeatsAction`,
@@ -214,6 +224,8 @@ of the five escalation actions and not, say, `issue:delete`.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-011, ADR-003, REQ-021
+- **Implemented by:** `src/lib/permissions.ts` — `can`, `explain`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`, `tests/contract/permissions.test.ts`
 
 `actor.isPlatformStaff` is checked immediately after the cross-tenant guard and before the
 role matrix, so a support engineer resolved as an `Actor` for a customer's organization is
@@ -235,6 +247,8 @@ runs first, so staff access is always scoped to one organization at a time throu
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-024, REQ-032, DES-020
+- **Implemented by:** `src/server/services/invitation-service.ts` — `inviteMember`, `inviteMembers`
+- **Verified by:** `tests/services/invitation-service.test.ts`, `tests/schemas/member.schema.test.ts`
 
 `inviteMember` in `src/server/services/invitation-service.ts` takes an email address and a
 target role, not a user id — the invited person need not have a Taskflow account yet. The
@@ -256,6 +270,8 @@ capped by the bulk-invite bound enforced in `tests/schemas/member.schema.test.ts
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-030, DES-030, ADR-020
+- **Implemented by:** `src/server/repositories/invitation-repository.ts` — `findInvitationByTokenHash`, `markInvitationAccepted`, `src/lib/hash.ts` — `hashToken`
+- **Verified by:** `tests/services/invitation-service.test.ts`
 
 `invitation-repository.ts` keys lookups on a hash of the token (`hashToken` in
 `src/lib/hash.ts`), the same pattern session tokens use (`REQ-203`), so the database never
@@ -275,6 +291,8 @@ expiry, is refused by `acceptInvitation` before it ever creates a member.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-006, REQ-111, DES-031
+- **Implemented by:** `src/server/services/invitation-service.ts` — `acceptInvitation`, `src/actions/members/accept-invitation.ts` — `acceptInvitationAction`
+- **Verified by:** `tests/services/invitation-service.test.ts`
 
 `acceptInvitation(userId, input)` in `invitation-service.ts` inserts the member row at the
 role recorded on the invitation, marks the invitation accepted, and emits `member.joined`
@@ -319,6 +337,8 @@ appeared to succeed but did nothing.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-133, REQ-138, ADR-010
+- **Implemented by:** `src/server/services/invitation-service.ts` — `inviteMember`, `src/config/plan-limits.ts` — `wouldExceedLimit`
+- **Verified by:** `tests/services/invitation-service.test.ts`, `tests/contract/plan-limits.test.ts`
 
 `inviteMember` calls `wouldExceedLimit(plan, 'seats', usedSeats)` before it writes the
 invitation row. A pending invitation counts toward the seat total the same as an accepted
@@ -338,6 +358,8 @@ moment they resolve.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-004, REQ-026, REQ-071
+- **Implemented by:** `src/server/services/member-service.ts` — `removeMember`, `src/server/repositories/user-repository.ts` — `findUsersByIds`
+- **Verified by:** `tests/services/member-service.test.ts`
 
 `removeMember` is a soft delete on the member row (`archivePatch`), not a cascade that
 deletes or reassigns the issues and comments that member authored. An issue's `authorId`
@@ -359,6 +381,8 @@ after someone leaves the org.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-220, REQ-222, ADR-022
+- **Implemented by:** `src/server/services/member-service.ts` — `updateMemberRole`, `src/server/services/activity-service.ts` — `record`
+- **Verified by:** `tests/services/member-service.test.ts`
 
 `updateMemberRole` is one of the events that flows into the audit trail: the `activity`
 service records the member's previous role and new role in the activity row's metadata, not

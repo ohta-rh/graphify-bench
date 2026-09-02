@@ -99,6 +99,8 @@ mutation site in every service.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-220, ADR-022
+- **Implemented by:** `src/server/repositories/activity-repository.ts`
+- **Verified by:** `tests/services/activity-service.test.ts`
 
 There is no `updateActivity` function anywhere in `activity-repository.ts` or
 `activity-service.ts`; once inserted, an activity row's fields never change. Even the
@@ -118,6 +120,8 @@ content, which would compromise the trail's evidentiary value.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-034, REQ-220
+- **Implemented by:** `src/server/services/activity-service.ts` — `record`
+- **Verified by:** `tests/services/activity-service.test.ts`
 
 Every `ActivityEvent` names three things: who did it (`actorId`, nullable for system
 actions), what it was done to (`subjectKind`, `subjectId`), and what happened
@@ -138,6 +142,8 @@ kind of detail `metadata` exists to carry.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-222, DES-230
+- **Implemented by:** `src/server/repositories/activity-repository.ts` — `listActivityForSubject`
+- **Verified by:** `tests/services/activity-service.test.ts`
 
 `listActivityForSubject(orgId, subjectKind, subjectId)` in `activity-repository.ts` powers
 the "history" panel on an individual issue's detail page, distinct from
@@ -156,6 +162,8 @@ two different read patterns over the same underlying append-only table.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-022, REQ-023
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `activity:read`'s `ROLE_MATRIX` minimum is `member`, one tier above the `viewer` floor most
 `*:read` actions use — a deliberate exception reflecting that the activity feed surfaces
@@ -175,6 +183,8 @@ contributors but not for the lowest-privilege observer role.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-079, REQ-024
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/server/services/activity-service.ts` — `exportActivity`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `activity:export`'s `ROLE_MATRIX` minimum is `admin`, stricter than `activity:read`'s
 `member` floor, mirroring the read-versus-bulk-export permission split used elsewhere in the
@@ -195,6 +205,8 @@ underlying read access is already restricted to `member`-and-above).
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-188, ADR-012
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/config/nav.ts` — `visibleNav`
+- **Verified by:** `tests/lib/feature-flags.test.ts`, `tests/config/nav.test.ts`
 
 `activity_feed` (`growth` plan minimum, overridable) gates the dedicated activity feed
 screen; `free` and `starter` orgs without an override do not see the feature in navigation
@@ -213,6 +225,8 @@ screen; `free` and `starter` orgs without an override do not see the feature in 
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-231, ADR-010, DES-240
+- **Implemented by:** `src/config/plan-limits.ts` — `getPlanLimits`, `src/server/jobs/cleanup-archived-job.ts` — `runCleanupArchivedJob`
+- **Verified by:** `tests/config/plan-limits.test.ts`
 
 `getPlanLimits(plan).retentionDays` — 30 for `free`, 90 for `starter`, 365 for `growth`, and
 2555 (roughly seven years) for `enterprise` — bounds how far back activity (and other
@@ -233,6 +247,8 @@ depth directly to the plan ladder the same way every other quota in the product 
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-220, ADR-005
+- **Implemented by:** `src/server/services/activity-service.ts` — `registerActivityListeners`, `src/lib/event-bus.ts` — `subscribe`
+- **Verified by:** `tests/lib/event-bus.test.ts`
 
 Because activity recording happens through an event-bus subscriber, not inline inside
 `issue-service.ts`/`comment-service.ts`/etc., a failure inside `record()` cannot roll back
@@ -254,6 +270,8 @@ audit-specific defensive coding in `activity-service.ts` itself.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-052, REQ-078, ADR-008
+- **Implemented by:** `src/server/services/activity-service.ts` — `listActivity`, `groupByDay`
+- **Verified by:** `tests/services/activity-service.test.ts`
 
 `listActivity(input)` returns a `Page<ActivityEvent>` using the same keyset-cursor pattern as
 every other paginated listing in the product, ordered by occurrence time, most recent first —
@@ -298,6 +316,8 @@ application.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-227, ADR-016
+- **Implemented by:** `src/server/repositories/activity-repository.ts` — `purgeActivityBefore`, `src/server/jobs/cleanup-archived-job.ts` — `runCleanupArchivedJob`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `purgeActivityBefore(orgId, before)` in `activity-repository.ts` is called by
 `runCleanupArchivedJob(now)` for each organization, using `before = now - retentionDays`

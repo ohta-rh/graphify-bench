@@ -80,6 +80,8 @@ the person who took the original action.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-010, REQ-136
+- **Implemented by:** `src/server/repositories/webhook-repository.ts` — `listEndpoints`, `src/server/services/webhook-service.ts` — `createWebhook`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `webhook-repository.ts`'s endpoint table carries `org_id`; `listEndpoints(orgId)` and every
 other function scope strictly to one organization, matching the tenancy discipline every
@@ -101,6 +103,8 @@ organizations.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-024, ADR-003
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `webhook:manage`'s `ROLE_MATRIX` minimum is `admin`; there is no ownership escalation for
 webhook endpoints the way there is for issues and comments, since an endpoint is
@@ -120,6 +124,8 @@ endpoint equally, with no notion of "the admin who created it" having special st
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-136, REQ-188, ADR-012
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/server/services/webhook-service.ts` — `createWebhook`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 The `webhooks` feature flag (`growth` plan minimum, **not** overridable, per the product
 facts) gates both endpoint creation and delivery — unlike most flags, `webhooks` cannot be
@@ -141,6 +147,8 @@ restriction distinct from the endpoint-count quota in `REQ-136`.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-160, DES-180
+- **Implemented by:** `src/server/repositories/webhook-repository.ts` — `insertEndpoint`, `src/server/services/webhook-service.ts` — `signPayload`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `insertEndpoint(input, secret)` stores a per-endpoint secret generated at creation;
 `signPayload(secret, payload)` HMAC-signs the serialized delivery body, and the signature is
@@ -185,6 +193,8 @@ health and latency of a third-party webhook receiver.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-154, ADR-018
+- **Implemented by:** `src/server/repositories/webhook-repository.ts` — `claimPendingDeliveries`
+- **Verified by:** `tests/server/jobs.test.ts`
 
 `CLAIM_BATCH = 25` bounds how many pending deliveries `claimPendingDeliveries(limit)`
 returns to one job tick, preventing a large backlog for one organization from starving
@@ -204,6 +214,8 @@ runs across all organizations rather than per-org.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-157, ADR-018
+- **Implemented by:** `src/server/jobs/webhook-delivery-job.ts` — `backoffMs`, `runWebhookDeliveryJob`
+- **Verified by:** `tests/server/jobs.test.ts`
 
 `backoffMs(attempts)` in `webhook-delivery-job.ts` returns 1000, 2000, 4000ms and so on,
 doubling per attempt and capped at 300000 ms. A failed delivery is not retried immediately
@@ -224,6 +236,8 @@ waits at least `backoffMs(attempts)` before becoming claimable again.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-156, DES-180
+- **Implemented by:** `src/server/jobs/webhook-delivery-job.ts` — `runWebhookDeliveryJob`, `src/config/constants.ts` — `WEBHOOK_MAX_ATTEMPTS`
+- **Verified by:** `tests/server/jobs.test.ts`
 
 `MAX_ATTEMPTS = 6`. Once a delivery's attempt count reaches this ceiling without a
 successful response, it is no longer retried; it stays in a terminal failed state, visible
@@ -242,6 +256,8 @@ through the delivery-attempts UI (`REQ-159`) but no longer occupying the retry q
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-136, REQ-152
+- **Implemented by:** `src/server/jobs/webhook-delivery-job.ts` — `runWebhookDeliveryJob`
+- **Verified by:** `tests/server/jobs.test.ts`
 
 An endpoint can be toggled disabled without being deleted; a delivery targeting a disabled
 endpoint is marked failed immediately by the job, without consuming an HTTP round trip or
@@ -263,6 +279,8 @@ would, since the failure here is a known local condition, not the endpoint's own
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-157, DES-190
+- **Implemented by:** `src/app/(dashboard)/[orgSlug]/settings/webhooks/webhook-manager.tsx`, `src/server/repositories/webhook-repository.ts` — `markDelivered`, `markDeliveryFailed`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `src/app/(dashboard)/[orgSlug]/settings/webhooks/webhook-manager.tsx` renders each
 endpoint's recent delivery attempts, backed by the delivery-attempt rows
@@ -283,6 +301,8 @@ to inspect logs outside the product.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-153, DES-071
+- **Implemented by:** `src/server/repositories/webhook-repository.ts` — `enqueueDelivery`
+- **Verified by:** `tests/server/jobs.test.ts`
 
 Every delivered payload includes the originating event's type string (one of the 21 keys in
 `TaskflowEventMap`) and the standard `EventEnvelope` fields (`orgId`, `actorId`,
@@ -302,6 +322,8 @@ Taskflow-specific schema per event beyond what the envelope already standardizes
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-096, REQ-176, ADR-011
+- **Implemented by:** `src/lib/rate-limit.ts` — `consumeRateLimit`, `getBucketConfig`
+- **Verified by:** `tests/lib/rate-limit.test.ts`
 
 The `webhook:deliver` rate-limit bucket (capacity 100, refill 50/minute) bounds how fast one
 organization's queued deliveries can be attempted, independent of the `CLAIM_BATCH` bound

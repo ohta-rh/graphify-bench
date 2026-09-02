@@ -3,7 +3,7 @@ title: Members and invitations
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [REQ-020, REQ-021, REQ-028, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, ADR-006, ADR-004, DES-MEMBER-INVITATION, DES-PERM]
+related: [REQ-020, REQ-021, REQ-028, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, ADR-006, ADR-004, DES-144, DES-040]
 ---
 
 ## Purpose
@@ -173,7 +173,7 @@ dictionary does and does not claim about it. The column itself is a closed four-
 those four values are *interpreted* by `src/lib/permissions.ts`'s `ROLE_MATRIX`, not something
 the `TEXT` column or its enum constraint expresses on its own; SQLite enforces that the stored
 value is one of the four literals, nothing about their relative ordering. `can()`, `assertCan()`
-and `explain()` (DES-PERM) are the functions that turn a `role` value plus a requested action
+and `explain()` (DES-040) are the functions that turn a `role` value plus a requested action
 into an allow/deny decision, and none of them are repository functions — they operate on an
 already-loaded `Actor`, built from a `members` row by the request-resolution layer described in
 REQ-210, not on a live database read performed at authorization-check time. This matters for

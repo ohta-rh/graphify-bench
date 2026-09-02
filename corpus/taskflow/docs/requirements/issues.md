@@ -69,6 +69,8 @@ of one job producing one event the rest of the system reacts to uniformly.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-040, REQ-010, DES-070
+- **Implemented by:** `src/server/repositories/issue-repository.ts` — `findIssueById`, `insertIssue`
+- **Verified by:** `tests/repositories/issue-repository.test.ts`
 
 `issues` carries both `org_id` and `project_id`; every `issue-repository.ts` function takes
 `orgId` first, and most also take or resolve a `projectId`. There is no cross-project issue
@@ -111,6 +113,8 @@ comment permalink and search result referencing it.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-066, REQ-077, DES-071
+- **Implemented by:** `src/types/issue.ts`, `src/schemas/issue.ts`, `src/lib/format.ts` — `humanizeStatus`
+- **Verified by:** `tests/schemas/issue.schema.test.ts`, `tests/lib/format.test.ts`
 
 `IssueStatus` in `src/types/issue.ts` is a fixed union, mirrored by an enum in
 `src/schemas/issue.ts` so a status value from an untrusted request is validated against the
@@ -132,6 +136,8 @@ also knowing about it.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-062, DES-071
+- **Implemented by:** `src/types/issue.ts`, `src/schemas/issue.ts`, `src/lib/format.ts` — `humanizePriority`
+- **Verified by:** `tests/schemas/issue.schema.test.ts`, `tests/lib/format.test.ts`
 
 Priority follows the same closed-union pattern as status: `IssuePriority` in
 `src/types/issue.ts`, validated in `src/schemas/issue.ts`, humanized by
@@ -152,6 +158,8 @@ judgment call rather than a workflow stage.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-135, REQ-138, ADR-010
+- **Implemented by:** `src/server/services/issue-service.ts` — `createIssue`, `src/config/plan-limits.ts` — `wouldExceedLimit`
+- **Verified by:** `tests/services/issue-service.test.ts`, `tests/contract/plan-limits.test.ts`
 
 `createIssue` calls `wouldExceedLimit(plan, 'issuesPerProject', used)` scoped to the target
 project, not to the organization as a whole — a `free`-plan org with two projects gets 100
@@ -195,6 +203,8 @@ three subscribers is referenced by name inside `issue-service.ts`.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-062, REQ-111, DES-070
+- **Implemented by:** `src/server/services/issue-service.ts` — `changeIssueStatus`
+- **Verified by:** `tests/services/issue-service.test.ts`
 
 `changeIssueStatus` emits `issue.status_changed`, distinct from the general `issue.updated`
 event a plain field edit would emit, because status transitions are the event most
@@ -215,6 +225,8 @@ which the two-event split makes possible without payload-level filtering.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-113, REQ-068
+- **Implemented by:** `src/server/services/issue-service.ts` — `assignIssue`
+- **Verified by:** `tests/services/issue-service.test.ts`
 
 `assignIssue` emits `issue.assigned` carrying both the new assignee and the previous one
 (which may be `null`), which is what lets the notification service decide whether to notify
@@ -235,6 +247,8 @@ were unassigned — two different notification semantics from one event.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-066, REQ-067, DES-071
+- **Implemented by:** `src/server/services/issue-service.ts` — `updateIssue`
+- **Verified by:** `tests/services/issue-service.test.ts`
 
 `updateIssue` diffs the incoming patch against the current row and includes only the fields
 that actually changed in the `issue.updated` payload, rather than the full before/after
@@ -258,6 +272,8 @@ on every minor edit.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-070, REQ-012
+- **Implemented by:** `src/schemas/issue.ts`, `src/lib/date.ts` — `isOverdue`
+- **Verified by:** `tests/schemas/issue.schema.test.ts`, `tests/lib/date.test.ts`
 
 `dueAt` is a nullable `IsoTimestamp` field on the issue, settable through `createIssue` or
 `updateIssue`. It is the input `isOverdue()` in `src/lib/date.ts` and the overdue sweep job
@@ -300,6 +316,8 @@ issue past its due date is never reported overdue.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-004, REQ-046, REQ-073
+- **Implemented by:** `src/server/services/issue-service.ts` — `archiveIssue`, `src/lib/soft-delete.ts` — `shouldFilterArchived`
+- **Verified by:** `tests/services/issue-service.test.ts`, `tests/lib/soft-delete.test.ts`
 
 `archiveIssue` sets `archived_at` via `archivePatch()`; there is no `deleteIssue` in
 `issue-service.ts` for interactive use, mirroring the project-level pattern (`REQ-048`).
@@ -319,6 +337,8 @@ queryable with an explicit scope.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-026, ADR-003
+- **Implemented by:** `src/lib/permissions.ts` — `can`
+- **Verified by:** `tests/lib/permissions.ownership.test.ts`
 
 This is the issue-specific instance of the ownership-escalation rule defined generally in
 `REQ-026`: `issue:update` and `issue:archive` are granted to the issue's author or its
@@ -340,6 +360,8 @@ explicitly reassigns that work.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-024, REQ-072
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `issue:delete`'s `ROLE_MATRIX` minimum is `admin`, one of the few issue actions ownership
 escalation does not reach (`REQ-072`). As with projects and organizations, there is no
@@ -358,6 +380,8 @@ through the retention cleanup job once an archived issue passes the plan's reten
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-013, DES-100
+- **Implemented by:** `src/server/repositories/label-repository.ts` — `setIssueLabels`, `listLabelsForIssues`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `setIssueLabels(orgId, issueId, labelIds)` attaches labels from the organization-wide label
 set (`REQ-013`) to an issue; `listLabelsForIssues` batches the reverse lookup for list and
@@ -376,6 +400,8 @@ board views so rendering a page of issues does not issue one label query per row
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-132, ADR-010
+- **Implemented by:** `src/server/services/attachment-service.ts` — `addAttachment`, `src/server/repositories/attachment-repository.ts` — `sumStorageBytes`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `attachment-service.ts#addAttachment` calls `wouldExceedLimit(plan, 'storageMb', used)`
 before `attachment-repository.ts#insertAttachment` runs, where `used` comes from
@@ -396,6 +422,8 @@ size accounting they carry is real and is what the quota check reads.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-061, REQ-042
+- **Implemented by:** `src/server/services/issue-service.ts` — `moveIssue`
+- **Verified by:** `tests/services/issue-service.test.ts`
 
 `moveIssue` calls `nextIssueNumber` for the destination project and assigns the issue a new
 number there, since issue numbers are scoped per project (`REQ-061`) and a number from the
@@ -415,6 +443,8 @@ source project could already be taken in the destination. The issue keeps its id
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-062, REQ-074, DES-100
+- **Implemented by:** `src/server/repositories/issue-repository.ts` — `listIssues`, `listIssuesWithRelations`
+- **Verified by:** `tests/repositories/issue-repository.test.ts`, `tests/components/issue-filter-params.test.ts`
 
 `IssueFilterInput` accepts status, assignee and label filters, consumed by
 `listIssues`/`listIssuesWithRelations`. These three are the filters the board view and the
@@ -433,6 +463,8 @@ triage by day to day.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-052, ADR-008
+- **Implemented by:** `src/server/repositories/issue-repository.ts` — `listIssues`, `src/server/repositories/base-repository.ts` — `encodeCursor`, `decodeCursor`
+- **Verified by:** `tests/repositories/issue-repository.test.ts`
 
 Issue lists use the same keyset-cursor pattern as project lists (`REQ-052`), for the same
 reason: issue lists are the highest-churn lists in the product (statuses and assignees
@@ -452,6 +484,8 @@ that churn.
 - **Priority:** could
 - **Status:** implemented
 - **Related:** REQ-230, ADR-010, DES-110
+- **Implemented by:** `src/lib/csv.ts` — `toCsv`, `src/app/api/export/issues/route.ts`
+- **Verified by:** `tests/lib/csv.test.ts`
 
 CSV export of an issue list is gated by the `csv_export` flag (`starter` plan minimum,
 overridable), evaluated before `toCsv()` in `src/lib/csv.ts` runs. Export reuses the same

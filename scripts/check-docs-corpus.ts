@@ -58,8 +58,12 @@ const rel = (f: string) => relative(repoRoot, f);
 const ID_PATTERN = /\b(REQ|DES|ADR)-(\d{3})\b/g;
 /** A heading whose text starts with an id defines that id. */
 const HEADING_DEF = /^#{1,6}\s+(REQ|DES|ADR)-(\d{3})\b/;
-/** Backticked corpus-relative source path. */
-const CODE_PATH = /`((?:src|tests|scripts)\/[^`\s]+?\.(?:ts|tsx|js|mjs|json|sql|css|md))`/g;
+/**
+ * Backticked corpus-relative source path. Globs (`src/lib/*.ts`) are legitimate prose for
+ * naming a whole directory's worth of files, so they are excluded from the existence check
+ * — only concrete paths are verified.
+ */
+const CODE_PATH = /`((?:src|tests|scripts)\/[^`\s*]+?\.(?:ts|tsx|js|mjs|json|sql|css|md))`/g;
 /** Fenced code blocks are skipped for id scanning to avoid counting illustrative snippets. */
 const FENCE = /^\s*```/;
 

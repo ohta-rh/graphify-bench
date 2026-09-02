@@ -78,6 +78,8 @@ surfaces identically without either needing its own copy of the search query log
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-171, REQ-060, REQ-090
+- **Implemented by:** `src/server/repositories/search-repository.ts` — `SearchSubjectKind`, `searchDocuments`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 `SearchSubjectKind` is `'issue' | 'comment' | 'project'` (`search-repository.ts`); these are
 the only three subject kinds the index holds. There is no member or organization-level
@@ -97,6 +99,8 @@ product's search is scoped to "the work," not the roster.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-010, REQ-181
+- **Implemented by:** `src/server/repositories/search-repository.ts` — `upsertSearchDocument`, `searchDocuments`, `countIndexed`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 `upsertSearchDocument(orgId, ...)` and `searchDocuments(input)` both require `orgId`; the
 index table's uniqueness key includes it, so two organizations' issues with identical titles
@@ -138,6 +142,8 @@ from `issue-service.ts`, `comment-service.ts` and `project-service.ts`.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-068, REQ-172
+- **Implemented by:** `src/server/services/search-service.ts` — `indexIssue`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 Because `issue.updated` only carries the changed fields, the search listener re-fetches the
 full issue via the repository before indexing it, so a title change alone still produces a
@@ -157,6 +163,8 @@ everything the event payload happened not to mention.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-071, REQ-099, DES-200
+- **Implemented by:** `src/server/services/search-service.ts` — `removeFromIndex`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 `removeFromIndex(orgId, subjectKind, subjectId)` is called by listeners on
 `issue.archived` and `comment.deleted`, and by the project-archive path, so an archived
@@ -176,6 +184,8 @@ exists in the underlying table per the soft-delete convention (`ADR-004`).
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-188, ADR-012
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/schemas/search.ts` — `searchQuerySchema`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 Free-text queries work on every plan; field-scoped syntax (searching a specific field rather
 than the whole document) is gated by the `advanced_search` flag (`enterprise` minimum,
@@ -198,6 +208,8 @@ gracefully.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-011, REQ-096
+- **Implemented by:** `src/lib/rate-limit.ts` — `consumeRateLimit`, `getBucketConfig`
+- **Verified by:** `tests/lib/rate-limit.test.ts`
 
 The `search:query` rate-limit bucket (capacity 120, refill 60/minute) protects the index
 from being hammered by a scripted client or an aggressive command-palette usage pattern,
@@ -217,6 +229,8 @@ scaling with the org's `apiRequestsPerHour` plan field like every other bucket.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-091, DES-200
+- **Implemented by:** `src/server/services/search-service.ts` — `search`, `src/lib/markdown.ts` — `stripMarkdown`, `excerpt`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 A `SearchHit` includes a `snippet` field, built from the indexed content around the matched
 term, using the same plain-text projection (`stripMarkdown`/`excerpt`-style truncation) that
@@ -236,6 +250,8 @@ around the match.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-170, DES-100
+- **Implemented by:** `src/lib/url.ts` — `issuePath`, `projectPath`, `src/server/services/search-service.ts` — `search`
+- **Verified by:** `tests/lib/url.test.ts`
 
 Every `SearchHit` includes an `href`, built through `src/lib/url.ts`'s path helpers
 (`issuePath`, `projectPath`) so a click on a search result navigates directly to the issue,
@@ -256,6 +272,8 @@ with no route to the underlying content.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-052, REQ-078, ADR-008
+- **Implemented by:** `src/server/services/search-service.ts` — `search`, `src/server/repositories/base-repository.ts` — `encodeCursor`, `decodeCursor`
+- **Verified by:** `tests/services/search-service.test.ts`
 
 Search results are a `Page<SearchHit>`, using the same keyset-cursor pattern as project and
 issue listings, for the same reason: search result sets can be large, and cursor-based
@@ -276,6 +294,8 @@ writes.
 - **Priority:** could
 - **Status:** implemented
 - **Related:** ADR-017, REQ-172
+- **Implemented by:** `src/server/jobs/search-reindex-job.ts` — `runSearchReindexJob`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `runSearchReindexJob(orgId)` performs a full rebuild for one organization by calling
 `indexIssue`/`indexComment`/`indexProject` for every current row, used to correct drift
@@ -295,6 +315,8 @@ synchronous per-event maintenance path to have caught everything correctly over 
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-022, REQ-024
+- **Implemented by:** `src/actions/search/search.ts` — `searchAction`, `src/lib/permissions.ts` — `can`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `searchAction` checks `can(actor, 'issue:read')` before calling `search()`, using the
 lowest-common-denominator permission across the three indexed subject kinds — issues,

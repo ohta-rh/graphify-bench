@@ -3,7 +3,7 @@ title: Billing and plan limits
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [REQ-130, REQ-131, REQ-132, REQ-133, REQ-134, REQ-135, REQ-136, REQ-137, REQ-138, REQ-141, REQ-142, REQ-143, REQ-144, ADR-006, ADR-010, DES-BILLING-REPO, DES-BILLING-USAGE]
+related: [REQ-130, REQ-131, REQ-132, REQ-133, REQ-134, REQ-135, REQ-136, REQ-137, REQ-138, REQ-141, REQ-142, REQ-143, REQ-144, ADR-006, ADR-010, DES-209, DES-136]
 ---
 
 ## Purpose

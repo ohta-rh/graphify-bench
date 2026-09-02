@@ -73,6 +73,8 @@ and when," without the storage and query cost of keeping every prior body around
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-060, REQ-010, DES-110
+- **Implemented by:** `src/server/repositories/comment-repository.ts` — `findCommentById`, `listComments`, `listThread`
+- **Verified by:** `tests/repositories/comment-repository.test.ts`
 
 `comments` carries both `org_id` and `issue_id`; there is no organization-level or
 project-level comment independent of a specific issue. `findCommentById(orgId, commentId)`
@@ -91,6 +93,8 @@ the `issueId` the caller is viewing.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-092, DES-100
+- **Implemented by:** `src/lib/markdown.ts` — `renderMarkdown`, `stripMarkdown`, `excerpt`
+- **Verified by:** `tests/lib/markdown.test.ts`
 
 `renderMarkdown` in `src/lib/markdown.ts` renders the subset the product supports; raw HTML
 in a comment body is not passed through, and `stripMarkdown`/`excerpt` provide plain-text
@@ -110,6 +114,8 @@ unrendered Markdown syntax to a reader.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-095, REQ-112, DES-110
+- **Implemented by:** `src/lib/mentions.ts` — `extractMentions`, `src/server/services/comment-service.ts` — `createComment`, `updateComment`
+- **Verified by:** `tests/lib/mentions.test.ts`
 
 `extractMentions(body)` runs during `createComment` and `updateComment`, before the write
 completes, so the set of mentioned users is computed once and stored as part of what
@@ -151,6 +157,8 @@ member whose handle happens to match.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-010, REQ-092
+- **Implemented by:** `src/lib/mentions.ts` — `resolveMentions`
+- **Verified by:** `tests/lib/mentions.test.ts`
 
 `resolveMentions(body, members)` is only ever called with the member list of the comment's
 own organization, so a syntactically valid `@handle` that does not correspond to a member of
@@ -191,6 +199,8 @@ consumes the already-resolved list.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-011, REQ-161, REQ-176
+- **Implemented by:** `src/lib/rate-limit.ts` — `consumeRateLimit`, `getBucketConfig`
+- **Verified by:** `tests/lib/rate-limit.test.ts`
 
 `consumeRateLimit(orgId, 'comment:create', 1)` runs before `insertComment`. The bucket
 (capacity 60, refill 20/minute) is scoped per organization, not per user, so the limit
@@ -209,6 +219,8 @@ from an organization-wide burst regardless of how many distinct members are post
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-026, ADR-003
+- **Implemented by:** `src/server/services/comment-service.ts` — `updateComment`, `src/lib/permissions.ts` — `can`
+- **Verified by:** `tests/services/comment-service.test.ts`, `tests/lib/permissions.ownership.test.ts`
 
 `comment:update`'s ownership escalation (`REQ-026`) grants the comment's author edit rights
 regardless of their current role rank, and `updateComment` in `comment-service.ts` enforces
@@ -228,6 +240,8 @@ comment is live, not soft-deleted).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-004, REQ-100
+- **Implemented by:** `src/server/services/comment-service.ts` — `deleteComment`, `src/server/repositories/comment-repository.ts` — `archiveComment`
+- **Verified by:** `tests/services/comment-service.test.ts`
 
 `archiveComment` sets `archived_at`; the row and its body remain in the database so a thread
 that references it (a later reply quoting it, or simply its position in chronological order)
@@ -249,6 +263,8 @@ brief's escalation list.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-172, REQ-220
+- **Implemented by:** `src/server/services/comment-service.ts` — `deleteComment`
+- **Verified by:** `tests/services/comment-service.test.ts`
 
 `deleteComment` emits `comment.deleted`, which drives `removeFromIndex` in the search
 service (`REQ-174`) and the activity row. It is a distinct event from `comment.created`
@@ -269,6 +285,8 @@ not merely that it changed.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-090, DES-100
+- **Implemented by:** `src/server/repositories/comment-repository.ts` — `listThread`
+- **Verified by:** `tests/repositories/comment-repository.test.ts`
 
 `listThread(orgId, issueId)` returns `CommentThreadNode`s ordered by `createdAt` ascending —
 the oldest comment first, matching how a reader would naturally follow a discussion from its
@@ -290,6 +308,8 @@ model is a flat, chronological thread, not a nested-reply tree.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-046, REQ-071, DES-001
+- **Implemented by:** `src/server/repositories/comment-repository.ts` — `listComments`, `countComments`, `src/lib/soft-delete.ts` — `shouldFilterArchived`
+- **Verified by:** `tests/repositories/comment-repository.test.ts`, `tests/lib/soft-delete.test.ts`
 
 `listComments` and the default `getThread` view apply `shouldFilterArchived`, matching the
 soft-delete display convention used for issues and projects. A deleted comment's slot in the
@@ -308,6 +328,8 @@ body content is not served in the default query path.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-092, REQ-095
+- **Implemented by:** `src/server/services/comment-service.ts` — `updateComment`, `src/lib/mentions.ts` — `extractMentions`, `resolveMentions`
+- **Verified by:** `tests/services/comment-service.test.ts`
 
 `updateComment` runs `extractMentions`/`resolveMentions` again against the new body, so
 adding a mention in an edit notifies the newly mentioned member, and removing one from the

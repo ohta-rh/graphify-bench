@@ -3,7 +3,7 @@ title: Projects
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [REQ-040, REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046, REQ-047, REQ-048, REQ-050, REQ-051, REQ-052, ADR-004, ADR-006, ADR-008, DES-PROJECTS-REPO]
+related: [REQ-040, REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046, REQ-047, REQ-048, REQ-050, REQ-051, REQ-052, ADR-004, ADR-006, ADR-008, DES-188]
 ---
 
 ## Purpose

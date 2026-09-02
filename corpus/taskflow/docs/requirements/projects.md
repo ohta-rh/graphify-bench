@@ -68,6 +68,8 @@ inconsistent to let it drop out of the count that limits how many projects an or
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-001, REQ-010, DES-001
+- **Implemented by:** `src/server/repositories/project-repository.ts` — `findProjectById`, `listProjects`
+- **Verified by:** `tests/repositories/project-repository.test.ts`
 
 Like every tenant-scoped entity, `projects` carries `org_id`, and every
 `project-repository.ts` function takes `orgId` as its first argument. There is no concept of
@@ -87,6 +89,8 @@ membership and the project-membership narrowing described in `REQ-051`.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-002, ADR-008, REQ-052
+- **Implemented by:** `src/server/repositories/project-repository.ts` — `listTakenProjectSlugs`, `src/lib/slug.ts` — `uniqueSlug`, `assertValidSlug`
+- **Verified by:** `tests/repositories/project-repository.test.ts`, `tests/lib/slug.test.ts`
 
 `listTakenProjectSlugs(orgId)` scopes the uniqueness check to one organization, unlike the
 organization slug, which is unique globally. Two different organizations can both have a
@@ -105,6 +109,8 @@ project slugged `website`; the URL disambiguates by org slug first
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-061, REQ-076, DES-041
+- **Implemented by:** `src/server/services/project-service.ts` — `projectKeyFromName`, `src/lib/format.ts` — `issueKey`
+- **Verified by:** `tests/lib/format.test.ts`
 
 `projectKeyFromName` derives an uppercase key from the project name at creation. Once set,
 no `updateProject` field allows changing `key`, because `issueKey(projectKey, issueNumber)`
@@ -123,6 +129,8 @@ change would orphan every link, bookmark and cross-reference already using the o
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-134, REQ-138, ADR-010
+- **Implemented by:** `src/server/services/project-service.ts` — `createProject`, `src/config/plan-limits.ts` — `wouldExceedLimit`
+- **Verified by:** `tests/services/project-service.test.ts`, `tests/contract/plan-limits.test.ts`
 
 `createProject` calls `wouldExceedLimit(plan, 'projects', used, 1)` before
 `project-repository.ts#insertProject` runs. `free` allows 2 projects, `starter` 10, `growth`
@@ -142,6 +150,8 @@ quota fails with `plan_limit_exceeded` before any row is written.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-043, REQ-046, DES-040
+- **Implemented by:** `src/server/repositories/project-repository.ts` — `countProjects`, `src/server/services/billing-service.ts` — `checkLimit`
+- **Verified by:** `tests/repositories/project-repository.test.ts`
 
 `countProjects(orgId, scope?)` defaults to counting archived and live projects together for
 the quota check specifically — the quota-relevant call site does not pass
@@ -185,6 +195,8 @@ idempotent with respect to already-archived issues.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-071, REQ-101, DES-001
+- **Implemented by:** `src/lib/soft-delete.ts` — `shouldFilterArchived`, `src/server/repositories/project-repository.ts` — `listProjects`
+- **Verified by:** `tests/lib/soft-delete.test.ts`, `tests/repositories/project-repository.test.ts`
 
 `shouldFilterArchived(scope)` in `src/lib/soft-delete.ts` defaults `listProjects` to
 `ArchiveScope: 'live'` unless the caller explicitly asks for archived rows, matching the same
@@ -206,6 +218,8 @@ available where it matters (project settings, the archive-restore flow).
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-045, ADR-004
+- **Implemented by:** `src/server/services/project-service.ts` — `restoreProject`, `src/lib/soft-delete.ts` — `restorePatch`
+- **Verified by:** `tests/services/project-service.test.ts`
 
 `restoreProject` clears the project's `archived_at` via `restorePatch()`. It does not touch
 any issue row — the issues archived by `REQ-045`'s cascade remain archived until someone
@@ -226,6 +240,8 @@ soft delete structurally prevents; it does not mean the issues automatically reo
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-007, REQ-025, ADR-004
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/server/jobs/cleanup-archived-job.ts` — `runCleanupArchivedJob`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 Unlike `archiveProject`, there is no `deleteProject` in `project-service.ts` — permanent
 project deletion in Taskflow happens only through the retention cleanup job
@@ -250,6 +266,8 @@ that authority level is the scheduled job, not a person.
 - **Priority:** could
 - **Status:** implemented
 - **Related:** REQ-054, REQ-023
+- **Implemented by:** `src/server/services/project-service.ts` — `updateProject`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `Project` carries an optional lead reference, set through `updateProject`. The lead is
 informational within the current permission model — it drives display (whose name shows as
@@ -270,6 +288,8 @@ minimum (`member`) as any other project metadata edit.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-188, ADR-012
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/server/services/project-service.ts`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `Project` has a `visibility` field, and the `public_projects` feature flag (`enterprise`
 plan minimum, overridable) is what unlocks the ability to mark a project public rather than
@@ -290,6 +310,8 @@ visibility value is allowed to matter anywhere it is read.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-111, DES-050
+- **Implemented by:** `src/server/repositories/project-member-repository.ts` — `isProjectMember`, `listProjectMemberIds`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `src/server/repositories/project-member-repository.ts` holds explicit project membership
 used for `private`-visibility projects. Notification fan-out (`REQ-111`) for a private
@@ -310,6 +332,8 @@ not get flooded with notifications for work they cannot even open.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-008, REQ-078, REQ-179
+- **Implemented by:** `src/server/repositories/base-repository.ts` — `encodeCursor`, `decodeCursor`, `src/server/repositories/project-repository.ts` — `listProjects`
+- **Verified by:** `tests/repositories/project-repository.test.ts`
 
 `listProjects` returns a `Page<Project>` built from a keyset cursor
 (`base-repository.ts#encodeCursor`/`decodeCursor`), not an offset. `ADR-008` documents why:
@@ -331,6 +355,8 @@ the list.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-014, REQ-172, DES-060
+- **Implemented by:** `src/server/services/project-service.ts` — `createProject`, `src/lib/event-bus.ts` — `emit`
+- **Verified by:** `tests/services/project-service.test.ts`, `tests/lib/event-bus.test.ts`
 
 `createProject` calls `emit('project.created', ...)` after `insertProject` succeeds. This is
 what the search indexer (`REQ-172`) and the activity service (`REQ-220`) both react to
@@ -351,6 +377,8 @@ event-bus pattern (`ADR-005`) is what keeps project creation's responsibility na
 - **Priority:** could
 - **Status:** implemented
 - **Related:** REQ-049, REQ-062
+- **Implemented by:** `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx`, `src/server/services/project-service.ts` — `updateProject`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx`
 exposes the fields

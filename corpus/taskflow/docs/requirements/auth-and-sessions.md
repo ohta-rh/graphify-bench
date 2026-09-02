@@ -81,6 +81,8 @@ where an unauthenticated request to a protected route is redirected to login (`R
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-201, REQ-209
+- **Implemented by:** `src/server/services/auth-service.ts` — `login`, `src/server/repositories/user-repository.ts` — `findUserByEmail`
+- **Verified by:** `tests/schemas/auth.schema.test.ts`
 
 There is no OAuth, SSO or magic-link path in Taskflow; `login(input)` in `auth-service.ts`
 takes an email and password, looks up the user by email
@@ -102,6 +104,8 @@ require enterprise identity federation on day one.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-020, REQ-200
+- **Implemented by:** `src/lib/hash.ts` — `hashPassword`, `verifyPassword`
+- **Verified by:** `tests/lib/hash.test.ts`
 
 `hashPassword`/`verifyPassword` in `src/lib/hash.ts` use `node:crypto`'s scrypt, with no
 external hashing dependency. `insertUser` never receives a plaintext password parameter — its
@@ -122,6 +126,8 @@ password literally cannot reach the repository layer through the type system.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-203, ADR-020
+- **Implemented by:** `src/server/services/session-service.ts` — `createSessionToken`, `src/server/services/auth-service.ts` — `login`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `login` calls `createSessionToken(user.id)` and returns both the `User` and the plaintext
 `token` to the caller (`loginAction`), which is the only point in the whole flow where the
@@ -141,6 +147,8 @@ immediately, and from then on only its hash is ever referenced.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-029, ADR-020
+- **Implemented by:** `src/server/repositories/session-repository.ts` — `createSession`, `findSessionByTokenHash`, `src/lib/hash.ts` — `hashToken`
+- **Verified by:** `tests/lib/hash.test.ts`
 
 `createSession(userId, tokenHash, expiresAt)` in `session-repository.ts` never receives a
 plaintext token; `hashToken` in `src/lib/hash.ts` is applied before the value reaches the
@@ -162,6 +170,8 @@ way.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-207, ADR-020
+- **Implemented by:** `src/server/services/session-service.ts` — `createSessionToken`, `resolveSession`, `src/server/repositories/session-repository.ts` — `purgeExpiredSessions`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `SESSION_TTL_DAYS = 30` in `session-service.ts`. `createSessionToken` computes `expiresAt`
 from this constant at creation time; there is no sliding-window renewal that extends a
@@ -182,6 +192,8 @@ of how often it is used in between.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-206, ADR-020
+- **Implemented by:** `src/lib/session.ts` — `setSessionCookie`, `src/config/env.ts` — `env`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `setSessionCookie` sets `httpOnly: true` (unreadable from client-side JavaScript, mitigating
 XSS-based token theft), `sameSite: 'lax'` (sent on top-level navigation but not on
@@ -204,6 +216,8 @@ cookie at all.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-205, DES-210
+- **Implemented by:** `src/lib/session.ts` — `getSessionToken`, `getSessionPrincipal`, `setSessionCookie`, `clearSessionCookie`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `src/lib/session.ts` is the sole module calling Next's `cookies()` API for session purposes;
 `getSessionToken`, `getSessionPrincipal`, `setSessionCookie` and `clearSessionCookie` are
@@ -225,6 +239,8 @@ properties (`REQ-205`) in one place rather than auditing every call site indepen
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-204, DES-210
+- **Implemented by:** `src/server/services/auth-service.ts` — `logout`, `src/server/services/session-service.ts` — `destroySession`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `logout(sessionId)` in `auth-service.ts` calls `destroySession` in `session-service.ts`,
 which calls `revokeSession` in the repository — the session row is actually removed (or
@@ -247,6 +263,8 @@ before logout.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-011, REQ-096
+- **Implemented by:** `src/lib/rate-limit.ts` — `consumeRateLimit`, `getBucketConfig`, `src/server/services/auth-service.ts` — `requestPasswordReset`
+- **Verified by:** `tests/lib/rate-limit.test.ts`
 
 The `auth:password-reset` rate-limit bucket (capacity 5, refill 1/minute — the tightest
 bucket in the whole rate-limit configuration) bounds `requestPasswordReset`, since password
@@ -266,6 +284,8 @@ other rate-limited actions, are available to unauthenticated callers.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-003, REQ-014
+- **Implemented by:** `src/server/services/auth-service.ts` — `register`, `src/server/services/organization-service.ts` — `createOrganization`
+- **Verified by:** `tests/schemas/auth.schema.test.ts`
 
 `register(input)` in `auth-service.ts` is the entry point that produces both a new `User`
 row and, through `organization-service.ts`, a new `Organization` with the registrant as
@@ -286,6 +306,8 @@ triggered by `registerAction`.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-213, REQ-009
+- **Implemented by:** `src/lib/actor.ts` — `getActor`, `requireActorFor`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 There is no global "current user" concept with a single role; every authorization decision
 resolves an `Actor` scoped to one `orgSlug` via `getActor(orgSlug)`, which internally
@@ -308,6 +330,8 @@ currently on.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-007, REQ-212
+- **Implemented by:** `src/proxy.ts` — `proxy`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `src/proxy.ts`'s `proxy` function checks for a valid session before a request reaches any
 dashboard route; a request with no cookie, an expired session, or an
@@ -329,6 +353,8 @@ implement its own "am I logged in" guard.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-002, ADR-007
+- **Implemented by:** `src/proxy.ts` — `proxy`, `src/lib/actor.ts` — `getActor`
+- **Verified by:** `tests/lib/tenant.test.ts`
 
 Beyond the session check, the proxy (or the page-level `getActor` call it precedes) rejects
 requests naming an `orgSlug` that does not resolve to any organization, or that resolves to
@@ -350,6 +376,8 @@ even begins.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-009, REQ-210, DES-041
+- **Implemented by:** `src/server/repositories/organization-repository.ts` — `listOrgsForUser`, `src/server/services/organization-service.ts` — `listOrganizationsForUser`
+- **Verified by:** none — covered indirectly; see the gaps section of the test plan
 
 `listOrgsForUser(userId)` returns every organization a user is an active member of; there is
 no limit on how many organizations one `User` row can belong to, and `user-repository.ts` is

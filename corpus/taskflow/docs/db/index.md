@@ -3,7 +3,7 @@ title: Database data dictionary — index
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [ADR-002, ADR-004, ADR-006, ADR-008, ADR-015, DES-TENANT, REQ-INDEX]
+related: [ADR-002, ADR-004, ADR-006, ADR-008, ADR-015, DES-030, REQ-001]
 ---
 
 ## Scope
@@ -99,7 +99,7 @@ model, and drawing every foreign-key-shaped reference in this schema (there are 
 diagram actually needs.
 
 Two relationships are worth calling out explicitly because they cross the tenant boundary
-described in **DES-TENANT** in a way the diagram's arrows can't show. First, `users` is the
+described in **DES-030** in a way the diagram's arrows can't show. First, `users` is the
 only table in the schema that is *not* tenant-scoped: a user account is global, and it is the
 `members` row — not the `users` row — that ties a specific person to a specific organization
 with a specific role. A user can be a member of several organizations simultaneously, each

@@ -3,7 +3,7 @@ title: Comments and attachments
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [REQ-090, REQ-091, REQ-092, REQ-093, REQ-094, REQ-096, REQ-097, REQ-098, REQ-100, REQ-101, REQ-102, REQ-075, ADR-004, ADR-006, ADR-008, DES-ISSUES-REPO, DES-COMMENT]
+related: [REQ-090, REQ-091, REQ-092, REQ-093, REQ-094, REQ-096, REQ-097, REQ-098, REQ-100, REQ-101, REQ-102, REQ-075, ADR-004, ADR-006, ADR-008, DES-186, DES-118]
 ---
 
 ## Purpose
@@ -47,7 +47,7 @@ boundary). Both tables hang off `issues`: every comment and every attachment nam
 - **A comment is never physically removed even after archiving (REQ-098), specifically
   because removing it would orphan any reply still pointing at it via `parent_id`** — this is
   the one piece of schema-design reasoning stated directly in `repository-issue-and-comment.md`
-  (DES-ISSUES-REPO) and repeated here because it is the clearest justification in the whole
+  (DES-186) and repeated here because it is the clearest justification in the whole
   corpus for why a *specific* table needs soft delete rather than hard delete: the `parent_id`
   self-reference makes hard deletion structurally unsafe, not merely undesirable.
 - **`mentioned_user_ids` is denormalized JSON, not a join table**, unlike `issue_labels`'s

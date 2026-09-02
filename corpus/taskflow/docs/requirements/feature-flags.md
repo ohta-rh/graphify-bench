@@ -85,6 +85,8 @@ nav item" maintenance step distinct from the flag definition driving the behavio
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-012, REQ-195, DES-200
+- **Implemented by:** `src/config/feature-flags.ts` — `FEATURE_FLAG_DEFINITIONS`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `FEATURE_FLAG_DEFINITIONS` in `src/config/feature-flags.ts` is the only place a flag's key,
 strategy, and overridability are declared. No service defines its own ad hoc flag check;
@@ -126,6 +128,8 @@ No caller re-implements a strategy's logic locally; everything defers to this on
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-012, REQ-188, REQ-189
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/config/feature-flags.ts`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 Plan-gated, percentage rollout, always-on, and role-gated are the complete set. Every entry
 in `FEATURE_FLAG_DEFINITIONS` declares exactly one; there is no flag with a hybrid or custom
@@ -146,6 +150,8 @@ to audit at a glance.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-131, REQ-050, REQ-120
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/config/plan-limits.ts` — `planAtLeast`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 A plan-gated flag's threshold is one of the four plan values, and evaluation uses
 `planAtLeast(org.plan, threshold)` — the same ordering `PLAN_ORDER` establishes for
@@ -167,6 +173,8 @@ own notion of "higher plan," rather than maintaining an independent comparison.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-187, DES-210
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `ai_issue_summary`'s percentage-25 strategy hashes the organization's id (not the acting
 user's) to decide whether that org falls inside the rollout percentage, so every member of a
@@ -187,6 +195,8 @@ because of random per-request evaluation.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-152, REQ-191, DES-220
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/server/services/feature-flag-service.ts` — `toggleFlag`, `buildFlagContext`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `command_palette` and `webhooks` are marked `overridable: false` in their registry entries;
 `toggleFlag` and `buildFlagContext`'s override lookup both must respect this — an override
@@ -207,6 +217,8 @@ there, has no effect on evaluation.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-005, REQ-192
+- **Implemented by:** `src/lib/feature-flags.ts` — `isEnabled`, `src/server/services/feature-flag-service.ts` — `buildFlagContext`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 This document is the evaluation-side complement to `REQ-005` in `organizations.md`, which
 describes the storage location. Here, the requirement is about precedence: when an override
@@ -228,6 +240,8 @@ computed.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-024, DES-071
+- **Implemented by:** `src/server/services/feature-flag-service.ts` — `toggleFlag`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `toggleFlag(actor, input)` requires `org:manage_flags` (`admin` minimum) and, on success,
 emits `flag.toggled` with the flag key and new override value, which the activity service
@@ -248,6 +262,8 @@ product surface area for an entire organization in one action.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** ADR-014, REQ-138
+- **Implemented by:** `src/lib/errors.ts` — `toAppError`
+- **Verified by:** `tests/lib/errors.test.ts`
 
 Attempting a gated action while its flag is off throws `FeatureDisabledError`, mapped by
 `toAppError` to a distinct, specific `AppErrorShape` — not folded into `forbidden` or
@@ -269,6 +285,8 @@ appropriate upsell or explanation.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-186, DES-230
+- **Implemented by:** `src/lib/feature-flags.ts` — `snapshotFlags`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `snapshotFlags()` produces a `FeatureFlagSnapshot` — a plain map of flag key to resolved
 boolean for the current actor and org — that server components pass down to client
@@ -291,6 +309,8 @@ something inspectable from client-side JavaScript.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-185, DES-200
+- **Implemented by:** `src/types/feature-flag.ts`, `src/schemas/feature-flag.ts`
+- **Verified by:** `tests/lib/feature-flags.test.ts`
 
 `FeatureFlagKey` in `src/types/feature-flag.ts` is a closed string-literal union matching
 exactly the ten keys in `FEATURE_FLAG_DEFINITIONS`; `src/schemas/feature-flag.ts` validates

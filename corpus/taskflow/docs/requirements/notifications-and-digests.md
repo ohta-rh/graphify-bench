@@ -65,6 +65,8 @@ requirement (`REQ-124`) without needing an SMTP integration to back it.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-010, REQ-118, DES-120
+- **Implemented by:** `src/server/repositories/notification-repository.ts` — `listNotifications`, `countUnread`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 `notifications` carries `org_id` and a `recipient_id`; every read (`listNotifications`,
 `countUnread`) is scoped to both. A user who belongs to several organizations sees
@@ -108,6 +110,8 @@ touching `issue-service.ts`, `comment-service.ts` or any other emitter.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-095, REQ-092, REQ-114
+- **Implemented by:** `src/server/services/notification-service.ts` — `notify`, `src/server/services/event-registry.ts`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 The `comment.created` listener reads the mentioned-user-id list straight from the event
 payload (`REQ-095`) and calls `notify(orgId, 'mention', mentionedIds, payload)` for each,
@@ -130,6 +134,8 @@ an issue I'm watching."
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-067, REQ-114
+- **Implemented by:** `src/server/services/notification-service.ts` — `notify`, `src/server/services/event-registry.ts`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 The `issue.assigned` listener notifies the new assignee (when non-null) with an
 `assignment`-kind notification; it does not separately notify the previous assignee by
@@ -149,6 +155,8 @@ though the previous assignee can still see the change on the issue's own activit
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-111, REQ-112, REQ-113
+- **Implemented by:** `src/server/services/notification-service.ts` — `notify`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 `notify()`'s recipient list is filtered to exclude `payload.actorId` before any
 `Notification` rows are inserted, applied uniformly across every notification kind — mention,
@@ -169,6 +177,8 @@ comment (both legal, neither unusual) never produces a notification about your o
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-120, DES-130
+- **Implemented by:** `src/server/repositories/notification-preference-repository.ts` — `getPreference`, `upsertPreference`, `src/server/services/notification-service.ts` — `updatePreference`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 `NotificationPreference` (`src/types/notification.ts`) is keyed by `(orgId, userId, kind)`
 and records which `NotificationChannel`s are enabled for that kind — a user might want
@@ -189,6 +199,8 @@ comment on every issue they are a project member of.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-118, DES-130
+- **Implemented by:** `src/server/services/notification-service.ts` — `markRead`, `markAllRead`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 `markRead(actor, input)` marks one notification; `markAllRead(actor, orgId)` marks every
 unread notification for that recipient in that org read in one call, returning the count
@@ -209,6 +221,8 @@ round trip to recompute it.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-110, REQ-116
+- **Implemented by:** `src/server/repositories/notification-repository.ts` — `countUnread`
+- **Verified by:** `tests/services/notification-service.test.ts`
 
 `countUnread(orgId, recipientId)` backs the sidebar's unread badge, computed fresh per
 request rather than maintained as a denormalized counter column, which trades a small query
@@ -229,6 +243,8 @@ notifications read.
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-026, ADR-003
+- **Implemented by:** `src/lib/permissions.ts` — `ROLE_MATRIX`, `src/server/services/notification-service.ts`
+- **Verified by:** `tests/lib/permissions.matrix.test.ts`
 
 `notification:manage`'s `ROLE_MATRIX` minimum is `viewer` — the lowest bar in the whole
 matrix — because the real restriction is not role rank but ownership: the ownership
@@ -250,6 +266,8 @@ personal.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-121, REQ-122, DES-140
+- **Implemented by:** `src/server/services/digest-service.ts` — `buildDigest`, `renderDigest`
+- **Verified by:** `tests/jobs/digest-email-job.test.ts`
 
 `buildDigest(orgId, recipientId, windowStart, windowEnd)` collects every unread notification
 in the window into one `DigestBundle`, rendered by `renderDigest` into a single email rather
@@ -272,6 +290,8 @@ immediacy for a bounded number of interruptions, capped in practice by
 - **Priority:** must
 - **Status:** implemented
 - **Related:** REQ-188, ADR-012
+- **Implemented by:** `src/server/jobs/digest-email-job.ts` — `shouldRunForOrg`, `src/lib/feature-flags.ts` — `isEnabled`
+- **Verified by:** `tests/jobs/digest-email-job.test.ts`, `tests/lib/feature-flags.test.ts`
 
 The `digest_email` flag (`growth` plan minimum, overridable) gates `shouldRunForOrg` and the
 digest channel in `resolveChannels`; an org below `growth` without an override never has the
@@ -291,6 +311,8 @@ plan does not include.
 - **Priority:** should
 - **Status:** partial
 - **Related:** REQ-012, REQ-119
+- **Implemented by:** `src/lib/date.ts` — `digestWindow`
+- **Verified by:** `tests/lib/date.test.ts`
 
 `digestWindow(digestHourUtc, reference)` computes a window from the reference time and the
 configured hour, not from a stored "last successful send" timestamp per organization —
@@ -312,6 +334,8 @@ gap-filling behavior the current implementation does not perform.
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-119, DES-140
+- **Implemented by:** `src/server/services/digest-service.ts` — `buildDigest`, `src/server/jobs/digest-email-job.ts` — `runDigestEmailJob`
+- **Verified by:** `tests/jobs/digest-email-job.test.ts`
 
 `buildDigest` returns `null` when there are no unread notifications in the window, and
 `runDigestEmailJob` treats a `null` bundle as "nothing to do" rather than sending an empty
@@ -331,6 +355,8 @@ kind of noise the digest channel exists to prevent.
 - **Priority:** could
 - **Status:** implemented
 - **Related:** REQ-119, DES-071
+- **Implemented by:** `src/server/jobs/digest-email-job.ts` — `runDigestEmailJob`
+- **Verified by:** `tests/jobs/digest-email-job.test.ts`
 
 The digest job emits `digest.due` at the point it determines an org's digest hour has
 arrived, ahead of the actual `buildDigest`/`renderDigest`/`sendEmail` sequence — giving any
@@ -350,6 +376,8 @@ built for this org" independent of whether the build ultimately produces a non-e
 - **Priority:** should
 - **Status:** implemented
 - **Related:** REQ-119, DES-150
+- **Implemented by:** `src/server/services/email-service.ts` — `renderEmail`, `sendEmail`
+- **Verified by:** `tests/emails/render.test.ts`
 
 `renderEmail(template, props)` in `email-service.ts` produces a `RenderedEmail` (subject,
 html, text) purely from react-email templates such as `src/emails/digest-email.tsx`;

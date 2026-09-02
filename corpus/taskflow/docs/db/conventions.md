@@ -3,7 +3,7 @@ title: Database conventions
 status: approved
 owners: [platform-team]
 last_updated: 2026-06-20
-related: [ADR-002, ADR-004, ADR-006, ADR-008, ADR-015, DES-TENANT, DES-ARCH]
+related: [ADR-002, ADR-004, ADR-006, ADR-008, ADR-015, DES-030, DES-004]
 ---
 
 ## Purpose
