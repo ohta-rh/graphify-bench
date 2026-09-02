@@ -1,6 +1,6 @@
 # graphify-bench results
 
-Generated 2026-09-02T10:09:57.039Z. 500 runs over 65 tasks, conditions: baseline, baseline-nosub, graphify, graphify-strict, graphify-strict-v2, graphify-v2, haiku-baseline, haiku-graphify, haiku-graphify-v2, haiku-mempalace, haiku-mempalace-v2, mempalace, mempalace-v2.
+Generated 2026-09-02T10:14:30.723Z. 500 runs over 65 tasks, conditions: baseline, baseline-nosub, graphify, graphify-strict, graphify-strict-v2, graphify-v2, haiku-baseline, haiku-graphify, haiku-graphify-v2, haiku-mempalace, haiku-mempalace-v2, mempalace, mempalace-v2.
 
 ## 1. Environment
 
@@ -178,7 +178,7 @@ Section 5 reports what each category *cost*. This one reports whether it was *an
 | `haiku-baseline` | 3/4 · 0.717 | 13/13 · 0.831 | 8/9 · 0.889 | 5/13 · 0.780 | 11/13 · 0.885 | 12/13 · 0.981 |
 | `haiku-graphify` | – | 9/9 · 0.933 | 8/9 · 0.889 | 5/9 · 0.898 | 6/9 · 0.852 | 9/9 · 0.974 |
 | `haiku-graphify-v2` | 2/4 · 0.550 | 4/4 · 0.850 | – | 1/4 · 0.617 | 4/4 · 1.000 | 4/4 · 1.000 |
-| `haiku-mempalace` | – | 9/9 · 0.844 | 9/9 · 1.000 | 4/9 · 0.878 | 6/9 · 0.778 | 6/9 · 0.808 |
+| `haiku-mempalace` | – | 9/9 · 0.867 | 9/9 · 1.000 | 4/9 · 0.878 | 6/9 · 0.778 | 6/9 · 0.808 |
 | `haiku-mempalace-v2` | 2/4 · 0.575 | 4/4 · 0.850 | – | 1/4 · 0.589 | 3/4 · 0.917 | 1/4 · 0.430 |
 | `mempalace` | – | 9/9 · 0.956 | 8/9 · 0.889 | 4/9 · 0.897 | 6/9 · 0.852 | 9/9 · 0.971 |
 | `mempalace-v2` | 2/4 · 0.588 | 4/4 · 0.950 | – | 0/4 · 0.536 | 4/4 · 1.000 | 2/4 · 0.783 |
