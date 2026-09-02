@@ -1,11 +1,12 @@
 /**
  * Query-time search plus the write-time index maintenance driven by `search.reindex_requested`.
  *
- * Must call (do not reimplement): assertCan, assertOrgScope, subscribe, isEnabled
+ * Must call (do not reimplement): assertCan, assertOrgScope, subscribe, isEnabled, consumeRateLimit
  */
 import { subscribe } from "@/lib/event-bus";
 import { isEnabled } from "@/lib/feature-flags";
 import { assertCan } from "@/lib/permissions";
+import { consumeRateLimit } from "@/lib/rate-limit";
 import { assertOrgScope } from "@/lib/tenant";
 import * as commentRepo from "@/server/repositories/comment-repository";
 import * as issueRepo from "@/server/repositories/issue-repository";
@@ -33,6 +34,9 @@ export type SearchHit = {
 /** Characters of surrounding context kept on either side of a match. */
 const SNIPPET_RADIUS = 60;
 
+/** Token bucket protecting the index from query bursts. */
+const SEARCH_QUERY_BUCKET = "search:query";
+
 /**
  * Runs a query against the denormalised index. Field-scoped syntax
  * (`status:done`) is an `advanced_search` feature, so a query containing a
@@ -45,6 +49,13 @@ export async function search(
 ): Promise<Page<SearchHit>> {
   assertOrgScope(actor, input.orgId);
   assertCan(actor, "issue:read", orgResource(input.orgId));
+
+  const verdict = await consumeRateLimit(input.orgId, SEARCH_QUERY_BUCKET);
+  if (!verdict.allowed) {
+    throw new Error(
+      `Search rate limit reached; try again after ${verdict.resetAt}`,
+    );
+  }
 
   const org = await orgRepo.findOrgById(input.orgId);
   const advanced = isEnabled("advanced_search", {
