@@ -5,6 +5,7 @@
  */
 import { isEnabled } from "@/lib/feature-flags";
 import { createLogger } from "@/lib/logger";
+import * as notificationRepo from "@/server/repositories/notification-repository";
 import * as orgRepo from "@/server/repositories/organization-repository";
 import * as usageRepo from "@/server/repositories/usage-repository";
 import * as userRepo from "@/server/repositories/user-repository";
@@ -54,6 +55,13 @@ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
 
           const rendered = await renderDigest(bundle, recipient);
           await sendEmail({ to: recipient.email, ...rendered });
+
+          // Once digested, these notifications are no longer "unread" — this
+          // is what keeps a later run inside the same window from sending
+          // the same digest twice.
+          for (const entry of bundle.entries) {
+            await notificationRepo.markRead(orgId, entry.notificationId, windowEnd);
+          }
 
           result.processed += 1;
         } catch (error) {

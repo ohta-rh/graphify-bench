@@ -3,24 +3,137 @@
  *
  * Owner C implements `@/server/repositories/project-repository`.
  */
-import { describe, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
+vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
+
+import * as projectRepo from "@/server/repositories/project-repository";
+import { createTenant, useTemporaryDatabase } from "../server/_support/fixtures";
+import type { Tenant } from "../server/_support/fixtures";
+
+let cleanup: () => void;
+let north: Tenant;
+let acme: Tenant;
+
+beforeAll(async () => {
+  cleanup = await useTemporaryDatabase();
+  north = await createTenant("northwind-projects");
+  acme = await createTenant("acme-projects");
+});
+
+afterAll(() => {
+  cleanup();
+});
 
 describe("repositories/project-repository", () => {
-  // The same slug may exist once per organization, not once globally.
-  it.todo("allows the same slug in two different organizations");
+  it("allows the same slug in two different organizations", async () => {
+    // createTenant already gave each org a project slugged "platform".
+    expect(north.project.slug).toBe("platform");
+    expect(acme.project.slug).toBe("platform");
+    expect(north.project.id).not.toBe(acme.project.id);
+  });
 
-  // A duplicate slug inside one org is a conflict.
-  it.todo("refuses a duplicate slug inside one organization");
+  it("refuses a duplicate slug inside one organization", async () => {
+    const second = await projectRepo.insertProject({
+      orgId: north.org.id,
+      name: "Second platform",
+      slug: "platform",
+      key: "SECD",
+      description: null,
+      visibility: "org",
+      leadId: null,
+      color: "#6366f1",
+      targetDate: null,
+    });
 
-  // findBySlug is org-scoped: org A's lookup never finds org B's project.
-  it.todo("scopes findBySlug to the organization");
+    expect(second.slug).not.toBe("platform");
+    expect(second.id).not.toBe(north.project.id);
 
-  // archivePatch() sets archived_at; the row is still present in the table.
-  it.todo("archives by stamping archived_at, keeping the row");
+    const original = await projectRepo.findProjectBySlug(north.org.id, "platform");
+    expect(original?.id).toBe(north.project.id);
+  });
 
-  // restorePatch() clears archived_at and the project lists again.
-  it.todo("restores an archived project");
+  it("scopes findBySlug to the organization", async () => {
+    const found = await projectRepo.findProjectBySlug(acme.org.id, "platform");
+    expect(found?.id).toBe(acme.project.id);
+    expect(found?.id).not.toBe(north.project.id);
+  });
 
-  // Live listings exclude archived projects by default.
-  it.todo("excludes archived projects from the default listing");
+  it("archives by stamping archived_at, keeping the row", async () => {
+    const created = await projectRepo.insertProject({
+      orgId: north.org.id,
+      name: "To archive",
+      slug: "to-archive",
+      key: "ARCH",
+      description: null,
+      visibility: "org",
+      leadId: null,
+      color: "#6366f1",
+      targetDate: null,
+    });
+
+    const archived = await projectRepo.archiveProject(north.org.id, created.id);
+    expect(archived.archivedAt).not.toBeNull();
+
+    const stillThere = await projectRepo.findProjectById(north.org.id, created.id);
+    expect(stillThere).not.toBeNull();
+    expect(stillThere?.archivedAt).not.toBeNull();
+  });
+
+  it("restores an archived project", async () => {
+    const created = await projectRepo.insertProject({
+      orgId: north.org.id,
+      name: "To restore",
+      slug: "to-restore",
+      key: "REST",
+      description: null,
+      visibility: "org",
+      leadId: null,
+      color: "#6366f1",
+      targetDate: null,
+    });
+
+    await projectRepo.archiveProject(north.org.id, created.id);
+    const restored = await projectRepo.restoreProject(north.org.id, created.id);
+
+    expect(restored.archivedAt).toBeNull();
+
+    const page = await projectRepo.listProjects({
+      orgId: north.org.id,
+      limit: 100,
+      cursor: null,
+    });
+    expect(page.items.map((row) => row.id)).toContain(created.id);
+  });
+
+  it("excludes archived projects from the default listing", async () => {
+    const created = await projectRepo.insertProject({
+      orgId: north.org.id,
+      name: "Stays archived",
+      slug: "stays-archived",
+      key: "STAY",
+      description: null,
+      visibility: "org",
+      leadId: null,
+      color: "#6366f1",
+      targetDate: null,
+    });
+    await projectRepo.archiveProject(north.org.id, created.id);
+
+    const defaultPage = await projectRepo.listProjects({
+      orgId: north.org.id,
+      limit: 100,
+      cursor: null,
+    });
+    expect(defaultPage.items.map((row) => row.id)).not.toContain(created.id);
+
+    const withArchived = await projectRepo.listProjects({
+      orgId: north.org.id,
+      limit: 100,
+      cursor: null,
+      includeArchived: true,
+    });
+    expect(withArchived.items.map((row) => row.id)).toContain(created.id);
+  });
 });
