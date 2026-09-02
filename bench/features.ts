@@ -25,11 +25,46 @@ export interface FeatureUsage {
   graph_json_reads: number;
   /** Strict-mode `permissionDecision: deny` responses seen in tool results. */
   strict_denials: number;
+  /**
+   * MCP tool name -> invocation count, e.g.
+   * `mcp__mempalace__mempalace_search`.
+   *
+   * The `mempalace` arms replace graphify's CLI with an MCP server, so the
+   * subcommand counters above are structurally zero for them and would read as
+   * "the tool was never used" — the opposite of the truth. This is the same
+   * question asked of the other retrieval mechanism.
+   */
+  mcp_calls: Record<string, number>;
+  /** Total calls to any `mcp__mempalace__*` tool — the retrieval nudge landing. */
+  mempalace_calls: number;
+  /**
+   * Bytes of tool_result content returned by MCP tools.
+   *
+   * The comparable figure on the graphify side is what `graphify query` prints,
+   * and it is the whole efficiency argument for a prebuilt index: a retrieval
+   * call is only cheaper than grepping if what it returns is smaller than what
+   * reading the files would have been.
+   */
+  mcp_result_bytes: number;
 }
 
 export function emptyUsage(): FeatureUsage {
-  return { subcommands: {}, invocations: 0, graph_json_reads: 0, strict_denials: 0 };
+  return {
+    subcommands: {},
+    invocations: 0,
+    graph_json_reads: 0,
+    strict_denials: 0,
+    mcp_calls: {},
+    mempalace_calls: 0,
+    mcp_result_bytes: 0,
+  };
 }
+
+/** Prefix Claude Code gives every tool contributed by an MCP server. */
+export const MCP_TOOL_PREFIX = "mcp__";
+
+/** The mempalace server's namespace, as `bench/conditions.ts` names it. */
+export const MEMPALACE_TOOL_PREFIX = "mcp__mempalace__";
 
 /**
  * Matches a `graphify` invocation at the start of a shell command segment.
@@ -81,6 +116,8 @@ export function graphifySubcommands(command: string): string[] {
 /** Scan one run's JSONL transcript. */
 export function parseFeatureUsage(jsonl: string): FeatureUsage {
   const usage = emptyUsage();
+  /** tool_use_id -> MCP tool name, so a tool_result's bytes attribute correctly. */
+  const mcpToolById = new Map<string, string>();
   for (const line of jsonl.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -98,6 +135,11 @@ export function parseFeatureUsage(jsonl: string): FeatureUsage {
       if (block.type === "tool_use") {
         const serialized = JSON.stringify(block.input ?? {});
         if (GRAPH_JSON_RE.test(serialized)) usage.graph_json_reads += 1;
+        if (typeof block.name === "string" && block.name.startsWith(MCP_TOOL_PREFIX)) {
+          usage.mcp_calls[block.name] = (usage.mcp_calls[block.name] ?? 0) + 1;
+          if (block.name.startsWith(MEMPALACE_TOOL_PREFIX)) usage.mempalace_calls += 1;
+          if (typeof block.id === "string") mcpToolById.set(block.id, block.name);
+        }
         if (block.name !== "Bash") continue;
         const command = (block.input as { command?: unknown } | undefined)?.command;
         if (typeof command !== "string") continue;
@@ -107,6 +149,8 @@ export function parseFeatureUsage(jsonl: string): FeatureUsage {
       } else if (block.type === "tool_result") {
         const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
         if (text.includes(STRICT_DENY_MARKER)) usage.strict_denials += 1;
+        const id = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
+        if (mcpToolById.has(id)) usage.mcp_result_bytes += Buffer.byteLength(text, "utf8");
       }
     }
   }
@@ -138,6 +182,22 @@ export interface ConditionFeatureUsage {
   /** Total / median strict denials observed per run. */
   strict_denials_total: number;
   strict_denials_median: number | null;
+  /**
+   * MCP tool -> total invocations across the condition. Empty for every arm
+   * without an MCP server, which is what keeps the report's MCP section (and
+   * therefore every already-committed report) absent unless it has something
+   * to say.
+   */
+  mcp_calls: Record<string, number>;
+  /** Total / median `mcp__mempalace__*` calls per run. */
+  mempalace_calls_total: number;
+  mempalace_calls_median: number | null;
+  /** Runs that called the mempalace server at least once. */
+  mempalace_runs_using: number;
+  /** Runs in an MCP arm that never called it — the nudge ignored. */
+  mempalace_never_called_runs: number;
+  /** Bytes returned by MCP tool results across the condition. */
+  mcp_result_bytes_total: number;
 }
 
 function medianOf(xs: number[]): number | null {
@@ -173,6 +233,11 @@ export function summarizeFeatureUsage(
         }
       }
       const denials = list.map((u) => u.strict_denials);
+      const mcpCalls: Record<string, number> = {};
+      for (const u of list) {
+        for (const [k, v] of Object.entries(u.mcp_calls ?? {})) mcpCalls[k] = (mcpCalls[k] ?? 0) + v;
+      }
+      const mempalace = list.map((u) => u.mempalace_calls ?? 0);
       return {
         condition,
         runs: list.length,
@@ -182,6 +247,12 @@ export function summarizeFeatureUsage(
         never_invoked_runs: list.filter((u) => u.invocations === 0).length,
         strict_denials_total: denials.reduce((a, b) => a + b, 0),
         strict_denials_median: medianOf(denials),
+        mcp_calls: mcpCalls,
+        mempalace_calls_total: mempalace.reduce((a, b) => a + b, 0),
+        mempalace_calls_median: medianOf(mempalace),
+        mempalace_runs_using: mempalace.filter((n) => n > 0).length,
+        mempalace_never_called_runs: mempalace.filter((n) => n === 0).length,
+        mcp_result_bytes_total: list.reduce((a, u) => a + (u.mcp_result_bytes ?? 0), 0),
       };
     });
 }

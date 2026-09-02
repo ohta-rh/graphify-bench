@@ -8,8 +8,11 @@ import {
   assertRegistryMatchesDisk,
   conditionNames,
   effectiveModel,
+  expandPalace,
   getCondition,
+  mcpToolPrefix,
   overlayDirs,
+  renderMcpConfig,
   resolveCondition,
 } from "./conditions.js";
 import { buildArgs } from "./lib/claude-p.js";
@@ -261,5 +264,91 @@ describe("applyOverlay with a delta chain", () => {
 
     expect(fs.readFileSync(path.join(dest, ".claude", "settings.json"), "utf8")).toBe('{"mode":"strict"}');
     expect(fs.readFileSync(path.join(dest, "big.json"), "utf8")).toBe("inherited");
+  });
+});
+
+describe("mempalace arms", () => {
+  const MEMPALACE_ARMS = ["mempalace", "haiku-mempalace", "mempalace-v2", "haiku-mempalace-v2"];
+
+  it("registers all four arms with the right model and corpus generation", () => {
+    for (const name of MEMPALACE_ARMS) {
+      const spec = getCondition(name);
+      expect(spec.mcp).toBeDefined();
+      expect(spec.model).toBe(name.startsWith("haiku-") ? HAIKU_MODEL : undefined);
+      expect(spec.corpus).toBe(name.endsWith("-v2") ? "v2" : "v1");
+    }
+  });
+
+  // The whole point of the v2 pair is that its index covers docs/. An arm
+  // pointing at the v1 palace while its CLAUDE.md advertises documents would
+  // measure a broken tool and read as "semantic search cannot find docs".
+  it("points each arm at the palace built for its own corpus generation", () => {
+    expect(getCondition("mempalace").mcp!.resourceDir).toBe(".palaces/palace-v1");
+    expect(getCondition("haiku-mempalace").mcp!.resourceDir).toBe(".palaces/palace-v1");
+    expect(getCondition("mempalace-v2").mcp!.resourceDir).toBe(".palaces/palace-v2");
+    expect(getCondition("haiku-mempalace-v2").mcp!.resourceDir).toBe(".palaces/palace-v2");
+  });
+
+  it("uses the overlay whose CLAUDE.md matches its corpus generation", () => {
+    expect(getCondition("mempalace").overlays).toEqual(["mempalace"]);
+    expect(getCondition("haiku-mempalace").overlays).toEqual(["mempalace"]);
+    expect(getCondition("mempalace-v2").overlays).toEqual(["mempalace-v2"]);
+    expect(getCondition("haiku-mempalace-v2").overlays).toEqual(["mempalace-v2"]);
+  });
+
+  // The instruction surface must differ from baseline in exactly one place:
+  // the appended section. Anything else and the pair stops isolating the index.
+  it("ships baseline's instruction text verbatim plus one appended section", () => {
+    const baseline = fs.readFileSync(path.join(OVERLAYS, "baseline", "CLAUDE.md"), "utf8");
+    for (const overlay of ["mempalace", "mempalace-v2"]) {
+      const text = fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8");
+      expect(text.startsWith(baseline)).toBe(true);
+      expect(text.slice(baseline.length)).toContain("## mempalace");
+      expect(text.slice(baseline.length)).toContain("mempalace_search");
+    }
+  });
+
+  // `source_path` is baked into the palace at build time, so the root the
+  // overlay tells the agent to strip must be the root build-palace.sh mined.
+  it("states the index root its own generation was built at", () => {
+    expect(fs.readFileSync(path.join(OVERLAYS, "mempalace", "CLAUDE.md"), "utf8")).toContain(
+      "/tmp/mempalace-index/v1/taskflow/",
+    );
+    expect(fs.readFileSync(path.join(OVERLAYS, "mempalace-v2", "CLAUDE.md"), "utf8")).toContain(
+      "/tmp/mempalace-index/v2/taskflow/",
+    );
+  });
+
+  it("never mentions graphify — the arms must not prime each other", () => {
+    for (const overlay of ["mempalace", "mempalace-v2"]) {
+      expect(fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8")).not.toMatch(/graphify/i);
+    }
+  });
+});
+
+describe("renderMcpConfig", () => {
+  const spec = getCondition("mempalace").mcp!;
+
+  it("expands ${PALACE} in the args and the env to the same directory", () => {
+    const config = renderMcpConfig(spec, "/run/tmp/palace");
+    expect(config.mcpServers.mempalace!.args).toEqual(["--palace", "/run/tmp/palace"]);
+    expect(config.mcpServers.mempalace!.env).toEqual({ MEMPALACE_PALACE_PATH: "/run/tmp/palace" });
+  });
+
+  // The server name is what namespaces every tool in the transcript, which is
+  // the only handle features.ts has for counting mempalace calls.
+  it("keys the server under the name the transcript will use", () => {
+    expect(Object.keys(renderMcpConfig(spec, "/p").mcpServers)).toEqual(["mempalace"]);
+    expect(mcpToolPrefix(spec.name)).toBe("mcp__mempalace__");
+  });
+
+  it("leaves a string with no placeholder alone", () => {
+    expect(expandPalace("--palace", "/p")).toBe("--palace");
+    expect(expandPalace("${PALACE}/sub", "/p")).toBe("/p/sub");
+  });
+
+  it("omits env entirely when the arm declares none", () => {
+    const bare = renderMcpConfig({ ...spec, envTemplate: undefined }, "/p");
+    expect(bare.mcpServers.mempalace!.env).toBeUndefined();
   });
 });

@@ -319,7 +319,23 @@ export function isoAccuracyTasks(rows: RunRow[], baseline: string, treatment: st
  */
 export function compare(rows: RunRow[], spec: ComparisonSpec, seed: string, B: number): ComparisonResult {
   const { baseline, treatment } = spec;
-  const own = rows.filter((r) => r.condition === baseline || r.condition === treatment);
+  const both = rows.filter((r) => r.condition === baseline || r.condition === treatment);
+  // Scope the comparison to tasks BOTH arms actually ran.
+  //
+  // Until the MemPalace set, every arm in a given results directory covered the
+  // same task list, so this was a no-op. It stops being one as soon as a single
+  // report pools measurement sets with different coverage: `baseline` ran all
+  // 65 tasks (45 code + 20 docs) while `mempalace` ran only the 45, and without
+  // this filter `n_tasks` would announce "all 65 tasks" over a paired CI
+  // computed from the 45 that could actually be paired — `pairByTask` already
+  // drops the unmatched ones. Intersecting here makes the header, the condition
+  // summaries and the per-category rows describe the same task set the interval
+  // does.
+  const tasksOf = (condition: string): Set<string> =>
+    new Set(both.filter((r) => r.condition === condition).map((r) => r.task_id));
+  const baselineTasks = tasksOf(baseline);
+  const treatmentTasks = tasksOf(treatment);
+  const own = both.filter((r) => baselineTasks.has(r.task_id) && treatmentTasks.has(r.task_id));
   const iso = isoAccuracyTasks(own, baseline, treatment);
   const isoRows = own.filter((r) => iso.includes(r.task_id));
   const key = `${seed}:cmp:${treatment}:${baseline}`;

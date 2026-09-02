@@ -63,15 +63,86 @@ export function rewriteGraphifyPaths(text: string, exe: string): { text: string;
   return { text: out, replaced };
 }
 
+/**
+ * The `mempalace-mcp` executable is host-specific in the same way graphify's
+ * hook command is, and fails the same way: a stale path means the MCP server
+ * never spawns, and `claude -p` carries on without it — the `mempalace` arm
+ * silently degrades into an expensive `baseline` re-run. Unlike graphify it is
+ * a Python entry point inside a virtualenv rather than a binary on PATH, so it
+ * is recorded as a literal in `bench/conditions.ts` and rewritten here.
+ */
+const CONDITIONS_FILE = path.join(REPO_ROOT, "bench", "conditions.ts");
+
+function whichMempalaceMcp(): string | null {
+  const flagIndex = process.argv.indexOf("--mempalace-exe");
+  if (flagIndex >= 0 && process.argv[flagIndex + 1]) return process.argv[flagIndex + 1]!;
+  const fromEnv = process.env.MEMPALACE_MCP_EXE?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const out = execFileSync("which", ["mempalace-mcp"], { encoding: "utf8" }).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Replace the absolute path ending in `/mempalace-mcp` inside a TS string literal. */
+export function rewriteMempalacePath(text: string, exe: string): { text: string; replaced: number } {
+  let replaced = 0;
+  const out = text.replace(/"(\/[^"'\s:]*\/mempalace-mcp)"/g, (whole, found: string) => {
+    if (found === exe) return whole;
+    replaced += 1;
+    return `"${exe}"`;
+  });
+  return { text: out, replaced };
+}
+
+/**
+ * Maintain the mempalace path, and stay quiet on hosts that have no mempalace.
+ *
+ * Deliberately NOT a `--check` failure when the executable cannot be resolved:
+ * mempalace is an optional dependency of one arm family, and most checkouts
+ * (and CI) will never install it, so failing there would make the check useless
+ * as a gate for everything else. The real gate is at the point of use —
+ * `provisionMcp` in `bench/run.ts` refuses to start a run whose server
+ * executable is missing, which is where a wrong path can actually corrupt a
+ * measurement.
+ */
+function patchMempalace(check: boolean): number {
+  if (!fs.existsSync(CONDITIONS_FILE)) return 0;
+  const exe = whichMempalaceMcp();
+  const rel = path.relative(REPO_ROOT, CONDITIONS_FILE);
+  if (!exe) {
+    console.log(`[patch-overlay] ${rel}: no mempalace-mcp on this host — leaving the recorded path alone.`);
+    return 0;
+  }
+  const before = fs.readFileSync(CONDITIONS_FILE, "utf8");
+  const { text, replaced } = rewriteMempalacePath(before, exe);
+  if (replaced === 0) {
+    console.log(`[patch-overlay] ${rel}: mempalace-mcp already points at ${exe}.`);
+    return 0;
+  }
+  if (check) {
+    console.error(`[patch-overlay] ${rel}: mempalace-mcp path does not match ${exe}.`);
+    return replaced;
+  }
+  fs.writeFileSync(CONDITIONS_FILE, text);
+  console.log(`[patch-overlay] ${rel}: rewrote ${replaced} mempalace-mcp path(s) to ${exe}`);
+  return 0;
+}
+
 function main(): void {
   const check = process.argv.includes("--check");
   const exeFlagIndex = process.argv.indexOf("--exe");
   const exe = exeFlagIndex >= 0 ? process.argv[exeFlagIndex + 1] : whichGraphify();
 
+  let stale = patchMempalace(check);
+
   const settingsFiles = overlaySettingsFiles(OVERLAYS_DIR);
   if (settingsFiles.length === 0) {
     // Expected before the Phase 2 worker lands the overlay. Not an error.
-    console.log("[patch-overlay] no overlay ships a .claude/settings.json yet — nothing to patch.");
+    console.log("[patch-overlay] no overlay ships a .claude/settings.json yet — nothing more to patch.");
+    if (check && stale > 0) process.exitCode = 1;
     return;
   }
   if (!exe) {
@@ -80,7 +151,6 @@ function main(): void {
     return;
   }
 
-  let stale = 0;
   for (const settings of settingsFiles) {
     const rel = path.relative(REPO_ROOT, settings);
     const before = fs.readFileSync(settings, "utf8");
@@ -101,7 +171,8 @@ function main(): void {
 
   if (check && stale > 0) {
     console.error(
-      `[patch-overlay] ${stale} path(s) stale across ${settingsFiles.length} overlay(s). Re-run without --check to fix.`,
+      `[patch-overlay] ${stale} executable path(s) stale across ${settingsFiles.length} overlay settings file(s) ` +
+        "and the condition registry. Re-run without --check to fix.",
     );
     process.exitCode = 1;
   }

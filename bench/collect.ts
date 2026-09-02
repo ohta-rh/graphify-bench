@@ -51,6 +51,14 @@ export interface Metrics {
   read_graph_json_events: number;
   skill_attributions: number;
   skill_attribution_names: Record<string, number>;
+  /**
+   * MCP tool name -> call count. Present only from the MemPalace measurement
+   * set onward; earlier runs' `metrics.json` predate the field, so readers must
+   * treat it as optional rather than as "zero calls".
+   */
+  mcp_tool_calls?: Record<string, number>;
+  /** Calls to any `mcp__mempalace__*` tool. Optional for the same reason. */
+  mempalace_calls?: number;
   /** cache_creation_input_tokens of the first assistant message: the fixed overhead. */
   first_turn_cache_creation: number | null;
 
@@ -219,6 +227,17 @@ export function computeMetrics(
         messages: null as number | null,
       };
 
+  // MCP tools keep their namespaced name through `classifyToolCall` (only Bash
+  // is rewritten), so the counts are already in `tool_calls` — this pulls them
+  // out under their own key so a reader does not have to know the prefix rule.
+  const mcpToolCalls: Record<string, number> = {};
+  for (const [name, count] of Object.entries(t.tool_calls)) {
+    if (name.startsWith("mcp__")) mcpToolCalls[name] = count;
+  }
+  const mempalaceCalls = Object.entries(mcpToolCalls)
+    .filter(([name]) => name.startsWith("mcp__mempalace__"))
+    .reduce((a, [, count]) => a + count, 0);
+
   return {
     run_id: id,
     task_id: meta?.task_id ?? null,
@@ -248,6 +267,8 @@ export function computeMetrics(
     read_graph_json_events: t.read_graph_json_events,
     skill_attributions: t.skill_attributions,
     skill_attribution_names: t.skill_attribution_names,
+    mcp_tool_calls: mcpToolCalls,
+    mempalace_calls: mempalaceCalls,
     first_turn_cache_creation: t.first_turn_cache_creation,
 
     is_error: typeof result?.is_error === "boolean" ? result.is_error : null,

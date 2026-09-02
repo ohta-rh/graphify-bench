@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   STRICT_DENY_MARKER,
+  emptyUsage,
   graphifySubcommands,
   parseFeatureUsage,
   summarizeFeatureUsage,
+  type FeatureUsage,
 } from "./features.js";
 
 describe("graphifySubcommands", () => {
@@ -60,11 +62,25 @@ describe("parseFeatureUsage", () => {
 });
 
 describe("summarizeFeatureUsage", () => {
-  const usage = (subcommands: Record<string, number>, extra: Partial<{ invocations: number; graph_json_reads: number; strict_denials: number }> = {}) => ({
+  const usage = (
+    subcommands: Record<string, number>,
+    extra: Partial<{
+      invocations: number;
+      graph_json_reads: number;
+      strict_denials: number;
+      mcp_calls: Record<string, number>;
+      mempalace_calls: number;
+      mcp_result_bytes: number;
+    }> = {},
+  ) => ({
+    ...emptyUsage(),
     subcommands,
     invocations: extra.invocations ?? Object.values(subcommands).reduce((a, b) => a + b, 0),
     graph_json_reads: extra.graph_json_reads ?? 0,
     strict_denials: extra.strict_denials ?? 0,
+    mcp_calls: extra.mcp_calls ?? {},
+    mempalace_calls: extra.mempalace_calls ?? Object.values(extra.mcp_calls ?? {}).reduce((a, b) => a + b, 0),
+    mcp_result_bytes: extra.mcp_result_bytes ?? 0,
   });
 
   it("reports an explicit zero for every tracked subcommand nobody used", () => {
@@ -99,5 +115,96 @@ describe("summarizeFeatureUsage", () => {
     expect(rows[1]!.strict_denials_median).toBe(1);
     expect(rows[0]!.strict_denials_median).toBe(0);
     expect(rows[0]!.graph_json_read_runs).toBe(1);
+  });
+});
+
+describe("MCP retrieval tracking", () => {
+  // The mempalace arms have no CLI to invoke, so the subcommand counters are
+  // structurally zero for them. If MCP calls were not counted separately the
+  // report would say "the tool was never used" about the arm whose entire
+  // treatment is that tool.
+  const transcript = (blocks: unknown[]): string =>
+    blocks.map((b) => JSON.stringify({ type: "assistant", message: { content: [b] } })).join("\n");
+
+  const call = (id: string, name: string): unknown => ({
+    type: "tool_use",
+    id,
+    name,
+    input: { query: "webhook retry" },
+  });
+  const result = (id: string, text: string): unknown => ({ type: "tool_result", tool_use_id: id, content: text });
+
+  const usageWithMcp = (mcp: Record<string, number>, bytes: number): FeatureUsage => ({
+    ...emptyUsage(),
+    mcp_calls: mcp,
+    mempalace_calls: Object.values(mcp).reduce((a, b) => a + b, 0),
+    mcp_result_bytes: bytes,
+  });
+
+  it("counts mempalace tool calls by name and totals them", () => {
+    const u = parseFeatureUsage(
+      transcript([
+        call("t1", "mcp__mempalace__mempalace_search"),
+        call("t2", "mcp__mempalace__mempalace_search"),
+        call("t3", "mcp__mempalace__mempalace_list_wings"),
+      ]),
+    );
+    expect(u.mcp_calls["mcp__mempalace__mempalace_search"]).toBe(2);
+    expect(u.mcp_calls["mcp__mempalace__mempalace_list_wings"]).toBe(1);
+    expect(u.mempalace_calls).toBe(3);
+  });
+
+  it("counts a non-mempalace MCP server without inflating mempalace_calls", () => {
+    const u = parseFeatureUsage(transcript([call("t1", "mcp__other__search")]));
+    expect(u.mcp_calls["mcp__other__search"]).toBe(1);
+    expect(u.mempalace_calls).toBe(0);
+  });
+
+  it("attributes returned bytes to the MCP call that asked for them", () => {
+    const u = parseFeatureUsage(
+      transcript([
+        call("t1", "mcp__mempalace__mempalace_search"),
+        result("t1", "0123456789"),
+        // A Read's result must not be charged to the MCP server.
+        { type: "tool_use", id: "t2", name: "Read", input: { file_path: "src/a.ts" } },
+        result("t2", "x".repeat(500)),
+      ]),
+    );
+    expect(u.mcp_result_bytes).toBe(10);
+  });
+
+  it("leaves every MCP counter empty for a run that used no MCP tool", () => {
+    const u = parseFeatureUsage(
+      transcript([{ type: "tool_use", id: "t1", name: "Bash", input: { command: 'graphify query "x"' } }]),
+    );
+    expect(u.mcp_calls).toEqual({});
+    expect(u.mempalace_calls).toBe(0);
+    expect(u.mcp_result_bytes).toBe(0);
+  });
+
+  it("summarizes calls, median-per-run and runs that ignored the nudge", () => {
+    const [row] = summarizeFeatureUsage([
+      { condition: "mempalace", usage: usageWithMcp({ mcp__mempalace__mempalace_search: 4 }, 100) },
+      { condition: "mempalace", usage: usageWithMcp({ mcp__mempalace__mempalace_search: 2 }, 50) },
+      // The nudge was ignored: this run is a baseline in everything but name.
+      { condition: "mempalace", usage: usageWithMcp({}, 0) },
+    ]);
+    expect(row!.mempalace_calls_total).toBe(6);
+    expect(row!.mempalace_calls_median).toBe(2);
+    expect(row!.mempalace_runs_using).toBe(2);
+    expect(row!.mempalace_never_called_runs).toBe(1);
+    expect(row!.mcp_result_bytes_total).toBe(150);
+    expect(row!.mcp_calls["mcp__mempalace__mempalace_search"]).toBe(6);
+  });
+
+  // A pre-MemPalace measurement set has no MCP fields at all, and the report
+  // keys its whole MCP section off these staying empty — an aggregate that
+  // invented counts there would make every committed report grow a section.
+  it("summarizes a graphify-era usage record with no MCP fields at all", () => {
+    const legacy = { subcommands: { query: 2 }, invocations: 2, graph_json_reads: 0, strict_denials: 0 };
+    const [row] = summarizeFeatureUsage([{ condition: "graphify", usage: legacy as unknown as FeatureUsage }]);
+    expect(row!.mcp_calls).toEqual({});
+    expect(row!.mempalace_calls_total).toBe(0);
+    expect(row!.mcp_result_bytes_total).toBe(0);
   });
 });

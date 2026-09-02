@@ -159,6 +159,59 @@ describe("parseComparisons", () => {
   });
 });
 
+describe("compare over arms with different task coverage", () => {
+  /**
+   * The MemPalace report pools measurement sets: `baseline` ran all 6 tasks,
+   * `narrow` only the first 3. Before this was handled, `n_tasks` announced the
+   * union while the paired CI was computed from the intersection, because
+   * `pairByTask` drops a task one arm never ran.
+   */
+  function unevenRows(): RunRow[] {
+    const rows: RunRow[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const base = 10_000 + i * 1000;
+      rows.push(row({ task_id: `T${i}`, condition: "base", uncached_equivalent: base }));
+      if (i <= 3) rows.push(row({ task_id: `T${i}`, condition: "narrow", uncached_equivalent: base * 0.5 }));
+    }
+    return rows;
+  }
+
+  it("counts only the tasks both arms ran", () => {
+    const c = compare(unevenRows(), { treatment: "narrow", baseline: "base" }, "s", 200);
+    expect(c.n_tasks).toBe(3);
+  });
+
+  it("makes n_tasks agree with the paired interval's own n", () => {
+    const c = compare(unevenRows(), { treatment: "narrow", baseline: "base" }, "s", 200);
+    for (const p of c.paired) expect(p.ci.n).toBe(c.n_tasks);
+  });
+
+  it("summarizes each arm over the shared tasks only", () => {
+    const c = compare(unevenRows(), { treatment: "narrow", baseline: "base" }, "s", 200);
+    // Without the intersection, `base` would report 6 runs against `narrow`'s 3
+    // and its median would be drawn from tasks the treatment never attempted.
+    expect(c.by_condition.find((s) => s.condition === "base")!.runs).toBe(3);
+    expect(c.by_condition.find((s) => s.condition === "narrow")!.runs).toBe(3);
+  });
+
+  it("leaves an evenly-covered pair exactly as it was", () => {
+    // Every already-committed report is this case, so it must not move.
+    const c = compare(threeArmRows(), { treatment: "treat", baseline: "base" }, "s", 200);
+    expect(c.n_tasks).toBe(6);
+    expect(c.by_condition.find((s) => s.condition === "base")!.runs).toBe(6);
+  });
+
+  it("yields an empty comparison when the arms share no task at all", () => {
+    const rows = [
+      row({ task_id: "A", condition: "base" }),
+      row({ task_id: "B", condition: "narrow" }),
+    ];
+    const c = compare(rows, { treatment: "narrow", baseline: "base" }, "s", 200);
+    expect(c.n_tasks).toBe(0);
+    expect(c.paired[0]!.ci.n).toBe(0);
+  });
+});
+
 describe("resolveCli", () => {
   it("threads --compare and --feature-usage through", () => {
     const cli = resolveCli(["--compare", "x:y", "--feature-usage"]);

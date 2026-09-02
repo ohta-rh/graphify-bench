@@ -4,7 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { captureTranscript, runClaudeP, type ClaudePInvocation } from "./lib/claude-p.js";
-import { effectiveModel, overlayDirs, resolveCondition, type ConditionSpec } from "./conditions.js";
+import {
+  effectiveModel,
+  expandPalace,
+  overlayDirs,
+  renderMcpConfig,
+  resolveCondition,
+  type ConditionSpec,
+} from "./conditions.js";
 import { applyOverlay, cloneDir } from "./lib/copy.js";
 import { REPO_ROOT, readEnv, runDir, runId, type BenchEnv } from "./lib/env.js";
 import type { Task } from "../tasks/tasks.schema.js";
@@ -28,6 +35,38 @@ export interface VitestOutcome {
   exitCode: number | null;
   spec: string | null;
   outputTail: string | null;
+  error?: string;
+}
+
+/**
+ * What the MCP-backed arms actually pointed at, recorded so a run directory
+ * remains self-describing.
+ *
+ * The index is gitignored and per-run temporary, so nothing about it survives
+ * except this record: without `source_hash` a reader cannot tell whether two
+ * runs queried the same index, and without `tool_count` they cannot attribute
+ * the arm's fixed token overhead to the server's tool definitions.
+ */
+export interface McpProvision {
+  server: string;
+  command: string;
+  args: string[];
+  /** The rendered `--mcp-config` file, inside the run's temp area. */
+  config_file: string;
+  /** Pre-built index this run cloned from, repo-relative. */
+  source_dir: string;
+  /** The run's own private clone — always under the temp dir, never shared. */
+  palace_dir: string;
+  source_files: number;
+  source_bytes: number;
+  /** sha256 over the source index's file list and contents. */
+  source_hash: string;
+  copy_strategy: string | null;
+  copy_ms: number | null;
+  /** Tools the server advertised, counted from the transcript after the run. */
+  tool_count: number | null;
+  /** Whether the transcript shows the server's tools present at all. */
+  connected: boolean | null;
   error?: string;
 }
 
@@ -55,6 +94,8 @@ export interface RunMeta {
   overlay_files: string[];
   copy_strategy: string | null;
   copy_ms: number | null;
+  /** Null for every arm without an `mcp` block — which is most of them. */
+  mcp: McpProvision | null;
   patch: { applied: boolean; file: string | null; method: string | null; error?: string } | null;
   claude: {
     argv: string[] | null;
@@ -139,6 +180,148 @@ function runVitest(spec: string, dir: string): VitestOutcome {
   };
 }
 
+/**
+ * sha256 over an index directory's sorted relative file list and contents.
+ *
+ * The palace is gitignored and rebuilt rather than committed, so this is the
+ * only handle on "which index did these 65 runs actually query". Relative paths
+ * go into the digest, not absolute ones, so the hash is a property of the index
+ * and not of where the checkout happens to live.
+ */
+function hashDir(dir: string): { hash: string; files: number; bytes: number } {
+  const rels: string[] = [];
+  const walk = (rel: string): void => {
+    for (const entry of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+      const child = rel ? path.join(rel, entry.name) : entry.name;
+      if (entry.isDirectory()) walk(child);
+      else if (entry.isFile()) rels.push(child);
+    }
+  };
+  walk("");
+  rels.sort();
+  const outer = crypto.createHash("sha256");
+  let bytes = 0;
+  for (const rel of rels) {
+    const buf = fs.readFileSync(path.join(dir, rel));
+    bytes += buf.length;
+    outer.update(`${crypto.createHash("sha256").update(buf).digest("hex")}  ${rel}\n`);
+  }
+  return { hash: outer.digest("hex"), files: rels.length, bytes };
+}
+
+/**
+ * Give one run its own MCP server: a private clone of the pre-built index and a
+ * config file naming it.
+ *
+ * Cloning rather than sharing is a correctness requirement, not a precaution.
+ * ChromaDB opens its sqlite file read-write even to serve a query, so the three
+ * concurrent runs `matrix.ts` allows would be three writers on one database.
+ *
+ * Everything lands beside the corpus copy but NOT inside it: the agent must not
+ * be able to read the index off its own filesystem, which would let it answer
+ * from raw chunk text rather than by querying — the mempalace equivalent of the
+ * `read_graph_json` counter-productive case that `collect.ts` already watches.
+ */
+export function provisionMcp(
+  spec: ConditionSpec,
+  mcpDir: string,
+  repoRoot: string,
+): { provision: McpProvision; extraArgs: string[]; env: Record<string, string> } | null {
+  const mcp = spec.mcp;
+  if (!mcp) return null;
+
+  const sourceDir = path.resolve(repoRoot, mcp.resourceDir);
+  // Fail loudly. A missing index or a stale executable path would leave the
+  // server unable to start, and `claude -p` carries on regardless — the arm
+  // would quietly degrade into an expensive `baseline` re-run wearing the
+  // treatment's name, which is exactly the failure `patch-overlay.ts` exists
+  // to prevent for graphify's hook.
+  if (!fs.existsSync(sourceDir)) {
+    throw new Error(
+      `condition "${spec.name}": MCP index not found at ${sourceDir}. ` +
+        `Build it first: pnpm palace:build ${path.basename(mcp.resourceDir).replace(/^palace-/, "")}`,
+    );
+  }
+  if (!fs.existsSync(mcp.command)) {
+    throw new Error(
+      `condition "${spec.name}": MCP server executable not found at ${mcp.command}. ` +
+        "Set MEMPALACE_MCP_EXE, or run scripts/patch-overlay.ts on this host.",
+    );
+  }
+
+  const palaceDir = path.join(mcpDir, "palace");
+  fs.mkdirSync(mcpDir, { recursive: true });
+  const copied = cloneDir(sourceDir, palaceDir);
+  const { hash, files, bytes } = hashDir(sourceDir);
+
+  const configFile = path.join(mcpDir, `${mcp.name}.mcp.json`);
+  const config = renderMcpConfig(mcp, palaceDir);
+  fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+
+  // `--strict-mcp-config` limits the run to exactly this server. Without it the
+  // agent would also inherit whatever MCP servers the operator has configured
+  // globally, making the arm depend on the measuring machine's personal setup.
+  const extraArgs = ["--mcp-config", configFile, "--strict-mcp-config"];
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(mcp.envTemplate ?? {})) env[k] = expandPalace(v, palaceDir);
+
+  return {
+    provision: {
+      server: mcp.name,
+      command: mcp.command,
+      args: config.mcpServers[mcp.name]!.args,
+      config_file: configFile,
+      source_dir: path.relative(repoRoot, sourceDir),
+      palace_dir: palaceDir,
+      source_files: files,
+      source_bytes: bytes,
+      source_hash: hash,
+      copy_strategy: copied.strategy,
+      copy_ms: copied.durationMs,
+      tool_count: null,
+      connected: null,
+    },
+    extraArgs,
+    env,
+  };
+}
+
+/**
+ * Count the server's tools as the transcript saw them.
+ *
+ * Claude Code announces MCP tools the same way it announces its own deferred
+ * ones, in a `deferred_tools_delta` attachment; a tool that is actually called
+ * shows up as a `tool_use` block. Either is proof the server connected, and the
+ * union is the honest count — a server whose tools were never advertised *and*
+ * never called did not connect, which is the case the sanity check must catch.
+ */
+export function mcpToolsFromTranscript(jsonl: string, prefix: string): { count: number; connected: boolean } {
+  const names = new Set<string>();
+  for (const line of jsonl.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes(prefix)) continue;
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const attachment = row.attachment as { addedNames?: unknown } | undefined;
+    for (const n of Array.isArray(attachment?.addedNames) ? attachment.addedNames : []) {
+      if (typeof n === "string" && n.startsWith(prefix)) names.add(n);
+    }
+    const content = (row.message as { content?: unknown } | undefined)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const rawBlock of content) {
+      const block = rawBlock as { type?: unknown; name?: unknown };
+      if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith(prefix)) {
+        names.add(block.name);
+      }
+    }
+  }
+  return { count: names.size, connected: names.size > 0 };
+}
+
 function writeJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
@@ -164,6 +347,10 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
   // would prime the model differently in each arm. The session uuid alone is
   // opaque; run.meta.json holds the mapping back to the run id.
   const workDir = path.join(env.scratch, sessionId);
+  // Beside the corpus copy, never inside it: an index the agent can read is an
+  // index it can answer from without querying. The name stays opaque for the
+  // same reason `workDir` does.
+  const mcpDir = path.join(env.scratch, `${sessionId}.mcp`);
   const startedAt = new Date();
   const t0 = Date.now();
 
@@ -184,6 +371,7 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     overlay_files: [],
     copy_strategy: null,
     copy_ms: null,
+    mcp: null,
     patch: null,
     claude: {
       argv: null,
@@ -229,7 +417,12 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       if (!outcome.applied) meta.error = `patch failed: ${outcome.error ?? "unknown"}`;
     }
 
-    // 4. the measured call
+    // 4. per-run MCP resources: a private index clone and the config naming it
+    fs.rmSync(mcpDir, { recursive: true, force: true });
+    const provisioned = provisionMcp(spec, mcpDir, REPO_ROOT);
+    if (provisioned) meta.mcp = provisioned.provision;
+
+    // 5. the measured call
     const tClaude = Date.now();
     invocation = await runClaudeP({
       prompt: req.task.prompt,
@@ -239,8 +432,16 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       effort: env.effort,
       maxTurns: env.maxTurns,
       maxBudgetUsd: env.maxBudgetUsd,
-      extraArgs: spec.extraClaudeArgs,
-      env: { ...(env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : {}), ...(spec.env ?? {}) },
+      extraArgs: [...(spec.extraClaudeArgs ?? []), ...(provisioned?.extraArgs ?? [])],
+      // The palace path is exported to `claude` itself, not only to the server
+      // it spawns: the server inherits this environment, so setting it here
+      // closes the gap if a mempalace code path ever resolves the palace before
+      // its own `--palace` argument is parsed.
+      env: {
+        ...(env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : {}),
+        ...(provisioned?.env ?? {}),
+        ...(spec.env ?? {}),
+      },
     });
     meta.timings_ms.claude = Date.now() - tClaude;
     meta.claude = {
@@ -253,7 +454,7 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       stderr_tail: invocation.stderr.trim().split("\n").slice(-20).join("\n") || null,
     };
 
-    // 5. persist result + transcript
+    // 6. persist result + transcript
     if (invocation.result) {
       writeJson(path.join(outDir, "result.json"), invocation.result);
     } else {
@@ -265,7 +466,23 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       unknown
     >;
 
-    // 6. grader === "vitest": run the spec inside the run dir before deleting it
+    // 7. did the MCP server actually connect? Read it back off the transcript
+    // rather than trusting the spawn: `claude -p` exits 0 whether or not its
+    // configured servers came up.
+    if (meta.mcp) {
+      const file = path.join(outDir, "transcript.jsonl");
+      if (fs.existsSync(file)) {
+        const seen = mcpToolsFromTranscript(fs.readFileSync(file, "utf8"), `mcp__${meta.mcp.server}__`);
+        meta.mcp.tool_count = seen.count;
+        meta.mcp.connected = seen.connected;
+        if (!seen.connected) {
+          meta.mcp.error = `no mcp__${meta.mcp.server}__* tool was advertised or called`;
+          meta.error = meta.error ?? `MCP server "${meta.mcp.server}" did not connect`;
+        }
+      }
+    }
+
+    // 8. grader === "vitest": run the spec inside the run dir before deleting it
     if (req.task.grader === "vitest" && req.task.spec) {
       const tTest = Date.now();
       meta.vitest = runVitest(req.task.spec, workDir);
@@ -274,12 +491,16 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
   } catch (err) {
     meta.error = meta.error ?? String(err instanceof Error ? err.stack ?? err.message : err);
   } finally {
-    // 7. tear down the run dir; a partial result is never discarded
+    // 9. tear down the run dir and the index clone; a partial result is never
+    // discarded. The clone is 30–40 MB, so leaving 130 of them behind would
+    // fill the temp volume long before the matrix finished.
     if (process.env.BENCH_KEEP_WORKDIR !== "1") {
-      try {
-        fs.rmSync(workDir, { recursive: true, force: true });
-      } catch (err) {
-        meta.error = meta.error ?? `cleanup failed: ${String(err)}`;
+      for (const dir of [workDir, mcpDir]) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+          meta.error = meta.error ?? `cleanup failed: ${String(err)}`;
+        }
       }
     }
     meta.finished_at = new Date().toISOString();

@@ -638,6 +638,54 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
           "evidence that forcing graph-first exploration does nothing.\n",
       );
     }
+    // MCP-backed arms only. Rendered from what the analysis actually carries, so
+    // a measurement set with no MCP arm — every set before MemPalace — prints
+    // nothing here and regenerates byte-identically.
+    const mcpArms = usage.filter((u) => Object.keys(u.mcp_calls ?? {}).length > 0 || (u.mempalace_calls_total ?? 0) > 0);
+    if (mcpArms.length > 0) {
+      const tools = [...new Set(mcpArms.flatMap((u) => Object.keys(u.mcp_calls ?? {})))].sort();
+      out.push("**MCP retrieval tools.** The same question asked of the other retrieval mechanism.\n");
+      out.push(
+        "The `mempalace` arms have no CLI to invoke, so every zero in the table above is structural for them " +
+          "rather than a finding. What they do have is a server exposing **45** tools, of which the nudge in " +
+          "`CLAUDE.md` points at exactly one. The columns below count what was actually called, and the " +
+          "`bytes returned` column is the efficiency claim itself: a prebuilt index only pays for itself if " +
+          "what it hands back is smaller than reading the files would have been.\n",
+      );
+      out.push(`| condition | runs | ${tools.map((t) => `\`${t.replace(/^mcp__/, "")}\``).join(" | ")} | total calls | median/run | runs using | bytes returned |`);
+      out.push(`|---|---|${tools.map(() => "---").join("|")}|---|---|---|---|`);
+      for (const u of mcpArms) {
+        const cells = tools.map((t) => {
+          const n = u.mcp_calls?.[t] ?? 0;
+          return n === 0 ? "**0**" : String(n);
+        });
+        out.push(
+          `| \`${u.condition}\` | ${u.runs} | ${cells.join(" | ")} | ${u.mempalace_calls_total ?? 0} | ` +
+            `${u.mempalace_calls_median ?? "–"} | ${u.mempalace_runs_using ?? 0}/${u.runs} | ${fmt(u.mcp_result_bytes_total ?? 0)} |`,
+        );
+      }
+      out.push("");
+      const ignored = mcpArms.filter((u) => (u.mempalace_never_called_runs ?? 0) > 0);
+      if (ignored.length > 0) {
+        out.push(
+          `> **The retrieval nudge was ignored in some runs.** ` +
+            `${ignored.map((u) => `\`${u.condition}\` ${u.mempalace_never_called_runs}/${u.runs}`).join(", ")} ` +
+            "run(s) never called `mempalace_search` at all, despite `CLAUDE.md` telling the agent to search " +
+            "before grepping. Those runs are a baseline in everything but name and their tokens are still " +
+            "pooled into the arm, so the arm's measured effect is diluted by exactly that fraction — the same " +
+            "caveat the `never invoked the CLI` column records for graphify.\n",
+        );
+      }
+      out.push(
+        "> **The 45 tool definitions are a fixed cost, and it is in §2.** Every `mempalace` run carries the " +
+          "server's full tool schema — ~32 KB of JSON, roughly 8k tokens — in its first request, whether or " +
+          "not it ever calls a tool. That lands in `first_turn_cache_creation`, so the fixed-overhead table " +
+          "in §2 is where the arms are separable on it; it is **not** subtracted from any figure in this " +
+          "report. Note also that these arms run with `--strict-mcp-config` while the others do not, so they " +
+          "are the only arms that do *not* also carry the measuring host's own MCP servers — those appear in " +
+          "the other arms as deferred names only, which is far cheaper than a loaded schema but not zero.\n",
+      );
+    }
     out.push(
       "> **Cross-session memory was never measured.** `save-result`, `reflect` and `affected` are the " +
         "mechanisms by which graphify is supposed to compound across sessions, and they were invoked **zero " +
