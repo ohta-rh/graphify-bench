@@ -2,10 +2,21 @@
 
 /**
  * Debounces search and filter inputs.
- *
- * STUB — owner B. Replace the body, keep every exported
- * signature exactly as declared in corpus-manifest.json.
  */
-export function useDebouncedValue(value: string, delayMs?: number): string {
-  throw new Error("stub: src/hooks/use-debounced-value.ts");
+import { useEffect, useState } from "react";
+
+export const DEFAULT_DEBOUNCE_MS = 250;
+
+export function useDebouncedValue(
+  value: string,
+  delayMs: number = DEFAULT_DEBOUNCE_MS,
+): string {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), Math.max(0, delayMs));
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+
+  return debounced;
 }
