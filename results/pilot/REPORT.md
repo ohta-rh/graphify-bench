@@ -39,6 +39,8 @@ Fixed overhead, reported separately so readers can subtract it (architecture.md 
 | total_cost_usd | 2 | -0.1806 | [-0.4144, 0.0532] | -14.8% | **CI crosses 0 — no detectable difference** |
 | num_turns | 2 | 4.0 | [3.0, 5.0] | 92.5% | graphify higher |
 
+> **Why the two token rows disagree.** Subagent use is asymmetric between the arms (baseline 1/2 runs, graphify 0/2). `uncached_equivalent` cannot see a subagent's tokens, so it charges that work to nobody and makes the subagent-spawning arm look cheap; `uncached_equivalent_all` counts it. **Read the `_all` row** — the main-only row is retained only to show the size of the distortion.
+
 ## 4. Iso-accuracy subset
 
 Tasks where every graded run of both conditions succeeded (2/2): `FIX1-issue-tenant-leak`, `REF1-assertcan-callers`
@@ -83,6 +85,8 @@ Tasks where every graded run of both conditions succeeded (2/2): `FIX1-issue-ten
 - graphify-condition runs that never invoked the `graphify` CLI (nudge ignored): **0**
 
 ## 7. Failed and ungraded runs
+
+Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0**. The table below also lists runs that completed normally but did not meet their grader's success threshold — those are accuracy results, not execution problems.
 
 _None._
 

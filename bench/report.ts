@@ -195,6 +195,17 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push("|---|---|---|---|---|---|");
   for (const p of a.paired) out.push(ciLine(p, p.metric === "total_cost_usd" ? 4 : 1));
   out.push("");
+  const subBase = a.by_condition.find((s) => s.condition === "baseline");
+  const subTreat = a.by_condition.find((s) => s.condition === "graphify");
+  if (subBase && subTreat && subBase.subagent_runs !== subTreat.subagent_runs) {
+    out.push(
+      `> **Why the two token rows disagree.** Subagent use is asymmetric between the arms ` +
+        `(baseline ${subBase.subagent_runs}/${subBase.runs} runs, graphify ${subTreat.subagent_runs}/${subTreat.runs}). ` +
+        `\`uncached_equivalent\` cannot see a subagent's tokens, so it charges that work to nobody and makes the ` +
+        `subagent-spawning arm look cheap; \`uncached_equivalent_all\` counts it. **Read the \`_all\` row** — the ` +
+        `main-only row is retained only to show the size of the distortion.\n`,
+    );
+  }
 
   out.push("## 4. Iso-accuracy subset\n");
   out.push(
@@ -233,6 +244,12 @@ export function buildReport(a: Analysis, rows: RunRow[]): string {
   out.push("");
 
   out.push("## 7. Failed and ungraded runs\n");
+  const harnessFailures = a.failures.filter((f) => f.is_error === true || (f.terminal_reason !== null && f.terminal_reason !== "completed"));
+  out.push(
+    `Harness failures (\`is_error\`, or \`terminal_reason\` other than \`completed\`): **${harnessFailures.length}**. ` +
+      `The table below also lists runs that completed normally but did not meet their grader's success threshold — ` +
+      `those are accuracy results, not execution problems.\n`,
+  );
   if (a.failures.length === 0) {
     out.push("_None._\n");
   } else {

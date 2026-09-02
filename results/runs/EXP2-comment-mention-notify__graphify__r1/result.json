@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 60414,
+  "stop_reason": "end_turn",
+  "session_id": "31a110df-f31f-4838-bb9a-8e8c2cf14a38",
+  "total_cost_usd": 0.21845520000000002,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 27687,
+    "cache_read_input_tokens": 279866,
+    "output_tokens": 5062,
+    "output_tokens_details": {
+      "thinking_tokens": 1919
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 27687,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1942,
+        "cache_read_input_tokens": 44694,
+        "cache_creation_input_tokens": 1752,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1752
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 12,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010819999999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 16,
+      "outputTokens": 5062,
+      "cacheReadInputTokens": 279866,
+      "cacheCreationInputTokens": 27687,
+      "webSearchRequests": 0,
+      "costUSD": 0.21737320000000002,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1919,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I have the full picture now needed to answer. That's enough tracing — the immediate email-vs-in-app decision is fully resolved in `notification-service.ts`, and digest-service is a separate downstream batching path outside what's asked.\n\n## How `@someone` becomes a notification in their inbox\n\n**1. Typing the handle — client-side, non-authoritative.**\n`src/components/domain/comment/mention-textarea.tsx` drives the autocomplete UI inside `comment-composer.tsx`, offering member handles as the user types `@`. Whatever it resolves gets sent along as `mentionedUserIds` in the `CreateCommentInput` payload (`src/schemas/comment.ts`). This client-side list is only an optimistic hint — it is never trusted on its own.\n\n**2. Extraction rules — `src/lib/mentions.ts`.**\nThis is where a typed handle becomes a real identity, and it's shared logic used both to parse and to render:\n- `handleOf(member)` defines the handle as the lowercased local-part of a member's email — this is the canonical mapping a `@handle` must match.\n- `extractMentions(body)` strips fenced/inline code (`withoutCode`) and applies `MENTION_PATTERN` (`/(^|[\\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi`) to pull out distinct handles in first-appearance order.\n- `resolveMentions(body, members)` builds a `handle -> UserId` map from the org's members and maps each extracted handle to a `UserId`, silently dropping typos/unknown handles (a bad mention must never fail the write).\n- `highlightMentions` is the rendering counterpart, wrapping `@handle` in a `<span class=\"mention\">` for display — same regex, so what's rendered as a mention is exactly what's resolved as one.\n\n**3. Server-side resolution — `createComment()` in `src/server/services/comment-service.ts`.**\nAfter permission (`assertCan`), archive, and rate-limit checks, `createComment` calls its private helper `resolveMentionedUsers(orgId, body, input.mentionedUserIds)`, which:\n- loads up to `MENTION_LOOKUP_LIMIT` (100) org members via `memberRepo.listMembers`,\n- re-runs `resolveMentions(body, members.items)` server-side (the source of truth — client input is never trusted alone),\n- unions that with the client-provided ids, filtered down to ids that are actually known members.\n\nThe result — the authoritative `mentionedUserIds` — is stored on the comment row via `commentRepo.insertComment`, and then **carried forward** as part of the event payload:\n\n```ts\nawait emit(\"comment.created\", {\n  ...actorEnvelope(actor),\n  commentId, issueId, mentionedUserIds,\n});\n```\n\nThat `emit` call, into the in-process pub/sub bus (`src/lib/event-bus.ts`), is what carries the resolved id list from the write path to the notification path. `emit` runs every subscriber via `Promise.allSettled` — one throwing handler can't break the comment write or its sibling handlers (also subscribed to `comment.created`: `activity-service.ts`, `search-service.ts`, `webhook-service.ts`).\n\n**4. Fan-out — `notification-service.ts`.**\nIts `comment.created` subscriber (registered at module load via `registerFanOut()`) does two things: it notifies the issue's author/assignee as \"watchers\" with kind `comment_created`, and separately, if `payload.mentionedUserIds.length > 0`, calls:\n\n```ts\nnotify(payload.orgId, \"comment_mention\", payload.mentionedUserIds, {\n  title: \"You were mentioned\", ...\n});\n```\n\n**5. `notify()` decides in-app / email / both / nothing.**\nFor each recipient (deduped, self-mentions skipped since `recipientId === payload.actorId` is excluded):\n- `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` loads that user's stored preference (or `null` if they've never touched settings).\n- `resolveChannels(preference, flags)` is the actual decision point:\n  - no preference row → `DEFAULT_CHANNELS = [\"in_app\", \"email\"]` (both).\n  - otherwise: `in_app` is included iff `preference.inApp`; `email` is included iff `preference.email` **and** (`!preference.digestOnly` **or** the org's `digest_email` feature flag is enabled via `isEnabled`).\n  - if the resulting channel list is empty, that recipient is skipped entirely — **no row is written for them at all** (a muted user gets nothing, not a suppressed row).\n- Recipients that survive get a row pushed with their computed `channels` array, and `notificationRepo.insertNotifications` bulk-inserts them (`src/server/repositories/notification-repository.ts`), JSON-stringifying `channels` per row.\n\nSo the order is: `mention-textarea.tsx` (optimistic client parse) → `mentions.ts:extractMentions/resolveMentions` (regex + handle→id map, run again server-side for trust) → `comment-service.ts:createComment`/`resolveMentionedUsers` (authoritative id list, stored on the comment) → `event-bus.ts:emit(\"comment.created\", …)` (carries the list forward) → `notification-service.ts`'s `comment.created` subscriber → `notify(..., \"comment_mention\", mentionedUserIds, ...)` → `resolveChannels()` reading `notification-preference-repository.ts`'s `getPreference` plus the `digest_email` flag, which is what finally decides in-app, email, both, or nothing → `notification-repository.ts:insertNotifications` persists the row(s) that made the cut.",
+  "ttft_ms": 2127,
+  "type": "result",
+  "duration_ms": 60110,
+  "uuid": "4df2382e-c262-4f73-831e-9e564ba3f740",
+  "ttft_stream_ms": 991,
+  "time_to_request_ms": 18,
+  "queued_turn_count": 0
+}
