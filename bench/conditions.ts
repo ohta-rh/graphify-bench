@@ -64,6 +64,14 @@ export interface McpSpec {
    * the answers off disk instead of querying for them.
    */
   resourceDir: string;
+  /**
+   * Name of the env var an operator sets to override `command` on a host where
+   * the default path is wrong — `MEMPALACE_MCP_EXE` for the mempalace family,
+   * `CGR_MCP_EXE` for the cgr family. `run.ts` names it in the "executable not
+   * found" error instead of hardcoding one family's variable, so the message
+   * stays correct as more MCP-backed families are added.
+   */
+  exeEnvHint?: string;
 }
 
 export interface ConditionSpec {
@@ -183,8 +191,108 @@ function mempalaceMcp(generation: "v1" | "v2"): McpSpec {
     args: ["--palace", "${PALACE}"],
     envTemplate: { MEMPALACE_PALACE_PATH: "${PALACE}" },
     resourceDir: `.palaces/palace-${generation}`,
+    exeEnvHint: "MEMPALACE_MCP_EXE",
   };
 }
+
+/**
+ * Absolute path to `code-graph-rag` on this host, verified by the Director
+ * 2026-09-03 (`code-graph-rag 0.0.845`, installed with
+ * `uv tool install --python 3.12 --with "mcp<2"
+ * "code-graph-rag[treesitter-full,semantic,ast-grep]"`). The `mcp<2` pin is
+ * load-bearing, not cosmetic: code-graph-rag 0.0.845 declares `mcp>=1.28.1`
+ * with no upper bound, and the `mcp` 2.x package removed `Server.list_tools`,
+ * so an unpinned install crashes the MCP server at startup ("'Server' object
+ * has no attribute 'list_tools'"). `CGR_MCP_EXE` overrides this path, exactly
+ * as `MEMPALACE_MCP_EXE` overrides the mempalace path above — a `uv tool
+ * install` places the executable under `~/.local/bin`, which is right on this
+ * host and inferrable on no other.
+ */
+export const CGR_MCP_EXE_DEFAULT = "/Users/tetsuyaohta/.local/bin/code-graph-rag";
+
+export function cgrMcpExe(): string {
+  return process.env.CGR_MCP_EXE?.trim() || CGR_MCP_EXE_DEFAULT;
+}
+
+/**
+ * The MCP block shared by every `cgr*` arm, differing only in which staged
+ * corpus generation's shared graph it points at.
+ *
+ * Unlike mempalace's palace, there is no per-run clone: `TARGET_REPO_PATH`
+ * names the STAGING directory the shared Memgraph + Qdrant index was built
+ * from (`scripts/build-cgr-index.sh`), and the server derives the project it
+ * queries from that path (dirname + sha256 prefix) rather than from a file it
+ * opens read-write. `resourceDir` therefore points at the tiny, committed
+ * `.cgr/index-<gen>/manifest.json` — record-keeping for which build this arm
+ * measured, not a payload `run.ts` clones — while `provisionMcp`'s existing
+ * clone-and-hash machinery runs unchanged over that manifest directory.
+ *
+ * The orchestrator/cypher env vars point at a local Ollama model the arm never
+ * actually reaches (`ask_agent` and `query_code_graph`, the tools that would
+ * call it, are disallowed below) — they exist only because code-graph-rag's
+ * startup validation requires *some* provider config even when every LLM-backed
+ * tool is off, and Ollama is the one that needs no API key.
+ */
+function cgrMcp(generation: "v1" | "v2"): McpSpec {
+  return {
+    name: "code-graph-rag",
+    command: cgrMcpExe(),
+    args: ["mcp-server"],
+    envTemplate: {
+      TARGET_REPO_PATH: `/tmp/cgr-index/${generation}/taskflow`,
+      ORCHESTRATOR_PROVIDER: "ollama",
+      ORCHESTRATOR_MODEL: "qwen3.5:4b",
+      CYPHER_PROVIDER: "ollama",
+      CYPHER_MODEL: "qwen3.5:4b",
+      // Without this cgr writes embeddings to a cwd-relative local Qdrant
+      // (./.qdrant_code_embeddings, single-process lock) instead of the
+      // daemon's shared container, and `semantic_search` answers "No
+      // embeddings have been generated yet" from any other cwd — verified by
+      // the Director's live smoke test 2026-09-03. The daemon's Qdrant
+      // container listens on 127.0.0.1:6333.
+      QDRANT_URL: "http://127.0.0.1:6333",
+    },
+    resourceDir: `.cgr/index-${generation}`,
+    exeEnvHint: "CGR_MCP_EXE",
+  };
+}
+
+/**
+ * The `code-graph-rag` MCP tools this benchmark measures, fully namespaced.
+ *
+ * `ask_agent` and `query_code_graph` are the tool's headline NL->Cypher path,
+ * and both require an external LLM — disallowing them is a deliberate scope
+ * cut (docs/plan/CGR.md), not an oversight. `index_repository`, `update_repository`,
+ * `reingest`, `wipe_database` and `delete_project` mutate the shared Memgraph
+ * graph that every concurrent run reads, so allowing them would let one run's
+ * agent corrupt or rebuild the index underneath every other run — the graph
+ * equivalent of mempalace's per-run clone requirement, solved here by removing
+ * the write path instead of cloning a database. `surgical_replace_code`,
+ * `write_file` and `structural_replace` mutate the STAGING tree the graph was
+ * built from, which every future run of this arm also reads. `read_file` and
+ * `list_directory` read that same staging copy rather than the agent's own
+ * working directory, so allowing them would let the agent open a file through
+ * a path Claude Code's own `Read`/`Glob` never touch and therefore
+ * `collect.ts` never counts — the MCP equivalent of the `read_graph_json`
+ * counter-productive case this benchmark already watches for graphify.
+ */
+export const CGR_DISALLOWED_TOOLS = [
+  "mcp__code-graph-rag__ask_agent",
+  "mcp__code-graph-rag__query_code_graph",
+  "mcp__code-graph-rag__index_repository",
+  "mcp__code-graph-rag__update_repository",
+  "mcp__code-graph-rag__reingest",
+  "mcp__code-graph-rag__wipe_database",
+  "mcp__code-graph-rag__delete_project",
+  "mcp__code-graph-rag__surgical_replace_code",
+  "mcp__code-graph-rag__write_file",
+  "mcp__code-graph-rag__structural_replace",
+  "mcp__code-graph-rag__read_file",
+  "mcp__code-graph-rag__list_directory",
+] as const;
+
+/** `CGR_DISALLOWED_TOOLS` as the CLI argument pair every `cgr*` arm appends. */
+export const CGR_DISALLOWED_ARGS: readonly string[] = ["--disallowedTools", CGR_DISALLOWED_TOOLS.join(",")];
 
 export const CONDITIONS: readonly ConditionSpec[] = [
   {
@@ -295,6 +403,47 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     model: HAIKU_MODEL,
     mcp: mempalaceMcp("v2"),
     note: "`mempalace-v2` run by a weaker explorer — its reference arm is `haiku-baseline`.",
+  },
+  {
+    name: "cgr",
+    overlays: ["cgr"],
+    corpus: "v1",
+    mcp: cgrMcp("v1"),
+    extraClaudeArgs: [...CGR_DISALLOWED_ARGS],
+    note:
+      "A third index shape: a Tree-sitter AST graph in a Memgraph database instead of a JSON file (graphify) " +
+      "or embedded text chunks (mempalace), reached through nine LLM-free, read-only MCP tools over the " +
+      "code-only corpus. `ask_agent` / `query_code_graph` (the tool's NL->Cypher path) and every write/mutate " +
+      "tool are disallowed — reference arms for both `graphify` and `mempalace`.",
+  },
+  {
+    name: "haiku-cgr",
+    overlays: ["cgr"],
+    corpus: "v1",
+    model: HAIKU_MODEL,
+    mcp: cgrMcp("v1"),
+    extraClaudeArgs: [...CGR_DISALLOWED_ARGS],
+    note: "`cgr` run by a weaker explorer — its reference arm is `haiku-baseline`.",
+  },
+  {
+    name: "cgr-v2",
+    overlays: ["cgr-v2"],
+    corpus: "v2",
+    mcp: cgrMcp("v2"),
+    extraClaudeArgs: [...CGR_DISALLOWED_ARGS],
+    note:
+      "`cgr` over code AND the 139-file documentation layer (corpus-v2): code-graph-rag indexes Markdown as " +
+      "`Section` nodes per heading, so the doc-vs-code task set is meaningful here too. Reference arms are " +
+      "`graphify-v2` and `mempalace-v2`.",
+  },
+  {
+    name: "haiku-cgr-v2",
+    overlays: ["cgr-v2"],
+    corpus: "v2",
+    model: HAIKU_MODEL,
+    mcp: cgrMcp("v2"),
+    extraClaudeArgs: [...CGR_DISALLOWED_ARGS],
+    note: "`cgr-v2` run by a weaker explorer — its reference arm is `haiku-baseline`.",
   },
   {
     name: "effort-medium",

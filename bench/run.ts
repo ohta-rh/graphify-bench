@@ -223,6 +223,23 @@ function hashDir(dir: string): { hash: string; files: number; bytes: number } {
  * from raw chunk text rather than by querying — the mempalace equivalent of the
  * `read_graph_json` counter-productive case that `collect.ts` already watches.
  */
+/**
+ * The `pnpm` command that (re)builds the pre-built resource an MCP arm's
+ * `resourceDir` points at, derived from the directory itself rather than
+ * hardcoded per family — `.palaces/palace-<gen>` is a `palace:build <gen>`
+ * and `.cgr/index-<gen>` is a `cgr:build <gen>`, and a resourceDir that
+ * matches neither shape falls back to naming itself rather than lying about
+ * which script builds it.
+ */
+function buildHint(resourceDir: string): string {
+  const base = path.basename(resourceDir);
+  if (base.startsWith("palace-")) return `pnpm palace:build ${base.replace(/^palace-/, "")}`;
+  if (base.startsWith("index-") && path.basename(path.dirname(resourceDir)) === ".cgr") {
+    return `pnpm cgr:build ${base.replace(/^index-/, "")}`;
+  }
+  return `(no known build command for resourceDir ${JSON.stringify(resourceDir)})`;
+}
+
 export function provisionMcp(
   spec: ConditionSpec,
   mcpDir: string,
@@ -240,13 +257,13 @@ export function provisionMcp(
   if (!fs.existsSync(sourceDir)) {
     throw new Error(
       `condition "${spec.name}": MCP index not found at ${sourceDir}. ` +
-        `Build it first: pnpm palace:build ${path.basename(mcp.resourceDir).replace(/^palace-/, "")}`,
+        `Build it first: ${buildHint(mcp.resourceDir)}`,
     );
   }
   if (!fs.existsSync(mcp.command)) {
     throw new Error(
       `condition "${spec.name}": MCP server executable not found at ${mcp.command}. ` +
-        "Set MEMPALACE_MCP_EXE, or run scripts/patch-overlay.ts on this host.",
+        `Set ${mcp.exeEnvHint ?? "the appropriate *_MCP_EXE env var"}, or run scripts/patch-overlay.ts on this host.`,
     );
   }
 

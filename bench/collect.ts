@@ -59,6 +59,11 @@ export interface Metrics {
   mcp_tool_calls?: Record<string, number>;
   /** Calls to any `mcp__mempalace__*` tool. Optional for the same reason. */
   mempalace_calls?: number;
+  /**
+   * Calls to any `mcp__code-graph-rag__*` tool. Optional for the same reason —
+   * present only from the `cgr*` measurement set onward.
+   */
+  cgr_calls?: number;
   /** cache_creation_input_tokens of the first assistant message: the fixed overhead. */
   first_turn_cache_creation: number | null;
 
@@ -237,6 +242,9 @@ export function computeMetrics(
   const mempalaceCalls = Object.entries(mcpToolCalls)
     .filter(([name]) => name.startsWith("mcp__mempalace__"))
     .reduce((a, [, count]) => a + count, 0);
+  const cgrCalls = Object.entries(mcpToolCalls)
+    .filter(([name]) => name.startsWith("mcp__code-graph-rag__"))
+    .reduce((a, [, count]) => a + count, 0);
 
   return {
     run_id: id,
@@ -269,6 +277,7 @@ export function computeMetrics(
     skill_attribution_names: t.skill_attribution_names,
     mcp_tool_calls: mcpToolCalls,
     mempalace_calls: mempalaceCalls,
+    cgr_calls: cgrCalls,
     first_turn_cache_creation: t.first_turn_cache_creation,
 
     is_error: typeof result?.is_error === "boolean" ? result.is_error : null,

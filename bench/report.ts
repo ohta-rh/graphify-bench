@@ -866,8 +866,20 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
     // MCP-backed arms only. Rendered from what the analysis actually carries, so
     // a measurement set with no MCP arm — every set before MemPalace — prints
     // nothing here and regenerates byte-identically.
-    const mcpArms = usage.filter((u) => Object.keys(u.mcp_calls ?? {}).length > 0 || (u.mempalace_calls_total ?? 0) > 0);
-    if (mcpArms.length > 0) {
+    const mcpArms = usage.filter(
+      (u) =>
+        Object.keys(u.mcp_calls ?? {}).length > 0 ||
+        (u.mempalace_calls_total ?? 0) > 0 ||
+        (u.cgr_calls_total ?? 0) > 0,
+    );
+    const CGR_PREFIX = "mcp__code-graph-rag__";
+    const rowIsCgr = (u: (typeof mcpArms)[number]): boolean =>
+      Object.keys(u.mcp_calls ?? {}).some((k) => k.startsWith(CGR_PREFIX));
+    const hasCgr = mcpArms.some(rowIsCgr);
+    if (mcpArms.length > 0 && !hasCgr) {
+      // Unchanged from the MemPalace-only report: a measurement set with no cgr
+      // arm regenerates byte-identically to what `bench:report:mempalace`
+      // already produced (verified before this branch was added).
       const tools = [...new Set(mcpArms.flatMap((u) => Object.keys(u.mcp_calls ?? {})))].sort();
       out.push("**MCP retrieval tools.** The same question asked of the other retrieval mechanism.\n");
       out.push(
@@ -909,6 +921,78 @@ export function buildReport(a: Analysis, rows: RunRow[], opts: ReportOptions = {
           "report. Note also that these arms run with `--strict-mcp-config` while the others do not, so they " +
           "are the only arms that do *not* also carry the measuring host's own MCP servers — those appear in " +
           "the other arms as deferred names only, which is far cheaper than a loaded schema but not zero.\n",
+      );
+    } else if (mcpArms.length > 0) {
+      // A report that also carries `cgr*` arms: the fixed one-tool-per-column
+      // table above would grow to ~10 columns (1 mempalace + up to 9 cgr
+      // tools), so this path caps the per-tool breakdown to the top callers and
+      // reports each row's own server total under a server-neutral header —
+      // `mempalace_calls` for a mempalace-namespaced row, `cgr_calls` for a
+      // cgr-namespaced one — instead of assuming every row is mempalace.
+      const TOP_TOOL_LIMIT = 6;
+      const toolTotals = new Map<string, number>();
+      for (const u of mcpArms) {
+        for (const [k, v] of Object.entries(u.mcp_calls ?? {})) toolTotals.set(k, (toolTotals.get(k) ?? 0) + v);
+      }
+      const allTools = [...toolTotals.keys()].sort();
+      const tools =
+        allTools.length > TOP_TOOL_LIMIT
+          ? [...toolTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_TOOL_LIMIT).map(([k]) => k).sort()
+          : allTools;
+      const omitted = allTools.filter((t) => !tools.includes(t));
+
+      out.push("**MCP retrieval tools.** The same question asked of each retrieval mechanism in this report.\n");
+      out.push(
+        "Every arm below reaches its index through MCP only — no CLI to invoke, so every zero in the table " +
+          "above is structural for them rather than a finding. `mempalace` exposes one tool the nudge points " +
+          "at; `cgr` exposes nine LLM-free, read-only tools (`docs/plan/CGR.md` §3), so the columns here are " +
+          `capped to the top ${tools.length} tools by total calls across every arm in this report` +
+          (omitted.length > 0 ? ` (omitted: ${omitted.map((t) => `\`${t.replace(/^mcp__/, "")}\``).join(", ")})` : "") +
+          '. **"treatment calls"** is the per-row total for that row\'s own server ' +
+          "(`mempalace_calls` for a `mempalace*` row, `cgr_calls` for a `cgr*` one), and `bytes returned` is " +
+          "the efficiency claim itself: a prebuilt index only pays for itself if what it hands back is smaller " +
+          "than reading the files would have been.\n",
+      );
+      out.push(`| condition | runs | ${tools.map((t) => `\`${t.replace(/^mcp__/, "")}\``).join(" | ")} | treatment calls | median/run | runs using | bytes returned |`);
+      out.push(`|---|---|${tools.map(() => "---").join("|")}|---|---|---|---|`);
+      for (const u of mcpArms) {
+        const cells = tools.map((t) => {
+          const n = u.mcp_calls?.[t] ?? 0;
+          return n === 0 ? "**0**" : String(n);
+        });
+        const isCgr = rowIsCgr(u);
+        const total = isCgr ? (u.cgr_calls_total ?? 0) : (u.mempalace_calls_total ?? 0);
+        const med = isCgr ? (u.cgr_calls_median ?? null) : (u.mempalace_calls_median ?? null);
+        const using = isCgr ? (u.cgr_runs_using ?? 0) : (u.mempalace_runs_using ?? 0);
+        out.push(
+          `| \`${u.condition}\` | ${u.runs} | ${cells.join(" | ")} | ${total} | ${med ?? "–"} | ${using}/${u.runs} | ${fmt(u.mcp_result_bytes_total ?? 0)} |`,
+        );
+      }
+      out.push("");
+      const ignored = mcpArms.filter((u) => {
+        const never = rowIsCgr(u) ? (u.cgr_never_called_runs ?? 0) : (u.mempalace_never_called_runs ?? 0);
+        return never > 0;
+      });
+      if (ignored.length > 0) {
+        out.push(
+          `> **The retrieval nudge was ignored in some runs.** ` +
+            `${ignored
+              .map((u) => `\`${u.condition}\` ${(rowIsCgr(u) ? u.cgr_never_called_runs : u.mempalace_never_called_runs) ?? 0}/${u.runs}`)
+              .join(", ")} ` +
+            "run(s) never called their arm's retrieval tool at all, despite `CLAUDE.md` telling the agent to " +
+            "search before grepping. Those runs are a baseline in everything but name and their tokens are " +
+            "still pooled into the arm, so the arm's measured effect is diluted by exactly that fraction — the " +
+            "same caveat the `never invoked the CLI` column records for graphify.\n",
+        );
+      }
+      out.push(
+        "> **Each server's tool definitions are a fixed cost, and it is in §2.** Every MCP-backed run carries " +
+          "its server's full tool schema in its first request, whether or not it ever calls a tool — `mempalace` " +
+          "45 tools / ~32 KB, `cgr` 9 tools. That lands in `first_turn_cache_creation`, so the fixed-overhead " +
+          "table in §2 is where the arms are separable on it; it is **not** subtracted from any figure in this " +
+          "report. These arms also all run with `--strict-mcp-config`, so they are the only arms that do *not* " +
+          "also carry the measuring host's own MCP servers — those appear in the other arms as deferred names " +
+          "only, which is far cheaper than a loaded schema but not zero.\n",
       );
     }
     out.push(

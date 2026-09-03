@@ -39,6 +39,7 @@ function fixture(): { repoRoot: string; exe: string; spec: ConditionSpec } {
         args: ["--palace", "${PALACE}"],
         envTemplate: { MEMPALACE_PALACE_PATH: "${PALACE}" },
         resourceDir: ".palaces/palace-v1",
+        exeEnvHint: "MEMPALACE_MCP_EXE",
       },
     },
   };

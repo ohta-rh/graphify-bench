@@ -197,6 +197,44 @@ describe("MCP retrieval tracking", () => {
     expect(row!.mcp_calls["mcp__mempalace__mempalace_search"]).toBe(6);
   });
 
+  it("counts cgr tool calls by name and totals them separately from mempalace_calls", () => {
+    const u = parseFeatureUsage(
+      transcript([
+        call("t1", "mcp__code-graph-rag__semantic_search"),
+        call("t2", "mcp__code-graph-rag__semantic_search"),
+        call("t3", "mcp__code-graph-rag__structural_search"),
+        call("t4", "mcp__mempalace__mempalace_search"),
+      ]),
+    );
+    expect(u.mcp_calls["mcp__code-graph-rag__semantic_search"]).toBe(2);
+    expect(u.mcp_calls["mcp__code-graph-rag__structural_search"]).toBe(1);
+    expect(u.cgr_calls).toBe(3);
+    // The two families are counted independently — a cgr call must not inflate
+    // mempalace_calls, and vice versa.
+    expect(u.mempalace_calls).toBe(1);
+  });
+
+  it("summarizes cgr calls, median-per-run and runs that ignored the nudge", () => {
+    const usageWithCgr = (mcp: Record<string, number>, bytes: number): FeatureUsage => ({
+      ...emptyUsage(),
+      mcp_calls: mcp,
+      cgr_calls: Object.values(mcp).reduce((a, b) => a + b, 0),
+      mcp_result_bytes: bytes,
+    });
+    const [row] = summarizeFeatureUsage([
+      { condition: "cgr", usage: usageWithCgr({ "mcp__code-graph-rag__semantic_search": 4 }, 100) },
+      { condition: "cgr", usage: usageWithCgr({ "mcp__code-graph-rag__semantic_search": 2 }, 50) },
+      // The nudge was ignored: this run is a baseline in everything but name.
+      { condition: "cgr", usage: usageWithCgr({}, 0) },
+    ]);
+    expect(row!.cgr_calls_total).toBe(6);
+    expect(row!.cgr_calls_median).toBe(2);
+    expect(row!.cgr_runs_using).toBe(2);
+    expect(row!.cgr_never_called_runs).toBe(1);
+    // mempalace's counters stay at their structural zero for a cgr-only row.
+    expect(row!.mempalace_calls_total).toBe(0);
+  });
+
   // A pre-MemPalace measurement set has no MCP fields at all, and the report
   // keys its whole MCP section off these staying empty — an aggregate that
   // invented counts there would make every committed report grow a section.
@@ -205,6 +243,7 @@ describe("MCP retrieval tracking", () => {
     const [row] = summarizeFeatureUsage([{ condition: "graphify", usage: legacy as unknown as FeatureUsage }]);
     expect(row!.mcp_calls).toEqual({});
     expect(row!.mempalace_calls_total).toBe(0);
+    expect(row!.cgr_calls_total).toBe(0);
     expect(row!.mcp_result_bytes_total).toBe(0);
   });
 });

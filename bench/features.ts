@@ -38,6 +38,14 @@ export interface FeatureUsage {
   /** Total calls to any `mcp__mempalace__*` tool — the retrieval nudge landing. */
   mempalace_calls: number;
   /**
+   * Total calls to any `mcp__code-graph-rag__*` tool — the `cgr*` arms' retrieval
+   * nudge landing. A parallel counter to `mempalace_calls` rather than a
+   * replacement for it: the two families run side by side in the same report
+   * (`bench:report:cgr` reads `results/mempalace/runs` too, to compare `cgr`
+   * against `mempalace`), so both totals must stay independently addressable.
+   */
+  cgr_calls: number;
+  /**
    * Bytes of tool_result content returned by MCP tools.
    *
    * The comparable figure on the graphify side is what `graphify query` prints,
@@ -56,6 +64,7 @@ export function emptyUsage(): FeatureUsage {
     strict_denials: 0,
     mcp_calls: {},
     mempalace_calls: 0,
+    cgr_calls: 0,
     mcp_result_bytes: 0,
   };
 }
@@ -65,6 +74,9 @@ export const MCP_TOOL_PREFIX = "mcp__";
 
 /** The mempalace server's namespace, as `bench/conditions.ts` names it. */
 export const MEMPALACE_TOOL_PREFIX = "mcp__mempalace__";
+
+/** The code-graph-rag server's namespace, as `bench/conditions.ts` names it. */
+export const CGR_TOOL_PREFIX = "mcp__code-graph-rag__";
 
 /**
  * Matches a `graphify` invocation at the start of a shell command segment.
@@ -138,6 +150,7 @@ export function parseFeatureUsage(jsonl: string): FeatureUsage {
         if (typeof block.name === "string" && block.name.startsWith(MCP_TOOL_PREFIX)) {
           usage.mcp_calls[block.name] = (usage.mcp_calls[block.name] ?? 0) + 1;
           if (block.name.startsWith(MEMPALACE_TOOL_PREFIX)) usage.mempalace_calls += 1;
+          if (block.name.startsWith(CGR_TOOL_PREFIX)) usage.cgr_calls += 1;
           if (typeof block.id === "string") mcpToolById.set(block.id, block.name);
         }
         if (block.name !== "Bash") continue;
@@ -196,6 +209,13 @@ export interface ConditionFeatureUsage {
   mempalace_runs_using: number;
   /** Runs in an MCP arm that never called it — the nudge ignored. */
   mempalace_never_called_runs: number;
+  /** Total / median `mcp__code-graph-rag__*` calls per run — the `cgr*` twin of `mempalace_calls_total`. */
+  cgr_calls_total: number;
+  cgr_calls_median: number | null;
+  /** Runs that called the code-graph-rag server at least once. */
+  cgr_runs_using: number;
+  /** Runs in a `cgr*` arm that never called it — the nudge ignored. */
+  cgr_never_called_runs: number;
   /** Bytes returned by MCP tool results across the condition. */
   mcp_result_bytes_total: number;
 }
@@ -238,6 +258,7 @@ export function summarizeFeatureUsage(
         for (const [k, v] of Object.entries(u.mcp_calls ?? {})) mcpCalls[k] = (mcpCalls[k] ?? 0) + v;
       }
       const mempalace = list.map((u) => u.mempalace_calls ?? 0);
+      const cgr = list.map((u) => u.cgr_calls ?? 0);
       return {
         condition,
         runs: list.length,
@@ -252,6 +273,10 @@ export function summarizeFeatureUsage(
         mempalace_calls_median: medianOf(mempalace),
         mempalace_runs_using: mempalace.filter((n) => n > 0).length,
         mempalace_never_called_runs: mempalace.filter((n) => n === 0).length,
+        cgr_calls_total: cgr.reduce((a, b) => a + b, 0),
+        cgr_calls_median: medianOf(cgr),
+        cgr_runs_using: cgr.filter((n) => n > 0).length,
+        cgr_never_called_runs: cgr.filter((n) => n === 0).length,
         mcp_result_bytes_total: list.reduce((a, u) => a + (u.mcp_result_bytes ?? 0), 0),
       };
     });

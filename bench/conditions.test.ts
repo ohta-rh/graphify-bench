@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  CGR_DISALLOWED_ARGS,
+  CGR_DISALLOWED_TOOLS,
   CONDITIONS,
   HAIKU_MODEL,
   LEAN_TOOLS,
@@ -325,6 +327,114 @@ describe("mempalace arms", () => {
   it("never mentions graphify — the arms must not prime each other", () => {
     for (const overlay of ["mempalace", "mempalace-v2"]) {
       expect(fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8")).not.toMatch(/graphify/i);
+    }
+  });
+});
+
+describe("cgr arms", () => {
+  const CGR_ARMS = ["cgr", "haiku-cgr", "cgr-v2", "haiku-cgr-v2"];
+  const ALLOWED_TOOLS = [
+    "semantic_search",
+    "get_code_snippet",
+    "get_function_source",
+    "find_duplicate_code",
+    "structural_search",
+    "list_projects",
+    "flow_verdict",
+    "explain_traceback",
+    "rank_root_causes",
+  ];
+
+  it("registers all four arms with the right model, corpus generation and mcp block", () => {
+    for (const name of CGR_ARMS) {
+      const spec = getCondition(name);
+      expect(spec.mcp).toBeDefined();
+      expect(spec.model).toBe(name.startsWith("haiku-") ? HAIKU_MODEL : undefined);
+      expect(spec.corpus).toBe(name.endsWith("-v2") ? "v2" : "v1");
+    }
+  });
+
+  it("points each arm at the staging dir for its own corpus generation via TARGET_REPO_PATH", () => {
+    expect(getCondition("cgr").mcp!.resourceDir).toBe(".cgr/index-v1");
+    expect(getCondition("haiku-cgr").mcp!.resourceDir).toBe(".cgr/index-v1");
+    expect(getCondition("cgr-v2").mcp!.resourceDir).toBe(".cgr/index-v2");
+    expect(getCondition("haiku-cgr-v2").mcp!.resourceDir).toBe(".cgr/index-v2");
+    expect(getCondition("cgr").mcp!.envTemplate?.TARGET_REPO_PATH).toBe("/tmp/cgr-index/v1/taskflow");
+    expect(getCondition("cgr-v2").mcp!.envTemplate?.TARGET_REPO_PATH).toBe("/tmp/cgr-index/v2/taskflow");
+  });
+
+  it("carries the ollama env so startup validation is satisfied without an API key", () => {
+    for (const name of CGR_ARMS) {
+      const env = getCondition(name).mcp!.envTemplate ?? {};
+      expect(env.ORCHESTRATOR_PROVIDER).toBe("ollama");
+      expect(env.ORCHESTRATOR_MODEL).toBe("qwen3.5:4b");
+      expect(env.CYPHER_PROVIDER).toBe("ollama");
+      expect(env.CYPHER_MODEL).toBe("qwen3.5:4b");
+    }
+  });
+
+  it("uses the overlay whose CLAUDE.md matches its corpus generation", () => {
+    expect(getCondition("cgr").overlays).toEqual(["cgr"]);
+    expect(getCondition("haiku-cgr").overlays).toEqual(["cgr"]);
+    expect(getCondition("cgr-v2").overlays).toEqual(["cgr-v2"]);
+    expect(getCondition("haiku-cgr-v2").overlays).toEqual(["cgr-v2"]);
+  });
+
+  it("appends the disallowed-tools flag to every arm", () => {
+    for (const name of CGR_ARMS) {
+      expect(getCondition(name).extraClaudeArgs).toEqual(CGR_DISALLOWED_ARGS);
+    }
+  });
+
+  it("names 12 disallowed tools, fully namespaced, and none of them are allowed tools", () => {
+    expect(CGR_DISALLOWED_TOOLS).toHaveLength(12);
+    for (const t of CGR_DISALLOWED_TOOLS) {
+      expect(t.startsWith("mcp__code-graph-rag__")).toBe(true);
+      const bare = t.replace("mcp__code-graph-rag__", "");
+      expect(ALLOWED_TOOLS).not.toContain(bare);
+    }
+    // The write/mutate/LLM-backed tools the spec calls out must all be present.
+    for (const bare of [
+      "ask_agent",
+      "query_code_graph",
+      "index_repository",
+      "update_repository",
+      "reingest",
+      "wipe_database",
+      "delete_project",
+      "surgical_replace_code",
+      "write_file",
+      "structural_replace",
+      "read_file",
+      "list_directory",
+    ]) {
+      expect(CGR_DISALLOWED_TOOLS).toContain(`mcp__code-graph-rag__${bare}`);
+    }
+  });
+
+  it("ships baseline's instruction text verbatim plus one appended section", () => {
+    const baseline = fs.readFileSync(path.join(OVERLAYS, "baseline", "CLAUDE.md"), "utf8");
+    for (const overlay of ["cgr", "cgr-v2"]) {
+      const text = fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8");
+      expect(text.startsWith(baseline)).toBe(true);
+      expect(text.slice(baseline.length)).toContain("## code-graph-rag");
+    }
+  });
+
+  it("names the allowed tools the agent should reach for", () => {
+    for (const overlay of ["cgr", "cgr-v2"]) {
+      const text = fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8");
+      for (const tool of ["semantic_search", "get_code_snippet", "find_duplicate_code", "structural_search"]) {
+        expect(text).toContain(tool);
+      }
+    }
+  });
+
+  it("never mentions graphify or mempalace — the arms must not prime each other", () => {
+    for (const overlay of ["cgr", "cgr-v2"]) {
+      const text = fs.readFileSync(path.join(OVERLAYS, overlay, "CLAUDE.md"), "utf8");
+      expect(text).not.toMatch(/graphify/i);
+      expect(text).not.toMatch(/mempalace/i);
     }
   });
 });
