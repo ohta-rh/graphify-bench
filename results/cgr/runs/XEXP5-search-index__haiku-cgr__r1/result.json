@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 71461,
+  "stop_reason": "end_turn",
+  "session_id": "2615e4b4-012b-4488-89de-db909c54a5a1",
+  "total_cost_usd": 0.1311264,
+  "usage": {
+    "input_tokens": 150,
+    "cache_creation_input_tokens": 27453,
+    "cache_read_input_tokens": 492634,
+    "output_tokens": 5141,
+    "output_tokens_details": {
+      "thinking_tokens": 1545
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 27453,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 2309,
+        "cache_read_input_tokens": 39638,
+        "cache_creation_input_tokens": 1597,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1597
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1022,
+      "outputTokens": 16,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001102,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 150,
+      "outputTokens": 5141,
+      "cacheReadInputTokens": 492634,
+      "cacheCreationInputTokens": 27453,
+      "webSearchRequests": 0,
+      "costUSD": 0.1300244,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1545,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 19,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have all the pieces. Here's how issue title updates stay searchable:\n\n## The Write Path: Keeping the Index in Step\n\nWhen someone edits an issue title in `src/actions/issues/update-issue.ts`, the flow is:\n\n1. **Validation and permissions** (`withAction` in `src/actions/_lib/with-action.ts` lines 74–99): The update payload is parsed against `updateIssueSchema`, the actor is resolved, and permission checks (`issue:update`) run before any database write happens.\n\n2. **Database write and event emission** (`src/server/services/issue-service.ts` lines 83–109, specifically `updateIssue`): The service calls `issueRepo.updateIssue()` to write the new title to the issues table, then calls `await emit(\"issue.updated\", ...)` with metadata about which fields changed (including the new title if it was in the payload).\n\n3. **Event bus delivery**: The in-process event bus (`src/lib/event-bus.ts` lines 54–72, the `emit` function) synchronously delivers this event to every registered subscriber, waiting for all handlers to settle before returning.\n\n4. **Search indexer listener** (`src/server/services/search-service.ts` lines 143–146): The search service has subscribed to `issue.updated` events. When one arrives, it re-reads the entire issue from the database using `issueRepo.findIssueById()` — **deliberately not trusting the event payload** (see line 134's comment). This read-after-write guards against indexing a partially-applied write.\n\n5. **Index upsert** (`src/server/services/search-service.ts` lines 88–96, `indexIssue`): The fresh issue is passed to `indexIssue()`, which combines the title and description as `[issue.title, issue.description ?? \"\"].join(\"\\n\")` and calls `searchRepo.upsertSearchDocument()`.\n\n6. **Idempotent storage** (`src/server/repositories/search-repository.ts` lines 18–59, `upsertSearchDocument`): The repository looks up any existing search document by `(orgId, subjectKind=\"issue\", subjectId)` using Drizzle-ORM. If found, it updates the `content`, `projectId`, and `indexedAt` columns in place; if not found, it inserts a new row. This upsert is keyed on the subject identity, not a row ID, making it safe to call repeatedly on the same issue without creating duplicates.\n\n## What's Stored in the Index\n\nThe `searchIndex` table (`src/server/db/schema/webhooks.ts` lines 54–70) is denormalized:\n\n- **`content`**: The searchable text — for issues, it's the title + newline + description concatenated together\n- **`subjectKind`**: Enum of `'issue' | 'comment' | 'project'` (only issues are searchable by default; comments require the `advanced_search` feature)\n- **`subjectId`**: Reference back to the original issue, comment, or project\n- **`projectId`**: Nullable, used for filtering searches to a specific project\n- **`indexedAt`**: Timestamp of when this document was last indexed\n- **`orgId`**: The tenant ID, enforcing that queries only see their own organization's data\n\n## The Query Path: Search Execution and Refusal\n\nA colleague searching for the new title calls `searchAction` in `src/actions/search/search.ts`:\n\n1. **Schema validation and actor resolution** (`withAction` lines 80–82): The search payload is validated against `searchQuerySchema` (`src/schemas/search.ts` lines 6–13), which requires:\n   - `q` (query string): 1–200 characters\n   - `orgId`: required (multi-tenant isolation)\n   - `kinds`: array of subject kinds (defaults to `[\"issue\"]`)\n   - `projectId`: optional filter\n   - Pagination cursor\n\n2. **Permission check and feature flag gating** (`src/server/services/search-service.ts` lines 46–71, the `search` function):\n   - `assertCan(actor, \"issue:read\", ...)`: Verifies the actor can read issues in this org\n   - Checks `isEnabled(\"advanced_search\", ...)` based on the org's plan, the user's role, and explicit overrides\n   - **Query refusal case 1**: If the query contains `:` (field-scoped syntax like `status:done`) and `advanced_search` is disabled, throws: `\"Field-scoped search is not included in this plan\"` (line 70)\n\n3. **Rate limiting** (`src/server/services/search-service.ts` lines 53–58): Calls `consumeRateLimit(orgId, \"search:query\")` using a token bucket. \n   - **Query refusal case 2**: If the bucket is exhausted, throws: `\"Search rate limit reached; try again after ${verdict.resetAt}\"` (line 56)\n\n4. **Index query** (`src/server/repositories/search-repository.ts` lines 83–121, `searchDocuments`): Builds a WHERE clause with:\n   - `orgPredicate(searchIndex.orgId, orgId)`: Tenant isolation\n   - `like(searchIndex.content, '%${input.q}%')`: Substring match (case-insensitive, line 91)\n   - `inArray(searchIndex.subjectKind, [...input.kinds])`: Filter by kind if provided\n   - `eq(searchIndex.projectId, input.projectId)`: Filter by project if provided\n   - Orders by `indexedAt DESC, id DESC` (newest first)\n   - Uses keyset pagination to handle cursors\n\n5. **Result transformation** (`src/server/services/search-service.ts` lines 76–81): Each row is mapped to a `SearchHit` with:\n   - `title`: First line of the indexed content\n   - `snippet`: Context around the matched query text (lines 196–204), padded ±60 characters\n\nThe search finds the updated title **moments later** because the entire emit-to-index flow happens synchronously within the same transaction scope — the indexer waits for `updateIssue`'s emit to complete before returning, so the search index is current by the time the write action's HTTP response is sent.",
+  "ttft_ms": 3359,
+  "type": "result",
+  "duration_ms": 74882,
+  "uuid": "60ab2754-dcf2-4c04-b433-4a050b446481",
+  "ttft_stream_ms": 858,
+  "time_to_request_ms": 16,
+  "queued_turn_count": 0
+}

@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 68607,
+  "stop_reason": "end_turn",
+  "session_id": "9d3795e0-7c5b-4351-837e-f2780917c4f8",
+  "total_cost_usd": 0.1616943,
+  "usage": {
+    "input_tokens": 116,
+    "cache_creation_input_tokens": 42068,
+    "cache_read_input_tokens": 521973,
+    "output_tokens": 4829,
+    "output_tokens_details": {
+      "thinking_tokens": 1267
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 42068,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 8,
+        "output_tokens": 2331,
+        "cache_read_input_tokens": 51717,
+        "cache_creation_input_tokens": 4133,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 4133
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1035,
+      "outputTokens": 13,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010999999999999998,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 116,
+      "outputTokens": 4829,
+      "cacheReadInputTokens": 521973,
+      "cacheCreationInputTokens": 42068,
+      "webSearchRequests": 0,
+      "costUSD": 0.16059430000000002,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 1267,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 14,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Now I have enough context. Let me provide a comprehensive explanation of the daily digest email system.\n\n## Daily Digest Email: Requirements, Design, and Implementation\n\nThe daily digest email system is governed by **REQ-119** (\"Digest email batches unread notifications into one message\") and **REQ-121** (\"The digest window is bounded by the last successful send\"), both defined in `docs/requirements/notifications-and-digests.md`.\n\n### Architecture and Design Elements\n\nThe system rests on two key design documents:\n\n1. **`docs/design/service-digest-and-email.md`** (DES-DIGEST-EMAIL) describes the separation of concerns: `src/server/services/digest-service.ts` decides *what* to send per recipient, while `src/server/services/email-service.ts` handles *how* to render it.\n\n2. **`docs/design/background-jobs.md`** (DES-JOBS, specifically DES-065) describes the scheduling strategy, which rests on **ADR-016** (the interval scheduler design). The scheduler runs an in-process `setInterval` every 60 seconds (`TICK_INTERVAL_MS = 60_000`), and the `digest-email` job is cadenced at 60 minutes (`CADENCE_MINUTES[\"digest-email\"] = 60`), meaning the job checks for work every 60 minutes.\n\n### How the Job Decides It's Due and Which Workspace Gets a Digest\n\nThe decision has two independent layers:\n\n**Layer 1: Job Eligibility (every 60 minutes)**\n- `src/server/jobs/scheduler.ts#tick(now)` runs every minute and checks `isDue(\"digest-email\", now)` — true if 60 minutes have elapsed since the job last ran. When true, it calls `src/server/jobs/digest-email-job.ts#runDigestEmailJob(now)`.\n\n**Layer 2: Workspace-Specific Eligibility (once per UTC hour per workspace)**\n- Inside `runDigestEmailJob`, the function calls `shouldRunForOrg(org, now)` for each organization. This function (at line 84-87 of `digest-email-job.ts`) returns `true` only if:\n  - The org is not archived: `org.archivedAt === null`\n  - The current UTC hour matches the org's configured digest hour: `now.getUTCHours() === org.settings.digestHourUtc`\n\nThis means that even though the job runs every 60 minutes, each workspace receives exactly one digest attempt per day, timed to the workspace's configured UTC hour. If a workspace is configured for digest hour 8 UTC, `shouldRunForOrg` will only return true when the current time is between 08:00:00 and 08:59:59 UTC.\n\n### The Window and Processing Flow\n\nOnce `shouldRunForOrg` returns true for a workspace:\n\n1. **Feature Flag Check** (line 38): The job verifies the workspace's plan includes `digest_email` via `isEnabled(\"digest_email\", buildFlagContext(null, org))`. This gates digests to `growth` and higher plans (REQ-120).\n\n2. **Window Computation** (lines 40-41): The job computes a 24-hour window:\n   - `windowEnd = toIsoTimestamp(now)` — the current moment\n   - `windowStart = toIsoTimestamp(new Date(now.getTime() - MS_PER_DAY))` — 24 hours ago\n\n3. **Per-Recipient Processing** (lines 43-75): For each recipient in `listDigestRecipients(orgId)` (who have set at least one notification to `digestOnly: true`):\n   - Calls `buildDigest(orgId, recipientId, windowStart, windowEnd)` in `digest-service.ts#buildDigest` (lines 27-58), which:\n     - Loads unread notifications since `windowStart` via `notificationRepo.listUnreadSince`\n     - Filters to only those created before `windowEnd` (application-level filtering, not in the repository query)\n     - Caps the list at `DIGEST_MAX_ENTRIES` (50, from `config/constants.ts`)\n     - Returns `null` if the bundle has zero entries (REQ-122) or if the plan does not include digests\n   - If `buildDigest` returns null, skips to the next recipient (line 51)\n   - Otherwise, calls `renderDigest(bundle, recipient)` (line 56), which delegates to `email-service.ts#renderEmail` with the template `\"digest\"` and props including:\n     - `entryCount`: number of notifications in the digest\n     - `headline`: the title of the first entry\n     - `windowStart` and `windowEnd` as ISO timestamps\n   - Calls `sendEmail(...)` (line 57), which in this codebase writes a structured log entry (lines 42-48 of `email-service.ts`); in production, this would perform actual SMTP delivery\n   - **Critically**: marks each digested notification as read via `notificationRepo.markRead(orgId, entry.notificationId, windowEnd)` (lines 62-64). This is what prevents the same digest from being sent twice in subsequent runs within the same UTC hour.\n\n### Verification\n\nThe system is verified by:\n\n1. **`tests/jobs/digest-email-job.test.ts`** (lines 103-214):\n   - Tests that the window respects the org's `digestHourUtc` setting\n   - Tests that the job skips orgs whose digest hour has not arrived\n   - Tests that the job skips orgs whose plan does not include `digest_email`\n   - Tests that empty windows produce no email\n   - Tests that entries are capped at `DIGEST_MAX_ENTRIES`\n   - Tests that re-running the job at the same hour does not resend (via the `markRead` idempotence mechanism)\n\n2. **`tests/lib/date.test.ts`** exercises `digestWindow()` window arithmetic, though the job itself does not call it — it computes the window inline as `now ± 24 hours`.\n\n### Distinction: Job Eligibility vs. Workspace Digest Frequency\n\n**The documentation's stated number (60 minutes, from `CADENCE_MINUTES[\"digest-email\"]`) describes how often the job is eligible to run**, not how often a single workspace receives a digest. The two are decoupled by the `shouldRunForOrg` check:\n\n- **Job eligibility**: 60 minutes — the scheduler will invoke the job every 60 minutes\n- **Per-workspace digest frequency**: 1 per UTC day — each workspace receives at most one digest per day, delivered during its configured `digestHourUtc`\n\nA workspace with `digestHourUtc = 8` will receive a digest once per calendar day, between 08:00:00 and 08:59:59 UTC, regardless of how many times the job runs during that day. If the job runs 24 times in a 24-hour period (every 60 minutes starting at noon on day 1), the workspace still gets exactly one digest, timed to 08:00 UTC on day 2.",
+  "ttft_ms": 2610,
+  "type": "result",
+  "duration_ms": 68384,
+  "uuid": "4c4fd16a-73da-40bb-99e4-2d6f47a5a4bb",
+  "ttft_stream_ms": 912,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

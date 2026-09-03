@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 69240,
+  "stop_reason": "end_turn",
+  "session_id": "9df46c40-7b0c-4c7a-8eb2-c158b363a1cf",
+  "total_cost_usd": 0.3432474,
+  "usage": {
+    "input_tokens": 22,
+    "cache_creation_input_tokens": 46246,
+    "cache_read_input_tokens": 438987,
+    "output_tokens": 6933,
+    "output_tokens_details": {
+      "thinking_tokens": 2904
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 46246,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2999,
+        "cache_read_input_tokens": 64293,
+        "cache_creation_input_tokens": 712,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 712
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1017,
+      "outputTokens": 15,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0010919999999999999,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 22,
+      "outputTokens": 6933,
+      "cacheReadInputTokens": 438987,
+      "cacheCreationInputTokens": 46246,
+      "webSearchRequests": 0,
+      "costUSD": 0.3421554,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2904,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 20,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the full chain from requirement down to code, and the discrepancy sitting in the middle of it.\n\n**Requirement.** `docs/requirements/webhooks.md`, **REQ-157** (\"A delivery is abandoned after a fixed attempt ceiling\"), states: `MAX_ATTEMPTS = 6`. Once a delivery's attempt count reaches that ceiling without success, it stops being retried and moves to a terminal failed state. Its \"Implemented by\" line names two things: `src/server/jobs/webhook-delivery-job.ts` — `runWebhookDeliveryJob`, **and** `src/config/constants.ts` — `WEBHOOK_MAX_ATTEMPTS`. Acceptance criterion 3 goes further and makes this an explicit, testable claim: *\"`MAX_ATTEMPTS` is read from `WEBHOOK_MAX_ATTEMPTS` in `src/config/constants.ts`, not hardcoded separately in `webhook-delivery-job.ts`.\"*\n\n**Design.** `docs/adr/ADR-018-webhook-retry-policy.md` is the design decision behind this: queue deliveries with capped exponential backoff instead of ADR-005's original inline-delivery sketch, because a slow/unreachable customer endpoint can't be allowed to block the request that triggered the event. It describes the ceiling as \"if `delivery.attempts > MAX_ATTEMPTS` (6), it is marked failed for good,\" and its References section lists `MAX_ATTEMPTS` as a symbol living in `src/server/jobs/webhook-delivery-job.ts` — no mention of `constants.ts` at all. `docs/design/service-webhook.md` is even more explicit that this number is *not* part of the service layer's design: \"What it deliberately does not own: the retry policy (`MAX_ATTEMPTS = 6` ... stated in the brief as job-layer constants).\" The ops runbook (`docs/ops/runbook-webhook-retries.md`, §6) reinforces the same story and even warns readers not to confuse this `MAX_ATTEMPTS = 6` (in `webhook-delivery-job.ts`, governing one delivery row) with the unrelated `MAX_ATTEMPTS = 5` in `src/server/jobs/queue.ts` (which governs retrying the job *kind* itself, not a delivery).\n\n**Code — where the ceiling actually lives.** `src/server/jobs/webhook-delivery-job.ts:22` declares `const MAX_ATTEMPTS = 6;`, a module-local constant. It's applied inside `runWebhookDeliveryJob` (lines 32–87), specifically at line 49:\n```ts\nif (delivery.attempts > MAX_ATTEMPTS) {\n  await webhookRepo.markDeliveryFailed(orgId, delivery.id, `giving up after ${delivery.attempts} attempts`);\n  result.failed += 1;\n  continue;\n}\n```\n`markDeliveryFailed` (`src/server/repositories/webhook-repository.ts:180-199`) writes the terminal `status: \"failed\"` row. Separately, `src/config/constants.ts:20` exports `WEBHOOK_MAX_ATTEMPTS: number = 5` — a *different* value. I grepped `src/` and `tests/` for `WEBHOOK_MAX_ATTEMPTS`: the only hit is its own declaration in `constants.ts`. It is never imported or read anywhere, including by `webhook-delivery-job.ts`.\n\n**Verification.** REQ-157 (and REQ-156, REQ-158) list \"Verified by: `tests/server/jobs.test.ts`.\" That file exists and does exercise `webhook-delivery-job.ts`, but only its pure `backoffMs` curve — the test `\"backs delivery attempts off exponentially, with a ceiling\"` (lines 197-202) asserts `backoffMs(0)===0`, `backoffMs(1)===1000` … up to the 300,000ms delay cap. That's REQ-156's backoff schedule, not REQ-157's abandonment behavior. Nothing in the file calls `runWebhookDeliveryJob` with a delivery whose `attempts` exceeds the ceiling and asserts `markDeliveryFailed` fires with the \"giving up after N attempts\" message. So the attempt-ceiling branch itself — the actual subject of REQ-157 — has no direct test, despite the requirement's \"Verified by\" field claiming it does.\n\n**Does the documentation's account match the code?** Partly, and the mismatch is specific. ADR-018, the service design doc, and the ops runbook all correctly describe the ceiling as a hardcoded `MAX_ATTEMPTS = 6` local to `webhook-delivery-job.ts` — that part matches the code exactly. But REQ-157's own acceptance criterion 3 is false: it asserts the code reads the ceiling from `WEBHOOK_MAX_ATTEMPTS` in `src/config/constants.ts` rather than hardcoding it separately, when in fact the job hardcodes its own `MAX_ATTEMPTS = 6` and `WEBHOOK_MAX_ATTEMPTS` (value 5, a different number) sits in `constants.ts` completely unused. And the \"verified by jobs.test.ts\" claim overstates coverage — the ceiling-crossing/abandonment path isn't actually exercised, only the backoff-delay math is.",
+  "ttft_ms": 1883,
+  "type": "result",
+  "duration_ms": 72473,
+  "uuid": "9e44ab4d-2684-4581-b284-b36ab7ebe429",
+  "ttft_stream_ms": 913,
+  "time_to_request_ms": 19,
+  "queued_turn_count": 0
+}

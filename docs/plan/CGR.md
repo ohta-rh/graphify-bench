@@ -179,4 +179,71 @@ haiku 側 4 本、あわせて計 13。graphify と mempalace の両方を参照
 
 ## 結果
 
-TBD — 計測は未実施。
+計測日 2026-09-03。130 run / 130 成功（harness エラー 0、MCP 接続失敗 0 — 全 run で
+`connected: true`, `tool_count: 9`）。1 run（`XIMP1-role-union__haiku-cgr`）が
+`--max-turns 60` に達して最終メッセージを出せず未採点。ブロック 1（code-45 × 2 arms）
+90 run / 42.7 分、ブロック 2（docs-20 × 2 arms）40 run / 21.1 分。API 実費 **$28.55**。
+レポートは `results/cgr/REPORT.md`、13 比較の対差はその §7。
+
+### 8.1 13 比較の要約（`cgr − 参照`、タスク対の平均差、95% ブートストラップ CI）
+
+| 比較 | n | tokens (`uncached_all`) | cost USD | turns | 正答 (cgr / 参照) |
+|---|---|---|---|---|---|
+| `cgr` vs `baseline` | 45 | **+95k [+44k, +145k]** | +$0.003, 0 をまたぐ | **+12.3** | 37/45 vs 38/45 |
+| `cgr` vs `graphify` | 45 | **+63k [+6k, +114k]** | +$0.010, 0 をまたぐ | **+5.6** | 37/45 vs 35/45 |
+| `cgr` vs `mempalace` | 45 | −75k, 0 をまたぐ | **−$0.133 [−0.197, −0.079]** | **+5.6** | 37/45 vs 36/45 |
+| `cgr` vs `baseline-nosub` | 45 | **+171k [+109k, +234k]** | **+$0.076 [+0.048, +0.104]** | **+7.4** | 37/45 vs 38/45 |
+| `haiku-cgr` vs `haiku-baseline` | 45 | +74k, 0 をまたぐ | +$0.011, 0 をまたぐ | **+3.7** | 32/44 vs 36/45 |
+| `haiku-cgr` vs `haiku-graphify` | 45 | **+194k [+35k, +369k]** | **+$0.027 [+0.001, +0.058]** | **+6.5** | 32/44 vs 37/45 |
+| `haiku-cgr` vs `haiku-mempalace` | 45 | −27k, 0 をまたぐ | −$0.024, 0 をまたぐ | **+5.0** | 32/44 vs 34/45 |
+| `cgr-v2` vs `baseline` | 20 | −111k, 0 をまたぐ | −$0.055, 0 をまたぐ | **+10.6** | 15/20 vs 14/20 |
+| `cgr-v2` vs `graphify-v2` | 20 | +19k, 0 をまたぐ | +$0.029, 0 をまたぐ | **+4.1** | 15/20 vs 16/20 |
+| `cgr-v2` vs `mempalace-v2` | 20 | +90k, 0 をまたぐ | −$0.057, 0 をまたぐ | **+6.1** | 15/20 vs 12/20 |
+| `haiku-cgr-v2` vs `haiku-baseline` | 20 | +87k, 0 をまたぐ | +$0.019, 0 をまたぐ | **+6.8** | 15/20 vs 16/20 |
+| `haiku-cgr-v2` vs `haiku-graphify-v2` | 20 | **+248k [+139k, +352k]** | **+$0.049 [+0.028, +0.072]** | **+8.3** | 15/20 vs 15/20 |
+| `haiku-cgr-v2` vs `haiku-mempalace-v2` | 20 | **+224k [+28k, +388k]** | +$0.033, 0 をまたぐ | **+8.9** | 15/20 vs 11/20 |
+
+太字は CI が 0 を含まない差。13 比較のうち cgr が**費用で本物の勝ち**を取ったのは
+`mempalace` に対する 1 つだけ、**トークンで本物の勝ち**は 0。本物の負けはトークンで 6、
+費用で 3。残りは差があるとは言えない。
+
+### 8.2 読み
+
+- **三つ目のインデックス形状でも、Sonnet 5 のコードでは素の Claude Code に勝てない。**
+  費用は baseline と同じ（差なし）だが、トークンは +39%、ターン数は中央値 14 対 5 の
+  2.8 倍。原因はツールの返す量にある: cgr の 9 ツールが 45 run で返した合計は 353 KB
+  （MemPalace は 4.0 MB、11 倍）と小さい代わりに、`semantic_search` → `get_code_snippet`
+  の細かい呼び出しを平均 8 回連ねる（run あたり中央値 6 回、全 45 run が使用）。ターンが
+  増えれば固定コンテキストの再送が増え、それがトークン差の正体である
+  （`results/lean/REPORT.md` の分解と同じ構図）。
+- **graphify に対しては +28% トークン、費用は同じ、正答は 2 問多い（37 対 35）。**
+  同じ AST 由来のグラフでも、CLI が一度に多く返す graphify より、細かく返す cgr は
+  ターンを食う。
+- **MemPalace には費用で明確に勝つ（−22%、CI が 0 を外れる）。** トークンは差なし、正答は
+  +1。事前構築インデックス同士なら、16 KB チャンクを返して結局 `Read` させる形より、
+  シンボル単位で小さく返す形のほうが安い。ここが今回の唯一の「本物の勝ち」。
+- **Haiku 4.5 では逆効果。** 正答 73%（32/44）対 baseline 80%、`haiku-graphify`
+  82% に対して +74% トークン・+31% 費用。9 ツールと `taskflow-v1.src.lib.x.y` 形式の
+  qualified name は弱い探索者には扱いにくく、45 run 中 9 run はツールを一度も呼ばず、
+  1 run は 60 ターンを使い切った。graphify の Haiku での勝ち（−21%）とは逆向き。
+- **文書↔コード（v2）では意味検索が効かない。** `semantic_search` は Function ノード
+  だけを埋め込み、`Section` ノード 1,442 個は検索対象外（§7 の懸念が現実になった）。
+  それでも正答は baseline 70% → 75%、`mempalace-v2` 60% → 75% に上回り、矛盾検出
+  （discrepancy）は 3/4（baseline 2/4、`mempalace-v2` 2/4、`graphify-v2` 4/4）。
+  ただし n=20 では費用・トークンの差はどの比較でも 0 をまたぐ。
+- **使われたツールは 4 つだけ。** `semantic_search` 176 回、`get_code_snippet` 154 回、
+  `structural_search`（ast-grep）40 回、Haiku のみ `get_function_source` 20 回。
+  `find_duplicate_code`・`list_projects`・`flow_verdict`・`explain_traceback`・
+  `rank_root_causes` は 130 run で 0 回。
+- **速度。** 1 呼び出しの中央値は 57 ms（`mempalace_search` 43 ms、`graphify query`
+  294 ms、`Read` 5 ms）と速いが、run の実時間中央値は 49.8 秒で baseline 26.8 秒・
+  graphify 38.6 秒より長く、MemPalace 49.6 秒と同じ。呼び出し回数がそのまま効いている。
+
+### 8.3 結論
+
+「事前構築インデックスを検索してから読む」という形は、これで AST グラフ + CLI
+（graphify）、埋め込みチャンク + MCP（MemPalace）、AST グラフ + DB + MCP（cgr）の
+三通りを測った。Sonnet 5 のコードタスクで素の Claude Code を費用でもトークンでも
+上回ったものは一つもない。形状の違いは**インデックス同士の順位**を決める（cgr は
+MemPalace より安く、graphify よりターンを食う）が、**素との差の符号**は変えない。
+graphify が Haiku と文書横断で得た勝ちは、cgr には再現しなかった。

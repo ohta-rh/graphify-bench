@@ -4,9 +4,11 @@ Does [graphify](https://github.com/Graphify-Labs/graphify) (a code and document 
 
 It now also measures a second, structurally different prebuilt index — [MemPalace](https://github.com/MemPalace/mempalace) 3.9.0, embedding + BM25 over text chunks rather than an AST graph — so that a null result on graphify can be attributed to *this index* or to *the whole idea*.
 
+A third index shape followed on 2026-09-03: [code-graph-rag](https://github.com/vitali87/code-graph-rag) 0.0.845, a Tree-sitter AST graph stored in Memgraph and reached through its MCP server, measured with its LLM-free tools only (`semantic_search`, `get_code_snippet`, `structural_search`, …; the tool's own NL→Cypher path was deliberately left out so the arm measures the graph, not a second model).
+
 ## Headline
 
-635 runs, 65 tasks, 16 conditions, one repetition each, about $145 of API spend. Every run's `result.json` and full transcript is committed.
+940 runs, 65 tasks, 25 conditions, one repetition each, about $183 of API spend. Every run's `result.json` and full transcript is committed.
 
 **For Sonnet 5 on a code-only corpus, graphify changes nothing measurable. It starts paying off when the explorer is weak (Haiku 4.5) or when the questions span documentation and code, and it is clearly counter-productive when a literal grep would do.**
 
@@ -31,6 +33,23 @@ MemPalace, measured on the same tasks and graded the same way (differences are `
 | Haiku 4.5, 45 code tasks, vs `haiku-baseline` | crosses 0 | **+$0.035 [+0.010, +0.062]** | 76% / 80% | same |
 | Sonnet 5, 20 doc↔code tasks, vs `graphify-v2` | crosses 0 | **+$0.086 [+0.009, +0.164]** | **60% / 80%** | same |
 | Haiku 4.5, 20 doc↔code tasks, vs `haiku-graphify-v2` | crosses 0 | crosses 0 | **55% / 75%** | same |
+
+code-graph-rag (`cgr`), measured on the same tasks and graded the same way (differences are `cgr − reference`):
+
+| setting | tokens | cost | accuracy (cgr / reference) | report |
+|---|---|---|---|---|
+| Sonnet 5, 45 code tasks, vs `baseline` | **+95k [+44k, +145k]** | crosses 0 | 82% / 84% | [`results/cgr`](results/cgr/REPORT.md) |
+| Sonnet 5, 45 code tasks, vs `graphify` | **+63k [+6k, +114k]** | crosses 0 | 82% / 78% | same |
+| Sonnet 5, 45 code tasks, vs `mempalace` | crosses 0 | **−$0.133 [−0.197, −0.079]** | 82% / 80% | same |
+| Sonnet 5, 45 code tasks, vs `baseline-nosub` | **+171k [+109k, +234k]** | **+$0.076 [+0.048, +0.104]** | 82% / 84% | same |
+| Haiku 4.5, 45 code tasks, vs `haiku-baseline` | crosses 0 | crosses 0 | **73% / 80%** | same |
+| Haiku 4.5, 45 code tasks, vs `haiku-graphify` | **+194k [+35k, +369k]** | **+$0.027 [+0.001, +0.058]** | **73% / 82%** | same |
+| Sonnet 5, 20 doc↔code tasks, vs `baseline` | crosses 0 | crosses 0 | 75% / 70% | same |
+| Sonnet 5, 20 doc↔code tasks, vs `graphify-v2` | crosses 0 | crosses 0 | 75% / 80% | same |
+| Sonnet 5, 20 doc↔code tasks, vs `mempalace-v2` | crosses 0 | crosses 0 | **75% / 60%** | same |
+| Haiku 4.5, 20 doc↔code tasks, vs `haiku-graphify-v2` | **+248k [+139k, +352k]** | **+$0.049 [+0.028, +0.072]** | 75% / 75% | same |
+
+**A third index shape does not change the sign.** On Sonnet 5 code tasks `cgr` costs the same as `baseline` and spends 39% more tokens over 2.8× the turns (median 14 vs 5): its nine tools return small, symbol-sized results (353 KB across 45 runs, an eleventh of MemPalace's 4.0 MB), so the agent chains `semantic_search` → `get_code_snippet` six times per run and pays the fixed context on every turn. Against `graphify` it is +28% tokens at the same cost with two more correct answers; against `mempalace` it is the one real win in thirteen comparisons, −22% cost with a CI clear of zero. On Haiku 4.5 it hurts (73% accuracy, 9 of 45 runs never called a tool, one exhausted 60 turns). On the doc↔code set its `semantic_search` embeds functions only — the 1,442 Markdown `Section` nodes are in the graph but unsearchable — yet accuracy still lands above `baseline` and `mempalace-v2` and below `graphify-v2`, with every cost and token CI crossing zero at n=20. Design and caveats: [`docs/plan/CGR.md`](docs/plan/CGR.md); single-page Japanese report: [`docs/report-cgr-ja.html`](docs/report-cgr-ja.html).
 
 **Runtime levers**, measured on the same 45 code tasks with Sonnet 5. These arms add no index and no tool — they change only how `claude -p` is invoked, which is the one thing that has actually moved the numbers in this repository.
 
@@ -89,6 +108,7 @@ A measurement lesson worth stating up front: the result JSON's `usage` block cov
 | `haiku-nosub` | `baseline-nosub` on `claude-haiku-4-5`. No `--effort` override: Haiku 4.5 does not honour the flag (measured), so declaring one would record a treatment that never ran. |
 | `all-in` | The union of the three above: Haiku, no subagents, the lean tool allowlist and the turn-economy `CLAUDE.md`. |
 | `mempalace` / `mempalace-v2` | MemPalace 3.9.0: a `## mempalace` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `mempalace-mcp` server reached via `--mcp-config --strict-mcp-config`, exposing `mempalace_search` over a prebuilt ChromaDB index. The index is built once per corpus generation and **cloned into a private temp directory per run**, never into the corpus copy. v1 indexes the code, v2 the code and `docs/`. |
+| `cgr` / `cgr-v2` | code-graph-rag 0.0.845: a `## code-graph-rag` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `code-graph-rag mcp-server` reached via `--mcp-config --strict-mcp-config`. The Tree-sitter AST graph lives in a shared Memgraph + Qdrant stack (`cgr daemon up`), indexed once per corpus generation from a staging tree by `pnpm cgr:build v1|v2`; nothing is cloned per run. `--disallowedTools` removes `ask_agent`, `query_code_graph` (external NL→Cypher LLM) and every write / index / staging-read tool, leaving nine LLM-free read-only graph tools. |
 | `haiku-*` | The same overlays with `claude-haiku-4-5`. |
 
 All arms run `claude -p --output-format json` with effort `high`, the same turn and budget caps, and a shuffled task order. Metrics come from the result JSON (`usage`, `modelUsage`, `total_cost_usd`, `num_turns`) and the JSONL transcript (tool calls by name, tool-result bytes, `graph.json` direct reads, hook denials, graphify subcommands used).
@@ -162,10 +182,11 @@ Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`
 ```
 bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 274 tests)
 corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
-overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace)
+overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace, cgr)
 tasks/       three task files, keys/, rubrics, bugs/*.patch, docs-discrepancies.json
-results/     runs/ ext/ (code sets), structural/, docs/, combined/, mempalace/, levers/ — raw result.json + transcript.jsonl per run
+results/     runs/ ext/ (code sets), structural/, docs/, combined/, mempalace/, levers/, lean/, cgr/ — raw result.json + transcript.jsonl per run
 .palaces/    gitignored MemPalace indexes; rebuild with `pnpm palace:build v1|v2` (stats in docs/plan/MEMPALACE.md)
+.cgr/        committed manifests of the code-graph-rag indexes; rebuild with `cgr daemon up && pnpm cgr:build v1|v2` (docs/plan/CGR.md)
 docs/plan/   design, implementation plan, research notes, corpus and graph build records (Japanese)
 ```
 
@@ -176,6 +197,7 @@ docs/plan/   design, implementation plan, research notes, corpus and graph build
 - The strict-hook result is a null about a knob that never engaged, not evidence that forcing graph-first exploration does nothing.
 - `graph.json` (4.6 MB v1, 6.2 MB v2) was opened directly in a handful of graphify runs; the nudge hooks do not guard `graphify-out/`.
 - Doc extraction cost is estimated at chars/4, not metered.
+- code-graph-rag's headline feature — natural-language questions compiled to Cypher by a second LLM (`query_code_graph`, `ask_agent`) — is **not measured**: those tools were disallowed so that no external model's tokens hide outside `result.json`. The `cgr` arms measure its LLM-free graph tools only, and its `semantic_search` embeds functions, not the Markdown sections it also indexes. Read the numbers as "what an AST graph in a database does for the agent", not as a verdict on the product. Its MCP server needs `mcp<2` pinned (0.0.845 declares no upper bound and mcp 2.x removed `Server.list_tools`) and `QDRANT_URL` set, or the server dies / searches an empty local store — both recorded in `docs/plan/CGR.md`.
 - MemPalace is a **conversation-memory** system; this benchmark repurposes its secondary project-file indexing for code search. Its published 96.6% R@5 is a LongMemEval conversation-recall figure and has nothing to do with what is measured here. Only 1 of its 45 MCP tools (`mempalace_search`) was ever called, so its cross-session memory loop is as untested as graphify's `save-result`/`reflect`.
 - The `mempalace` arms run with `--strict-mcp-config` and so are the only arms that do not also carry the measuring host's own MCP servers (present elsewhere as deferred names only). Fixed-overhead comparisons include that asymmetry.
 - Wall-clock numbers in the `--speed` section were measured at concurrency 3 on one machine and are secondary. Per-tool-call latency is the sturdier half: it shows `mempalace_search` at ~43 ms against `graphify query` at ~294 ms, and graphify's PreToolUse hook adding ~55 ms to every `Read`.

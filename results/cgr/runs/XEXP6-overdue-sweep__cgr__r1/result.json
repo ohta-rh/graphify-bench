@@ -1,0 +1,109 @@
+{
+  "duration_api_ms": 125092,
+  "stop_reason": "end_turn",
+  "session_id": "ef463b52-6040-45e3-99f3-e477541ebf73",
+  "total_cost_usd": 0.5173398,
+  "usage": {
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 54114,
+    "cache_read_input_tokens": 986639,
+    "output_tokens": 10236,
+    "output_tokens_details": {
+      "thinking_tokens": 3416
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 54114,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1550,
+        "cache_read_input_tokens": 68019,
+        "cache_creation_input_tokens": 4854,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 4854
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 1038,
+      "outputTokens": 14,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.001108,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-haiku-4-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    },
+    "claude-sonnet-5": {
+      "inputTokens": 44,
+      "outputTokens": 10236,
+      "cacheReadInputTokens": 986639,
+      "cacheCreationInputTokens": 54114,
+      "webSearchRequests": 0,
+      "costUSD": 0.5162317999999999,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3416,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 34,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "This confirms and enriches everything I traced in the code. I now have the full path. Here's the explanation.\n\n## The path from \"due date passes\" to \"one alert, one person\"\n\n**What starts the check.** `src/instrumentation.ts`'s `register()` runs once per server process and calls `startScheduler()` from `src/server/jobs/scheduler.ts`. That starts a `setInterval` ticking every 60 seconds (`TICK_INTERVAL_MS`). Each `tick(now)` checks `CADENCE_MINUTES` and finds `\"overdue-issues\"` due once every 60 minutes; when due, it `enqueue()`s a job into the in-process queue (`src/server/jobs/queue.ts`) and immediately `drain()`s it, which dynamically imports and calls `runOverdueIssueJob(now)` from `src/server/jobs/overdue-issue-job.ts`. (There's also an HTTP-triggerable path, `POST /api/cron/overdue` in `src/app/api/cron/overdue/route.ts`, guarded by `assertCronSecret`, for an external cron caller to invoke the same function directly — either way the entry point is `runOverdueIssueJob`.)\n\n**How the set of issues is narrowed.** Inside `runOverdueIssueJob`, `shouldFilterArchived(LIVE_ONLY)` (from `src/lib/soft-delete.ts`) is asserted true as a defensive guard — archived issues must never count as overdue. It then walks orgs in pages via `usageRepo.listOrgIdsForRollup(ORG_BATCH)` (50 orgs per pass) and, per org, calls `issueRepo.listOverdueIssues(orgId, stamp)` (`src/server/repositories/issue-repository.ts`). That query is the real filter: live (non-archived) issues, `dueAt` non-null and less than `now`, and status still in `[\"backlog\",\"todo\",\"in_progress\",\"in_review\"]` — i.e. not `done`, not archived.\n\n**What the checking component does and doesn't own.** For each returned issue, the job checks its own in-process `reported: Set<string>` — if the issue's id is already in it, it's skipped. Otherwise it calls `emit(\"issue.overdue\", { orgId, actorId: null, occurredAt, issueId, projectId, dueAt, assigneeId })` via `src/lib/event-bus.ts`, then adds the id to `reported`. The job explicitly does no notification work itself (\"announce, don't act\" per its doc comment) — it never writes a `Notification` row, decides a channel, or contacts anyone. That's entirely delegated to whoever subscribes to `issue.overdue` on the bus.\n\n**What stops repeat announcements.** The `reported` `Set` is the dedup mechanism: as long as the process stays up, a still-open overdue issue is only emitted once, no matter how many hourly ticks pass. It is deliberately in-memory only (not a DB column) — a process restart clears it, so the first sweep after a deploy or crash will re-announce every currently-overdue issue once more. `resetOverdueTracking()` exists only to reset this set between tests.\n\n**How the alert reaches one specific person.** `src/server/services/notification-service.ts` is wired up at process start (imported transitively by `event-registry.ts`'s `registerEventHandlers()`, also called from `instrumentation.ts`). Its `registerFanOut()` subscribes to `issue.overdue`; the handler bails out if `assigneeId` is null, otherwise calls `notify(orgId, \"issue_overdue\", [assigneeId], {...})`. `notify()` looks up that one recipient's stored preference via `preferenceRepo.getPreference(orgId, recipientId, \"issue_overdue\")` and turns it into a channel list with `resolveChannels()` — `null` preference falls back to `DEFAULT_CHANNELS = [\"in_app\", \"email\"]`; an explicit preference yields `in_app` if enabled, and `email` only if `preference.email` is true and (not `digestOnly`, or `digestOnly` with the org's `digest_email` flag enabled — meaning digest subscribers get folded into the daily digest email built by `digest-service.ts`/`digest-email-job.ts` instead of an immediate one). If the resolved channel list is empty (everything muted) the recipient is skipped entirely. Otherwise `notificationRepo.insertNotifications` writes one row scoped to that `recipientId`, carrying the allowed `channels` — that row is what the in-app bell/notification list later queries by `recipientId`, so only that one assignee ever sees it.",
+  "ttft_ms": 1952,
+  "type": "result",
+  "duration_ms": 128060,
+  "uuid": "ea60d29f-49c1-4610-8e47-2ca08fa24991",
+  "ttft_stream_ms": 838,
+  "time_to_request_ms": 15,
+  "queued_turn_count": 0
+}
