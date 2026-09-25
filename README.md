@@ -82,6 +82,20 @@ code-graph-rag (`cgr`), measured on the same tasks and graded the same way (diff
 
 **Pinning exploration to Haiku works mechanically and still loses.** The project-local `.claude/agents/Explore.md` override fired on all 15 runs that delegated to `Explore` (Haiku carried 150k–3.35M tokens each, 54% of the arm's tokens and 28% of its cost, while the main session stayed on Sonnet), but a weak explorer searches inefficiently enough to erase its own price advantage: +59% tokens against `baseline` and +101% against `baseline-nosub`. The 8 runs that chose the `general-purpose` agent instead stayed on Sonnet entirely — the override covers `Explore` only.
 
+**Model swap: Opus 5.5 vs Sonnet 5** (2026-09-25, Claude Code 2.1.282, no index or tool, only `--model` / `--effort` changed). 385 runs, $109.20. Two task sets: the existing 45 code tasks, and a new hard set of 16 tasks graded only by hidden vitest specs installed after the agent exits (`tasks/tasks-hard.json`; 8 multi-defect or deep fixes, 8 feature or cross-cutting implementations, each spanning ≥3 files and ≥2 layers, each validated so the visible suite stays green on the bug and the reference solution passes the hidden spec), run twice.
+
+| set | arm | correct | cost median | wall median | turns median |
+|---|---|---|---|---|---|
+| hard 16×2 | Opus 5.5 `--effort low` | **32/32** | **$0.209** | **28 s** | 7 |
+| hard 16×2 | Opus 5.5 `--effort medium` | **32/32** | $0.285 | 40 s | 8.5 |
+| hard 16×2 | Sonnet 5 low, no subagents | 29/32 | $0.226 | 53 s | 14 |
+| hard 16×2 | Sonnet 5 low | 30/32 | $0.287 | 71 s | 14 |
+| hard 16×2 | Sonnet 5 medium | 31/32 | $0.432 | 114 s | 17.5 |
+| code 45 | Opus 5.5 low / medium | 38/45 / 38/45 | $0.138 / $0.168 | 19 s / 21 s | 5 / 5 |
+| code 45 | Sonnet 5 low no-sub / low / medium | 38/45 / 35/45 / 36/45 | **$0.107** / $0.158 / $0.181 | 21 s / 34 s / 45 s | 6 / 3 / 4 |
+
+**On hard work Opus 5.5 at `--effort low` beats every Sonnet arm on accuracy, cost and speed at once.** Paired over the 16 hard tasks it is −$0.138 [−0.274, −0.025] and −58 s [−94, −27] per run against the strongest Sonnet arm (low, subagents disallowed), both CIs clear of zero; Opus answered 64/64 against Sonnet's 90/96 (one-sided Fisher p ≈ 0.044, though five of the six misses are one task, HFX8, where Sonnet repeatedly stopped after 4–11 turns with a fix that still reset explicitly-sent `0` / `[]` values). On the three cross-cutting implementation tasks Sonnet used 44–61 turns (four runs hit `--max-turns 60`) where Opus used 8–19. `--effort medium` on Opus added +$0.107 per run and no accuracy. On the easy 45-task set accuracy sits at the ceiling for every arm, and Opus's edge there is delegation, not intelligence: plain Sonnet hands exploration to a Sonnet subagent in 58% of runs and waits for it, which puts it 23–31 s per run behind Opus; Opus delegated in 0 of 154 runs. With subagents disallowed, Sonnet is the cheapest arm on easy lookups (Opus low is +$0.037 [+0.027, +0.047] per run), but disallowing `Agent` is a benchmark lever, not a practical default. Caveats: the hard tasks were authored by Opus subagents (independently re-validated), Sonnet's default `high` effort was not measured, and from CLI 2.1.28x `Agent` runs asynchronously so `result.json`'s `duration_ms` stops early — wall times here are the harness-measured process time (`claude.wall_ms`). Single-page Japanese report: [`docs/report-opus-ja.html`](docs/report-opus-ja.html); data: [`results/opus`](results/opus/REPORT.md), [`results/hard`](results/hard/REPORT.md).
+
 Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
 
 Three findings behind the table:
@@ -110,6 +124,7 @@ A measurement lesson worth stating up front: the result JSON's `usage` block cov
 | `mempalace` / `mempalace-v2` | MemPalace 3.9.0: a `## mempalace` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `mempalace-mcp` server reached via `--mcp-config --strict-mcp-config`, exposing `mempalace_search` over a prebuilt ChromaDB index. The index is built once per corpus generation and **cloned into a private temp directory per run**, never into the corpus copy. v1 indexes the code, v2 the code and `docs/`. |
 | `cgr` / `cgr-v2` | code-graph-rag 0.0.845: a `## code-graph-rag` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `code-graph-rag mcp-server` reached via `--mcp-config --strict-mcp-config`. The Tree-sitter AST graph lives in a shared Memgraph + Qdrant stack (`cgr daemon up`), indexed once per corpus generation from a staging tree by `pnpm cgr:build v1|v2`; nothing is cloned per run. `--disallowedTools` removes `ask_agent`, `query_code_graph` (external NL→Cypher LLM) and every write / index / staging-read tool, leaving nine LLM-free read-only graph tools. |
 | `haiku-*` | The same overlays with `claude-haiku-4-5`. |
+| `opus-effort-medium`, `opus-effort-low` | `effort-medium` / `effort-low` with only the model swapped to `claude-opus-5-5`. |
 
 All arms run `claude -p --output-format json` with effort `high`, the same turn and budget caps, and a shuffled task order. Metrics come from the result JSON (`usage`, `modelUsage`, `total_cost_usd`, `num_turns`) and the JSONL transcript (tool calls by name, tool-result bytes, `graph.json` direct reads, hook denials, graphify subcommands used).
 
