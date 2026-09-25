@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 106444,
+  "stop_reason": "end_turn",
+  "session_id": "cd0224a9-8f60-4657-b9ee-468d9d75c94b",
+  "total_cost_usd": 0.3210129,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 3955,
+    "cache_read_input_tokens": 31677,
+    "output_tokens": 2030,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 3955,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2030,
+        "cache_read_input_tokens": 31677,
+        "cache_creation_input_tokens": 3955,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3955
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 24,
+      "outputTokens": 8674,
+      "cacheReadInputTokens": 339527,
+      "cacheCreationInputTokens": 56467,
+      "webSearchRequests": 0,
+      "costUSD": 0.3210129,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 279,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "general-purpose": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## End-to-end trace: submitting the \"new issue\" form\n\n**1. Client form → Server Action invocation**\n\n`src/components/domain/issue/issue-form.tsx` is the client component (`\"use client\"`). It builds a `react-hook-form` instance (`useForm`, line 44) validated by `zodResolver(createIssueSchema)` (line 45). It does *not* use `useFormState`/`useActionState`; instead the native `<form onSubmit={form.handleSubmit((input) => submit(input))}>` (lines 71–74) triggers RHF validation, and `submit` comes from the custom hook `useFormAction` (`src/hooks/use-form-action.ts:22`, wired in at `issue-form.tsx:62`). `useFormAction.submit` (lines 40–62) just invokes the Server Action as a plain async function call — `action(input)`.\n\nThe page wiring the `onSubmit` prop is `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx:116`, passing `createIssueAction` imported from `src/actions/issues/create-issue.ts`.\n\n**2. The Server Action**\n\n`src/actions/issues/create-issue.ts` (`\"use server\"`) exports `createIssueAction(raw: unknown): Promise<ActionResult<Issue>>` (lines 79–81), which delegates to a handler built by the generic wrapper `withAction<typeof createIssueSchema, Issue>(createIssueSchema, handler, options)` (lines 25–53). `withAction` (`src/actions/_lib/with-action.ts:74-99`) parses the raw input with `createIssueSchema.safeParse(raw)` — the schema lives in `src/schemas/issue.ts:31-43` (orgId, projectId, title 3–200 chars, description, status/priority enums with defaults, assigneeId, parentId, estimate 0–100, dueAt, labelIds max 20). A validation failure returns an error `ActionResult` (via `toActionResult`, `src/lib/errors.ts`) and never reaches the handler.\n\n**3. Authorization/permission gates, in execution order**\n\n- `withAction` → `resolveActorFor` → `requireActorFor(orgId)` (`src/lib/actor.ts:68-81`): `getSessionPrincipal()` (`src/lib/session.ts`) throws `UnauthorizedError` if not signed in; `findOrgById` resolves the org; `resolveActorForOrg` (`src/server/services/session-service.ts`) throws `NoMembershipError` if the user isn't a member; `assertOrgScope(actor, orgId)` (`src/lib/tenant.ts:28-32`) confirms the actor matches the input org.\n- Handler in `create-issue.ts` (lines 27–51) calls `can(actor, \"issue:create\", {...})` (`src/lib/permissions.ts:96-102`), which checks cross-tenant access, platform-staff bypass, and the `ROLE_MATRIX[\"issue:create\"] = \"member\"` rank; throws `ForbiddenActionError` if disallowed.\n- `assertProjectHasRoom(actor, input)` (`create-issue.ts:60-77`) — a plan-quota gate using `getPlanLimits` (`src/config/plan-limits.ts`) and a live issue count, throwing `PlanLimitError` if the project is at capacity.\n- `createIssue(actor, input)` (`src/server/services/issue-service.ts:42-81`) independently re-runs its own gates (defense in depth): `assertOrgScope`, project lookup with `requireFound`, `assertNotArchived(\"Project\", ...)` (`src/lib/soft-delete.ts`), `assertCan(actor, \"issue:create\", projectResource(project))` (`src/lib/permissions.ts:150-159`), and a second plan-quota check via `issueRepo.countIssues` + `wouldExceedLimit`. No explicit rate limiter exists in this path.\n\n**4. Database write**\n\nDrizzle ORM over SQLite. `issueRepo.nextIssueNumber(orgId, projectId)` (`src/server/repositories/issue-repository.ts:292-304`) computes the next per-project number, then `insertIssue(input, actor.userId, number)` (`issue-repository.ts:306-351`) runs `db.insert(issues).values({...}).returning().get()` against the `issues` table (`src/server/db/schema/issues.ts`), generating the id via `newId()` (`src/lib/id.ts`). If labels are attached, a second insert populates the `issueLabels` junction table. The row is mapped back to a domain object by `toIssue()` (`src/server/repositories/_mappers.ts`).\n\n**5. Post-write side effects**\n\n- `issue-service.ts:71-78` emits `\"issue.created\"` on the in-process event bus (`src/lib/event-bus.ts:54-72`), awaiting all subscribers via `Promise.allSettled` so one failing handler doesn't break the others.\n- Subscribers: `activity-service.ts:169-176` writes an activity/audit-log entry; `search-service.ts:139-142` re-indexes the issue; `webhook-service.ts:110-112` enqueues a webhook delivery for background dispatch; `usage-service.ts:74-76` increments the org's plan-usage counter.\n- Back in the action (`create-issue.ts:46-49`), `revalidateTagged([orgTag, projectTag, issueTag], ...)` calls Next.js `revalidateTag` for the affected cache tags; `withAction` also revalidates its own static `\"issues\"` tag afterward.\n- `withAction` stamps the result (`stamp()`, adding `submittedAt`) and returns `{ ok: true, data: issue }`, which flows back through `createIssueAction` → `useFormAction.submit`, whose `onSuccess` resets the form (`issue-form.tsx:63`). There's no `redirect()` in this path — the UI just resets in place.",
+  "ttft_ms": 18156,
+  "type": "result",
+  "duration_ms": 18176,
+  "uuid": "05e1b1d9-4800-433a-b2d2-7f4ad2d50edc",
+  "ttft_stream_ms": 1418,
+  "time_to_request_ms": 8,
+  "first_content_frame_ms": 1418,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

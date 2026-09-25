@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 24124,
+  "stop_reason": "end_turn",
+  "session_id": "ed7ccef8-74eb-46f9-ad4e-034b744ff371",
+  "total_cost_usd": 0.2096074,
+  "usage": {
+    "input_tokens": 12,
+    "cache_creation_input_tokens": 17551,
+    "cache_read_input_tokens": 119357,
+    "output_tokens": 2264,
+    "output_tokens_details": {
+      "thinking_tokens": 72
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 17551,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1667,
+        "cache_read_input_tokens": 27577,
+        "cache_creation_input_tokens": 317,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 317
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 12,
+      "outputTokens": 2264,
+      "cacheReadInputTokens": 119357,
+      "cacheCreationInputTokens": 17551,
+      "webSearchRequests": 0,
+      "costUSD": 0.2096074,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 72,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 6,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Nothing I found actually sends an email when someone is mentioned. Deciding on a channel just means writing `\"email\"` into the notification row's `channels` array. My search of the notification repository and email service turned up no code that reads that array and sends a mail; `email-service.ts` has only the `\"mention\"` template and its subject line. The steps, in the order they run:\n\n**1. Server action: `src/actions/comments/create-comment.ts`, `createCommentAction`.** It wraps `withAction(createCommentSchema, …)`, which validates the input. It then checks `can(actor, \"comment:create\", …)`, charges the `\"comment:create\"` rate limit with `consumeRateLimit`, and calls `createComment(actor, input)` in `comment-service`. The action does no mention handling. Its header says the fan-out happens through the `comment.created` event.\n\n**2. Service: `src/server/services/comment-service.ts`, `createComment`.** It runs `assertOrgScope`, loads the issue, and runs `assertCan` and `assertNotArchived`. It charges the rate limit a second time. Then it calls `resolveMentionedUsers(orgId, body, input.mentionedUserIds)`:\n- It loads the org's members with `memberRepo.listMembers({ orgId, limit: MENTION_LOOKUP_LIMIT /* 100 */ })`.\n- It calls `resolveMentions(body, members.items)` in `src/lib/mentions.ts`:\n  - `withoutCode` removes code spans and fenced blocks.\n  - `extractMentions` matches `MENTION_PATTERN`. The `@` must start the line or follow whitespace or `(`, `<` or `[`, so email addresses don't match. Handles are lowercased and duplicates removed.\n  - Each handle is looked up in a map built from `handleOf(member)`, which is the lowercased part of the member's email before the `@`. Unknown handles are silently dropped.\n- It merges in any user ids the client already resolved, keeping only those that belong to real members, and removes duplicates.\n\n**3. What carries the list forward.** The resolved `mentionedUserIds` is used twice:\n- `commentRepo.insertComment` stores it on the comment row as JSON (`comment-repository.ts:150`).\n- `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` puts it on the event. The event type is declared in `src/types/event.ts:73`.\n\nThe notification side reads this list from the event and never parses the markdown again.\n\n**4. Subscriber: `src/server/services/notification-service.ts`, `registerFanOut`.** It runs when the module loads and subscribes to `comment.created`. The handler first calls `notify(..., \"comment_created\", watchers)` for the issue's author and assignee. Then, if `payload.mentionedUserIds.length > 0`, it calls `notify(orgId, \"comment_mention\", mentionedUserIds, { title: \"You were mentioned\", href: /issues/<id>, actorId })`.\n\n**5. Who gets what: `notify` and `resolveChannels`.**\n- `notify` builds a `FlagContext` from the org's plan and flag overrides. For each distinct recipient:\n  - **The comment's author is skipped** (`recipientId === payload.actorId`), so mentioning yourself produces nothing.\n  - It fetches the recipient's `comment_mention` preference with `preferenceRepo.getPreference`.\n  - `resolveChannels` turns that preference into channels:\n    - **No stored preference** gives the defaults, `[\"in_app\", \"email\"]`: both.\n    - `preference.inApp` adds `\"in_app\"`.\n    - `\"email\"` is added only if `preference.email` is on and either `digestOnly` is off or the org's `digest_email` feature flag (`isEnabled`) is on.\n  - **If no channels are left, the recipient gets no row at all.**\n- The remaining rows, each carrying its own `channels` list, go to `notificationRepo.insertNotifications`, which stores `channels` as JSON. That row is what appears in the user's inbox; it is listed through `listNotifications` and shown by `notification-list.tsx`.\n\n**Outcomes for the mentioned person:**\n\n| Situation | Result |\n|---|---|\n| No stored preference | In-app and email |\n| `inApp` off, `email` on | Email only |\n| `inApp` on, email not allowed | In-app only |\n| Every channel off | Nothing |\n| Handle not a member of the org | Nothing |\n| Handle only inside code | Nothing |\n| Author mentions themselves | Nothing |\n\n\"Email not allowed\" means `email` is off, or `digestOnly` is on while the org's `digest_email` flag is off.\n\nOne more gap: mentions resolve only against the first 100 members returned by `listMembers`. In a larger org, a valid handle outside that page is silently dropped.",
+  "ttft_ms": 2047,
+  "type": "result",
+  "duration_ms": 24543,
+  "uuid": "1533e247-a8e3-43c4-be9a-8f342c6845df",
+  "ttft_stream_ms": 907,
+  "time_to_request_ms": 27,
+  "first_content_frame_ms": 907,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

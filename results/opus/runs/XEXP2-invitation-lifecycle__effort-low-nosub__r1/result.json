@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 76534,
+  "stop_reason": "end_turn",
+  "session_id": "12acdd20-b549-4ce6-b1c7-e2b72105e8de",
+  "total_cost_usd": 0.27012559999999997,
+  "usage": {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 32972,
+    "cache_read_input_tokens": 431948,
+    "output_tokens": 5180,
+    "output_tokens_details": {
+      "thinking_tokens": 726
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 32972,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2255,
+        "cache_read_input_tokens": 47458,
+        "cache_creation_input_tokens": 1306,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1306
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 24,
+      "outputTokens": 5180,
+      "cacheReadInputTokens": 431948,
+      "cacheCreationInputTokens": 32972,
+      "webSearchRequests": 0,
+      "costUSD": 0.27012559999999997,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 726,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the complete lifecycle. Let me write it up.\n\n## Lifecycle of an invitation\n\n**1. Creation — admin submits the email on the members settings page**\n\nThe form on `src/app/(dashboard)/[orgSlug]/settings/members/page.tsx` (rendering `src/components/domain/member/invite-member-form.tsx`) calls the server action `inviteMemberAction` in `src/actions/members/invite-member.ts`. That action:\n\n1. Parses the input against `inviteMemberSchema` (`src/schemas/member.ts`).\n2. Calls `can(actor, \"member:invite\", {...})` from `src/lib/permissions.ts` — the role matrix (`ROLE_MATRIX[\"member:invite\"] = \"admin\"`) requires the actor to be an admin/owner of the target org (`PENDING_MEMBER_ID` is used as a placeholder resource id since no member row exists yet). Throws `ForbiddenActionError` if not allowed.\n3. Calls `consumeRateLimit(input.orgId, \"member:invite\")` (`src/lib/rate-limit.ts`, bucket config `{capacity: 20, refillPerMinute: 2}`) — throws `RateLimitedError` if exhausted.\n4. Loads `getOrganizationSummary` and `getPlanLimits` (`src/config/plan-limits.ts`) to check `seatsUsed + 1 <= limits.seats`, throwing `PlanLimitError` otherwise.\n5. Delegates to `inviteMember` → `inviteMembers` in `src/server/services/invitation-service.ts`, which re-does the authoritative checks server-side (`assertOrgScope`, `assertCan(actor, \"member:invite\", orgResource(...))` via `src/lib/tenant.ts` / `src/lib/permissions.ts`), re-checks the rate limit, and recomputes the seat count as `countActiveMembers` + `countPendingInvitations` (pending invites hold a seat) against `wouldExceedLimit` from `src/config/plan-limits.ts`.\n\n**2. What gets minted and stored vs. what travels in the link**\n\nFor each invite, `inviteMembers` calls `randomToken(32)` (`src/lib/hash.ts`, `crypto.randomBytes(32).toString(\"base64url\")`) to generate the raw token, then `invitationRepo.insertInvitation` (`src/server/repositories/invitation-repository.ts`) persists a row containing `orgId`, `email`, `role`, `invitedBy`, `expiresAt` (14 days via `DEFAULT_EXPIRY_DAYS`), `acceptedAt: null`, `revokedAt: null`, and — critically — `tokenHash: hashToken(token)` (SHA-256 digest), **never the raw token itself**. The raw token only ever exists in memory long enough to be hashed and (intended to be) embedded in the accept URL sent by email; the database never sees it in plaintext, so a DB leak can't be replayed as a valid invite link. An `emit(\"member.invited\", {...})` event fires afterward, which `activity-service.ts`'s `registerActivityListeners` picks up to record an activity-log entry — it does not send mail.\n\nOne notable gap: `src/emails/invite-email.tsx` (`InviteEmail`) and the `\"invite\"` template in `email-service.ts`/`emails/render.ts` exist and are wired for rendering/testing, but no subscriber or service call in the current codebase actually invokes `renderEmail(\"invite\", ...)` / `sendEmail(...)` with the accept URl when `member.invited` fires — unlike `auth-service.ts`, which does call `sendEmail` for welcome/password-reset mail. So today, nothing in the traced code path actually delivers the invite link to the colleague; that wiring appears to be missing.\n\n**3. Using the link — colleague clicks days later**\n\nThe link routes to `src/app/(auth)/invite/[token]/page.tsx`. This page: validates the token shape with `invitationTokenSchema` (regex `^[A-Za-z0-9_-]+$`, 32-128 chars) — purely a format check, no DB lookup happens here (the comment explicitly notes the token is only ever resolved inside `InvitationService`). It then calls `getSessionPrincipal()` (`src/lib/session.ts`); if the visitor isn't signed in, it redirects to `/login?next=/invite/<token>` so they authenticate (or register) first. Once signed in, it renders `InviteAcceptForm` (`invite-accept-form.tsx`), a client component that on submit calls the server action `acceptInvitationAction` in `src/actions/members/accept-invitation.ts`.\n\nThat action re-validates with `acceptInvitationTokenSchema`, requires a session principal, then calls `acceptInvitation(userId, {token})` in `invitation-service.ts`, which:\n\n1. Hashes the submitted token with `hashToken` and looks it up via `invitationRepo.findInvitationByTokenHash` — the one repository read that is *not* org-scoped, since the token hash itself is the credential and carries the tenant.\n2. Checks `revokedAt === null`, `acceptedAt === null`, and `expiresAt > now`, throwing on any failure.\n3. Checks for an existing membership (idempotent — if already a member, returns that record).\n4. Calls `memberRepo.insertMember(orgId, userId, invitation.role, invitation.invitedBy)`, creating the `members` row with `status: \"active\"`.\n5. Marks the invitation `acceptedAt` via `invitationRepo.markInvitationAccepted`.\n6. Emits `member.joined`.\n\nBack in the action, `assertSeatAvailable` re-resolves an `Actor` for the new member (`resolveActor`) and re-checks `getOrganizationSummary`/`getPlanLimits` — a second, post-hoc seat check, since the organization could have filled up in the days between invite and acceptance.\n\n**4. What the rest of the system learns once membership exists**\n\nThe `member.joined` event, dispatched through `src/lib/event-bus.ts`'s `emit`, fans out to every subscriber registered in `src/server/services/event-registry.ts`:\n- `usage-service.ts` increments `seatsUsed` by 1 via `usageRepo.incrementUsage`.\n- `notification-service.ts` looks up the org owner and creates a `member_joined` notification for them.\n- (`activity-service.ts` records `member.invited` at creation time, not `member.joined`.)\n\nThe new member's role then flows through `src/lib/permissions.ts`'s `can`/`assertCan` for every subsequent authorization check in the org.",
+  "ttft_ms": 1875,
+  "type": "result",
+  "duration_ms": 77017,
+  "uuid": "cee2e7f2-dfd1-4b46-83e4-2e4571662417",
+  "ttft_stream_ms": 1444,
+  "time_to_request_ms": 27,
+  "first_content_frame_ms": 1444,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

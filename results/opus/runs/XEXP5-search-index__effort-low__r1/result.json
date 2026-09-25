@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 77154,
+  "stop_reason": "end_turn",
+  "session_id": "0a836af4-6678-4507-9ec5-0b8020c76915",
+  "total_cost_usd": 0.2579601,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 3795,
+    "cache_read_input_tokens": 31404,
+    "output_tokens": 1805,
+    "output_tokens_details": {
+      "thinking_tokens": 52
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 3795,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1805,
+        "cache_read_input_tokens": 31404,
+        "cache_creation_input_tokens": 3795,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3795
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 18,
+      "outputTokens": 7313,
+      "cacheReadInputTokens": 203958,
+      "cacheCreationInputTokens": 47800,
+      "webSearchRequests": 0,
+      "costUSD": 0.2579601,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 163,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How an edited issue title becomes searchable\n\n**The write.** Editing a title goes through the server action `updateIssueAction` in `src/actions/issues/update-issue.ts` (its `run()`, lines 24-46), which validates the input against `updateIssueSchema` (`title: z.string().min(3).max(200).optional()` in `src/schemas/issue.ts:48`), then calls `updateIssue()` in `src/server/services/issue-service.ts:83-109`. That service function re-loads the current issue, authorizes the actor via `assertCan(actor, \"issue:update\", …)`, rejects archived issues, and then does two things in sequence: it calls `issueRepo.updateIssue(input)` in `src/server/repositories/issue-repository.ts:353` to run the actual `UPDATE issues SET title = …` against the primary table, and — after that write returns — it calls `emit(\"issue.updated\", { changedFields, … })` (lines 99-106), diffing which fields actually changed.\n\n**Keeping the search copy in sync.** `emit()` lives in `src/lib/event-bus.ts` and is an in-process (not queued/cron) event bus; the service `await`s it, and `emit()` internally `Promise.allSettled`s over all subscriber handlers, so indexing finishes before the action returns to the caller. But it runs *outside* the database transaction that wrote the title — a failing subscriber is caught and reported via `reportHandlerError` rather than rolling back the issue write, so the primary row and the search copy can in principle drift apart transiently.\n\nThe subscriber that matters here is registered in `src/server/services/search-service.ts`, `registerSearchListeners()` (lines 137-183). Its handler for `\"issue.updated\"` (lines 143-146) deliberately ignores the payload's fields and instead re-reads the issue fresh with `issueRepo.findIssueById(...)`, then calls `indexIssue()` (lines 88-96) on that fresh row. `indexIssue()` writes into the denormalized `search_index` table (defined in `src/server/db/schema/webhooks.ts:54-70`) via `upsertSearchDocument()` in `src/server/repositories/search-repository.ts:18-59`, upserting by `(orgId, subjectKind, subjectId)`. What's stored is not a full copy of the issue: `content` is just `[issue.title, issue.description ?? \"\"].join(\"\\n\")`, plus `subjectKind`, `subjectId`, `projectId`, `orgId`, and `indexedAt`. The title is literally reconstructed later as `content.split(\"\\n\")[0]`. There's also a backstop `search.reindex_requested` event and a `search-reindex-job.ts` background job for correcting drift, with `countIndexed()` acting as a \"drift alarm.\"\n\n## What a colleague's search query goes through\n\nTwo entry points converge on the same service, both intentionally duplicating their gating so neither is more permissive: the REST route `src/app/api/search/route.ts` `GET()` (used by the command palette on every keystroke) and the server action `src/actions/search/search.ts` `searchAction()` (used by the search page). Both parse/validate against `searchQuerySchema` (`src/schemas/search.ts:6-13`: `q` must be 1-200 chars, `orgId` required, `kinds` restricted to `issue|comment|project`), and the REST route additionally checks the `command_palette` feature flag and requires `orgSlug`/`q` query params to be present at all.\n\nBoth then call `search()` in `src/server/services/search-service.ts:46-86`, which runs, in order:\n\n1. `assertOrgScope(actor, input.orgId)` — tenant check.\n2. `assertCan(actor, \"issue:read\", orgResource(input.orgId))` — permission check.\n3. `consumeRateLimit(input.orgId, \"search:query\")` — a token-bucket limiter (`src/lib/rate-limit.ts`, ~120 capacity/60 refill per minute, scaled by plan). If exhausted, it throws even though the query itself is fine.\n4. A feature-flag check for `advanced_search`.\n5. **The interesting rejection case**: `if (input.q.includes(\":\") && !advanced) throw new Error(\"Field-scoped search is not included in this plan\")` (lines 69-71). A query like `status:done` is syntactically valid and well-formed, but on a plan/org without `advanced_search` enabled it's refused outright rather than being searched as literal text — so a perfectly reasonable-looking query can fail purely because of the org's plan tier, not anything wrong with the query.\n6. Only after all that does it delegate to `searchRepo.searchDocuments(input)`, which does a `like(content, '%q%')` substring match over the `search_index` table (with `kinds`/`projectId` filters and keyset pagination), and maps rows back to hits using `content.split(\"\\n\")[0]` as the title.\n\nSo the colleague's search of the new title works because the title write and the index write happen in the same request (via the awaited, synchronous-feeling event emission) even though they're two separate, non-transactional operations — and their query would only be refused if it exceeded 200 chars, hit the rate limit, or contained a `:` field-scope on a non-advanced-search plan.",
+  "ttft_ms": 1131,
+  "type": "result",
+  "duration_ms": 16389,
+  "uuid": "072c3336-80bb-40ee-b395-ac0ffed5bc0f",
+  "ttft_stream_ms": 639,
+  "time_to_request_ms": 7,
+  "first_content_frame_ms": 639,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

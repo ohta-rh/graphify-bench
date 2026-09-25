@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 150341,
+  "stop_reason": "end_turn",
+  "session_id": "6746bda9-3d08-4019-8d6a-116f236b8f9c",
+  "total_cost_usd": 0.43080760000000007,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 5855,
+    "cache_read_input_tokens": 31497,
+    "output_tokens": 2238,
+    "output_tokens_details": {
+      "thinking_tokens": 76
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 5855,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2238,
+        "cache_read_input_tokens": 31497,
+        "cache_creation_input_tokens": 5855,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5855
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 40,
+      "outputTokens": 14085,
+      "cacheReadInputTokens": 557078,
+      "cacheCreationInputTokens": 60292,
+      "webSearchRequests": 0,
+      "costUSD": 0.43080760000000007,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1505,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## The lifecycle of a member invitation\n\n**1. The admin submits the invite.** On `src/app/(dashboard)/[orgSlug]/settings/members/page.tsx`, the server component `Page()` checks `can(actor, \"member:invite\", …)` to decide whether to render `InviteMemberForm` at all (`src/components/domain/member/invite-member-form.tsx`). That client component validates the email/role locally with `inviteMemberSchema.safeParse` (a UI-only convenience — the component itself notes real enforcement happens server-side), then submits to the Server Action `inviteMemberAction` in `src/actions/members/invite-member.ts`.\n\n**2. Checks before the invitation row exists.** Every Server Action is wrapped by `withAction` (`src/actions/_lib/with-action.ts`), which first re-validates the payload against `inviteMemberSchema` (`src/schemas/member.ts`, using `emailSchema` from `src/schemas/common.ts`) and resolves an `Actor` from the session via `resolveActorFor`/`getActor` (`src/lib/actor.ts`), rejecting unauthenticated callers. Inside `inviteMemberAction` itself: a permission check `can(actor, \"member:invite\", …)` (`src/lib/permissions.ts`, which requires the `admin` role for this action), a token-bucket rate-limit check via `consumeRateLimit(orgId, \"member:invite\")` (`src/lib/rate-limit.ts`), and a seat-quota check against `getOrganizationSummary` + `getPlanLimits`. It then calls `inviteMember` → `inviteMembers` in `src/server/services/invitation-service.ts`, which redundantly re-runs an org-scope check (`assertOrgScope`), a permission check (`assertCan`), the rate limit again, and a second independent seat-quota computation (`countActiveMembers` + `countPendingInvitations` vs. `wouldExceedLimit` from `src/config/plan-limits.ts`) — effectively duplicated logic across the action and the service layer. Notably, nothing in this path checks whether the email already has a pending invitation or is already an active member; the `(orgId, email)` index on `invitations` is non-unique, so duplicate invites are allowed.\n\n**3. What gets stored vs. what travels in the link.** `insertInvitation` (`src/server/repositories/invitation-repository.ts`) writes a row to the `invitations` table (`src/server/db/schema/members.ts`) containing `orgId`, `email`, `role`, `invitedBy`, an `expiresAt` (default 14 days out), and a `tokenHash` — never the raw token. The raw token is generated once in `invitation-service.ts` via `randomToken(32)` (`src/lib/hash.ts`, effectively `crypto.randomBytes(32).toString(\"base64url\")` — an opaque random credential, not a signed/encoded JWT), then hashed with SHA-256 for storage. Only that raw token is meant to travel in the email link; the `invite-email.tsx` template (`InviteEmail`) takes an `acceptUrl` built from it. However, the actual send path is broken: `inviteMembers()` only calls `emit(\"member.invited\", …)`, and no code was found that calls `renderEmail(\"invite\", …)`/`sendEmail()` with a real `acceptUrl` — `email-service.ts`'s `sendEmail()` just logs, so as written the invite email is never dispatched with a working link.\n\n**4. What happens when the link is clicked.** The route `src/app/(auth)/invite/[token]/page.tsx` only validates the token's shape (`invitationTokenSchema`), then requires a signed-in session via `getSessionPrincipal` (`src/lib/session.ts`), redirecting to login-with-`next` if absent. The invitee submits through `InviteAcceptForm` to the Server Action `acceptInvitationAction` (`src/actions/members/accept-invitation.ts`), which deliberately bypasses `withAction` (there's no org-scoped `Actor` yet) and calls `acceptInvitation(userId, {token})` in `invitation-service.ts`. That function looks up the row by `hashToken(token)` — the only unscoped repository lookup in the system, since the token itself is the tenant credential — then checks in order: not revoked, not already accepted, not expired. **It does not verify that the invitation's stored `email` matches the signed-in user's account email**, so any authenticated user holding the token can accept it. If the user is already a member it returns the existing membership idempotently; otherwise it calls `memberRepo.insertMember` to create the `members` row and `markInvitationAccepted` to stamp `acceptedAt`. `acceptInvitationAction` then separately re-checks seat capacity (`assertSeatAvailable`) as a post-hoc race guard — with no rollback if it fails.\n\n**5. What the rest of the system learns.** Membership creation fires through the in-process event bus (`src/lib/event-bus.ts`), whose subscribers are registered once at startup by `registerEventHandlers` in `src/server/services/event-registry.ts` (invoked from `src/instrumentation.ts`). `member.invited` (emitted per-invite in `inviteMembers`) is picked up only by `activity-service.ts`, which writes an audit-log entry. `member.joined` (emitted from `acceptInvitation`) fans out to: `usage-service.ts`, which increments the org's `seatsUsed` billing counter; `notification-service.ts`, which notifies the org owner; and `activity-service.ts` again, for the audit trail. Despite `member.joined` being declared as a valid webhook event type in `src/schemas/webhook.ts`, `webhook-service.ts` never subscribes to it, so outbound webhooks aren't actually triggered. Cache invalidation is handled outside the event bus: `inviteMemberAction` calls `revalidateTagged([orgTag(orgId)], …)` and `withAction` revalidates the `\"members\"`/`\"invitations\"` tags, but `acceptInvitationAction` (bypassing `withAction`) never revalidates anything, so pages showing the new member rely on dynamic rendering rather than cache tags. There is no session or permission token re-issue for the invitee — subsequent requests simply re-resolve their `Actor` by querying the `members` table fresh each time (`resolveActor`/`getActor`).",
+  "ttft_ms": 1966,
+  "type": "result",
+  "duration_ms": 19378,
+  "uuid": "8ddd35da-b7c1-4f75-8805-a09ef8000010",
+  "ttft_stream_ms": 1171,
+  "time_to_request_ms": 8,
+  "first_content_frame_ms": 1171,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

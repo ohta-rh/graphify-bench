@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 46202,
+  "stop_reason": "end_turn",
+  "session_id": "47ca3749-7120-44cb-808a-8d0dda493c0a",
+  "total_cost_usd": 0.230367,
+  "usage": {
+    "input_tokens": 18,
+    "cache_creation_input_tokens": 31807,
+    "cache_read_input_tokens": 308515,
+    "output_tokens": 4140,
+    "output_tokens_details": {
+      "thinking_tokens": 957
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 31807,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1963,
+        "cache_read_input_tokens": 45929,
+        "cache_creation_input_tokens": 1670,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1670
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 18,
+      "outputTokens": 4140,
+      "cacheReadInputTokens": 308515,
+      "cacheCreationInputTokens": 31807,
+      "webSearchRequests": 0,
+      "costUSD": 0.230367,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 957,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 13,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the full path from a typed `@handle` to whatever actually lands in the mentioned person's inbox.\n\n**1. Extraction — `src/lib/mentions.ts`**\nNothing happens at keystroke time in terms of resolution (the composer's `mention-textarea.tsx`/`mention-query.ts` just autocomplete handles for UX). The real extraction happens server-side when the comment is submitted. `extractMentions(body)` in `src/lib/mentions.ts` runs `MENTION_PATTERN` (`/(^|[\\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi`) over the body with code spans/fences stripped (`withoutCode`), returning the distinct lowercase handles in first-appearance order.\n\n**2. Handle → real user — `resolveMentions` in the same file, called from `createComment` (`src/server/services/comment-service.ts`)**\n`createComment` calls its private `resolveMentionedUsers(orgId, body, clientProvided)`, which fetches up to `MENTION_LOOKUP_LIMIT` (100) org members via `memberRepo.listMembers`, builds a `handle → userId` map using `handleOf(member)` (the lowercased local part of `member.user.email`), and calls `resolveMentions(body, members.items)` to turn the parsed handles into real `UserId`s. Unknown handles are silently dropped. This resolved server-side set is unioned with whatever `UserId`s the client optimistically sent (filtered to only known members), producing the final `mentionedUserIds` array — the server list wins on any disagreement.\n\n**3. What carries the list forward — the `comment.created` event**\n`createComment` persists the comment with `mentionedUserIds` via `commentRepo.insertComment`, then calls `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` (`src/lib/event-bus`). This event payload is the thing that carries the resolved id list forward — nothing downstream re-parses the markdown.\n\n**4. Fan-out — `registerFanOut` in `src/server/services/notification-service.ts`**\nAt module load, `registerFanOut()` subscribes to `comment.created`. Its handler first notifies the issue's author/assignee of `comment_created`, then, if `payload.mentionedUserIds.length > 0`, calls `notify(orgId, \"comment_mention\", payload.mentionedUserIds, { title: \"You were mentioned\", ... })`.\n\n**5. Per-recipient channel decision — `notify()` and `resolveChannels()`**\nFor each distinct recipient (skipping the actor mentioning themselves), `notify()` loads that user's `NotificationPreference` via `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` and calls `resolveChannels(preference, flags)`:\n- No stored preference → `DEFAULT_CHANNELS = [\"in_app\", \"email\"]` (both).\n- A preference exists → `in_app` is included iff `preference.inApp`; `email` is included iff `preference.email` is true AND (`!preference.digestOnly` OR the org's `digest_email` feature flag is enabled via `isEnabled`).\n- If the resolved channel list is empty, that recipient is skipped entirely — no row at all.\n\n**6. What actually lands in the inbox**\n`notify()` writes one row per recipient (with its own `channels` array) via `notificationRepo.insertNotifications` (`src/server/repositories/notification-repository.ts`) — this is the in-app row, immediately visible in `notification-list.tsx` / the unread badge (`countUnread`).\n\nThe `email` entry in `channels` is not itself an immediate send — there is no job that fires a \"mention\" email right away (the `mention` template in `src/emails/mention-email.tsx` / `src/emails/render.ts` is wired into the render pipeline but nothing currently calls `renderEmail(\"mention\", …)`). Instead, email delivery only happens for users who are digest subscribers: `runDigestEmailJob` (`src/server/jobs/digest-email-job.ts`) runs per org during its configured UTC hour, calls `digest-service.ts`'s `buildDigest`/`listDigestRecipients` to gather each subscriber's still-unread notifications (`notificationRepo.listUnreadSince`) inside the window, renders them through the generic `\"digest\"` template, and `sendEmail`s the bundle (which in this offline corpus just logs `\"email.sent\"` via `email-service.ts`). Digested notifications are then marked read so they aren't re-sent next run.\n\nSo the end state for a mentioned user is: always an in-app row (unless every channel was disabled), and email participation depends entirely on their `comment_mention` preference plus the org's `digest_email` flag — non-digest \"email\" preference currently results in the channel being recorded on the row but no separate immediate email is actually dispatched anywhere in the codebase, while `digestOnly` users get their mention bundled into the next daily digest email.",
+  "ttft_ms": 2110,
+  "type": "result",
+  "duration_ms": 46628,
+  "uuid": "b6ef6c1e-3b7d-45d0-bc93-f81a360c4b39",
+  "ttft_stream_ms": 1230,
+  "time_to_request_ms": 25,
+  "first_content_frame_ms": 1230,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

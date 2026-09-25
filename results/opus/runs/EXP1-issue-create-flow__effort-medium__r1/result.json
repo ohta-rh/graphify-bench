@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 111649,
+  "stop_reason": "end_turn",
+  "session_id": "f8151227-068e-4a88-9130-21322f338480",
+  "total_cost_usd": 0.39350589999999996,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 3639,
+    "cache_read_input_tokens": 31467,
+    "output_tokens": 2165,
+    "output_tokens_details": {
+      "thinking_tokens": 23
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 3639,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2165,
+        "cache_read_input_tokens": 31467,
+        "cache_creation_input_tokens": 3639,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3639
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 36,
+      "outputTokens": 10201,
+      "cacheReadInputTokens": 547392,
+      "cacheCreationInputTokens": 63033,
+      "webSearchRequests": 0,
+      "costUSD": 0.39350589999999996,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 424,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "general-purpose": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## End-to-end flow: signed-in member submits \"New issue\"\n\n**Page render and initial gate.** `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx` (`Page`) is an async Server Component. It calls `loadProjectContext(orgSlug, projectSlug)` to resolve `{ org, actor, project }`, does a UI-level `can(actor, \"issue:create\", …)` check (from `src/lib/permissions.ts`, using `PENDING_ISSUE_ID` in `src/actions/_lib/permission-resources.ts`) purely to decide whether the form is even shown, and renders `<IssueForm onSubmit={createIssueAction} … />`, passing the Server Action `createIssueAction` (from `@/actions/issues/create-issue`) directly as a prop.\n\n**Client form.** `src/components/domain/issue/issue-form.tsx` is `\"use client\"`. It uses `react-hook-form` with `zodResolver(createIssueSchema)` (schema from `@/schemas/issue`) for client-side validation, and a helper hook `useFormAction` (`src/hooks/use-form-action.ts`) to submit. On submit, `form.handleSubmit` calls `submit(input)`, which directly invokes `onSubmit(input)` — i.e., calls `createIssueAction(input)` — awaits an `ActionResult`, then either sets an error or calls `form.reset()` on success. It's a direct async call of the Server Action reference, not `useActionState`/`form action=`.\n\n**Server Action entry point.** `src/actions/issues/create-issue.ts` (`\"use server\"`) exports:\n```ts\nexport async function createIssueAction(raw: unknown): Promise<ActionResult<Issue>>\n```\nwhich delegates to a `run` function built by `withAction<typeof createIssueSchema, Issue>(createIssueSchema, handler, { revalidate: [\"issues\"], cacheProfile: \"minutes\" })`.\n\n**Shared wrapper — parse, then auth.** `src/actions/_lib/with-action.ts`'s `withAction()`/`runAction()` runs, in order:\n1. `schema.safeParse(raw)` (`createIssueSchema`) — a parse failure short-circuits to an error `ActionResult` before anything else touches the DB or session.\n2. `resolveActorFor(parsed.data, …)` → `requireActorFor(orgId)` in `src/lib/actor.ts`, which reads the session cookie via `getSessionPrincipal()` (`src/lib/session.ts`, using `next/headers` `cookies()`), resolves it through `resolveSession(token)` (`src/server/services/session-service.ts`), checks expiry (throws `UnauthorizedError` if invalid), loads the org, resolves the actor via `resolveActorForOrg`, and confirms tenant match with `assertOrgScope(actor, orgId)` (`src/lib/tenant.ts`). This is the authentication gate — this app uses its own cookie/session-token system, not NextAuth.\n\n**Authorization inside the handler.** In `create-issue.ts`'s handler:\n```ts\nconst allowed = can(actor, \"issue:create\", { kind: \"issue\", orgId, projectId, issueId: \"\", authorId: actor.userId, assigneeId });\nif (!allowed) throw new ForbiddenActionError(\"issue:create\");\n```\n`can()`/`explain()` in `src/lib/permissions.ts` checks cross-tenant scope, platform-staff bypass, and role rank via `ROLE_MATRIX[\"issue:create\"]` against `ROLE_RANK` (requires role `member`+).\n\n**Business-rule gate before writing.** Still in the handler, `assertProjectHasRoom(actor, input)` pulls the org's plan via `getOrganizationSummary`/`getPlanLimits` (`src/config/plan-limits.ts`) and counts existing issues via `listIssues`, throwing `PlanLimitError` if the `issuesPerProject` quota would be exceeded.\n\n**Service layer (defense-in-depth) and DB write.** The handler calls `createIssue(actor, input)` in `src/server/services/issue-service.ts`, which re-asserts `assertOrgScope`, loads/validates the project (`projectRepo.findProjectById`, `requireFound`, `assertNotArchived`), re-checks permission with the throwing `assertCan(actor, \"issue:create\", projectResource(project))`, and re-verifies the quota (`wouldExceedLimit`). It then allocates the sequential number via `issueRepo.nextIssueNumber(orgId, projectId)` and writes the row with `issueRepo.insertIssue(...)` in `src/server/repositories/issue-repository.ts`, which does `getDb().insert(issues).values({...})` using Drizzle ORM over `better-sqlite3` (table defined in `src/server/db/schema/issues.ts`).\n\n**Post-write side effects.** `createIssue` emits `emit(\"issue.created\", {...})` on the in-process pub/sub bus (`src/lib/event-bus.ts`). Listeners registered at startup (`registerEventHandlers()` in `src/server/services/event-registry.ts`, called from `src/instrumentation.ts`) react via `Promise.allSettled`:\n- `activity-service.ts` writes an audit/activity-log entry.\n- `search-service.ts` re-indexes the issue (`indexIssue`).\n- `usage-service.ts` increments org usage counters.\n- `webhook-service.ts` enqueues an outbound webhook job.\n- (No notification fires for plain `issue.created`, since the notification listeners only handle `issue.assigned`/`issue.overdue`.)\n\nBack in `create-issue.ts`, after the write resolves, `revalidateTagged([orgTag, projectTag, issueTag], CACHE_PROFILES.minutes)` (`src/lib/cache.ts`) invalidates Next.js cache tags, and `withAction` also revalidates the `\"issues\"` tag it was configured with. The `ActionResult<Issue>` (stamped with `submittedAt`) flows back through `createIssueAction` → `useFormAction.submit` → `IssueForm`, which resets the form on success. No server-side `redirect()` is issued.",
+  "ttft_ms": 909,
+  "type": "result",
+  "duration_ms": 15510,
+  "uuid": "3ffe915a-900c-4414-8773-2a508bd6f158",
+  "ttft_stream_ms": 700,
+  "time_to_request_ms": 6,
+  "first_content_frame_ms": 700,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 48691,
+  "stop_reason": "end_turn",
+  "session_id": "f531f0ae-806f-4f70-b642-13748135bcd5",
+  "total_cost_usd": 0.2605388,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 39737,
+    "cache_read_input_tokens": 275394,
+    "output_tokens": 4648,
+    "output_tokens_details": {
+      "thinking_tokens": 21
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39737,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2523,
+        "cache_read_input_tokens": 52128,
+        "cache_creation_input_tokens": 3401,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3401
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 16,
+      "outputTokens": 4648,
+      "cacheReadInputTokens": 275394,
+      "cacheCreationInputTokens": 39737,
+      "webSearchRequests": 0,
+      "costUSD": 0.2605388,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 21,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I have a complete picture now. Let me write the explanation.\n\n## End-to-end walkthrough: submitting the \"New issue\" form\n\n**1. Rendering the form (server, before any submission)**\n\n`src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx` runs `loadProjectContext(orgSlug, projectSlug)` to get `{ org, actor, project }`, then does an early `can(actor, \"issue:create\", …)` check via `src/lib/permissions.ts` (redirecting to `notFound()` if denied) and a quota pre-check using `getPlanLimits(org.plan)` against `listIssues(...)` — purely to decide whether to render the form or a \"project is full\" message. It then renders `IssueForm` (`src/components/domain/issue/issue-form.tsx`), a client component built with `react-hook-form` and `zodResolver(createIssueSchema)` (from `src/schemas/issue.ts`), passing `createIssueAction` as `onSubmit`.\n\n**2. Client submission**\n\nWhen the member submits, `form.handleSubmit` validates client-side against the same `createIssueSchema`, then `useFormAction`'s `submit()` (from `src/hooks/use-form-action.ts`) calls `onSubmit(input)`, i.e. the Server Action `createIssueAction` exported from `src/actions/issues/create-issue.ts`.\n\n**3. The Server Action wrapper — `withAction`**\n\n`createIssueAction` just calls `run(raw)`, where `run` is built by `withAction(createIssueSchema, handler, { revalidate: [\"issues\"], cacheProfile: \"minutes\" })` in `src/actions/_lib/with-action.ts`. `withAction`'s returned `runAction`:\n1. Re-parses `raw` with `createIssueSchema.safeParse` (server-side re-validation, independent of the client).\n2. Resolves the `Actor` via `resolveActorFor` → `getActor(orgSlug)` or `requireActorFor(orgId)` (`src/lib/actor.ts`), falling back to `getSessionPrincipal()` (`src/lib/session.ts`) and throwing `UnauthorizedActionError` if there's no session/active org — this is the authentication gate.\n3. Invokes the action's `handler(parsed.data, actor)`.\n4. Catches any thrown error and maps it through `toActionResult` (`src/lib/errors.ts`) into an `ActionResult`.\n5. On success, calls `revalidateTagged` again for the static `revalidate: [\"issues\"]` tags.\n6. `stamp()` attaches a `submittedAt` timestamp used by `useActionState`/`useFormAction` to distinguish results.\n\n**4. The action's own handler (`create-issue.ts`)**\n\nInside the handler:\n1. `can(actor, \"issue:create\", {...})` — a second, authoritative permission check (via `src/lib/permissions.ts`), throwing `ForbiddenActionError` if denied.\n2. `assertProjectHasRoom(actor, input)` — calls `getOrganizationSummary` (`src/server/services/organization-service.ts`) to get the org's plan, `getPlanLimits` (`src/config/plan-limits.ts`) for `issuesPerProject`, then `listIssues(actor, { ..., includeArchived: true })` to count existing issues (archived included) and throws `PlanLimitError` if at/over quota.\n3. Calls `createIssue(actor, input)` in `src/server/services/issue-service.ts` — the actual domain write (see next section).\n4. On success, calls `revalidateTagged` again with `issueTag`/`orgTag`/`projectTag` (`src/lib/cache.ts`) for finer-grained cache tags.\n\n**5. Domain service — `createIssue` (`issue-service.ts`)**\n\nThis is where the write's real gates live, in order:\n1. `assertOrgScope(actor, input.orgId)` (`src/lib/tenant.ts`) — tenant isolation, ensures the actor belongs to the org they claim.\n2. Loads the parent project via `projectRepo.findProjectById`, `requireFound`s it (404-style), then `assertNotArchived(\"Project\", …)` (`src/lib/soft-delete.ts`) — can't file issues into an archived project.\n3. `assertCan(actor, \"issue:create\", projectResource(project))` — a third, throwing form of the permission check, now scoped against the actual project resource loaded from the DB (not just client-supplied IDs).\n4. Loads the org via `orgRepo.findOrgById`, counts existing issues via `issueRepo.countIssues`, and checks `wouldExceedLimit(org.plan, \"issuesPerProject\", used)` (`src/config/plan-limits.ts`) — the authoritative, race-safe quota check (the action-layer check above is just an early UX short-circuit).\n5. Allocates the next per-project number via `issueRepo.nextIssueNumber`.\n6. Calls `issueRepo.insertIssue(input, actor.userId, number)` — the actual database write.\n\n**6. The database row (`issue-repository.ts`)**\n\n`insertIssue` generates an id (`newId()`), stamps `createdAt`/`updatedAt`, and does a Drizzle `insert(issues).values({...}).returning().get()` into the `issues` table (`src/server/db/schema/issues.ts`). If `labelIds` were supplied, it also inserts rows into `issueLabels` in the same call. The row is mapped back to the `Issue` domain type via `toIssue`.\n\n**7. Post-write side effects — the event**\n\nBack in `createIssue`, after the insert succeeds, it calls `emit(\"issue.created\", {...})` from `src/lib/event-bus.ts`. `emit` fans out to every handler registered for that event type (registered once at startup via `registerActivityListeners`, `registerSearchListeners`, `registerUsageListeners`, `registerWebhookListeners` — see `src/server/services/event-registry.ts`), running them via `Promise.allSettled` so one failing handler doesn't fail the write or its siblings:\n- **Activity** (`activity-service.ts`): `record(...)` writes an audit-log entry (\"Created issue …\").\n- **Search** (`search-service.ts`): re-fetches the issue and calls `indexIssue` to update the search index.\n- **Usage** (`usage-service.ts`): `usageRepo.incrementUsage(orgId, { issuesUsed: 1 })` bumps the cached usage counter.\n- **Webhooks** (`webhook-service.ts`): `enqueueForOrg(orgId, \"issue.created\", JSON.stringify(payload))` queues an outbound webhook delivery for a background job to drain.\n\n(`notification-service.ts` doesn't subscribe to `issue.created` itself — only to `issue.assigned`, `issue.overdue`, `comment.created`, `member.joined` — so a bare new-issue submission with no assignee doesn't trigger a notification.)\n\n**8. Response back to the client**\n\n`createIssue` returns the `Issue`; `issue-service`'s caller (`create-issue.ts`) revalidates cache tags and returns it up through `withAction`'s success path as `{ ok: true, data: issue, submittedAt }`. `useFormAction` receives this, calls `form.reset()` via its `onSuccess` callback, and the `IssueForm` clears back to its defaults.",
+  "ttft_ms": 1359,
+  "type": "result",
+  "duration_ms": 49119,
+  "uuid": "1d2342c0-58ae-448b-a761-b38ba1f28e00",
+  "ttft_stream_ms": 989,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 989,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

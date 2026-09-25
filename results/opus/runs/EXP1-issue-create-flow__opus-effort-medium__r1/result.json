@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 71809,
+  "stop_reason": "end_turn",
+  "session_id": "6b6e9667-3c5f-473f-97da-4890331189d1",
+  "total_cost_usd": 0.6011526,
+  "usage": {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 46830,
+    "cache_read_input_tokens": 414383,
+    "output_tokens": 7177,
+    "output_tokens_details": {
+      "thinking_tokens": 706
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 46830,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 3368,
+        "cache_read_input_tokens": 55014,
+        "cache_creation_input_tokens": 2159,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2159
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 24,
+      "outputTokens": 7177,
+      "cacheReadInputTokens": 414383,
+      "cacheCreationInputTokens": 46830,
+      "webSearchRequests": 0,
+      "costUSD": 0.6011526,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 706,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 17,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I traced the whole path through the code. Here it is in the order it runs.\n\n## 0. Before the action: page render and the proxy\n- **`src/proxy.ts` → `proxy()`**: the form's POST goes to a non-public URL, so the proxy only checks that a session cookie exists. It can't reach the database, so this is not a real authorization check.\n- **`src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx`**: when the page renders, it calls `loadProjectContext`, then `can(actor, \"issue:create\", …)` (calls `notFound()` if false), then `getPlanLimits(org.plan)` plus `listIssues(..., includeArchived: true)`. If the project is full it shows \"This project is full\" instead of the form. Otherwise it renders `<IssueForm onSubmit={createIssueAction}>`. These are display checks only; the action runs them again.\n\n## 1. Client-side submit\n- **`src/components/domain/issue/issue-form.tsx` → `IssueForm`**: react-hook-form with `zodResolver(createIssueSchema)` validates the fields in the browser. `form.handleSubmit` then calls `submit(input)`.\n- **`src/hooks/use-form-action.ts` → `useFormAction`**: sets `pending` and calls the Server Action. It then routes the returned `ActionResult` to `onSuccess` (which does `form.reset()`) or into `error`. Anything thrown is normalised with `toAppError()`.\n\n## 2. The Server Action\n- **`src/actions/issues/create-issue.ts` → `createIssueAction(raw)`** (`\"use server\"`) just calls `run(raw)`. `run` is built with **`withAction`** from `src/actions/_lib/with-action.ts`, and `runAction` does this:\n  1. **Gate 1, schema:** `createIssueSchema.safeParse(raw)` (`src/schemas/issue.ts`). This is the same schema the client used: title 3–200 characters, enums for status and priority, estimate 0–100, up to 20 `labelIds`, branded IDs, and defaults. A parse failure returns `stamp(toActionResult(zodError))`.\n  2. **Gate 2, authentication and membership:** `resolveActorFor(parsed.data, true)`. The input has `orgId` but no `orgSlug`, so it calls **`requireActorFor(orgId)`** (`src/lib/actor.ts`):\n     - `getSessionPrincipal()` (`src/lib/session.ts`) reads the cookie, calls `resolveSession(token)` and checks `expiresAt`.\n     - `findOrgById` looks up the org.\n     - **`resolveActorForOrg`** (`src/server/services/session-service.ts`) needs an `active` membership. It builds the `Actor {userId, orgId, role}`, runs `assertOrgScope` and calls `touchLastSeen`.\n     - `requireActorFor` then runs `assertOrgScope(actor, orgId)` again.\n     - Failures throw `UnauthorizedError` or `NoMembershipError`.\n  3. The handler in `create-issue.ts` then runs:\n     - **Gate 3, permission (action layer):** `can(actor, \"issue:create\", {kind:\"issue\", …})` (`src/lib/permissions.ts`). `explain()` rejects a cross-tenant request, allows platform staff, then compares `ROLE_RANK[actor.role]` with `ROLE_MATRIX[\"issue:create\"] = \"member\"`. If denied it throws `ForbiddenActionError` (`src/actions/_lib/action-errors.ts`).\n     - **Gate 4, plan quota (action layer):** `assertProjectHasRoom`. It calls `getOrganizationSummary` to get the plan, then `getPlanLimits(plan).issuesPerProject`, then `listIssues(..., includeArchived: true)`. If `total >= limit` it throws `PlanLimitError(\"issuesPerProject\", …)`.\n     - It then calls the service.\n\n## 3. The service: `src/server/services/issue-service.ts` → `createIssue(actor, input)`\nIt checks everything again, for defence in depth:\n- **Gate 5:** `assertOrgScope(actor, input.orgId)` (`src/lib/tenant.ts`), which throws `TenantScopeError`.\n- **Gate 6:** `projectRepo.findProjectById`, then `requireFound` (`_support.ts`), which throws `NotFoundError`.\n- **Gate 7:** `assertNotArchived(\"Project\", …)` (`src/lib/soft-delete.ts`), which throws `AlreadyArchivedError`.\n- **Gate 8:** `assertCan(actor, \"issue:create\", projectResource(project))`, which throws `PermissionDeniedError`.\n- **Gate 9:** `orgRepo.findOrgById`, then `issueRepo.countIssues(orgId, projectId)`, then `wouldExceedLimit(org.plan, \"issuesPerProject\", used)` (`src/config/plan-limits.ts`). This throws a plain `Error`.\n\n## 4. The database write: `src/server/repositories/issue-repository.ts`\n- **`nextIssueNumber`**: `max(issues.number) + 1` for the org and project. Archived rows are included so numbers are never reused.\n- **`insertIssue(input, actor.userId, number)`**: Drizzle inserts into the `issues` table (`src/server/db/schema/issues.ts`) with a fresh `newId()`. `authorId` comes from the actor, `startedAt` and `completedAt` are null, and `createdAt`/`updatedAt` share one timestamp. The call uses `.returning().get()`. If there are labels, it also inserts rows into `issueLabels`. It returns `toIssue(row, labelIds)` as the `Issue` type.\n- The connection is the single better-sqlite3 client from `getDb()` in `src/server/db/client.ts` (WAL mode, `foreign_keys = ON`).\n\n## 5. Afterwards: the `issue.created` event\n`createIssue` awaits `emit(\"issue.created\", {...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority})` (`src/lib/event-bus.ts`).\n- `emit` runs every handler with `Promise.allSettled`. A handler that fails is sent to the `onHandlerError` sinks and never fails the write.\n- The handlers are attached once per process: `src/instrumentation.ts` → `register()` → `registerEventHandlers()` in `src/server/services/event-registry.ts`. The same `register()` also starts the job scheduler.\n\nFour subscribers react to `issue.created`:\n1. **Activity log** (`activity-service.ts`, `registerActivityListeners`): `record()` → `activityRepo.insertActivity`, with summary `Created issue \"<title>\"` and the priority as metadata.\n2. **Search** (`search-service.ts`, `registerSearchListeners`): reloads the row with `issueRepo.findIssueById`, then `indexIssue` → `searchRepo.upsertSearchDocument` (title plus description).\n3. **Usage** (`usage-service.ts`, `registerUsageListeners`): `usageRepo.incrementUsage(orgId, { issuesUsed: 1 })`.\n4. **Webhooks** (`webhook-service.ts`, `registerWebhookListeners`): `enqueueForOrg` lists the org's endpoints and, for each enabled endpoint subscribed to `issue.created`, calls `webhookRepo.enqueueDelivery`. Later, the scheduler's **`runWebhookDeliveryJob`** (`src/server/jobs/webhook-delivery-job.ts`) claims those rows. It checks the plan allows webhooks, signs the payload with `signPayload` (HMAC-SHA256) and records the attempt, with retry and backoff up to `MAX_ATTEMPTS`.\n\n## 6. Unwinding back to the browser\n- The handler calls `revalidateTagged([orgTag, projectTag, issueTag(issue.id)], CACHE_PROFILES.minutes)` (`src/lib/cache.ts`).\n- `withAction` then revalidates its static `[\"issues\"]` tag.\n- It returns `stamp({ ok: true, data: issue })`. `stamp` adds a `submittedAt` timestamp.\n- Any error from any gate is turned into `{ ok: false, error }` by `toActionResult` (`src/lib/errors.ts`), using each error's `code`: `forbidden`, `plan_limit_exceeded`, `tenant_scope_violation`, and so on.\n- `useFormAction` gets the result and either resets the form or shows the error.\n\n## Things I noticed along the way\n- **No notification on create.** The `createIssue` doc comment says notifications hang off `issue.created`, but `notification-service.ts` only subscribes to `issue.assigned`, `issue.overdue`, `comment.created` and `member.joined`. `createIssue` never emits `issue.assigned`, so an assignee picked on the form gets no notification.\n- **The two quota checks disagree.** The action and the page count archived issues (`includeArchived: true`). The service's `countIssues(orgId, projectId)` uses the default scope, which excludes archived issues. The action's check is therefore the stricter one that actually applies.\n- **Race on issue numbers.** `nextIssueNumber` then `insertIssue` is a read followed by a separate write, with no transaction around them.",
+  "ttft_ms": 2673,
+  "type": "result",
+  "duration_ms": 72436,
+  "uuid": "685306a4-7472-40fb-ad41-14097c106690",
+  "ttft_stream_ms": 1015,
+  "time_to_request_ms": 41,
+  "first_content_frame_ms": 1015,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 133719,
+  "stop_reason": "end_turn",
+  "session_id": "7fb6984f-1b7a-44ea-8e3f-53693510cb01",
+  "total_cost_usd": 0.3307685,
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 16970,
+    "cache_read_input_tokens": 49277,
+    "output_tokens": 2357,
+    "output_tokens_details": {
+      "thinking_tokens": 29
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 16970,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1636,
+        "cache_read_input_tokens": 30413,
+        "cache_creation_input_tokens": 5421,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5421
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 26,
+      "outputTokens": 10678,
+      "cacheReadInputTokens": 346195,
+      "cacheCreationInputTokens": 51697,
+      "webSearchRequests": 0,
+      "costUSD": 0.3307685,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1037,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 2,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How `@someone` becomes a notification\n\n**1. Parsing the handle out of the comment text.**\nWhen a comment is saved, `src/server/services/comment-service.ts`'s `createComment(actor, input)` calls `resolveMentionedUsers(orgId, input.body, input.mentionedUserIds)`. That function loads the org's member roster (`memberRepo.listMembers({ orgId, limit: 100, cursor: null })`) and hands the body plus that member list to `src/lib/mentions.ts`. There, `extractMentions(body)` strips fenced/inline code (`withoutCode`) and runs `MENTION_PATTERN = /(^|[\\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi` via `matchAll`, returning distinct lowercased handles in order of first appearance.\n\n**2. Turning the handle into a real user.**\n`handleOf(member)` in the same file defines a member's handle as the local part of their email (`email.split(\"@\")[0]`, lowercased). `resolveMentions(body, members)` builds a `handle -> UserId` map from the org members, looks up each extracted handle in it, and silently drops anything that doesn't match a known member (typos just vanish, no error). `resolveMentionedUsers` in `comment-service.ts` unions this server-resolved set with any client-supplied `input.mentionedUserIds` (filtered to only actual org members) — the server-derived list wins on any disagreement.\n\n**3. What carries the list forward.**\nThe result is a plain `readonly UserId[]` called `mentionedUserIds`. `createComment` writes it onto the comment row via `commentRepo.insertComment({ ...input, mentionedUserIds }, actor.userId)`, and — more importantly for notifications — attaches the same array to the domain event it emits: `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` (`src/lib/event-bus.ts`). Downstream code reads this field straight off the event rather than re-parsing the markdown.\n\n**4. Fan-out and persistence.**\n`src/server/services/notification-service.ts` subscribes to `\"comment.created\"` (wired up at boot through `event-registry.ts` / `instrumentation.ts`). Its handler first notifies watchers, then, if `mentionedUserIds` is non-empty, calls `notify(orgId, \"comment_mention\", mentionedUserIds, { title, body, href, actorId })`. `notify()` dedupes recipients, skips the comment's own author, and for each remaining recipient loads their preference row via `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` (`src/server/repositories/notification-preference-repository.ts`).\n\n**5. In-app vs. email vs. nothing.**\n`resolveChannels(preference, flags)` in `notification-service.ts` makes the call: if the user has no preference row yet, they get the default `[\"in_app\", \"email\"]`; otherwise `in_app` is included only if `preference.inApp`, and `email` only if `preference.email` and either they aren't `digestOnly` or the org's `digest_email` feature flag is off. If the resulting channel list is empty, that recipient gets no notification row at all. Whoever remains gets a row batch-inserted by `notificationRepo.insertNotifications(orgId, rows)` (`src/server/repositories/notification-repository.ts`) into the `notifications` table, with the chosen `channels` array stored as JSON on the row.\n\n**6. The email that (almost) happens.**\nThere's a real `MentionEmail` template (`src/emails/mention-email.tsx`) wired into `src/emails/render.ts` and known to `email-service.ts` as the `\"mention\"` `EmailTemplate`, but nothing in the codebase actually calls `renderEmail(\"mention\", ...)` / `sendEmail(...)` for it. The `channels` field on the notification row is written but never read to trigger an immediate send — it looks like scaffolding that was never connected. The only email a mention can actually produce is via the daily digest path: `digestOnly` recipients' unread mention notifications get swept up by `runDigestEmailJob` (`src/server/jobs/digest-email-job.ts`, driven by `src/server/jobs/scheduler.ts`), which calls into `src/server/services/digest-service.ts` (`listDigestRecipients`, `buildDigest`) and ultimately `sendEmail(\"digest\", ...)`.\n\nSo: a normal (non-digest) recipient with mentions enabled ends up with just an in-app row despite the row saying `channels: [\"in_app\",\"email\"]`; a `digestOnly` recipient with the `digest_email` flag on eventually gets one batched email the next time the digest job runs; anyone with mention notifications turned off in preferences gets nothing at all.",
+  "ttft_ms": 2171,
+  "type": "result",
+  "duration_ms": 134268,
+  "uuid": "4635cbd0-e72f-44ef-9e0f-c22e2b0aac07",
+  "ttft_stream_ms": 1582,
+  "time_to_request_ms": 29,
+  "first_content_frame_ms": 1582,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 142472,
+  "stop_reason": "end_turn",
+  "session_id": "9e99258b-1466-4e24-8fae-3a19a535c676",
+  "total_cost_usd": 0.3828043,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 5532,
+    "cache_read_input_tokens": 31764,
+    "output_tokens": 2227,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 5532,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2227,
+        "cache_read_input_tokens": 31764,
+        "cache_creation_input_tokens": 5532,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5532
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 32,
+      "outputTokens": 12255,
+      "cacheReadInputTokens": 380974,
+      "cacheCreationInputTokens": 62539,
+      "webSearchRequests": 0,
+      "costUSD": 0.3828043,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 350,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 1,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## From keystrokes to an authorized workspace\n\n**Submitting the form.** `LoginForm` in `src/app/(auth)/login/login-form.tsx` is a client component. It does a quick client-side `loginSchema.safeParse` (from `src/schemas/auth.ts`) just for instant field errors — that check is explicitly not the enforcement point — then calls the Next.js Server Action `loginAction` in `src/actions/auth/login.ts` via `useActionState`.\n\n**Verifying credentials.** `loginAction` re-validates the input server-side (the real enforcement), calls `consumeRateLimit` (`src/lib/rate-limit.ts`) to throttle brute-force attempts, and hands off to `login(input)` in `src/server/services/auth-service.ts`. `login` looks the user up with `userRepo.findUserByEmail`, fetches the stored hash with `userRepo.findPasswordHash`, and checks the password with `verifyPassword` in `src/lib/hash.ts`. There's no bcrypt/argon2 dependency — passwords are hashed with Node's built-in `crypto.scrypt` (random 16-byte salt, 64-byte derived key, stored as `scrypt:<salt>:<key>`), and verification re-derives the key and compares it with `timingSafeEqual` for constant-time safety. A missing user and a wrong password produce the identical error message, so failed sign-ins don't leak which case occurred.\n\n**Creating the session — server vs. browser.** On success, `login()` calls `createSessionToken(userId)` in `src/server/services/session-service.ts`. This generates a 32-byte random token, computes its SHA-256 hash via `hashToken` (`src/lib/hash.ts`), and persists only that hash — plus `userId` and a 30-day `expiresAt` — into the `sessions` table (`src/server/db/schema/users.ts`) through `sessionRepo.createSession`. The raw token itself is never stored in the database; it only exists in memory long enough to be sent to the browser. Back in `loginAction`, `setSessionCookie(token, expiresAt)` (`src/lib/session.ts`) writes the raw token into an `httpOnly`, `sameSite=lax`, secure-in-prod cookie named `taskflow_session`. So: the DB holds a hash tied to a user and expiry; the browser holds only an opaque random token it can't decode (it isn't a JWT — no payload, just a lookup key).\n\n**Re-establishing identity on later requests.** Two layers do this deliberately separately. `src/proxy.ts` (this app's Next.js 16 `middleware.ts` equivalent) runs on nearly every request and does only a cheap check — is the route public, and does the `taskflow_session` cookie exist at all — redirecting to `/login` if not, since a proxy/edge function can't reach the database. The authoritative check happens later, inside Server Components/layouts/actions, via `getSessionPrincipal()` in `src/lib/session.ts`: it reads the cookie, hashes the token, and calls `resolveSession(token)` (`session-service.ts`), which does `sessionRepo.findSessionByTokenHash` — a DB join of `sessions` and `users` that also filters out already-expired rows.\n\n**\"Still signed in.\"** Expiry is checked twice — once in the DB query itself, and again in `getSessionPrincipal` by comparing `principal.expiresAt` against `Date.now()`. There's no rolling/refresh logic; a session is simply valid for its fixed 30-day window and then must be re-created by logging in again (or swept via `purgeExpiredSessions`). The actual gate for the whole authenticated area is `src/app/(dashboard)/layout.tsx`, which calls `getSessionPrincipal()` and `redirect(\"/login\")` if it returns `null`.\n\n**Turning bare identity into workspace authorization.** `getSessionPrincipal()` only returns an org-agnostic `{userId, email, activeOrgId, expiresAt}` — it knows who you are, not what you can do anywhere in particular. The nested `src/app/(dashboard)/[orgSlug]/layout.tsx` does the rest: it resolves the org via `resolveOrgBySlug`, then calls `resolveActorForOrg(principal, orgSlug)` (`session-service.ts`), which looks up the caller's row in the `members` table (`src/server/db/schema/members.ts` — the join table between users and organizations, carrying a `role` enum of owner/admin/member/viewer) and builds an `Actor{ userId, orgId, role }`. `assertOrgScope` (`src/lib/tenant.ts`) then guards against cross-tenant access. That `Actor` is what the RBAC module `src/lib/permissions.ts` consumes: `ROLE_MATRIX` maps each permission action to a minimum role, and `can()`/`explain()` decide access by rank comparison (plus ownership escalations and a platform-staff bypass).\n\n**Rendering the tailored sidebar.** The layout passes `actor` into `DashboardShell` (`.../_components/dashboard-shell.tsx`), which passes it to `AppSidebar` (`src/components/domain/nav/app-sidebar.tsx`). `AppSidebar` calls `visibleNav(SIDEBAR_NAV, actor, flags)` (`src/config/nav.ts`), which filters the declarative nav config through `can()` per item — nothing branches directly on `actor.role`. Individual UI elements elsewhere use the declarative `<PermissionGate actor action resource>` wrapper (`src/components/domain/permission/permission-gate.tsx`) around the same `can()` check, though that's explicitly documented as a UI courtesy, not real enforcement — Server Actions still call `assertCan()` themselves before doing anything sensitive.\n\n**Order, end to end:** form submit → `loginAction` → `login()` (DB lookup + `verifyPassword`) → `createSessionToken()` (hash stored in `sessions` table, raw token returned) → `setSessionCookie()` (cookie sent to browser) → on every later request, `proxy.ts` does a cheap presence check, then `getSessionPrincipal()` does the real hashed-token DB lookup and expiry check → `(dashboard)/layout.tsx` gates on that → `(dashboard)/[orgSlug]/layout.tsx` resolves an `Actor` (with `role`) from the `members` table → `DashboardShell`/`AppSidebar` filter navigation and controls through `src/lib/permissions.ts`'s `can()`.",
+  "ttft_ms": 22074,
+  "type": "result",
+  "duration_ms": 22096,
+  "uuid": "1f5975e5-f2a8-49c7-bfd8-593d996f790b",
+  "ttft_stream_ms": 1363,
+  "time_to_request_ms": 10,
+  "first_content_frame_ms": 1363,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

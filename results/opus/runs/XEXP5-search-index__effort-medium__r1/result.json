@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 126588,
+  "stop_reason": "end_turn",
+  "session_id": "42e089c0-987a-404c-a27a-0027955997de",
+  "total_cost_usd": 0.37305900000000003,
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 18640,
+    "cache_read_input_tokens": 49257,
+    "output_tokens": 2727,
+    "output_tokens_details": {
+      "thinking_tokens": 65
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 18640,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2057,
+        "cache_read_input_tokens": 30393,
+        "cache_creation_input_tokens": 7111,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 7111
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 22,
+      "outputTokens": 12242,
+      "cacheReadInputTokens": 334650,
+      "cacheCreationInputTokens": 62282,
+      "webSearchRequests": 0,
+      "costUSD": 0.37305900000000003,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 173,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 2,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## How an issue-title edit becomes searchable, and how a search query is served\n\n**The write path (editing the title).** A title edit enters through the Server Action `updateIssueAction` in `src/actions/issues/update-issue.ts`, which is wrapped by `withAction` (`src/actions/_lib/with-action.ts`). `withAction` first validates the payload with `updateIssueSchema` (`src/schemas/issue.ts`) — `title` must be a string between 3 and 200 characters if present — and resolves the acting user into an `Actor` via `resolveActorFor`/`getSessionPrincipal` (`src/lib/actor.ts`, `src/lib/session.ts`). The action handler then does a coarse `can(actor, \"issue:update\", …)` pre-check (`src/lib/permissions.ts`) before calling the real work in `updateIssue()` in `src/server/services/issue-service.ts`. That service function enforces tenant scoping with `assertOrgScope` (`src/lib/tenant.ts`), loads the current row with `issueRepo.findIssueById`, re-checks permission authoritatively against the real `authorId`/`assigneeId` via `assertCan`, refuses edits to archived issues via `assertNotArchived` (`src/lib/soft-delete.ts`), and finally writes the new title with `issueRepo.updateIssue()` in `src/server/repositories/issue-repository.ts`.\n\n**Keeping the search copy in sync.** There's no database trigger and no external search engine — synchronization is done with an in-process event bus. After the write succeeds, `updateIssue()` calls `emit(\"issue.updated\", { orgId, issueId, projectId, changedFields })` (`src/lib/event-bus.ts`). At startup, `registerSearchListeners()` in `src/server/services/search-service.ts` has subscribed to that event (alongside `issue.created`, `issue.archived`, comment/project events, and a manual reindex event). Its handler deliberately ignores the event payload's field values and re-reads the issue row fresh via `issueRepo.findIssueById(orgId, issueId)`, then calls `indexIssue(orgId, issue)`, which concatenates `title + \"\\n\" + (description ?? \"\")` into a single `content` string and calls `searchRepo.upsertSearchDocument(orgId, \"issue\", issue.id, content, projectId)` (`src/server/repositories/search-repository.ts`). That upsert keys on `(orgId, subjectKind, subjectId)`, so the same search-index row is updated in place rather than duplicated. Because `emit()` awaits subscribers via `Promise.allSettled` and swallows failures, indexing normally completes before the action returns (so the colleague's search \"moments later\" typically just works), but a failure in the indexer never fails or blocks the original title edit — meaning the index *can* silently drift, which is why a separate batch job, `runSearchReindexJob` in `src/server/jobs/search-reindex-job.ts`, exists to walk and re-index everything in an org on demand.\n\n**What's stored in the search copy.** The `search_index` table (`src/server/db/schema/webhooks.ts`) holds `id`, `orgId`, `subjectKind` (`\"issue\" | \"comment\" | \"project\"`), `subjectId`, an optional denormalized `projectId`, a single denormalized `content` text blob, and `indexedAt`. There is no tokenizer or FTS index — for an issue, `content` is just `title` followed by `description`; the \"title\" shown in results is reconstructed at query time as `content.split(\"\\n\")[0]`.\n\n**The query path.** Two entry points converge on the same service: the Server Action `searchAction` (`src/actions/search/search.ts`) for the in-app search UI, and the route handler `GET /api/search` (`src/app/api/search/route.ts`) for the command palette. Both validate the request against `searchQuerySchema` (`src/schemas/search.ts`) — `q` must be 1–200 characters, `limit` 1–100, `kinds` a known enum — resolve the actor, and check `can(actor, \"org:read\", …)`, throwing/returning a permission error if denied. Both then call the shared `search()` function in `src/server/services/search-service.ts`, which re-checks tenant scope (`assertOrgScope`) and permission (`assertCan(actor, \"issue:read\", …)`) as defense in depth, then calls `consumeRateLimit(orgId, \"search:query\")` (`src/lib/rate-limit.ts`), a token bucket scaled by the org's plan. Finally it evaluates the `advanced_search` feature flag and, notably, checks `input.q.includes(\":\")` — if the query uses field-scoped syntax like `status:done` but the org's plan doesn't include `advanced_search`, the query is rejected outright with `\"Field-scoped search is not included in this plan\"` even though it's syntactically well-formed. Only after all of that does `searchRepo.searchDocuments()` run, filtering by `orgPredicate(orgId)` for tenant isolation, an optional `kinds`/`projectId` filter, a plain SQL `LIKE '%q%'` substring match on `content`, and keyset pagination ordered by `indexedAt`/`id`.\n\n**Where a valid-looking query gets refused.** Beyond schema validation, a well-formed query can still be rejected for reasons unrelated to its shape: no session/no active org (`UnauthorizedActionError`); the requested `orgId` not matching the actor's own org (`TenantScopeError` / cross-tenant denial inside `can`/`explain`); insufficient role for `org:read`/`issue:read` (`ForbiddenActionError`/`PermissionDeniedError`); the `command_palette` feature flag being off (API route only); the org's token-bucket rate limit for `search:query` being exhausted; and — most subtly — using `:` field-scoped syntax without the `advanced_search` plan flag, which the service treats as a hard rejection rather than falling back to literal-text matching.",
+  "ttft_ms": 2854,
+  "type": "result",
+  "duration_ms": 126971,
+  "uuid": "52253d1a-e1fe-42a8-8c03-83a414aa9a8c",
+  "ttft_stream_ms": 2393,
+  "time_to_request_ms": 26,
+  "first_content_frame_ms": 2394,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

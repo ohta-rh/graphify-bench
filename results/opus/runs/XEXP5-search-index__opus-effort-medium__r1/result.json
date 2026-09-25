@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 46038,
+  "stop_reason": "end_turn",
+  "session_id": "a3016bb5-c9cf-41dd-b9ca-c21c4c435338",
+  "total_cost_usd": 0.3521544,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 27656,
+    "cache_read_input_tokens": 190312,
+    "output_tokens": 4639,
+    "output_tokens_details": {
+      "thinking_tokens": 345
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 27656,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 3177,
+        "cache_read_input_tokens": 36672,
+        "cache_creation_input_tokens": 1327,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1327
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 16,
+      "outputTokens": 4639,
+      "cacheReadInputTokens": 190312,
+      "cacheCreationInputTokens": 27656,
+      "webSearchRequests": 0,
+      "costUSD": 0.3521544,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 345,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 10,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Search here is a denormalised `search_index` table. It is updated in-process through the event bus whenever something is written, and it is queried with a plain substring match after several checks on who is asking and what their plan allows.\n\n## Setup, before any request\n\n1. `src/instrumentation.ts` → `register()` runs once per Node server process. It imports `registerEventHandlers()` from `src/server/services/event-registry.ts` and then calls `startScheduler()`.\n2. `registerEventHandlers()` calls `registerSearchListeners()` in `src/server/services/search-service.ts`, alongside the activity, usage, webhook and digest listeners. It has a guard (`detach !== null`) so that a hot reload doesn't attach everything twice.\n3. `registerSearchListeners()` calls `subscribe()` from `src/lib/event-bus.ts` for these events: `issue.created`, `issue.updated`, `issue.archived`, `comment.created`, `comment.deleted`, `project.created`, `project.archived` and `search.reindex_requested`.\n\n## Write side: the title edit\n\n1. **`updateIssueAction`** (`src/actions/issues/update-issue.ts`) goes through `withAction`, which validates the payload against `updateIssueSchema` and resolves the actor. It then checks `can(actor, \"issue:update\", …)` and calls the service.\n2. **`updateIssue`** (`src/server/services/issue-service.ts`):\n   - checks the tenant with `assertOrgScope`;\n   - loads the current row with `issueRepo.findIssueById`;\n   - checks permission again with `assertCan(… \"issue:update\" …)` and calls `assertNotArchived`;\n   - writes the change with `issueRepo.updateIssue(input)`;\n   - then `await emit(\"issue.updated\", { …actorEnvelope, issueId, projectId, changedFields })`.\n3. **`emit`** (`src/lib/event-bus.ts`) runs every subscriber through `Promise.allSettled`. If a handler throws, the error goes to the error sinks and is never rethrown, so a failed index update can't fail the user's edit. Because the service awaits `emit`, the index is normally updated before the action returns. That is why a colleague can find the new title moments later.\n4. **The `issue.updated` handler** in `registerSearchListeners` ignores the payload's data. It re-reads the row with `issueRepo.findIssueById(orgId, issueId)`, so a write that only partly applied is never indexed as if it had succeeded. It then calls **`indexIssue`**.\n5. **`indexIssue`** builds the document content as `title + \"\\n\" + description`, then calls **`upsertSearchDocument`** in `src/server/repositories/search-repository.ts`. That function looks up an existing row by `(orgId, subjectKind, subjectId)`. If one exists it updates `content`, `projectId` and `indexedAt`; otherwise it inserts a new row with a `newId()`. Keying on the subject rather than the row id makes it safe to call on every write.\n\nOther ways the index changes:\n- Archiving an issue or project, or deleting a comment, calls `removeFromIndex` → `deleteSearchDocument`.\n- `search.reindex_requested` re-indexes one issue and ignores other kinds.\n- As a safety net, `src/server/jobs/scheduler.ts` schedules the `\"search-reindex\"` job every 1,440 minutes (daily). `src/server/jobs/queue.ts` dispatches it to `runSearchReindexJob(orgId)` in `src/server/jobs/search-reindex-job.ts`. That job re-upserts the org's projects, issues and their comments by calling `indexProject`, `indexIssue` and `indexComment`.\n\n## What the index stores\n\nThe `searchIndex` table (`search_index`) is defined in `src/server/db/schema/webhooks.ts`. Each row has:\n- `id` and the tenant columns (`orgId`);\n- `subjectKind`, which is `issue`, `comment` or `project`;\n- `subjectId`;\n- `projectId`, which is `null` for comments;\n- `content`: title plus description for issues, name plus description for projects, the body for comments;\n- `indexedAt`.\n\nThere is an index on `(orgId, subjectKind)`. Status, assignee and labels are not stored, so a status change doesn't need to touch the index.\n\n## Read side: the colleague's query\n\nThere are two entry points, and both apply the same checks on purpose.\n\n**Command palette:** `GET` in `src/app/api/search/route.ts`.\n1. Requires both `orgId` and `q` in the URL, otherwise it returns `validation_failed`.\n2. `getActor(orgSlug)`, then `can(actor, \"org:read\", …)`. If that fails it returns `forbidden`.\n3. `getOrganizationSummary` → `buildFlagContext` → `isEnabled(\"command_palette\")`. This flag is always on and cannot be overridden, but a `forbidden` path still exists.\n4. `searchQuerySchema.safeParse(...)` (`src/schemas/search.ts`). `q` must be 1–200 characters. `kinds` is `[\"issue\",\"comment\",\"project\"]` only if `advanced_search` is on, otherwise `[\"issue\"]`. `limit` is 10.\n\n**Server Action:** `searchAction` in `src/actions/search/search.ts`.\n- `withAction` validates against `searchQuerySchema` and requires an org.\n- It checks `can(… \"org:read\" …)`.\n- If `advanced_search` is off, it quietly removes every kind except `issue` from the request rather than rejecting it.\n\nBoth entry points then call **`search(actor, input)`** in `search-service.ts`, which runs these steps in order:\n1. `assertOrgScope(actor, input.orgId)` checks the tenant.\n2. `assertCan(actor, \"issue:read\", orgResource(orgId))` checks permission.\n3. `consumeRateLimit(orgId, \"search:query\")` (`src/lib/rate-limit.ts`). This is a per-org, in-process token bucket with a base of 120 tokens refilling at 60 per minute, scaled by the plan's `apiRequestsPerHour`. If the bucket is empty it throws `\"Search rate limit reached; try again after …\"`.\n4. `orgRepo.findOrgById` loads the org, and `isEnabled(\"advanced_search\", …)` is evaluated from its plan. This flag needs the `enterprise` plan unless the org has an override in `enabledFlagOverrides` (see `src/config/feature-flags.ts`).\n5. **If `q` contains a `:` and `advanced_search` is off, it throws `\"Field-scoped search is not included in this plan\"`.**\n6. `searchRepo.searchDocuments(input)`:\n   - filters on the org, `content LIKE %q%`, `subjectKind IN kinds`, and `projectId` if one was given;\n   - counts the total;\n   - fetches one page ordered by `indexedAt DESC, id DESC`, using `keysetPredicate` and `probeLimit`;\n   - returns it via `toPage`.\n7. Each row becomes a `SearchHit`:\n   - `title` is the first line of `content`;\n   - `snippet` comes from `snippetAround`, which keeps about 60 characters on each side of the match;\n   - `href` comes from `hrefFor`, e.g. `/issues/{id}`.\n\nBecause the edit just updated `indexedAt`, the edited issue also sorts near the top.\n\n## When a valid-looking query is refused\n\n- **A colon in the query without `advanced_search`.** On any plan below enterprise with no override, a literal search such as `\"fix: login\"` or `\"10:30\"` is rejected as field-scoped syntax, even though the repository would treat it as plain substring text. The Server Action's quiet narrowing only affects `kinds`, not the colon, so this rejection still reaches the user.\n- **The rate limit.** Once the org's `search:query` bucket runs out, every query from anyone in that org fails until it refills. Because the palette searches on each keystroke, this can happen quickly.\n- **Length or empty input.** An empty `q` or one longer than 200 characters fails the schema, and the route answers `\"Bad search query.\"`.\n- **Permissions and tenant.** A member without `org:read` or `issue:read` is refused, as is an actor whose org doesn't match `input.orgId`.\n- **Narrowed kinds.** Without `advanced_search`, the palette sends only `[\"issue\"]` and the action filters out comments and projects. Those queries aren't refused, but matches in comments or projects silently disappear.\n\n## Gaps I noticed\n\n- The comment in `change-issue-status.ts` says the search reindex hangs off `issue.status_changed`, but `registerSearchListeners` doesn't subscribe to that event. This does no harm because status isn't stored in `content`.\n- The reindex job reads only the first page (`PAGE_SIZE = 100`, `cursor: null`) of projects, issues and comments. For a large org it won't rebuild everything.",
+  "ttft_ms": 2426,
+  "type": "result",
+  "duration_ms": 46519,
+  "uuid": "dfac5a3a-1dc9-4b00-bb48-d11048057736",
+  "ttft_stream_ms": 1340,
+  "time_to_request_ms": 26,
+  "first_content_frame_ms": 1340,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

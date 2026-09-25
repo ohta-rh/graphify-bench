@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 32282,
+  "stop_reason": "end_turn",
+  "session_id": "a9976afc-1672-4563-9918-4b09883ee14c",
+  "total_cost_usd": 0.1678982,
+  "usage": {
+    "input_tokens": 8,
+    "cache_creation_input_tokens": 28043,
+    "cache_read_input_tokens": 107401,
+    "output_tokens": 3423,
+    "output_tokens_details": {
+      "thinking_tokens": 72
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 28043,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2033,
+        "cache_read_input_tokens": 35958,
+        "cache_creation_input_tokens": 7877,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 7877
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 8,
+      "outputTokens": 3423,
+      "cacheReadInputTokens": 107401,
+      "cacheCreationInputTokens": 28043,
+      "webSearchRequests": 0,
+      "costUSD": 0.1678982,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 72,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 11,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I now have the full picture. Here's the end-to-end flow.\n\n**1. Submission — `LoginForm` (`src/app/(auth)/login/login-form.tsx`)**\nThe client form is a `\"use client\"` component driven by `useActionState`. On submit it first re-validates the fields against `loginSchema` (from `src/schemas/auth`) purely so it can show inline field errors without a round trip, then calls the Server Action `loginAction` from `src/actions/auth/login.ts`.\n\n**2. Server Action — `loginAction` (`src/actions/auth/login.ts`)**\nThis is the real enforcement point. It re-parses the input with `loginSchema.safeParse` (the client copy is never trusted), then calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")` from `src/lib/rate-limit.ts` — charged to an anonymous bucket because no tenant/actor exists yet at this point. It then calls `login(parsed.data)` in `src/server/services/auth-service.ts`.\n\n**3. Credential check — `login()` (`src/server/services/auth-service.ts`)**\nThis looks up the user by email via `userRepo.findUserByEmail`, fetches the stored password hash via `userRepo.findPasswordHash`, and verifies it with `verifyPassword` from `src/lib/hash.ts` (scrypt + `timingSafeEqual`, both failure paths — no user, wrong password — throw the same generic message to avoid enumeration). On success it calls `createSessionToken(user.id)` in `src/server/services/session-service.ts`.\n\n**4. Session creation — `createSessionToken()` (`src/server/services/session-service.ts`)**\nGenerates a random 32-byte token (`randomToken`), hashes it with `hashToken` (SHA-256, no salt needed since it's already high-entropy), and persists only the hash via `sessionRepo.createSession` (`src/server/repositories/session-repository.ts`) into the `sessions` table with a 30-day expiry. The **raw token** is returned to the caller and never stored — only its hash lives in the database, so a DB dump can't be replayed as a login.\n\n**5. Back in `loginAction`**: it calls `resolveSession(token)` (also in `session-service.ts`), which just re-hashes the token and looks up the row via `sessionRepo.findSessionByTokenHash`, returning a `SessionPrincipal` (`userId`, `email`, `activeOrgId`, `expiresAt`). It then calls `setSessionCookie(token, principal.expiresAt)` from `src/lib/session.ts`, which writes the **raw token** into an `httpOnly`, `sameSite=lax`, `secure`-in-prod cookie (`SESSION_COOKIE_NAME`, from `src/schemas/session.ts`). This is the only place the raw token is handed to the browser — as an opaque cookie value it can't read or use it directly.\n\n**6. Response to the client**: `loginAction` returns `{ ok: true, data: principal }`; `LoginForm`'s effect sees `state.ok === true` and calls `router.push(props.next)`, navigating to the workspace/org URL.\n\n**7. Re-establishing identity on the next request — `getSessionPrincipal()` (`src/lib/session.ts`)**\nOn the subsequent navigation (a Server Component render), `getSessionToken()` reads the cookie back out of `cookies()`, then `getSessionPrincipal()` calls `resolveSession(token)` again (same hash-and-lookup as step 5) and additionally checks `principal.expiresAt` against `Date.now()` — this is literally \"how the app decides they are still signed in\": a valid, unexpired row keyed by the token's hash.\n\n**8. Bare identity → authorization — `[orgSlug]/layout.tsx`**\nThe dashboard layout (`src/app/(dashboard)/[orgSlug]/layout.tsx`) calls `getSessionPrincipal()`; if null it throws `UnauthorizedActionError`. It resolves the org by slug (`resolveOrgBySlug`), then turns the bare `SessionPrincipal` into a tenant-scoped `Actor` via `resolveActorForOrg(principal, orgSlug)` in `session-service.ts`. That function looks up the org, finds the user's membership row (`memberRepo.findMember`) and checks `status === \"active\"`, builds `{ userId, orgId, role }`, and calls `assertOrgScope(actor, org.id)` (`src/lib/tenant.ts`) as a final invariant check before touching `lastSeen`. A `SessionPrincipal` with no membership in that org yields `null` → `notFound()`.\n\n**9. Rendering the workspace**: with a real `Actor` in hand, the layout calls `snapshotFlags(buildFlagContext(actor, org))` for feature flags, `listProjects`, `listNotifications`, and `checkLimit` (all actor/org-scoped), then renders `OrgProvider` and `DashboardShell` (`src/app/(dashboard)/[orgSlug]/_components/`), passing `actor`, `org`, and `flags` down — this is what lets the sidebar and page tree render role-appropriate content and lets every Server Action further downstream call `getActor(orgSlug)` (`src/lib/actor.ts`) to redo steps 7–8 and get an authorization-ready `Actor`.\n\nIn short: password → `login()` verifies via scrypt → `createSessionToken()` mints a random token, stores only its SHA-256 hash in `sessions`, and hands the raw token to the browser as an httpOnly cookie → each later request rehashes the cookie value and looks it up (`resolveSession`/`getSessionPrincipal`), checking expiry → the per-org layout upgrades that bare `SessionPrincipal` into a tenant-scoped `Actor` via `resolveActorForOrg` (membership + `assertOrgScope`), which is the object every authorization check and the workspace UI actually consumes.",
+  "ttft_ms": 1177,
+  "type": "result",
+  "duration_ms": 32611,
+  "uuid": "a8af7fb4-539b-4465-ab6e-e7602e0decc1",
+  "ttft_stream_ms": 699,
+  "time_to_request_ms": 26,
+  "first_content_frame_ms": 699,
+  "queued_turn_count": 0,
+  "result_index": 0
+}
