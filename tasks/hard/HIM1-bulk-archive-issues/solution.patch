@@ -1,0 +1,156 @@
+--- a/src/schemas/issue.ts
++++ b/src/schemas/issue.ts
+@@ -70,6 +70,14 @@
+   issueId: issueIdSchema,
+ });
+ 
++/** Maximum number of issues one bulk archive request may name. */
++export const BULK_ARCHIVE_MAX_ISSUES = 50;
++
++export const bulkArchiveIssuesSchema = z.object({
++  orgId: orgIdSchema,
++  issueIds: z.array(issueIdSchema).min(1).max(BULK_ARCHIVE_MAX_ISSUES),
++});
++
+ export const issueFilterSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -108,3 +116,4 @@
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
++export type BulkArchiveIssuesInput = z.infer<typeof bulkArchiveIssuesSchema>;
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -70,6 +70,59 @@
+   return toIssue(row, (labels[row.id] ?? []).map((label) => label.id));
+ }
+ 
++/**
++ * Batched lookup by id within one org. Archived rows are included — callers
++ * decide what an archived row means for them. Ids from another org simply do
++ * not match.
++ */
++export async function findIssuesByIds(
++  orgId: OrgId,
++  issueIds: readonly IssueId[],
++): Promise<readonly Issue[]> {
++  if (issueIds.length === 0) return [];
++
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(orgPredicate(issues.orgId, orgId), inArray(issues.id, [...issueIds])),
++    )
++    .all();
++
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map((row) => row.id as IssueId),
++  );
++  return rows.map((row) =>
++    toIssue(row, (labels[row.id] ?? []).map((label) => label.id)),
++  );
++}
++
++/** Archives the given live issues of one org in a single statement. */
++export async function archiveIssuesByIds(
++  orgId: OrgId,
++  issueIds: readonly IssueId[],
++): Promise<readonly Issue[]> {
++  if (issueIds.length === 0) return [];
++
++  const rows = getDb()
++    .update(issues)
++    .set(archivePatch())
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          inArray(issues.id, [...issueIds]),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      ),
++    )
++    .returning()
++    .all();
++
++  return rows.map((row) => toIssue(row));
++}
++
+ export async function findIssueByNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -6,7 +6,7 @@
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { assertNotArchived, isArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -23,6 +23,7 @@
+ } from "./_support";
+ import type {
+   AssignIssueInput,
++  BulkArchiveIssuesInput,
+   ChangeIssueStatusInput,
+   CreateIssueInput,
+   IssueFilterInput,
+@@ -215,6 +216,52 @@
+ }
+ 
+ /**
++ * Archives many issues at once. Ids that are unknown in the org or already
++ * archived are skipped; every remaining issue must pass the same permission
++ * check as a single archive, otherwise nothing is archived at all.
++ */
++export async function bulkArchiveIssues(
++  actor: Actor,
++  input: BulkArchiveIssuesInput,
++): Promise<{ archived: readonly IssueId[]; skipped: readonly IssueId[] }> {
++  assertOrgScope(actor, input.orgId);
++
++  const requested = [...new Set(input.issueIds)];
++  const found = await issueRepo.findIssuesByIds(input.orgId, requested);
++  const byId = new Map(found.map((issue) => [issue.id, issue]));
++
++  const toArchive: Issue[] = [];
++  const skipped: IssueId[] = [];
++  for (const id of requested) {
++    const issue = byId.get(id);
++    if (issue === undefined || isArchived(issue)) {
++      skipped.push(id);
++      continue;
++    }
++    toArchive.push(issue);
++  }
++
++  for (const issue of toArchive) {
++    assertCan(actor, "issue:archive", issueResource(issue));
++  }
++
++  await issueRepo.archiveIssuesByIds(
++    input.orgId,
++    toArchive.map((issue) => issue.id),
++  );
++
++  for (const issue of toArchive) {
++    await emit("issue.archived", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++    });
++  }
++
++  return { archived: toArchive.map((issue) => issue.id), skipped };
++}
++
++/**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+  * `updated_at` — so a move is a status change plus a touch.
+  */

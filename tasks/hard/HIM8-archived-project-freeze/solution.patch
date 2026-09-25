@@ -1,0 +1,195 @@
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -22,7 +23,14 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issues,
++  projects,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -503,7 +511,10 @@
+   return rows.length;
+ }
+ 
+-/** Live, still-open issues whose due date has passed. Drives the overdue job. */
++/**
++ * Live, still-open issues whose due date has passed. Drives the overdue job.
++ * Issues of an archived project are frozen and never reported.
++ */
+ export async function listOverdueIssues(
+   orgId: OrgId,
+   now: IsoTimestamp,
+@@ -519,6 +530,18 @@
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
++          notInArray(
++            issues.projectId,
++            getDb()
++              .select({ id: projects.id })
++              .from(projects)
++              .where(
++                and(
++                  orgPredicate(projects.orgId, orgId),
++                  isNotNull(projects.archivedAt),
++                ),
++              ),
++          ),
+         ),
+       ),
+     )
+diff --git a/src/server/services/attachment-service.ts b/src/server/services/attachment-service.ts
+--- a/src/server/services/attachment-service.ts
++++ b/src/server/services/attachment-service.ts
+@@ -11,6 +11,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { issueResource, requireFound } from "./_support";
++import { assertProjectNotArchived } from "./issue-service";
+ import type {
+   CreateAttachmentInput,
+   DeleteAttachmentInput,
+@@ -56,6 +57,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertProjectNotArchived(issue.orgId, issue.projectId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -102,6 +104,7 @@
+     attachment.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertProjectNotArchived(issue.orgId, issue.projectId);
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -18,6 +18,7 @@
+   issueResource,
+   requireFound,
+ } from "./_support";
++import { assertProjectNotArchived } from "./issue-service";
+ import type {
+   CreateCommentInput,
+   DeleteCommentInput,
+@@ -55,6 +56,7 @@
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertProjectNotArchived(issue.orgId, issue.projectId);
+ 
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+@@ -102,6 +104,7 @@
+   );
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++  await assertIssueWritable(comment);
+ 
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+     throw new Error("The edit window for this comment has closed");
+@@ -128,6 +131,7 @@
+   );
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++  await assertIssueWritable(comment);
+ 
+   const { archivedAt } = archivePatch();
+   const archived = await commentRepo.archiveComment(
+@@ -160,6 +164,16 @@
+   assertCan(actor, "comment:read", issueResource(issue));
+ 
+   return commentRepo.listThread(orgId, issueId);
++}
++
++/** Comment edits follow the freeze of the issue's project. */
++async function assertIssueWritable(comment: Comment): Promise<void> {
++  const issue = requireFound(
++    await issueRepo.findIssueById(comment.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  await assertProjectNotArchived(issue.orgId, issue.projectId);
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -34,6 +34,22 @@
+ import type { Actor } from "@/types/member";
+ 
+ /**
++ * An archived project freezes its issues (and their comments): every write is
++ * refused as a conflict until the project is restored. Reads stay available.
++ */
++export async function assertProjectNotArchived(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++}
++
++/**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+  * Only then is a number allocated and `issue.created` published — everything
+@@ -93,6 +109,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectNotArchived(before.orgId, before.projectId);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -122,6 +139,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectNotArchived(before.orgId, before.projectId);
+ 
+   if (before.status === input.status) return before;
+ 
+@@ -160,6 +178,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectNotArchived(before.orgId, before.projectId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -202,6 +221,7 @@
+   );
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertProjectNotArchived(issue.orgId, issue.projectId);
+ 
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
+ 

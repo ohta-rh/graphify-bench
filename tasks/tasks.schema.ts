@@ -11,6 +11,7 @@ export const CategorySchema = z.enum([
   "explain", // 3: architecture explanation
   "impact", // 4: impact analysis
   "fix", // 5: small bug fix
+  "implement", // hard set: build a specified feature, graded by hidden tests
   // 6: doc-vs-code contradiction detection. Introduced with the documentation
   // layer (corpus-v2): the answer is the set of DOCUMENT paths whose stated
   // behaviour the frozen code does not implement. Graded `set-f1` like the other
@@ -42,6 +43,14 @@ export const TaskSchema = z
     spec: z.string().optional(),
     /** Patch applied to the run dir before the agent starts, relative to `tasks/`. */
     patch: z.string().optional(),
+    /**
+     * Hidden test files, copied into the run dir only AFTER the agent has
+     * finished and immediately before `spec` runs. `from` is relative to
+     * `tasks/`, `to` is corpus-relative; an existing file at `to` (including one
+     * the agent wrote) is overwritten, so the agent can neither see nor shape
+     * the test it is graded by.
+     */
+    hidden: z.array(z.object({ from: z.string().min(1), to: z.string().min(1) })).optional(),
     /** F1 threshold counted as success for `set-f1`. */
     success_threshold: z.number().min(0).max(1).default(0.9),
     /** Score (0..1) counted as success for `llm-judge`. */
@@ -57,6 +66,9 @@ export const TaskSchema = z
     }
     if (task.grader === "llm-judge" && !task.key) {
       ctx.addIssue({ code: "custom", message: `task ${task.id}: grader "llm-judge" requires "key"` });
+    }
+    if (task.hidden && task.grader !== "vitest") {
+      ctx.addIssue({ code: "custom", message: `task ${task.id}: "hidden" is only meaningful for grader "vitest"` });
     }
     if (task.grader === "vitest" && !task.spec) {
       ctx.addIssue({ code: "custom", message: `task ${task.id}: grader "vitest" requires "spec"` });

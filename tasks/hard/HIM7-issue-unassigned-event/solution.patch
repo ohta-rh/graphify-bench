@@ -1,0 +1,296 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -18,6 +18,7 @@
+   "issue.updated": "updated an issue",
+   "issue.status_changed": "changed status",
+   "issue.assigned": "assigned an issue",
++  "issue.unassigned": "unassigned an issue",
+   "issue.archived": "archived an issue",
+   "issue.restored": "restored an issue",
+   "comment.created": "commented",
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -40,6 +40,7 @@
+ 
+ const KIND_LABELS: Readonly<Record<NotificationKind, string>> = {
+   issue_assigned: "Issue assigned to me",
++  issue_unassigned: "Unassigned from an issue",
+   issue_status_changed: "Issue status changed",
+   issue_due_soon: "Issue due soon",
+   issue_overdue: "Issue overdue",
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -17,6 +17,7 @@
+   "issue.updated",
+   "issue.status_changed",
+   "issue.assigned",
++  "issue.unassigned",
+   "issue.archived",
+   "issue.restored",
+   "comment.created",
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -9,6 +9,7 @@
+ 
+ export const notificationKindSchema = z.enum([
+   "issue_assigned",
++  "issue_unassigned",
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
+diff --git a/src/schemas/webhook.ts b/src/schemas/webhook.ts
+--- a/src/schemas/webhook.ts
++++ b/src/schemas/webhook.ts
+@@ -6,6 +6,7 @@
+   "issue.updated",
+   "issue.status_changed",
+   "issue.assigned",
++  "issue.unassigned",
+   "comment.created",
+   "member.joined",
+   "project.created",
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -3,6 +3,7 @@
+ 
+ const NOTIFICATION_KINDS = [
+   "issue_assigned",
++  "issue_unassigned",
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -450,6 +450,29 @@
+   return toIssue(row);
+ }
+ 
++/** Live issues currently assigned to `userId`, oldest first. */
++export async function listLiveIssuesAssignedTo(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          livePredicate(issues.archivedAt, {}),
++          eq(issues.assigneeId, userId),
++        ),
++      ),
++    )
++    .orderBy(issues.createdAt, issues.id)
++    .all();
++
++  return rows.map((row) => toIssue(row));
++}
++
+ export async function archiveIssue(
+   orgId: OrgId,
+   issueId: IssueId,
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -195,6 +195,15 @@
+         summary: `Assigned to ${payload.assigneeId}`,
+       }).then(() => undefined),
+     ),
++    subscribe("issue.unassigned", (payload) =>
++      record(payload.orgId, "issue.unassigned", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: `Unassigned ${payload.previousAssigneeId}`,
++      }).then(() => undefined),
++    ),
+     subscribe("comment.created", (payload) =>
+       record(payload.orgId, "comment.created", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -144,8 +144,9 @@
+ 
+ /**
+  * Assignment has its own permission because a member may reassign work they
+- * do not otherwise own. Un-assigning publishes `issue.updated` instead, since
+- * `issue.assigned` carries a non-null assignee by contract.
++ * do not otherwise own. Un-assigning publishes `issue.unassigned` instead,
++ * since `issue.assigned` carries a non-null assignee by contract; clearing an
++ * issue that had no assignee publishes nothing.
+  */
+ export async function assignIssue(
+   actor: Actor,
+@@ -168,12 +169,14 @@
+   );
+ 
+   if (input.assigneeId === null) {
+-    await emit("issue.updated", {
+-      ...actorEnvelope(actor),
+-      issueId: after.id,
+-      projectId: after.projectId,
+-      changedFields: ["assigneeId"],
+-    });
++    if (before.assigneeId !== null) {
++      await emit("issue.unassigned", {
++        ...actorEnvelope(actor),
++        issueId: after.id,
++        projectId: after.projectId,
++        previousAssigneeId: before.assigneeId,
++      });
++    }
+     return after;
+   }
+ 
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+@@ -95,6 +96,20 @@
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
+ 
++  // A former member cannot keep work: their live issues are released.
++  for (const issue of await issueRepo.listLiveIssuesAssignedTo(
++    input.orgId,
++    removed.userId,
++  )) {
++    await issueRepo.setIssueAssignee(input.orgId, issue.id, null);
++    await emit("issue.unassigned", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++      previousAssigneeId: removed.userId,
++    });
++  }
++
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+     memberId: removed.id,
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -190,6 +190,20 @@
+     });
+   });
+ 
++  subscribe("issue.unassigned", async (payload) => {
++    await notify(
++      payload.orgId,
++      "issue_unassigned",
++      [payload.previousAssigneeId],
++      {
++        title: "You were unassigned from an issue",
++        body: `Issue ${payload.issueId} is no longer assigned to you`,
++        href: `/issues/${payload.issueId}`,
++        actorId: payload.actorId,
++      },
++    );
++  });
++
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+     await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+diff --git a/src/server/services/webhook-service.ts b/src/server/services/webhook-service.ts
+--- a/src/server/services/webhook-service.ts
++++ b/src/server/services/webhook-service.ts
+@@ -110,6 +110,13 @@
+     subscribe("issue.created", async (payload) => {
+       await enqueueForOrg(payload.orgId, "issue.created", JSON.stringify(payload));
+     }),
++    subscribe("issue.unassigned", async (payload) => {
++      await enqueueForOrg(
++        payload.orgId,
++        "issue.unassigned",
++        JSON.stringify(payload),
++      );
++    }),
+     subscribe("issue.status_changed", async (payload) => {
+       await enqueueForOrg(
+         payload.orgId,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -18,6 +18,7 @@
+   | "issue.updated"
+   | "issue.status_changed"
+   | "issue.assigned"
++  | "issue.unassigned"
+   | "issue.archived"
+   | "issue.restored"
+   | "comment.created"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -60,6 +60,11 @@
+     previousAssigneeId: UserId | null;
+     assigneeId: UserId;
+   };
++  "issue.unassigned": EventEnvelope & {
++    issueId: IssueId;
++    projectId: ProjectId;
++    previousAssigneeId: UserId;
++  };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -8,6 +8,7 @@
+ 
+ export type NotificationKind =
+   | "issue_assigned"
++  | "issue_unassigned"
+   | "issue_status_changed"
+   | "issue_due_soon"
+   | "issue_overdue"
+diff --git a/tests/server/domain-events.test.ts b/tests/server/domain-events.test.ts
+--- a/tests/server/domain-events.test.ts
++++ b/tests/server/domain-events.test.ts
+@@ -144,7 +144,7 @@
+     });
+   });
+ 
+-  it("falls back to issue.updated when the issue is un-assigned", async () => {
++  it("publishes issue.unassigned when the issue is un-assigned", async () => {
+     const issue = await issueService.createIssue(
+       tenant.actors.member,
+       issueInput(tenant.org.id, tenant.project.id, {
+@@ -154,7 +154,7 @@
+     );
+ 
+     const assigned = capture("issue.assigned");
+-    const updated = capture("issue.updated");
++    const unassigned = capture("issue.unassigned");
+ 
+     await issueService.assignIssue(tenant.actors.member, {
+       orgId: tenant.org.id,
+@@ -163,8 +163,8 @@
+     });
+ 
+     expect(assigned).toHaveLength(0);
+-    expect(updated).toHaveLength(1);
+-    expect(updated[0]?.changedFields).toEqual(["assigneeId"]);
++    expect(unassigned).toHaveLength(1);
++    expect(unassigned[0]?.previousAssigneeId).toBe(tenant.userIds.admin);
+   });
+ });
+ 

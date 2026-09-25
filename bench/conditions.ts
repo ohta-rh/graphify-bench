@@ -118,6 +118,9 @@ export interface ConditionSpec {
 /** The exact Haiku model id used for the weak-explorer arms. */
 export const HAIKU_MODEL = "claude-haiku-4-5";
 
+/** The exact Opus model id used for the model-swap arms. */
+export const OPUS_MODEL = "claude-opus-5-5";
+
 /**
  * The built-in tools the `lean-tools` family leaves in the request.
  *
@@ -535,6 +538,24 @@ export const CONDITIONS: readonly ConditionSpec[] = [
       "allowlist and the turn-economy CLAUDE.md. Like `haiku-nosub` it declares no `--effort`, because " +
       "Haiku ignores it. The arm answers whether the levers still compose once the model itself is the " +
       "variable being cut.",
+  },
+  {
+    name: "opus-effort-medium",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: OPUS_MODEL,
+    effort: "medium",
+    note:
+      "`effort-medium` with one change: the model is Opus 5.5 instead of the harness default Sonnet 5. " +
+      "Overlay, effort and flags are identical, so the pair isolates the model at a fixed effort.",
+  },
+  {
+    name: "opus-effort-low",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: OPUS_MODEL,
+    effort: "low",
+    note: "As `opus-effort-medium`, one notch down: `effort-low` on Opus 5.5.",
   },
 ] as const;
 

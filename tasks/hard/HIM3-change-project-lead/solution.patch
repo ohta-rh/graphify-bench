@@ -1,0 +1,114 @@
+--- a/src/lib/permissions.ts
++++ b/src/lib/permissions.ts
+@@ -36,6 +36,7 @@
+   "project:read": "viewer",
+   "project:update": "member",
+   "project:archive": "admin",
++  "project:change_lead": "admin",
+   "project:delete": "owner",
+   "issue:create": "member",
+   "issue:read": "viewer",
+@@ -56,6 +57,7 @@
+ 
+ /** Actions an actor may perform on their own content regardless of role rank. */
+ const OWNERSHIP_ESCALATIONS: Readonly<Partial<Record<PermissionAction, true>>> = {
++  "project:change_lead": true,
+   "issue:update": true,
+   "issue:archive": true,
+   "comment:update": true,
+--- a/src/schemas/project.ts
++++ b/src/schemas/project.ts
+@@ -43,6 +43,13 @@
+   archiveIssues: z.boolean().default(true),
+ });
+ 
++/** Hands the project lead to another member, or clears it with `null`. */
++export const changeProjectLeadSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  leadId: userIdSchema.nullable(),
++});
++
+ export const listProjectsSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -56,3 +63,4 @@
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
++export type ChangeProjectLeadInput = z.infer<typeof changeProjectLeadSchema>;
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -10,6 +10,7 @@
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+@@ -20,6 +21,7 @@
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
++  ChangeProjectLeadInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+@@ -89,6 +91,46 @@
+ }
+ 
+ /**
++ * Hands the project lead to someone else. Admins may always do it; the
++ * current lead may hand over their own project. The new lead must be a live,
++ * active member who would themselves be allowed to update the project.
++ */
++export async function changeProjectLead(
++  actor: Actor,
++  input: ChangeProjectLeadInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:change_lead", projectResource(project));
++  assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== null) {
++    const member = await memberRepo.findMember(input.orgId, input.leadId);
++    const lead = requireFound(
++      member !== null && member.status === "active" ? member : null,
++      "Member",
++      input.leadId,
++    );
++    assertCan(
++      { userId: lead.userId, orgId: lead.orgId, role: lead.role },
++      "project:update",
++      projectResource(project),
++    );
++  }
++
++  return projectRepo.updateProject({
++    orgId: input.orgId,
++    projectId: input.projectId,
++    leadId: input.leadId,
++  });
++}
++
++/**
+  * Archiving a project cascades to its issues by default — leaving live issues
+  * behind an archived project is the drift this flag exists to prevent.
+  */
+--- a/src/types/permission.ts
++++ b/src/types/permission.ts
+@@ -28,6 +28,7 @@
+   | "project:read"
+   | "project:update"
+   | "project:archive"
++  | "project:change_lead"
+   | "project:delete"
+   | "issue:create"
+   | "issue:read"

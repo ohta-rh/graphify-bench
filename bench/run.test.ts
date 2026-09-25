@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { mcpToolsFromTranscript, provisionMcp } from "./run.js";
+import { installHidden, mcpToolsFromTranscript, provisionMcp } from "./run.js";
 import type { ConditionSpec } from "./conditions.js";
 
 const temps: string[] = [];
@@ -166,5 +166,28 @@ describe("mcpToolsFromTranscript", () => {
   it("survives a malformed line rather than losing the whole transcript", () => {
     const jsonl = ["{not json", line({ attachment: { addedNames: ["mcp__mempalace__x"] } })].join("\n");
     expect(mcpToolsFromTranscript(jsonl, "mcp__mempalace__").count).toBe(1);
+  });
+});
+
+describe("installHidden", () => {
+  it("overwrites an agent-written file at the target and refuses paths that escape", () => {
+    const tasksDir = fs.mkdtempSync(path.join(os.tmpdir(), "hidden-tasks-"));
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "hidden-run-"));
+    try {
+      fs.mkdirSync(path.join(tasksDir, "hard"), { recursive: true });
+      fs.writeFileSync(path.join(tasksDir, "hard", "h.test.ts"), "real");
+      fs.mkdirSync(path.join(runDir, "tests", "hidden"), { recursive: true });
+      fs.writeFileSync(path.join(runDir, "tests", "hidden", "h.test.ts"), "agent wrote this");
+      expect(installHidden([{ from: "hard/h.test.ts", to: "tests/hidden/h.test.ts" }], tasksDir, runDir)).toEqual([
+        "tests/hidden/h.test.ts",
+      ]);
+      expect(fs.readFileSync(path.join(runDir, "tests", "hidden", "h.test.ts"), "utf8")).toBe("real");
+      expect(() => installHidden([{ from: "hard/h.test.ts", to: "../escape.test.ts" }], tasksDir, runDir)).toThrow(
+        /escapes/,
+      );
+    } finally {
+      fs.rmSync(tasksDir, { recursive: true, force: true });
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
   });
 });

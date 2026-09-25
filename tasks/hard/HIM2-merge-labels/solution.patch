@@ -1,0 +1,145 @@
+--- a/src/schemas/label.ts
++++ b/src/schemas/label.ts
+@@ -21,5 +21,18 @@
+   labelId: labelIdSchema,
+ });
+ 
++/** Folds one label into another: every use of the source becomes the target. */
++export const mergeLabelsSchema = z
++  .object({
++    orgId: orgIdSchema,
++    sourceLabelId: labelIdSchema,
++    targetLabelId: labelIdSchema,
++  })
++  .refine((value) => value.sourceLabelId !== value.targetLabelId, {
++    message: "A label cannot be merged into itself",
++    path: ["targetLabelId"],
++  });
++
+ export type CreateLabelInput = z.infer<typeof createLabelSchema>;
+ export type UpdateLabelInput = z.infer<typeof updateLabelSchema>;
++export type MergeLabelsInput = z.infer<typeof mergeLabelsSchema>;
+--- a/src/server/repositories/label-repository.ts
++++ b/src/server/repositories/label-repository.ts
+@@ -86,6 +86,66 @@
+     .run();
+ }
+ 
++export async function findLabelById(
++  orgId: OrgId,
++  labelId: LabelId,
++): Promise<IssueLabel | null> {
++  const row = getDb()
++    .select()
++    .from(labels)
++    .where(and(orgPredicate(labels.orgId, orgId), eq(labels.id, labelId)))
++    .get();
++  return row ? toLabel(row) : null;
++}
++
++/**
++ * Moves every issue carrying `sourceId` onto `targetId` (issues that already
++ * carry both keep a single target row), then removes the source label. Works
++ * on the join table directly, so archived issues are relabelled too. Returns
++ * the number of issues that carried the source label.
++ */
++export async function mergeLabelInto(
++  orgId: OrgId,
++  sourceId: LabelId,
++  targetId: LabelId,
++): Promise<number> {
++  const db = getDb();
++  return db.transaction((tx) => {
++    const carrying = tx
++      .select({ issueId: issueLabels.issueId })
++      .from(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, orgId),
++          eq(issueLabels.labelId, sourceId),
++        ),
++      )
++      .all()
++      .map((row) => row.issueId);
++
++    if (carrying.length > 0) {
++      tx.insert(issueLabels)
++        .values(carrying.map((issueId) => ({ orgId, issueId, labelId: targetId })))
++        .onConflictDoNothing()
++        .run();
++    }
++
++    tx.delete(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, orgId),
++          eq(issueLabels.labelId, sourceId),
++        ),
++      )
++      .run();
++    tx.delete(labels)
++      .where(and(orgPredicate(labels.orgId, orgId), eq(labels.id, sourceId)))
++      .run();
++
++    return carrying.length;
++  });
++}
++
+ /** Replaces the whole label set of one issue in a single round trip. */
+ export async function setIssueLabels(
+   orgId: OrgId,
+--- a/src/server/services/label-service.ts
++++ b/src/server/services/label-service.ts
+@@ -6,8 +6,13 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as labelRepo from "@/server/repositories/label-repository";
+-import { orgResource } from "./_support";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import { mergeLabelsSchema } from "@/schemas/label";
++import { orgResource, requireFound } from "./_support";
++import type {
++  CreateLabelInput,
++  MergeLabelsInput,
++  UpdateLabelInput,
++} from "@/schemas/label";
+ import type { LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -59,3 +64,36 @@
+   assertCan(actor, "project:archive", orgResource(orgId));
+   await labelRepo.deleteLabel(orgId, labelId);
+ }
++
++/**
++ * Merges the source label into the target: every issue (archived ones
++ * included) that carried the source now carries the target exactly once, and
++ * the source label is gone. Same blast radius as a delete, so same permission.
++ */
++export async function mergeLabels(
++  actor: Actor,
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number }> {
++  const parsed = mergeLabelsSchema.parse(input);
++  assertOrgScope(actor, parsed.orgId);
++  assertCan(actor, "project:archive", orgResource(parsed.orgId));
++
++  requireFound(
++    await labelRepo.findLabelById(parsed.orgId, parsed.sourceLabelId),
++    "Label",
++    parsed.sourceLabelId,
++  );
++  const target = requireFound(
++    await labelRepo.findLabelById(parsed.orgId, parsed.targetLabelId),
++    "Label",
++    parsed.targetLabelId,
++  );
++
++  const issuesRelabelled = await labelRepo.mergeLabelInto(
++    parsed.orgId,
++    parsed.sourceLabelId,
++    parsed.targetLabelId,
++  );
++
++  return { label: target, issuesRelabelled };
++}

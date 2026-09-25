@@ -1,0 +1,333 @@
+diff --git a/src/actions/members/invite-member.ts b/src/actions/members/invite-member.ts
+--- a/src/actions/members/invite-member.ts
++++ b/src/actions/members/invite-member.ts
+@@ -26,6 +26,7 @@
+ import { inviteMember } from "@/server/services/invitation-service";
+ import { getOrganizationSummary } from "@/server/services/organization-service";
+ import type { ActionResult } from "@/types/api";
++import { isBillableRole } from "@/types/member";
+ import type { Invitation } from "@/types/member";
+ 
+ const INVITE_BUCKET = "member:invite";
+@@ -53,7 +54,7 @@
+ 
+     const summary = await getOrganizationSummary(actor, input.orgId);
+     const limits = getPlanLimits(summary.organization.plan);
+-    if (summary.usage.seatsUsed + 1 > limits.seats) {
++    if (isBillableRole(input.role) && summary.usage.seatsUsed + 1 > limits.seats) {
+       throw new PlanLimitError("seats", limits.seats, summary.usage.seatsUsed);
+     }
+ 
+diff --git a/src/server/repositories/invitation-repository.ts b/src/server/repositories/invitation-repository.ts
+--- a/src/server/repositories/invitation-repository.ts
++++ b/src/server/repositories/invitation-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * Pending invitations, keyed by token hash for the unauthenticated accept flow.
+  */
+-import { and, count, desc, eq, isNull } from "drizzle-orm";
++import { and, count, desc, eq, isNull, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, invitations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -137,3 +137,22 @@
+     .get();
+   return row?.value ?? 0;
+ }
++
++/** Pending invitations that will occupy a paid seat once accepted. */
++export async function countBillablePendingInvitations(
++  orgId: OrgId,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(invitations)
++    .where(
++      and(
++        orgPredicate(invitations.orgId, orgId),
++        isNull(invitations.acceptedAt),
++        isNull(invitations.revokedAt),
++        ne(invitations.role, "viewer"),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
+diff --git a/src/server/repositories/member-repository.ts b/src/server/repositories/member-repository.ts
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, isNull, like, ne, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -109,6 +109,23 @@
+       and(
+         orgPredicate(members.orgId, orgId),
+         eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Active members holding a paid seat — every role except `viewer`. */
++export async function countBillableMembers(orgId: OrgId): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.status, "active"),
++        ne(members.role, "viewer"),
+         liveMemberPredicate(),
+       ),
+     )
+diff --git a/src/server/repositories/usage-repository.ts b/src/server/repositories/usage-repository.ts
+--- a/src/server/repositories/usage-repository.ts
++++ b/src/server/repositories/usage-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, isNull, ne, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -56,6 +56,7 @@
+       and(
+         eq(members.orgId, orgId),
+         eq(members.status, "active"),
++        ne(members.role, "viewer"),
+         isNull(members.archivedAt),
+       ),
+     )
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -16,7 +16,8 @@
+ import { envelope, orgResource, requireFound } from "./_support";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+-import type { InvitationId, UserId } from "@/types/common";
++import { isBillableRole } from "@/types/member";
++import type { InvitationId, OrgId, UserId } from "@/types/common";
+ import type { Actor, Invitation, Member } from "@/types/member";
+ 
+ /** Token bucket protecting the invite mailer from being used as a spam relay. */
+@@ -67,12 +68,16 @@
+     input.orgId,
+   );
+ 
+-  const seatsUsed =
+-    (await memberRepo.countActiveMembers(input.orgId)) +
+-    (await invitationRepo.countPendingInvitations(input.orgId));
++  // Viewers are free: only billable invites ask for a seat, and only billable
++  // members and pending invitations are counted as occupying one.
++  const seatsRequested = input.invites.filter((invite) =>
++    isBillableRole(invite.role),
++  ).length;
++  const seatsUsed = await countOccupiedSeats(input.orgId);
+ 
+   if (
+-    wouldExceedLimit(org.plan, "seats", seatsUsed, input.invites.length)
++    seatsRequested > 0 &&
++    wouldExceedLimit(org.plan, "seats", seatsUsed, seatsRequested)
+   ) {
+     const limits = getPlanLimits(org.plan);
+     throw new Error(
+@@ -195,3 +200,14 @@
+     role: previous.role === "owner" ? "admin" : previous.role,
+   });
+ }
++
++/**
++ * Seats currently spoken for: billable active members plus billable pending
++ * invitations. Shared with the role-change path so both agree on the number.
++ */
++export async function countOccupiedSeats(orgId: OrgId): Promise<number> {
++  return (
++    (await memberRepo.countBillableMembers(orgId)) +
++    (await invitationRepo.countBillablePendingInvitations(orgId))
++  );
++}
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -3,11 +3,14 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, hasRoleAtLeast
+  */
++import { getPlanLimits, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+-import { hasRoleAtLeast } from "@/types/member";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import { hasRoleAtLeast, isBillableRole } from "@/types/member";
++import { countOccupiedSeats } from "./invitation-service";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+@@ -58,6 +61,21 @@
+ 
+   await assertLastOwnerRetained(input.orgId, input.memberId, input.role);
+ 
++  // Promoting a free viewer into a billable role takes a seat.
++  if (!isBillableRole(member.role) && isBillableRole(input.role)) {
++    const org = requireFound(
++      await orgRepo.findOrgById(input.orgId),
++      "Organization",
++      input.orgId,
++    );
++    const seatsUsed = await countOccupiedSeats(input.orgId);
++    if (wouldExceedLimit(org.plan, "seats", seatsUsed, 1)) {
++      throw new Error(
++        `Plan ${org.plan} includes ${getPlanLimits(org.plan).seats} seats and ${seatsUsed} are taken`,
++      );
++    }
++  }
++
+   const updated = await memberRepo.updateMemberRole(
+     input.orgId,
+     input.memberId,
+@@ -99,6 +117,7 @@
+     ...actorEnvelope(actor),
+     memberId: removed.id,
+     userId: removed.userId,
++    role: member.role,
+   });
+ 
+   return removed;
+diff --git a/src/server/services/usage-service.ts b/src/server/services/usage-service.ts
+--- a/src/server/services/usage-service.ts
++++ b/src/server/services/usage-service.ts
+@@ -11,6 +11,7 @@
+ import { toIsoTimestamp } from "@/types/common";
+ import type { OrgId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
++import { isBillableRole } from "@/types/member";
+ import type { Actor } from "@/types/member";
+ import type { OrganizationUsage } from "@/types/organization";
+ 
+@@ -86,10 +87,19 @@
+         issuesUsed: -payload.issuesArchived,
+       });
+     }),
++    // Only billable roles occupy a seat; viewers are free.
+     subscribe("member.joined", async (payload) => {
++      if (!isBillableRole(payload.role)) return;
+       await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
+     }),
++    subscribe("member.role_changed", async (payload) => {
++      const delta =
++        Number(isBillableRole(payload.to)) - Number(isBillableRole(payload.from));
++      if (delta === 0) return;
++      await usageRepo.incrementUsage(payload.orgId, { seatsUsed: delta });
++    }),
+     subscribe("member.removed", async (payload) => {
++      if (!isBillableRole(payload.role)) return;
+       await usageRepo.incrementUsage(payload.orgId, { seatsUsed: -1 });
+     }),
+   ];
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -80,7 +80,11 @@
+     from: Role;
+     to: Role;
+   };
+-  "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.removed": EventEnvelope & {
++    memberId: MemberId;
++    userId: UserId;
++    role: Role;
++  };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+diff --git a/src/types/member.ts b/src/types/member.ts
+--- a/src/types/member.ts
++++ b/src/types/member.ts
+@@ -83,6 +83,14 @@
+   readonly expiresAt: IsoTimestamp;
+ }
+ 
++/**
++ * True when a member (or pending invitation) holding `role` occupies a paid
++ * seat. Viewers are free: they never count against the plan's `seats` quota.
++ */
++export function isBillableRole(role: Role): boolean {
++  return role !== "viewer";
++}
++
+ /** True when `role` is at least as privileged as `atLeast`. */
+ export function hasRoleAtLeast(role: Role, atLeast: Role): boolean {
+   return ROLE_RANK[role] >= ROLE_RANK[atLeast];
+diff --git a/tests/server/jobs.test.ts b/tests/server/jobs.test.ts
+--- a/tests/server/jobs.test.ts
++++ b/tests/server/jobs.test.ts
+@@ -189,7 +189,8 @@
+     });
+ 
+     expect(usage.issuesUsed).toBe(live.total);
+-    expect(usage.seatsUsed).toBe(4);
++    // Four members, but the viewer does not occupy a seat.
++    expect(usage.seatsUsed).toBe(3);
+   });
+ });
+ 
+diff --git a/tests/server/plan-limits.test.ts b/tests/server/plan-limits.test.ts
+--- a/tests/server/plan-limits.test.ts
++++ b/tests/server/plan-limits.test.ts
+@@ -26,7 +26,7 @@
+ import type { Tenant } from "./_support/fixtures";
+ 
+ let cleanup: () => void;
+-/** Free plan: 3 seats, 2 projects. The fixture seeds four members. */
++/** Free plan: 3 seats, 2 projects. The fixture seeds four members, three billable. */
+ let free: Tenant;
+ let growth: Tenant;
+ 
+@@ -154,7 +154,7 @@
+       resource: "seats",
+       plan: "free",
+       limit: 3,
+-      used: 4,
++      used: 3,
+       remaining: 0,
+       exceeded: true,
+     });
+diff --git a/tests/services/invitation-service.test.ts b/tests/services/invitation-service.test.ts
+--- a/tests/services/invitation-service.test.ts
++++ b/tests/services/invitation-service.test.ts
+@@ -68,9 +68,9 @@
+   it("checks the seat quota once for a bulk invite", async () => {
+     const tenant = await createTenant("invite-bulk-quota", "starter");
+ 
+-    // Bring the org to 9 of its 10 starter seats: 4 from createTenant, 5 more
+-    // inserted directly so only a single seat remains.
+-    for (let i = 0; i < 5; i += 1) {
++    // Bring the org to 9 of its 10 starter seats: 3 billable from createTenant
++    // (the viewer is free), 6 more inserted directly so one seat remains.
++    for (let i = 0; i < 6; i += 1) {
+       const user = await userRepo.insertUser({
+         email: `filler${i}@invite-bulk-quota.test`,
+         name: `Filler ${i}`,
+@@ -78,7 +78,7 @@
+       });
+       await memberRepo.insertMember(tenant.org.id, user.id, "member", null);
+     }
+-    await expect(memberRepo.countActiveMembers(tenant.org.id)).resolves.toBe(9);
++    await expect(memberRepo.countActiveMembers(tenant.org.id)).resolves.toBe(10);
+ 
+     // A batch of two exceeds the one remaining seat; the check runs once for
+     // the whole batch, so nothing is created — not even the first invite.

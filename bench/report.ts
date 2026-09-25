@@ -453,15 +453,22 @@ export function speedBlock(rows: RunRow[]): string[] {
       "rows as an order of magnitude only.\n",
   );
   out.push("Session timings, median (IQR) in ms:\n");
-  out.push("| condition | runs | wall `duration_ms` | API `duration_api_ms` | `ttft_ms` | pre-request `time_to_request_ms` |");
-  out.push("|---|---|---|---|---|---|");
+  out.push(
+    "| condition | runs | process wall `claude.wall_ms` | wall `duration_ms` | API `duration_api_ms` | `ttft_ms` | pre-request `time_to_request_ms` |",
+  );
+  out.push("|---|---|---|---|---|---|---|");
   for (const s of summaries) {
     out.push(
-      `| \`${s.condition}\` | ${s.runs} | ${spreadCell(s.duration_ms)} | ${spreadCell(s.duration_api_ms)} | ` +
+      `| \`${s.condition}\` | ${s.runs} | ${spreadCell(s.process_wall_ms)} | ${spreadCell(s.duration_ms)} | ${spreadCell(s.duration_api_ms)} | ` +
         `${spreadCell(s.ttft_ms)} | ${spreadCell(s.time_to_request_ms)} |`,
     );
   }
   out.push("");
+  out.push(
+    "`claude.wall_ms` is the whole `claude -p` process as the harness timed it. Prefer it over " +
+      "`duration_ms` when an arm delegates: from Claude Code 2.1.28x the `Agent` tool runs in the " +
+      "background and `duration_ms` stops before the subagent's work is folded back in.\n",
+  );
   out.push(
     "`time_to_request_ms` covers everything before the first API request, which is where **MCP server " +
       "startup lands**: it is the only column in which an arm that must spawn and handshake with a server " +

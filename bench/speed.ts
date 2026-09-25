@@ -141,6 +141,15 @@ export function mcpAnnounceDelayMs(jsonl: string, prefix: string): number | null
 
 /** Session-level timings, straight from the run's own `result.json`. */
 export interface RunSpeed {
+  /**
+   * Wall-clock of the whole `claude -p` process, from `run.meta.json`
+   * (`claude.wall_ms`). Unlike `duration_ms` it includes time spent waiting on a
+   * background subagent: from Claude Code 2.1.28x `Agent` launches
+   * asynchronously and `result.json`'s `duration_ms` stops before the
+   * subagent's work is folded back in, so on a delegating run it can read a
+   * third of the real latency.
+   */
+  process_wall_ms: number | null;
   duration_ms: number | null;
   duration_api_ms: number | null;
   ttft_ms: number | null;
@@ -170,6 +179,15 @@ export function speedForRun(runDir: string, mcpPrefix = "mcp__mempalace__"): Run
   } catch {
     result = null;
   }
+  let processWall: number | null = null;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(runDir, "run.meta.json"), "utf8")) as {
+      claude?: { wall_ms?: unknown };
+    };
+    processWall = num(meta.claude?.wall_ms);
+  } catch {
+    processWall = null;
+  }
   const transcriptFile = path.join(runDir, "transcript.jsonl");
   let jsonl = "";
   try {
@@ -178,6 +196,7 @@ export function speedForRun(runDir: string, mcpPrefix = "mcp__mempalace__"): Run
     jsonl = "";
   }
   return {
+    process_wall_ms: processWall,
     duration_ms: num(result?.duration_ms),
     duration_api_ms: num(result?.duration_api_ms),
     ttft_ms: num((result as Record<string, unknown> | null)?.ttft_ms),
@@ -201,6 +220,7 @@ export function spread(xs: readonly number[]): Spread {
 export interface ConditionSpeed {
   condition: string;
   runs: number;
+  process_wall_ms: Spread;
   duration_ms: Spread;
   duration_api_ms: Spread;
   ttft_ms: Spread;
@@ -233,6 +253,7 @@ export function summarizeSpeed(runs: Array<{ condition: string; speed: RunSpeed 
       return {
         condition,
         runs: list.length,
+        process_wall_ms: spread(defined(list.map((s) => s.process_wall_ms))),
         duration_ms: spread(defined(list.map((s) => s.duration_ms))),
         duration_api_ms: spread(defined(list.map((s) => s.duration_api_ms))),
         ttft_ms: spread(defined(list.map((s) => s.ttft_ms))),

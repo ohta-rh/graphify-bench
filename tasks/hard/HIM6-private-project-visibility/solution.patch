@@ -1,0 +1,359 @@
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -90,7 +91,10 @@
+ }
+ 
+ /** Builds the shared predicate list behind `listIssues` and its count. */
+-function issueFilters(input: IssueFilterInput): readonly SQL[] {
++function issueFilters(
++  input: IssueFilterInput,
++  hiddenProjectIds: readonly ProjectId[] = [],
++): readonly SQL[] {
+   const scope: ArchiveScope = shouldFilterArchived(input)
+     ? {}
+     : { includeArchived: true };
+@@ -101,6 +105,9 @@
+     input.projectId === undefined
+       ? undefined
+       : eq(issues.projectId, input.projectId),
++    hiddenProjectIds.length === 0
++      ? undefined
++      : notInArray(issues.projectId, [...hiddenProjectIds]),
+     input.status === undefined || input.status.length === 0
+       ? undefined
+       : inArray(issues.status, [...input.status]),
+@@ -141,9 +148,10 @@
+ 
+ export async function listIssues(
+   input: IssueFilterInput,
++  hiddenProjectIds: readonly ProjectId[] = [],
+ ): Promise<Page<Issue>> {
+   const db = getDb();
+-  const filters = issueFilters(input);
++  const filters = issueFilters(input, hiddenProjectIds);
+   const sort = { sortColumn: issues.createdAt, idColumn: issues.id };
+ 
+   const total = db
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, inArray, isNotNull, like, lt, sql } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNotNull, like, lt, notInArray, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -49,8 +49,27 @@
+   return row ? toProject(row) : null;
+ }
+ 
++/** Every `private` project of the org, archived or not. */
++export async function listPrivateProjects(
++  orgId: OrgId,
++): Promise<readonly Project[]> {
++  return getDb()
++    .select()
++    .from(projects)
++    .where(
++      and(orgPredicate(projects.orgId, orgId), eq(projects.visibility, "private")),
++    )
++    .all()
++    .map(toProject);
++}
++
++/**
++ * `hiddenProjectIds` are projects the caller may not see; they are excluded
++ * from both the rows and the total.
++ */
+ export async function listProjects(
+   input: ListProjectsInput,
++  hiddenProjectIds: readonly ProjectId[] = [],
+ ): Promise<Page<Project>> {
+   const db = getDb();
+   const sort = { sortColumn: projects.createdAt, idColumn: projects.id };
+@@ -68,6 +87,9 @@
+     input.query === undefined
+       ? undefined
+       : like(projects.name, `%${input.query}%`),
++    hiddenProjectIds.length === 0
++      ? undefined
++      : notInArray(projects.id, [...hiddenProjectIds]),
+   );
+ 
+   const total = db
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -18,6 +18,7 @@
+   issueResource,
+   requireFound,
+ } from "./_support";
++import { assertCanViewIssueProject } from "./project-service";
+ import type {
+   CreateCommentInput,
+   DeleteCommentInput,
+@@ -53,6 +54,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertCanViewIssueProject(actor, issue);
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -100,6 +102,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await assertCanViewCommentIssue(actor, comment);
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -126,6 +129,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await assertCanViewCommentIssue(actor, comment);
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -157,9 +161,23 @@
+     "Issue",
+     issueId,
+   );
++  await assertCanViewIssueProject(actor, issue);
+   assertCan(actor, "comment:read", issueResource(issue));
+ 
+   return commentRepo.listThread(orgId, issueId);
++}
++
++/** A comment is as visible as the project its issue belongs to. */
++async function assertCanViewCommentIssue(
++  actor: Actor,
++  comment: Comment,
++): Promise<void> {
++  const issue = requireFound(
++    await issueRepo.findIssueById(comment.orgId, comment.issueId),
++    "Comment",
++    comment.id,
++  );
++  await assertCanViewIssueProject(actor, issue);
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -21,6 +21,11 @@
+   projectResource,
+   requireFound,
+ } from "./_support";
++import {
++  assertCanViewIssueProject,
++  assertCanViewProject,
++  hiddenProjectIdsFor,
++} from "./project-service";
+ import type {
+   AssignIssueInput,
+   ChangeIssueStatusInput,
+@@ -50,6 +55,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertCanViewProject(actor, project);
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
+@@ -91,6 +97,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertCanViewIssueProject(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -120,6 +127,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertCanViewIssueProject(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -158,6 +166,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertCanViewIssueProject(actor, before);
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -200,6 +209,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertCanViewIssueProject(actor, issue);
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -241,6 +251,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertCanViewIssueProject(actor, issue);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   const labels = await labelRepo.listLabelsForIssues(orgId, [issue.id]);
+@@ -262,7 +273,10 @@
+   // A cross-project list is an org-wide read; per-project visibility is
+   // enforced when the caller opens an individual issue.
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+-  return issueRepo.listIssues(input);
++  return issueRepo.listIssues(
++    input,
++    await hiddenProjectIdsFor(actor, input.orgId),
++  );
+ }
+ 
+ export async function getBoard(
+@@ -277,6 +291,7 @@
+     "Project",
+     projectId,
+   );
++  await assertCanViewProject(actor, project);
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -11,9 +11,12 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectMemberRepo from "@/server/repositories/project-member-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { hasRoleAtLeast } from "@/types/member";
+ import {
+   actorEnvelope,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -26,7 +29,61 @@
+ } from "@/schemas/project";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
+ import type { Actor } from "@/types/member";
++import type { Issue } from "@/types/issue";
+ import type { Project, ProjectWithStats } from "@/types/project";
++
++/**
++ * Private-project visibility. A `private` project is seen only by admins and
++ * owners, its lead, and users explicitly added to it; to everyone else it does
++ * not exist. `org` and `public` projects are visible to the whole org.
++ */
++export async function canViewProject(
++  actor: Actor,
++  project: Project,
++): Promise<boolean> {
++  if (project.visibility !== "private") return true;
++  if (actor.isPlatformStaff === true) return true;
++  if (hasRoleAtLeast(actor.role, "admin")) return true;
++  if (project.leadId !== null && project.leadId === actor.userId) return true;
++  return projectMemberRepo.isProjectMember(
++    project.orgId,
++    project.id,
++    actor.userId,
++  );
++}
++
++/** Throws `NotFoundError` — not a 403 — for a project the actor may not see. */
++export async function assertCanViewProject(
++  actor: Actor,
++  project: Project,
++): Promise<void> {
++  if (!(await canViewProject(actor, project))) {
++    throw new NotFoundError("Project", project.id);
++  }
++}
++
++/** Resolves an issue's project and applies the same visibility rule. */
++export async function assertCanViewIssueProject(
++  actor: Actor,
++  issue: Issue,
++): Promise<void> {
++  const project = await projectRepo.findProjectById(issue.orgId, issue.projectId);
++  if (project === null || !(await canViewProject(actor, project))) {
++    throw new NotFoundError("Issue", issue.id);
++  }
++}
++
++/** Private projects the actor may not see, for listing filters. */
++export async function hiddenProjectIdsFor(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly ProjectId[]> {
++  const hidden: ProjectId[] = [];
++  for (const project of await projectRepo.listPrivateProjects(orgId)) {
++    if (!(await canViewProject(actor, project))) hidden.push(project.id);
++  }
++  return hidden;
++}
+ 
+ /**
+  * Creates a project once the plan still has room for one. The key is derived
+@@ -82,6 +139,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertCanViewProject(actor, project);
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -103,6 +161,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertCanViewProject(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -137,6 +196,7 @@
+     "Project",
+     projectId,
+   );
++  await assertCanViewProject(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+@@ -161,6 +221,7 @@
+     "Project",
+     slug,
+   );
++  await assertCanViewProject(actor, project);
+   assertCan(actor, "project:read", projectResource(project));
+ 
+   return {
+@@ -176,7 +237,10 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:read", orgResource(input.orgId));
+ 
+-  const page = await projectRepo.listProjects(input);
++  const page = await projectRepo.listProjects(
++    input,
++    await hiddenProjectIdsFor(actor, input.orgId),
++  );
+ 
+   const items = await Promise.all(
+     page.items.map(async (project) => ({

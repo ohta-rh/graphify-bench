@@ -9,6 +9,7 @@ import {
   HAIKU_MODEL,
   LEAN_TOOLS,
   LEAN_TOOLS_ARGS,
+  OPUS_MODEL,
   assertRegistryMatchesDisk,
   conditionNames,
   effectiveEffort,
@@ -557,6 +558,24 @@ describe("runtime lever arms", () => {
   it("registers all four levers", () => {
     for (const n of ["effort-medium", "effort-low", "haiku-explore", "effort-low-nosub"])
       expect(conditionNames()).toContain(n);
+  });
+
+  // The Opus arms must differ from their Sonnet twins by the model and nothing
+  // else, or the pair stops being a single-variable comparison.
+  it.each([
+    ["opus-effort-medium", "effort-medium"],
+    ["opus-effort-low", "effort-low"],
+  ])("%s is %s with only the model swapped", (opus, sonnet) => {
+    const o = getCondition(opus);
+    const s = getCondition(sonnet);
+    expect(o.model).toBe(OPUS_MODEL);
+    expect(s.model).toBeUndefined();
+    expect(o.overlays).toEqual(s.overlays);
+    expect(o.effort).toBe(s.effort);
+    expect(o.extraClaudeArgs).toEqual(s.extraClaudeArgs);
+    expect(o.env).toBeUndefined();
+    expect(o.mcp).toBeUndefined();
+    expect(o.corpus).toBe(s.corpus);
   });
 
   // Phase 11: the combined arm. It must be the exact conjunction of the two

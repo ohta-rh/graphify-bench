@@ -1,7 +1,11 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   mcpAnnounceDelayMs,
   parseToolLatencies,
+  speedForRun,
   spread,
   summarizeSpeed,
   toolGroup,
@@ -112,6 +116,7 @@ describe("spread", () => {
 
 describe("summarizeSpeed", () => {
   const run = (over: Partial<RunSpeed> = {}): RunSpeed => ({
+    process_wall_ms: 1200,
     duration_ms: 1000,
     duration_api_ms: 900,
     ttft_ms: 100,
@@ -153,5 +158,23 @@ describe("summarizeSpeed", () => {
     ]);
     expect(row!.runs).toBe(2);
     expect(row!.ttft_ms).toEqual({ n: 1, median: 200, q1: 200, q3: 200 });
+  });
+});
+
+describe("speedForRun process wall", () => {
+  // An async `Agent` makes result.json's duration_ms stop early; the process
+  // wall in run.meta.json is the latency the user actually waited.
+  it("reads claude.wall_ms from run.meta.json and tolerates its absence", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "speed-"));
+    try {
+      fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify({ duration_ms: 15000 }));
+      expect(speedForRun(dir).process_wall_ms).toBeNull();
+      fs.writeFileSync(path.join(dir, "run.meta.json"), JSON.stringify({ claude: { wall_ms: 78000 } }));
+      const s = speedForRun(dir);
+      expect(s.process_wall_ms).toBe(78000);
+      expect(s.duration_ms).toBe(15000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

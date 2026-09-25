@@ -1,0 +1,127 @@
+--- a/src/schemas/comment.ts
++++ b/src/schemas/comment.ts
+@@ -34,7 +34,14 @@
+   })
+   .extend(pageRequestSchema.shape);
+ 
++/** Who has taken part in one issue: its author, assignee and commenters. */
++export const issueParticipantsSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++});
++
+ export type CreateCommentInput = z.infer<typeof createCommentSchema>;
+ export type UpdateCommentInput = z.infer<typeof updateCommentSchema>;
+ export type DeleteCommentInput = z.infer<typeof deleteCommentSchema>;
+ export type ListCommentsInput = z.infer<typeof listCommentsSchema>;
++export type IssueParticipantsInput = z.infer<typeof issueParticipantsSchema>;
+--- a/src/server/repositories/comment-repository.ts
++++ b/src/server/repositories/comment-repository.ts
+@@ -114,6 +114,27 @@
+     }));
+ }
+ 
++/** Distinct authors of the live (not deleted) comments on one issue. */
++export async function listCommentAuthorIds(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly UserId[]> {
++  const rows = getDb()
++    .selectDistinct({ authorId: comments.authorId })
++    .from(comments)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(comments.orgId, orgId),
++          eq(comments.issueId, issueId),
++          shouldFilterArchived() ? isNull(comments.archivedAt) : undefined,
++        ),
++      ),
++    )
++    .all();
++  return rows.map((row) => row.authorId as UserId);
++}
++
+ export async function countComments(
+   orgId: OrgId,
+   issueId: IssueId,
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -43,6 +43,29 @@
+   return row ? toMember(row) : null;
+ }
+ 
++/** The live, active memberships among `userIds` in one org. */
++export async function listActiveMembersByUserIds(
++  orgId: OrgId,
++  userIds: readonly UserId[],
++): Promise<readonly Member[]> {
++  if (userIds.length === 0) return [];
++  const rows = getDb()
++    .select()
++    .from(members)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(members.orgId, orgId),
++          inArray(members.userId, [...userIds]),
++          eq(members.status, "active"),
++          liveMemberPredicate(),
++        ),
++      ),
++    )
++    .all();
++  return rows.map(toMember);
++}
++
+ export async function findMemberById(
+   orgId: OrgId,
+   memberId: MemberId,
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -189,3 +189,36 @@
+     ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+   ];
+ }
++
++/**
++ * Everyone who has taken part in an issue: its author, its current assignee
++ * and the authors of its live comments — limited to people who are still
++ * active members of the organization. Readable by anyone who can read the
++ * thread.
++ */
++export async function getIssueParticipants(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly UserId[]> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "comment:read", issueResource(issue));
++
++  const candidates = new Set<UserId>([issue.authorId]);
++  if (issue.assigneeId !== null) candidates.add(issue.assigneeId);
++  for (const authorId of await commentRepo.listCommentAuthorIds(orgId, issueId)) {
++    candidates.add(authorId);
++  }
++
++  const active = await memberRepo.listActiveMembersByUserIds(orgId, [
++    ...candidates,
++  ]);
++  const activeIds = new Set(active.map((member) => member.userId));
++  return [...candidates].filter((userId) => activeIds.has(userId));
++}

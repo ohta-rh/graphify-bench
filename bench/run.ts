@@ -109,6 +109,8 @@ export interface RunMeta {
   };
   transcript: Record<string, unknown> | null;
   vitest: VitestOutcome | null;
+  /** Hidden test files installed after the agent finished (corpus-relative). */
+  hidden: string[] | null;
   env: BenchEnv;
   versions: Record<string, string | null>;
   timings_ms: { total: number; copy: number; claude: number; vitest: number };
@@ -159,6 +161,24 @@ function applyPatch(patchFile: string, dir: string): { applied: boolean; method:
     method: null,
     error: `git apply: ${(git.stderr ?? "").trim().slice(0, 400)} | patch: ${(posix.stderr || posix.stdout || "").trim().slice(0, 400)}`,
   };
+}
+
+/**
+ * Copy hidden test files into the run dir, overwriting whatever is there.
+ *
+ * Runs after the agent has exited, so nothing it did can have read or edited
+ * these files; a `to` path that escapes the run dir is refused rather than
+ * written, because a task file is data and should never reach outside it.
+ */
+export function installHidden(files: ReadonlyArray<{ from: string; to: string }>, tasksDir: string, dir: string): string[] {
+  const root = path.resolve(dir);
+  return files.map(({ from, to }) => {
+    const dest = path.resolve(root, to);
+    if (!dest.startsWith(root + path.sep)) throw new Error(`hidden test path escapes the run dir: ${to}`);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(path.resolve(tasksDir, from), dest);
+    return to;
+  });
 }
 
 function runVitest(spec: string, dir: string): VitestOutcome {
@@ -420,6 +440,7 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     },
     transcript: null,
     vitest: null,
+    hidden: null,
     env,
     versions: toolVersions(),
     timings_ms: { total: 0, copy: 0, claude: 0, vitest: 0 },
@@ -520,6 +541,7 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
 
     // 8. grader === "vitest": run the spec inside the run dir before deleting it
     if (req.task.grader === "vitest" && req.task.spec) {
+      if (req.task.hidden) meta.hidden = installHidden(req.task.hidden, req.tasksDir, workDir);
       const tTest = Date.now();
       meta.vitest = runVitest(req.task.spec, workDir);
       meta.timings_ms.vitest = Date.now() - tTest;

@@ -618,3 +618,47 @@ describe("grader dry-run against the committed keys", () => {
     expect(score.f1 >= loc.success_threshold).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// tasks-hard.json — hidden-test set meant to separate strong models
+// ---------------------------------------------------------------------------
+
+describe("tasks-hard.json", () => {
+  const hard = loadTasks("tasks-hard.json");
+  const TAIL = {
+    fix: "This is a `fix` task: edit the code and stop. Do not write a summary and do not emit an ANSWER line.",
+    implement:
+      "This is an `implement` task: edit the code and stop, as for a `fix` task. Do not write a summary and do not emit an ANSWER line.",
+  } as const;
+
+  it("has 8 fix and 8 implement tasks, all graded by vitest", () => {
+    expect(hard).toHaveLength(16);
+    expect(hard.filter((t) => t.category === "fix")).toHaveLength(8);
+    expect(hard.filter((t) => t.category === "implement")).toHaveLength(8);
+    for (const t of hard) expect(t.grader, t.id).toBe("vitest");
+  });
+
+  // The whole point of the set: the graded spec is never in the agent's copy.
+  it("grades every task with a hidden spec that is absent from the corpus", () => {
+    for (const t of hard) {
+      expect(t.hidden, t.id).toEqual([{ from: `hard/${t.id}/hidden.test.ts`, to: `tests/hidden/${t.id}.test.ts` }]);
+      expect(t.spec, t.id).toBe(`tests/hidden/${t.id}.test.ts`);
+      expect(fs.existsSync(path.resolve(TASKS_DIR, t.hidden![0]!.from)), t.id).toBe(true);
+      expect(fs.existsSync(path.join(CORPUS_ROOT, t.spec!)), t.id).toBe(false);
+    }
+  });
+
+  it("ships a bug patch for every fix task and a reference solution for every task", () => {
+    for (const t of hard) {
+      if (t.category === "fix") expect(fs.existsSync(path.resolve(TASKS_DIR, t.patch ?? "")), t.id).toBe(true);
+      else expect(t.patch, t.id).toBeUndefined();
+      expect(fs.existsSync(path.join(TASKS_DIR, "hard", t.id, "solution.patch")), t.id).toBe(true);
+    }
+  });
+
+  it("ends every prompt with its category's tail line", () => {
+    for (const t of hard) {
+      expect(t.prompt.trimEnd().split("\n").at(-1), t.id).toBe(TAIL[t.category as keyof typeof TAIL]);
+    }
+  });
+});
