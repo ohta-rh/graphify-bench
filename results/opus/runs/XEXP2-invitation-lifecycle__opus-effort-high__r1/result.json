@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 93522,
+  "stop_reason": "end_turn",
+  "session_id": "526e5b81-65bf-4c5e-b0af-61535c0ae075",
+  "total_cost_usd": 0.7506524,
+  "usage": {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 58283,
+    "cache_read_input_tokens": 516462,
+    "output_tokens": 9050,
+    "output_tokens_details": {
+      "thinking_tokens": 1680
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 58283,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 3917,
+        "cache_read_input_tokens": 66962,
+        "cache_creation_input_tokens": 1664,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1664
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 24,
+      "outputTokens": 9050,
+      "cacheReadInputTokens": 516462,
+      "cacheCreationInputTokens": 58283,
+      "webSearchRequests": 0,
+      "costUSD": 0.7506524,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 1680,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 14,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I've traced the whole flow. Here is how it works, in the order it runs. One thing to know up front: part of this story doesn't exist in the code. Nothing ever emails the colleague a usable link.\n\n## 1. Before the invitation exists\n\n**Page render.** `src/app/(dashboard)/[orgSlug]/settings/members/page.tsx`:\n1. `loadTenantContext(orgSlug)` (`[orgSlug]/_lib/tenant-context.ts`) runs `resolveOrgBySlug`, then `getActor` (session → membership), then `assertOrgScope`.\n2. `can(actor, \"member:read\", …)` runs, or the page returns `notFound()`.\n3. `can(actor, \"member:invite\", …)` decides whether the form is shown. In `src/lib/permissions.ts` the `ROLE_MATRIX` requires `admin` for invites. `explain()` first rejects cross-tenant access, then lets platform staff through, then compares `ROLE_RANK`.\n4. `checkLimit(org.id, \"seats\")` (`billing-service.ts`) builds a `LimitCheck` from the cached `organization_usage.seatsUsed` counter. The same check feeds both `SeatLimitBanner` and `InviteMemberForm`.\n\n**Client form.** `src/components/domain/member/invite-member-form.tsx`, `InviteMemberForm`:\n- It repeats the `can(…, \"member:invite\", organizationResource(orgId))` check and returns `null` if it fails.\n- It disables its inputs when `seatCheck.exceeded || remaining <= 0`.\n- `RoleSelect` limits which roles can be picked.\n- On submit it runs `inviteMemberSchema.safeParse` (`src/schemas/member.ts`). The email must be valid, at most 254 characters, and is lowercased by `emailSchema`. The role must be in `invitableRoleSchema` (`admin | member | viewer`), so `owner` can never be invited.\n- It then calls `useFormAction(onSubmit)` → `inviteMemberAction`.\n\n**Server action.** `src/actions/members/invite-member.ts` → `withAction` (`src/actions/_lib/with-action.ts`):\n1. `inviteMemberSchema.safeParse` runs again on the server.\n2. `resolveActorFor` → `requireActorFor(orgId)` (`src/lib/actor.ts`): session principal → org → membership → `assertOrgScope`.\n3. The handler then runs these checks:\n   - `can(actor, \"member:invite\", {kind:\"member\", memberId: PENDING_MEMBER_ID, …})`, else `ForbiddenActionError`.\n   - `consumeRateLimit(orgId, \"member:invite\")` (`src/lib/rate-limit.ts`; bucket capacity 20, refill 2 per minute), else `RateLimitedError`.\n   - `getOrganizationSummary` → `getPlanLimits(plan)`. If `usage.seatsUsed + 1 > limits.seats`, it throws `PlanLimitError`.\n4. Only then does it call `inviteMember(actor, input)`.\n\n**Service.** `src/server/services/invitation-service.ts`: `inviteMember` wraps `inviteMembers`, which checks everything again:\n1. `assertOrgScope`, then `assertCan(actor, \"member:invite\", orgResource(orgId))`.\n2. `consumeRateLimit` on the same `\"member:invite\"` bucket, costing one token per invite.\n3. `orgRepo.findOrgById`.\n4. The seat check. This time seats are counted as `memberRepo.countActiveMembers` plus `invitationRepo.countPendingInvitations`, and passed to `wouldExceedLimit(plan, \"seats\", used, n)` (`src/config/plan-limits.ts`). Pending invitations hold a seat here.\n\n## 2. What is stored and what travels\n\nFor each invite, `inviteMembers` runs:\n- `randomToken(32)`: 32 random bytes, base64url-encoded (`src/lib/hash.ts`).\n- `hashToken(token)`: an unsalted SHA-256 hex digest.\n\n`invitationRepo.insertInvitation` then writes a row to the `invitations` table (`src/server/db/schema/members.ts`) containing:\n- `id`, `orgId`, the lowercased `email`, `role`, `invitedBy`\n- **`tokenHash`**, protected by the unique index `invitations_token_idx`\n- `expiresAt` = now + `DEFAULT_EXPIRY_DAYS` (14 days)\n- `acceptedAt` and `revokedAt`, both `null`\n- timestamps\n\nThe raw token is never stored. It is meant to exist only in the link `/invite/<token>`, which `src/proxy.ts` lists as public under `PUBLIC_PREFIXES`.\n\nAfter the insert, `emit(\"member.invited\", {orgId, actorId, occurredAt, email, role})` fires. Its only subscriber is `registerActivityListeners` in `activity-service.ts`, which records \"Invited x as role\". Back in the action, `revalidateTagged([orgTag(orgId)])` runs, `withAction` revalidates `members` and `invitations`, and the result goes back to the admin's browser.\n\n**The gap:**\n- Nothing sends the email. No code calls `renderEmail(\"invite\")` or `sendEmail` for invites. `InviteEmail` (`src/emails/invite-email.tsx`, which has an `acceptUrl` prop) is only wired into `src/emails/render.ts`.\n- The raw token goes out of scope as soon as `inviteMembers` returns.\n- `toInvitation` (`_mappers.ts`) copies `row.tokenHash` into `Invitation.token`, so the admin's browser receives the hash, not the token. The hash can't be used as a link, because `hashToken(hash)` won't match any stored row.\n\nAs written, the colleague can't receive a link that works. There are also smaller issues on the create side:\n- The optional `message` field in the schema is dropped.\n- A single invite charges the rate-limit bucket twice, once in the action and once in the service.\n- The two seat checks disagree. The action uses the cached counter, which ignores pending invites. The service counts active members plus pending invites.\n\n## 3. When the link is used\n\n**Landing page.** `src/app/(auth)/invite/[token]/page.tsx`:\n1. The proxy lets `/invite/…` through without a session.\n2. `invitationTokenSchema.safeParse` (`src/schemas/invitation.ts`): 32 to 128 characters, base64url alphabet only. If it fails, the page shows \"This invitation is not valid\".\n3. `getSessionPrincipal()` (`src/lib/session.ts`). If there's no session, it redirects to `/login?next=/invite/<token>`.\n4. It renders `InviteAcceptForm`. On purpose, the token is not looked up here. The optional `?org=` slug is only used to decide where to redirect afterwards.\n\n**Accept form.** `invite-accept-form.tsx` posts the token in a hidden field to `acceptInvitationAction` (`src/actions/members/accept-invitation.ts`). This action doesn't use `withAction`, because the user has no membership yet and so there is no `Actor`:\n1. `acceptInvitationTokenSchema.safeParse`.\n2. `getSessionPrincipal()`, else `UnauthorizedActionError`.\n3. `acceptInvitation(principal.userId, {token})` in the service:\n   - `findInvitationByTokenHash(hashToken(token))`. This is the only repository read that isn't scoped by `orgId`; the stored row supplies the tenant. If nothing matches, it throws `NotFoundError`.\n   - It rejects the invite if `revokedAt` is set (revoked, or replaced by `resendInvitation`), if `acceptedAt` is set, or if `expiresAt <= now`.\n   - `memberRepo.findMember(orgId, userId)`. If the user is already a member, it returns that membership without doing anything else.\n   - `memberRepo.insertMember(orgId, userId, invitation.role, invitation.invitedBy)`, with status `active`. The role comes from the stored row, not from the request.\n   - `markInvitationAccepted`.\n   - `emit(\"member.joined\", {...envelope(orgId, userId), memberId, userId, role})`.\n4. `assertSeatAvailable(member)`: `resolveActor` (`member-service.ts`), then `getOrganizationSummary`, then `getPlanLimits`. If `seatsUsed > seats`, it throws `PlanLimitError`, and the form shows \"run out of seats\".\n5. On success the form calls `router.push` to `/${orgSlug}` or `/orgs`.\n\n**Gaps on this side:**\n- The service never compares the signed-in user's email with `invitation.email`, so anyone signed in who holds the token can join.\n- The seat check runs *after* the membership row is written, the invite is marked accepted, and `member.joined` is emitted. A seat failure reports an error but doesn't undo any of that.\n- When the user is already a member, the invitation stays pending and keeps holding a seat.\n\n## 4. What the rest of the system learns\n\n**Stored state:**\n- A `members` row, unique on `(orgId, userId)`.\n- The invitation now has `acceptedAt` set, so `countPendingInvitations` and `listPendingInvitations` no longer include it.\n- On the next request, `getActor` and `resolveActorForOrg` find the new membership, so `can()` evaluates the user at the invited role.\n\n**`member.joined` subscribers.** These are wired by `registerEventHandlers` (`src/server/services/event-registry.ts`), which `src/instrumentation.ts` calls:\n- **`usage-service.ts` → `registerUsageListeners`:** `incrementUsage(orgId, {seatsUsed: 1})`. That counter is what the members page's `checkLimit`, the banner, and the invite action's seat check read.\n- **`notification-service.ts`**, fan-out attached on import: `notify(orgId, \"member_joined\", [org.ownerId], …)`. It respects the owner's preferences via `resolveChannels`. The notification's `href` is `/settings/members`, which has no org slug.\n- **Activity:** the log records `member.invited` but has no `member.joined` subscriber, even though `activity-labels.ts` defines a label for it.\n- **Webhooks:** `webhookEventTypeSchema` allows subscribing to `member.joined`, but `registerWebhookListeners` doesn't listen for it, so no webhook fires.\n- **Search:** it doesn't subscribe to membership events.\n\n**The two biggest gaps** are that no link is ever produced (the raw token is thrown away and the hash is returned in its place), and that acceptance never checks the email. Tell me if you want either one fixed.",
+  "ttft_ms": 1317,
+  "type": "result",
+  "duration_ms": 94178,
+  "uuid": "fd8fba44-2c5d-4f4d-ad9e-2fa6920e2f42",
+  "ttft_stream_ms": 818,
+  "time_to_request_ms": 24,
+  "first_content_frame_ms": 818,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

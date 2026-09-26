@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 167492,
+  "stop_reason": "end_turn",
+  "session_id": "47a0ac54-4865-49f2-b44c-ed18e7860796",
+  "total_cost_usd": 0.5203896000000001,
+  "usage": {
+    "input_tokens": 6,
+    "cache_creation_input_tokens": 20661,
+    "cache_read_input_tokens": 85323,
+    "output_tokens": 3533,
+    "output_tokens_details": {
+      "thinking_tokens": 199
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 20661,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2381,
+        "cache_read_input_tokens": 36032,
+        "cache_creation_input_tokens": 3493,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3493
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 46,
+      "outputTokens": 14634,
+      "cacheReadInputTokens": 712093,
+      "cacheCreationInputTokens": 80219,
+      "webSearchRequests": 0,
+      "costUSD": 0.5203896000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 1252,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 3,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "This confirms the trace holds up. Here's the full path from keystroke to a role-aware sidebar.\n\n## 1. Submitting the form\n\n`src/app/(auth)/login/page.tsx` is a server component. It first calls `getSessionPrincipal()` (`src/lib/session.ts:23`) — if a valid session already exists it redirects away immediately — otherwise it renders `<LoginForm next={next} />` from `src/app/(auth)/login/login-form.tsx`. `LoginForm` is a client component (`useActionState`) that does a lightweight client-side `loginSchema.safeParse` (`src/schemas/auth.ts`) purely for inline error messages, then submits via a real Next.js Server Action, `loginAction` (`src/actions/auth/login.ts:28`) — no `fetch`/XHR involved.\n\n## 2. Checking the credentials\n\n`loginAction` re-validates with `loginSchema`, applies `consumeRateLimit` (`src/lib/rate-limit.ts`) against an anonymous bucket (no tenant exists yet), then calls `login()` in `src/server/services/auth-service.ts:88`. `login()`:\n1. Rate-limits again at the service layer.\n2. `userRepo.findUserByEmail(email)` then `userRepo.findPasswordHash(user.id)` (`src/server/repositories/user-repository.ts`).\n3. `verifyPassword(password, storedHash)` (`src/lib/hash.ts:37`) — this is hand-rolled on Node's `crypto.scrypt`, not Auth.js/NextAuth/Lucia. Hashes are stored as `scrypt:<saltHex>:<keyHex>`; verification re-derives the key with the stored salt and compares with `timingSafeEqual` for constant-time comparison.\n4. Unknown email and wrong password both throw the same \"Those credentials did not match\" to avoid a user-enumeration oracle.\n\n## 3. What gets created, stored, and sent to the browser\n\nOn success, `createSessionToken(userId)` (`src/server/services/session-service.ts:27`) generates a 32-byte random token (`randomToken`, base64url), sets a 30-day expiry (`SESSION_TTL_DAYS`), and calls `sessionRepo.createSession(userId, hashToken(token), expiresAt)` — **only the SHA-256 hash of the token is persisted** in the `sessions` SQLite table (`src/server/db/schema/users.ts`, columns `id`, `userId`, `activeOrgId`, `tokenHash`, `expiresAt`), never the raw token. `loginAction` then re-resolves that hash back into a `SessionPrincipal` via `resolveSession(token)` and calls `setSessionCookie(token, expiresAt)` (`src/lib/session.ts:33`), which sets a cookie named `taskflow_session` (`SESSION_COOKIE_NAME` in `src/schemas/session.ts`) with `httpOnly: true`, `sameSite: \"lax\"`, `secure` in production only, and `expires` matching the DB row. The cookie value is the raw opaque token itself — not a JWT, no embedded claims; it's purely a bearer key into the `sessions` table. The client's `useEffect` then `router.push`es to `next`.\n\n## 4. Re-establishing identity on a later request\n\nTwo layers run in sequence:\n- **Edge**: `src/proxy.ts` (Next.js 16 renamed `middleware.ts`/`middleware()` → `proxy.ts`/`proxy()`) runs on every request except static assets. For non-public paths it only checks whether the `taskflow_session` cookie is *present* (it can't reach the DB at the edge); missing → redirect to `/login?next=...`. Present → `NextResponse.next()` with an `x-taskflow-authenticated` header.\n- **Database-backed**: `src/app/(dashboard)/[orgSlug]/layout.tsx` calls `getSessionPrincipal()` (`src/lib/session.ts:23`), which reads the cookie (`getSessionToken`), calls `resolveSession(token)` → `sessionRepo.findSessionByTokenHash(hashToken(token))` (`src/server/repositories/session-repository.ts`), joining `sessions` with `users` and returning `null` if the row is missing or expired. The same helper is exposed as `getActor`/`requireActorFor` in `src/lib/actor.ts` for Server Actions, and is used directly by `GET /api/auth/session` for client-side liveness pings.\n\n## 5. Deciding \"still signed in\"\n\nThere's no rolling/refresh logic — a session simply lives for its fixed 30-day TTL. Expiry is checked in two places: inside `findSessionByTokenHash` (DB-side, comparing `expiresAt` against now) and redundantly inside `getSessionPrincipal` itself (`session.ts:30`, `parseIso(principal.expiresAt).getTime() > Date.now()`). The dashboard layout is `export const dynamic = \"force-dynamic\"`, so this check runs fresh on every navigation rather than being cached; a `null` principal there throws an unauthorized error. Expired rows are swept later by `purgeExpiredSessions`, not on every read.\n\n## 6. From bare identity to an authorizable `Actor`\n\n`resolveActorForOrg(principal, orgSlug)` (`src/server/services/session-service.ts:55`), called from the dashboard layout, is the bridge: it resolves the org by slug (`orgRepo.findOrgBySlug`), looks up the membership row (`memberRepo.findMember(org.id, principal.userId)`, `src/server/repositories/member-repository.ts`) which carries a `role: Role` and `status`, and returns `null` (→ `notFound()`) if there's no active membership. It assembles `Actor = { userId, orgId, role }`, sanity-checks it with `assertOrgScope` (`src/lib/tenant.ts`), and touches last-seen presence.\n\nThe layout passes `actor` (plus `org`, feature flags, projects) into `DashboardShell` (`src/app/(dashboard)/[orgSlug]/_components/dashboard-shell.tsx`), which forwards `actor` as a prop straight into `AppSidebar` (`src/components/domain/nav/app-sidebar.tsx`). The sidebar never branches on `actor.role` directly — instead it calls `visibleNav(SIDEBAR_NAV, actor, flags)` (`src/config/nav.ts`), which filters each declarative `NavItem` through `can(actor, item.action, resource)` (`src/lib/permissions.ts:96`). `can()` is the single authorization entry point: it checks tenant scope, looks up the minimum required `Role` for that action in `ROLE_MATRIX`, and compares against `ROLE_RANK[actor.role]` (owner > admin > member > viewer), with a few resource-ownership escalations layered on top. That's what ultimately determines which nav entries the signed-in user sees.",
+  "ttft_ms": 2126,
+  "type": "result",
+  "duration_ms": 168581,
+  "uuid": "4a659147-39fc-4073-9389-898c8d807065",
+  "ttft_stream_ms": 1287,
+  "time_to_request_ms": 38,
+  "first_content_frame_ms": 1287,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

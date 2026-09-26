@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 209323,
+  "stop_reason": "end_turn",
+  "session_id": "cb244912-6b3b-4015-a399-fe1e195feb23",
+  "total_cost_usd": 0.6146961000000001,
+  "usage": {
+    "input_tokens": 8,
+    "cache_creation_input_tokens": 19073,
+    "cache_read_input_tokens": 164002,
+    "output_tokens": 3270,
+    "output_tokens_details": {
+      "thinking_tokens": 301
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 19073,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2096,
+        "cache_read_input_tokens": 48851,
+        "cache_creation_input_tokens": 2297,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2297
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 44,
+      "outputTokens": 17921,
+      "cacheReadInputTokens": 810323,
+      "cacheCreationInputTokens": 89963,
+      "webSearchRequests": 0,
+      "costUSD": 0.6146961000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3310,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Confirmed — `sendEmail` is only ever called from `digest-email-job.ts` and `auth-service.ts`, never for a mention directly. This all matches the sub-agent's findings, so I have what I need to write the explanation.\n\n## How a typed `@handle` becomes a notification in Taskflow\n\n**Parsing the text.** When a comment is composed, `src/components/domain/comment/comment-composer.tsx`'s `CommentComposer.handleSubmit()` validates the form against `createCommentSchema` (`src/schemas/comment.ts`) and calls the server action `createCommentAction()` in `src/actions/comments/create-comment.ts`. The client-side autocomplete (`mention-textarea.tsx` / `mention-query.ts`, with `findMentionQuery`/`matchMembers`/`applyMention`) produces a best-guess `mentionedUserIds` array as the user types, but this is not trusted — the server re-derives the truth.\n\n`createCommentAction()` runs through `withAction()` (checks `can()` permission, then `consumeRateLimit()`) and calls `createComment(actor, input)` in `src/server/services/comment-service.ts`. After loading the issue and re-checking permissions/archive state/rate limit, it calls its own private helper `resolveMentionedUsers(orgId, input.body, input.mentionedUserIds)`.\n\n**Turning a handle into a user.** `resolveMentionedUsers()` fetches up to 100 org members via `memberRepo.listMembers()` (`src/server/repositories/member-repository.ts` — note: org-scoped, first page only, capped at `MENTION_LOOKUP_LIMIT = 100`), then calls `resolveMentions(body, members.items)` from `src/lib/mentions.ts`. That function first runs `extractMentions(body)`, which strips fenced/inline code (`withoutCode`) and regex-matches `@handle` tokens (`MENTION_PATTERN`), deduping in first-appearance order. Each handle is derived the same way a member's handle is computed elsewhere (`handleOf()`: the lowercased local-part of their email), so a `Map<handle, UserId>` built from the member list resolves each extracted handle to a `UserId`. Unknown/typo'd handles are silently dropped — a bad mention never fails the comment write. `resolveMentionedUsers()` then unions these server-resolved IDs with any client-provided IDs that are still known org members, with the server list winning on disagreement.\n\n**What carries the list forward.** There's no separate mentions join table. The resulting `mentionedUserIds` array is (1) stored directly on the comment row via `commentRepo.insertComment()`, and (2) attached to a `comment.created` domain event: `await emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })`, published through the typed in-process pub/sub bus in `src/lib/event-bus.ts`. `emit()` awaits all subscribers via `Promise.allSettled`, isolating failures so one throwing handler can't break the comment write or a sibling handler.\n\n**Creating the notification.** The consumer is `registerFanOut()` in `src/server/services/notification-service.ts` (auto-invoked at module load). Its `comment.created` subscriber fires two independent calls to the single generic `notify(orgId, kind, recipients, payload)` function: one with `kind: \"comment_created\"` to the issue's author/assignee, and — only if `mentionedUserIds.length > 0` — a second with `kind: \"comment_mention\"` to the mentioned users. The \"type\" of notification is just whichever string literal the subscriber passes as `kind`; `notify()` itself has no per-kind branching logic.\n\n**Deciding in-app vs. email vs. both vs. neither**, all inside `notify()`:\n- Self-mentions are skipped outright (`if (recipientId === payload.actorId) continue`).\n- For each remaining recipient, `preferenceRepo.getPreference(orgId, recipientId, kind)` (`src/server/repositories/notification-preference-repository.ts`) reads the `notification_preferences` table keyed on `(orgId, userId, kind)`. `null` (no row) means \"use defaults,\" not \"muted.\"\n- `resolveChannels(preference, flags)` turns that into a channel list: `inApp: false` drops the in-app row; `email: false` drops email; `digestOnly: true` drops the *immediate* email unless the org's `digest_email` feature flag is off (in which case email is kept as a fallback). A recipient whose channels resolve to empty gets skipped entirely — no row at all.\n- Notably, there is **no** issue/project-level visibility check on the recipient at this point — only org membership was checked during mention resolution — so a mentioned org member without access to that specific issue still gets notified.\n- Surviving rows are written in one batch via `notificationRepo.insertNotifications()`.\n\n**Synchronous vs. async.** The in-app row (and the `channels` field recording that \"email\" was allowed) is written synchronously inside the same request that creates the comment — `emit()` is awaited by `createComment()` before it returns. There's a `mention-email.tsx` template and `\"mention\"` cases wired into the render/email-type registries, but no call site ever actually invokes `sendEmail()` for a `comment_mention` notification directly — grepping for `sendEmail(` call sites shows only `auth-service.ts` (welcome/reset emails) and `digest-email-job.ts`. So the only path by which a mention ever reaches an actual inbox email is the nightly digest: `src/server/jobs/scheduler.ts` ticks every 60s and enqueues due jobs into `src/server/jobs/queue.ts`; `runDigestEmailJob()` in `src/server/jobs/digest-email-job.ts` finds orgs due for their digest hour, pulls each `digestOnly`-subscribed user's unread notifications (including any `comment_mention` rows) via `buildDigest()`, and sends one rolled-up `\"digest\"` email through `sendEmail()`. For everyone else, the \"email\" channel is recorded on the row but never triggers a real send — the dedicated mention email template is effectively dead code for this flow.",
+  "ttft_ms": 2937,
+  "type": "result",
+  "duration_ms": 39095,
+  "uuid": "06a65ac1-546c-4d1c-9fc1-82789bc4a48e",
+  "ttft_stream_ms": 1351,
+  "time_to_request_ms": 8,
+  "first_content_frame_ms": 1351,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

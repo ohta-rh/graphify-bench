@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 121885,
+  "stop_reason": "end_turn",
+  "session_id": "21e5ab5c-06f4-4710-83a0-b96406ad994f",
+  "total_cost_usd": 0.952818,
+  "usage": {
+    "input_tokens": 32,
+    "cache_creation_input_tokens": 70325,
+    "cache_read_input_tokens": 816050,
+    "output_tokens": 11344,
+    "output_tokens_details": {
+      "thinking_tokens": 3755
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 70325,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4292,
+        "cache_read_input_tokens": 79391,
+        "cache_creation_input_tokens": 1277,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1277
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 32,
+      "outputTokens": 11344,
+      "cacheReadInputTokens": 816050,
+      "cacheCreationInputTokens": 70325,
+      "webSearchRequests": 0,
+      "costUSD": 0.952818,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 3755,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 18,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "A downgrade is recorded only on the `subscriptions` row, which is the authoritative source. The `organizations.plan` column is never updated, so most of the product outside billing keeps behaving as if the org were still on the bigger plan. Only code that goes through `billing-service.ts`'s `planFor()` sees the new plan.\n\n## 1. Entry point and who may do it\n\n1. The billing page, `src/app/(dashboard)/[orgSlug]/settings/billing/page.tsx`, first checks `can(actor, \"org:manage_billing\", …)` and returns `notFound()` if it fails. Its inline server action `selectPlan(plan)` calls `changePlanAction({ orgId, plan, interval: \"monthly\" })`. The interval is always `\"monthly\"`, so an annual org that downgrades is also switched to monthly. The page ignores the returned result.\n2. `changePlanAction` in `src/actions/billing/change-plan.ts` runs through `withAction` in `src/actions/_lib/with-action.ts`:\n   - `changePlanSchema.safeParse` (in `src/schemas/billing.ts`) validates `orgId`, `plan` (one of free, starter, growth or enterprise) and `interval`, which defaults to monthly.\n   - `resolveActorFor` sees an `orgId`, so it calls `requireActorFor(orgId)` in `src/lib/actor.ts`. That loads the session principal and the membership, then calls `assertOrgScope`.\n3. The handler calls `can(actor, \"org:manage_billing\", { kind: \"billing\", orgId })` in `src/lib/permissions.ts`:\n   - The actor must belong to the same org (cross-tenant guard).\n   - Platform staff always pass.\n   - Otherwise `ROLE_MATRIX[\"org:manage_billing\"]` is `\"owner\"`, so only owners pass. Admins are refused with `ForbiddenActionError`.\n   - The service checks the same thing again later with `assertOrgScope` and `assertCan`.\n\n## 2. What is compared before the change is accepted\n\nThere are two checks, and both compare current usage against the **target** plan's limits, not the current plan's.\n\n**First check: `assertPlanFitsCurrentUsage` in the action.**\n- It reads `getUsage(actor, orgId)` from `src/server/services/usage-service.ts`, which returns the cached `organization_usage` counters via `usage-repository.getUsage`.\n- It reads `getPlanLimits(input.plan)`.\n- For seats, projects and storageMb it calls `wouldExceedLimit(input.plan, resource, used, 0)` from `src/config/plan-limits.ts`. With a requested amount of 0 this means \"refuse if used > limit\", so usage exactly at the limit is allowed.\n- A failure throws `PlanLimitError`.\n\n**Second check: `changePlan(actor, input)` in `src/server/services/billing-service.ts`.**\n- It calls `assertOrgScope` and `assertCan`.\n- It records the current plan via `planFor(orgId)`.\n- It repeats the comparison over `SUMMARY_RESOURCES`, which adds webhooks to the three above. `usageFor` counts webhooks live with `webhookRepo.countEndpoints`; the other dimensions use the same cached counters.\n- A failure throws a plain `Error`.\n\nIssues per project are not checked by either. Neither refusal comes back with the `plan_limit_exceeded` code: `toAppError` in `src/lib/errors.ts` doesn't recognise `PlanLimitError` or `ForbiddenActionError`, so both are returned as `internal_error` carrying the message.\n\n## 3. Where the plan is stored and which value wins\n\n`subscriptionRepo.updateSubscriptionPlan(orgId, plan, interval)` in `src/server/repositories/subscription-repository.ts` updates the `subscriptions` row. It sets `plan`, `interval`, `status: \"active\"` and `updatedAt`. Nothing else is written.\n\n- **Authoritative value:** `subscriptions.plan`. The private `planFor()` in `billing-service.ts` says so explicitly: it reads the subscription first and only falls back to `organizations.plan` when no subscription row exists.\n- **The other copy:** `organizations.plan` is described there as \"a display convenience\". Nothing on this path updates it. `organization-repository.updateOrg` doesn't even write that column.\n\n## 4. What happens afterwards\n\n1. `changePlan` emits `billing.plan_changed` with `{ …actorEnvelope, from, to }` via `emit` in `src/lib/event-bus.ts`. `emit` uses `Promise.allSettled`, so a failing listener doesn't undo the change. The listeners are wired by `registerEventHandlers` in `src/server/services/event-registry.ts`:\n   - `registerActivityListeners` in `src/server/services/activity-service.ts` writes an audit row: \"Plan growth → starter\".\n   - `registerWebhookListeners` in `src/server/services/webhook-service.ts` runs `enqueueForOrg`, which queues a delivery for each enabled endpoint subscribed to `billing.plan_changed`. `webhook-delivery-job.ts` sends them later.\n   - Nothing listens for this event to update `organizations.plan`, recount usage or change rate limits.\n2. Back in the action, `revalidateTagged([orgTag(orgId)], \"hours\")` runs. Then `withAction` revalidates the `\"billing\"` tag and returns a `{ ok: true, data: subscription }` result.\n3. Because `status` is now `\"active\"`, `listTrialsEndingBefore` (which only selects trialing subscriptions) no longer returns this org. The trial-expiry job, `src/server/jobs/trial-expiry-job.ts`, therefore leaves it alone.\n\n## 5. What behaves differently outside the billing pages\n\n**Code that reads the new plan (through `planFor`):**\n- `checkLimit` and `updateSeats` in `billing-service.ts`. `assertWithinLimit` does too, but nothing calls it.\n- `src/app/(dashboard)/[orgSlug]/layout.tsx` calls `checkLimit(org.id, …, 0)` for seats and projects on every navigation and passes the results to `OrgProvider`. `usePlanLimits().checks` and `isExceeded` in `src/hooks/use-plan-limits.ts` therefore reflect the smaller plan, and so do `usage-meter.tsx` and `seat-limit-banner.tsx`.\n- The members settings page, `settings/members/page.tsx`, gets its seat check from `checkLimit(org.id, \"seats\")`.\n- `/api/orgs/[orgId]/usage/route.ts` builds its `checks` array from `checkLimit`.\n\n**Code that still reads the old plan (from `organizations.plan`), and so does not change:**\n- **Feature flags:**\n  - The dashboard layout builds `buildFlagContext` in `src/server/services/feature-flag-service.ts` from `org.plan`, then calls `snapshotFlags`. The client-side `orgFlagContext` in `src/hooks/flag-context.ts` does the same.\n  - Plan-gated flags therefore stay on after a downgrade. `isEnabled` in `src/lib/feature-flags.ts` evaluates `planAtLeast(ctx.plan, minPlan)`, so kanban, the activity feed, webhooks, digest email and similar features stay on.\n- **Server-side flag checks:**\n  - `search-service.search` (advanced search).\n  - `activity-service.exportActivity` (CSV export).\n  - `notification-service.notify` (channels such as digest).\n  - `webhook-service`'s create path.\n- **Quota guards on create paths:**\n  - `project-service` for projects, `issue-service` for issues per project, `invitation-service` for seats, `attachment-service` for storage and `webhook-service` for webhooks.\n  - The actions `create-project.ts`, `create-issue.ts`, `invite-member.ts`, `accept-invitation.ts`, `create-webhook.ts` and `update-seats.ts`, which use `summary.organization.plan` from `getOrganizationSummary`.\n  - These still allow the old plan's quotas.\n- **Jobs:**\n  - `webhook-delivery-job.ts`'s `orgAllowsWebhooks` keeps delivering to webhooks.\n  - `cleanup-archived-job.ts` keeps the old `retentionDays` window.\n  - `usage-service.recomputeUsage` raises its warning thresholds against the old limits.\n- **Rate limits:** `src/lib/rate-limit.ts` doesn't change either way. `setOrgPlan` is never called, so every org is sized as free.\n\n**Mixed signals:** some places combine both values.\n- `usePlanLimits().limits` comes from the stale `org.plan`, but its `checks` come from the new subscription plan.\n- The members page text says \"X of {limits.seats} seats used on the {org.plan} plan\" with the old numbers.\n- The usage API returns `plan: organization.plan` next to `checks` computed from the subscription.\n- Even the billing page labels the current plan from `org.plan`, while `getBillingSummary` and `UsagePanel` use `subscription.plan`.\n\nNothing reconciles the two stored values after a plan change.",
+  "ttft_ms": 1479,
+  "type": "result",
+  "duration_ms": 122734,
+  "uuid": "f1b13214-c101-4d45-97cb-14564ba302d5",
+  "ttft_stream_ms": 851,
+  "time_to_request_ms": 26,
+  "first_content_frame_ms": 851,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

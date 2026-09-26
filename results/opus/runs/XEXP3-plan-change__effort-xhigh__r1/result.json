@@ -1,0 +1,103 @@
+{
+  "duration_api_ms": 343622,
+  "stop_reason": "end_turn",
+  "session_id": "3a8965fd-7868-47c2-a676-83ebbca531f9",
+  "total_cost_usd": 1.0056880999999998,
+  "usage": {
+    "input_tokens": 8,
+    "cache_creation_input_tokens": 29509,
+    "cache_read_input_tokens": 178700,
+    "output_tokens": 4596,
+    "output_tokens_details": {
+      "thinking_tokens": 996
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 29509,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2408,
+        "cache_read_input_tokens": 57807,
+        "cache_creation_input_tokens": 5420,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 5420
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 72,
+      "outputTokens": 26884,
+      "cacheReadInputTokens": 1523323,
+      "cacheCreationInputTokens": 146198,
+      "webSearchRequests": 0,
+      "costUSD": 1.0056880999999998,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 8041,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 2,
+    "requested": {
+      "background": 0,
+      "foreground": 1,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 2,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1,
+      "general-purpose": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 10,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "All claims from the research agent check out against the actual source. I now have everything verified to write the explanation.\n\n## How a plan downgrade works in this codebase\n\n**Who can do it, and where the request lands.** The owner clicks a plan card on the billing settings page (`src/app/(dashboard)/[orgSlug]/settings/billing/page.tsx`), rendered by `BillingPlanCard` (`src/components/domain/billing/billing-plan-card.tsx`), which invokes the page's inline server action `selectPlan(plan)` → `changePlanAction({ orgId, plan, interval })` in `src/actions/billing/change-plan.ts`. That file's `run` handler, wrapped by `withAction()` (`src/actions/_lib/with-action.ts`), first resolves the `Actor` (role included) via `getActor`/`resolveActorForOrg` in `src/server/services/session-service.ts`, then calls `can(actor, \"org:manage_billing\", { kind: \"billing\", orgId })` from `src/lib/permissions.ts`. `can()` delegates to `explain()`, which checks cross-tenant scope, a platform-staff bypass, then looks up `ROLE_MATRIX[\"org:manage_billing\"]`, which is `\"owner\"` — so only a member whose `role` rank (`ROLE_RANK`, `src/types/member.ts`) is ≥ owner passes. If the caller isn't an owner, `changePlanAction` throws `ForbiddenActionError` before anything else runs. The billing page itself and `BillingPlanCard`'s enabled state also call `can()` so non-owners never see an actionable button.\n\n**What's compared before the downgrade is accepted.** `change-plan.ts` next calls its own `assertPlanFitsCurrentUsage(actor, input)`, which loads live counters via `getUsage(actor, orgId)` (`src/server/services/usage-service.ts`, backed by the `organization_usage` table) and compares `seatsUsed`/`projectsUsed`/`storageMbUsed` against the **target** plan's limits from `getPlanLimits()`/`wouldExceedLimit()` (`src/config/plan-limits.ts`), using a requested delta of `0` — i.e. \"does what's already consumed still fit with nothing new added.\" Any breach throws `PlanLimitError`, which is converted to a rejected `ActionResult` (`code: \"plan_limit_exceeded\"`) and no write happens. If that passes, `changePlan(actor, input)` in `src/server/services/billing-service.ts` runs, and repeats essentially the same check for `SUMMARY_RESOURCES = [\"seats\",\"projects\",\"storageMb\",\"webhooks\"]` against live usage before touching the database — this second check is the one that actually gates the write, since the service is the real chokepoint (the action-layer check is a fast-fail duplicate). If any resource would exceed the new plan's limit, `changePlan` throws before calling the repository, leaving the subscription untouched.\n\n**Where the plan is recorded, and which value is authoritative.** There are two `plan` columns in this schema, and they diverge on purpose. `subscriptions.plan` (`src/server/db/schema/billing.ts`) is the one `changePlan()` actually writes, via `subscriptionRepo.updateSubscriptionPlan(orgId, plan, interval)`. `organizations.plan` (`src/server/db/schema/organizations.ts`) is set once by `insertOrg()` (`src/server/repositories/organization-repository.ts`) at org creation and never touched again — `updateOrg()` only ever patches `name`, `logoUrl`, and settings fields. `billing-service.ts`'s own doc comment on its private `planFor(orgId)` helper states the invariant directly: \"The subscription row is the authority on which plan an org is on; the denormalised `organizations.plan` column is only a display convenience.\" `planFor()` reads `subscriptionRepo.findSubscription(orgId).plan` first, falling back to `organizations.plan` only if no subscription row exists at all.\n\n**What happens right after.** Inside `changePlan()`, once `updateSubscriptionPlan` returns, it calls `emit(\"billing.plan_changed\", { ...actorEnvelope(actor), from: currentPlan, to: input.plan })` on the in-process event bus (`src/lib/event-bus.ts`). Two listeners registered at boot by `registerEventHandlers()` (`src/server/services/event-registry.ts`, invoked from `src/instrumentation.ts`) react: `registerActivityListeners()` in `activity-service.ts` writes an audit-log entry (\"Plan X → Y\"), and `registerWebhookListeners()` in `webhook-service.ts` queues delivery rows for the org's configured webhook endpoints (actually \"delivered\" later, asynchronously, by the cron-driven `runWebhookDeliveryJob` in `src/server/jobs/webhook-delivery-job.ts`). Back in the Server Action, `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` is called explicitly, and `withAction()`'s own `{ revalidate: [\"billing\"] }` option triggers a second `revalidateTag`. No email is sent, and no code recomputes or syncs `organizations.plan` or the usage counters as part of this flow.\n\n**The consequence outside the billing pages.** This is the load-bearing detail: almost every quota/feature check elsewhere in the product reads `organizations.plan` directly — the stale, creation-time value — rather than going through `billing-service.ts`'s `planFor()`/`checkLimit()`. Concretely: `createIssue()` in `src/server/services/issue-service.ts` fetches `orgRepo.findOrgById()` and checks `wouldExceedLimit(org.plan, \"issuesPerProject\", used)`; `inviteMembers()` in `src/server/services/invitation-service.ts` does the same for the seat quota; `buildFlagContext()` in `src/server/services/feature-flag-service.ts` sets `plan: org?.plan ?? \"free\"`, which feeds `isEnabled()`/`snapshotFlags()` (`src/lib/feature-flags.ts`) and therefore gates the sidebar nav (`visibleNav()` in `src/config/nav.ts`), the command palette, and any `useFeatureFlag()` consumer; similarly, `project-service.ts` (project quota), `webhook-service.ts`'s `createWebhook()` and the delivery job, and `attachment-service.ts` (storage quota) all key off `org.plan`. Only the billing settings page itself — `getBillingSummary()`, `checkLimit()`, and `changePlan()` in `billing-service.ts`, all via `planFor()` — read the authoritative `subscriptions.plan`. So immediately after an owner downgrades, the billing page correctly shows and enforces the new plan, but the rest of the app (issue/project/seat/webhook/attachment limits and feature-flag-driven UI) keeps behaving as if the org were still on the old, bigger plan, because `organizations.plan` was never updated.",
+  "ttft_ms": 5157,
+  "type": "result",
+  "duration_ms": 50882,
+  "uuid": "e188ece3-a595-463b-ac8f-3163c8f0089f",
+  "ttft_stream_ms": 1722,
+  "time_to_request_ms": 9,
+  "first_content_frame_ms": 1722,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

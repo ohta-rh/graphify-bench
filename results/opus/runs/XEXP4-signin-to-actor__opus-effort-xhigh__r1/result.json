@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 91341,
+  "stop_reason": "end_turn",
+  "session_id": "bdf15d82-ee3d-4328-8bd9-5ec3593aea6f",
+  "total_cost_usd": 0.85504,
+  "usage": {
+    "input_tokens": 24,
+    "cache_creation_input_tokens": 69779,
+    "cache_read_input_tokens": 574560,
+    "output_tokens": 9090,
+    "output_tokens_details": {
+      "thinking_tokens": 1513
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 69779,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4883,
+        "cache_read_input_tokens": 79342,
+        "cache_creation_input_tokens": 780,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 780
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 24,
+      "outputTokens": 9090,
+      "cacheReadInputTokens": 574560,
+      "cacheCreationInputTokens": 69779,
+      "webSearchRequests": 0,
+      "costUSD": 0.85504,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 1513,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 13,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I've read everything from the login form down to the sidebar. Here is the full sequence, in the order it runs.\n\n## 1. The sign-in form (client)\n\nThe route `/login` is public: `isPublicPath` in `src/proxy.ts` lets it through. `Page` in `src/app/(auth)/login/page.tsx` does two things:\n- It cleans up the `?next=` parameter with `safeDestination`, which only accepts same-site paths and otherwise falls back to `/orgs`.\n- It calls `getSessionPrincipal()`. If you're already signed in, it redirects you straight to that destination.\n\nOtherwise it renders `LoginForm` (`src/app/(auth)/login/login-form.tsx`). On submit, the `useActionState` callback reads the email, password and `rememberMe` fields. It runs `loginSchema.safeParse` (`src/schemas/auth.ts`) in the browser, but only so it can show field errors without a round trip. It then calls the Server Action `loginAction(parsed.data)`.\n\n## 2. Checking the credentials (server)\n\n`loginAction` in `src/actions/auth/login.ts` doesn't go through `withAction()`, because at this point there's no `Actor` to resolve. It runs in this order:\n\n1. **Validate again.** It re-runs `loginSchema.safeParse` on the server. This is the check that actually counts.\n2. **Rate limit.** It calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")` from `src/lib/rate-limit.ts`. This is an in-memory token bucket. `auth:login` isn't in `RATE_LIMIT_BUCKETS`, so it uses `DEFAULT_BUCKET`. If the bucket is empty, it throws `RateLimitedError`.\n3. **Check the password.** It calls `login()` in `src/server/services/auth-service.ts`, which:\n   - charges the rate limiter a second time, against its own `ANONYMOUS_ORG` constant;\n   - looks up the user with `userRepo.findUserByEmail`, which lowercases the email;\n   - fetches the stored hash with `userRepo.findPasswordHash`;\n   - calls `verifyPassword` in `src/lib/hash.ts`. That parses the stored `scrypt:<salt>:<key>` string, re-derives the key with scrypt over the NFKC-normalized password, and compares with `timingSafeEqual`.\n\n   An unknown email and a wrong password both throw the same error: \"Those credentials did not match\".\n\n## 3. What gets created, what's stored, what the browser gets\n\nIf the password matches, `login()` calls `createSessionToken(user.id)` in `src/server/services/session-service.ts`:\n\n- `randomToken(32)` makes 32 random bytes, base64url-encoded. This raw token is the credential.\n- `expiresAt` is set to now plus `SESSION_TTL_DAYS` (30 days).\n- `sessionRepo.createSession(userId, hashToken(token), expiresAt)` in `src/server/repositories/session-repository.ts` inserts a row into the `sessions` table (defined in `src/server/db/schema/users.ts`) with:\n  - a new `id`, the `userId` and `expiresAt`;\n  - `activeOrgId: null`;\n  - `tokenHash`, which is SHA-256 of the token. It has a unique index.\n\n**What's stored:** only the hash. A dump of the table can't be replayed as a login.\n\n**What the browser gets:**\n- **The raw token, in a cookie.** Back in `loginAction`, the code calls `resolveSession(token)` to rebuild a `SessionPrincipal` from the database, then `setSessionCookie(token, principal.expiresAt)` in `src/lib/session.ts`. That writes the `taskflow_session` cookie (`SESSION_COOKIE_NAME` in `src/schemas/session.ts`) as `httpOnly`, `sameSite: \"lax\"`, `secure` in production, `path: \"/\"`, expiring when the row does.\n- **The principal, as the action's return value.** `{ ok: true, data: principal }`, where the principal is `{ userId, email, activeOrgId, expiresAt }`. It never includes the token or any role.\n\nBack in the browser, the form's `useEffect` sees `state.ok === true` and calls `router.push(props.next)`.\n\n## 4. How a later request re-establishes who you are\n\nThe next navigation is usually `/orgs`, or whatever `next` was.\n\n1. **`proxy()` in `src/proxy.ts`** runs first. It only checks that a `taskflow_session` cookie exists. If it doesn't, you're redirected to `/login?next=<path>`. If it does, the request continues with an `x-taskflow-authenticated: 1` header. The proxy can't reach the database, so this is just a shortcut, not proof you're signed in.\n2. **The `(dashboard)` layout** (`src/app/(dashboard)/layout.tsx`) makes the real signed-in decision. It calls `getSessionPrincipal()`, which:\n   - reads the cookie via `getSessionToken()` (using `cookies()`);\n   - calls `resolveSession(token)`, which runs `sessionRepo.findSessionByTokenHash(hashToken(token))`. That query joins `sessions` to `users` on the hash and returns `null` if there's no row or `expiresAt` has passed;\n   - checks expiry once more against `parseIso(principal.expiresAt)`.\n\n   If it gets `null`, the layout calls `redirect(\"/login\")`.\n\n**\"Still signed in\" means:** the cookie exists, its hash matches a `sessions` row, and that row hasn't expired. There's no sliding refresh; a session lasts a fixed 30 days. The client can re-check at any time with `GET /api/auth/session` (`src/app/api/auth/session/route.ts`), which returns the principal or a 401 and never the token.\n\n## 5. Choosing a workspace\n\n`src/app/(dashboard)/orgs/page.tsx` works with the bare `SessionPrincipal`. It calls `listOrganizationsForUser(principal.userId)`:\n- **Exactly one org:** it redirects to `/${slug}`.\n- **Otherwise:** it shows a list to pick from.\n\n## 6. From identity to an authorizable `Actor`\n\nOn `/[orgSlug]`, `src/app/(dashboard)/[orgSlug]/layout.tsx` runs:\n\n1. **Re-check the session.** `getSessionPrincipal()` again; `null` throws `UnauthorizedActionError`.\n2. **Find the org.** `resolveOrgBySlug(orgSlug)`; `notFound()` if it doesn't exist.\n3. **Build the `Actor`.** `resolveActorForOrg(principal, orgSlug)` in `session-service.ts`:\n   - looks up the org with `orgRepo.findOrgBySlug`;\n   - looks up your membership with `memberRepo.findMember(org.id, principal.userId)` and requires `status === \"active\"`;\n   - builds `Actor = { userId, orgId: org.id, role: member.role }`;\n   - calls `assertOrgScope(actor, org.id)` from `src/lib/tenant.ts`;\n   - calls `memberRepo.touchLastSeen`.\n\n   This is the step that attaches a role. The session itself carries none; the role comes from the `members` row for this org. If you're not a member, you get the same `notFound()` as a missing org, so the app doesn't leak which slugs exist.\n4. **Check scope again.** `assertOrgScope(actor, org.id)`.\n5. **Evaluate feature flags.** `snapshotFlags(buildFlagContext(actor, org))`. The flag context is built from the org's plan, the actor's role and the org's flag overrides, and every flag is evaluated once with `isEnabled`.\n6. **Load shell data in parallel.** `listProjects(actor, …)` (which itself calls `assertOrgScope` and `assertCan(actor, \"project:read\", …)`), `listNotifications(actor, …)`, and `checkLimit` for seats and projects.\n7. **Render.** It renders `<OrgProvider org actor flags limitChecks>`, which wraps `<DashboardShell …>`.\n\n## 7. The role-aware sidebar\n\n- **`DashboardShell`** (`_components/dashboard-shell.tsx`) is a Server Component. It calls `can(actor, \"project:create\", …)` to decide whether to show \"New project\", and `isEnabled(\"command_palette\", …)` to decide whether to show Search. It then renders `AppSidebar` and `TopBar`, passing the `actor` and `flags` as serialized props.\n- **`AppSidebar`** (`src/components/domain/nav/app-sidebar.tsx`) calls `visibleNav(SIDEBAR_NAV, actor, flags)` and `visibleNav(SETTINGS_NAV, actor, flags)` from `src/config/nav.ts`. It separately checks `can(actor, \"project:read\", organizationResource(org.id))` for the project list.\n- **`visibleNav`** goes through each `NavItem`:\n  - if the item has a flag, `flagAllows` reads it from the snapshot;\n  - if the item has an `action`, it calls `can(actor, item.action, navResource(item.action, actor))`;\n  - it recurses into children and drops any group left empty.\n- **`can()` / `explain()`** in `src/lib/permissions.ts` decide in this order:\n  1. deny if `actor.orgId !== resource.orgId`;\n  2. allow if `isPlatformStaff`;\n  3. look up `ROLE_MATRIX[action]` and compare using `ROLE_RANK` from `src/types/member.ts` (owner 4, admin 3, member 2, viewer 1);\n  4. apply `OWNERSHIP_ESCALATIONS`, which let people act on their own content.\n\n  So a viewer sees Overview, Projects, Issues, Inbox and Members. \"Activity\" needs member plus the `activity_feed` flag. \"Feature flags\" needs admin. \"Billing\" needs owner.\n- **Client components** read the same `Actor` through `OrgProvider` (`@/hooks/org-context`) with `useOrg()` and `usePermission()`. `usePermission` (`src/hooks/use-permission.ts`) calls the same `can()`, so there's only one permission table.\n\n## 8. The workspace page\n\nThe page under the layout, for example `src/app/(dashboard)/[orgSlug]/page.tsx`, calls `loadTenantContext(orgSlug)` from `_lib/tenant-context.ts`. That runs `resolveOrgBySlug`, then `getActor(orgSlug)` from `src/lib/actor.ts`, then `assertOrgScope`, then `snapshotFlags`. `getActor` repeats the whole chain: `getSessionPrincipal()` → `resolveActorForOrg`, throwing `UnauthorizedError` or `NoMembershipError`. So the cookie is resolved again, independently of the layout.\n\nThe page then authorizes with `can(actor, \"org:manage_billing\", …)` and passes the `actor` into services like `listIssues` and `listProjects`. Those enforce `assertOrgScope` and `assertCan`. Later Server Actions go through `withAction` → `resolveActorFor`, which calls `getActor` or `requireActorFor`, so every mutation starts from the cookie again the same way.\n\n## Quirks worth knowing\n- **\"Keep me signed in\" does nothing.** `rememberMe` is parsed but never used; every session lasts 30 days.\n- **Each login charges the rate limiter twice, in two different buckets.** The action uses `ANONYMOUS_ORG_ID = \"\"` and the service uses `\"000…0\"`.\n- **`activeOrgId` starts out `null`.** So `requireActorFor` (used by id-based routes and by `withAction` when an action names no org) fails until the org-switch action (`switch-org.ts`) sets it. The slug-based `getActor` path doesn't depend on it.\n- **The session is resolved from scratch several times per page view.** The dashboard layout, the org layout and `loadTenantContext` each do it, with nothing cached between them, and `touchLastSeen` writes on each actor resolution.\n- **A dead session loses the return path.** The `(dashboard)` layout redirects to `/login` without a `next` parameter, so someone whose cookie exists but whose session has expired lands on `/orgs` after signing in, not the page they wanted.",
+  "ttft_ms": 1472,
+  "type": "result",
+  "duration_ms": 92097,
+  "uuid": "6e22e923-d611-4199-bcba-93a478b33655",
+  "ttft_stream_ms": 767,
+  "time_to_request_ms": 40,
+  "first_content_frame_ms": 768,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

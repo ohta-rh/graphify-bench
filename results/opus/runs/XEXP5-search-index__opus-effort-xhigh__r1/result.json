@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 124553,
+  "stop_reason": "end_turn",
+  "session_id": "1c805c11-1125-41da-acf8-3fe608018e44",
+  "total_cost_usd": 0.8408929999999999,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 59813,
+    "cache_read_input_tokens": 643385,
+    "output_tokens": 11680,
+    "output_tokens_details": {
+      "thinking_tokens": 4646
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 59813,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 6229,
+        "cache_read_input_tokens": 69468,
+        "cache_creation_input_tokens": 688,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 688
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 28,
+      "outputTokens": 11680,
+      "cacheReadInputTokens": 643385,
+      "cacheCreationInputTokens": 59813,
+      "webSearchRequests": 0,
+      "costUSD": 0.8408929999999999,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 4646,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 19,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "An edited issue title becomes searchable before the edit request even returns. The search listener updates the index inside the same `await` chain as the database write. On the query side, a search that passes validation can still be refused: on any plan below enterprise, a query containing a colon is rejected.\n\n## 1. Wiring (once per server process)\n\n`src/instrumentation.ts` → `register()` runs only on the Node.js runtime. It imports `src/server/services/event-registry.ts` and calls `registerEventHandlers()`. That function is safe to call twice (it checks its `detach` handle) and calls `registerSearchListeners()` in `src/server/services/search-service.ts:137`. This attaches handlers on the in-process bus in `src/lib/event-bus.ts` for:\n\n- `issue.created`, `issue.updated`, `issue.archived`\n- `comment.created`, `comment.deleted`\n- `project.created`, `project.archived`\n- `search.reindex_requested`\n\n## 2. Write side: the title edit\n\n1. **`updateIssueAction`** (`src/actions/issues/update-issue.ts`) is wrapped by `withAction` (`src/actions/_lib/with-action.ts`). That wrapper checks the payload against `updateIssueSchema` and resolves the actor through `resolveActorFor` → `requireActorFor`. The action then checks `can(actor, \"issue:update\", …)`.\n2. **`issueService.updateIssue`** (`src/server/services/issue-service.ts:83`) runs, in order:\n   - `assertOrgScope`\n   - `issueRepo.findIssueById`\n   - `assertCan(\"issue:update\")`\n   - `assertNotArchived`\n   - `issueRepo.updateIssue`, an `UPDATE … RETURNING` that sets only the fields present, plus `updatedAt`\n3. It then calls **`await emit(\"issue.updated\", {…, changedFields})`**. `emit` in `src/lib/event-bus.ts` runs every subscriber with `Promise.allSettled` and waits for all of them. So the search, activity, webhook and notification handlers all finish before `updateIssue` returns.\n4. **The search handler** (`search-service.ts:143`) ignores the payload and reads the row again with `issueRepo.findIssueById`. That way, a half-applied write is never indexed as if it had succeeded. It then calls `indexIssue(orgId, issue)`.\n5. **`indexIssue`** builds the content as `title + \"\\n\" + (description ?? \"\")` and calls **`searchRepo.upsertSearchDocument`** (`src/server/repositories/search-repository.ts:18`). That function looks up the existing row by (org, `\"issue\"`, issueId). If it finds one, it updates `content`, `projectId` and `indexedAt` in place; otherwise it inserts a new row. Because of this, being called on every write is safe.\n6. Control returns up the stack, and the action calls `revalidateTagged`. The colleague's search is now hitting a row that already has the new title and a fresh `indexedAt`, so it also sorts first.\n\n**Failure behaviour:** a handler that throws is passed to `reportHandlerError` and never rethrown. The edit still succeeds, the index silently keeps the old text, and nothing retries.\n\n**The backstop doesn't work as scheduled:** `runSearchReindexJob` (`src/server/jobs/search-reindex-job.ts`) is meant to catch this kind of drift, but:\n- `scheduler.ts` `tick()` queues it daily with `payload: {}`.\n- The `\"search-reindex\"` case in `queue.ts` returns early when `orgId` isn't a string, so the scheduled run does nothing.\n- Even when given an org, the job reads only the first page of 100 items.\n- Nothing in `src` ever emits `search.reindex_requested`.\n\n## 3. What's in the searchable copy\n\nIt's a single table, `search_index`: `searchIndex` in `src/server/db/schema/webhooks.ts`, with the raw DDL in `src/server/db/migrate.ts`.\n\n| Column | Contents |\n|---|---|\n| `id` | row id |\n| `org_id` | tenant |\n| `subject_kind` | `issue` / `comment` / `project` |\n| `subject_id` | id of the indexed item |\n| `project_id` | owning project; `null` for comments; for a project row, the project's own id |\n| `content` | issue: title + `\\n` + description; project: name + `\\n` + description; comment: body |\n| `indexed_at` | time of the last upsert |\n\nThe only index is on `(org_id, subject_kind)`. The table stores plain text with no tokens, and no status, labels or assignee.\n\n## 4. Query side\n\nThere are three entry points, each with its own checks before the shared service call:\n\n- **`GET /api/search`** (`src/app/api/search/route.ts`), used by the command palette:\n  1. requires `orgSlug` and `q`\n  2. `getActor(orgSlug)`, then `can(org:read)`\n  3. `getOrganizationSummary`, then `buildFlagContext`\n  4. `isEnabled(\"command_palette\")`\n  5. `searchQuerySchema.safeParse`: `kinds` is all three if `advanced_search` is on, otherwise only `[\"issue\"]`; `limit` is 10\n- **`searchAction`** (`src/actions/search/search.ts`): `withAction` validation and actor lookup, then `can(org:read)`. If `advanced_search` is off, the requested kinds are quietly narrowed to `issue` rather than refused.\n- **The search page** (`src/app/(dashboard)/[orgSlug]/search/page.tsx`): `loadTenantContext`, then `safeParse` with `limit` 30.\n\nOn the client, `SearchDialog` (`src/components/domain/search/search-dialog.tsx`) waits for typing to pause (`useDebouncedValue`) and runs `parseSearchQuery` (`query-syntax.ts`). With the advanced flag on, that removes `kind:`, `in:` and `project:` tokens; with it off, the whole string is sent as `q`.\n\n`searchQuerySchema` (`src/schemas/search.ts`) requires `q` to be 1–200 characters, defaults `kinds` to `[\"issue\"]`, and allows an optional `projectId`. Page `limit` must be 1–100.\n\nAll three entry points then call **`search()`** (`search-service.ts:46`), which runs in this order:\n\n1. **`assertOrgScope`**: throws `TenantScopeError` if the query names another org.\n2. **`assertCan(actor, \"issue:read\", orgResource)`**: requires at least viewer.\n3. **`consumeRateLimit(orgId, \"search:query\")`** (`src/lib/rate-limit.ts`): a token bucket shared by the whole org, with a base of 120 tokens refilling at 60 per minute.\n   - It is meant to scale with plan, but `setOrgPlan` is never called, so every org gets the free-plan size.\n   - The palette sends a request every time typing pauses, so a busy org can empty it.\n   - When empty it throws \"Search rate limit reached; try again after …\".\n4. **`orgRepo.findOrgById`**, then **`isEnabled(\"advanced_search\", …)`**. That flag needs the `enterprise` plan (the order is free < starter < growth < enterprise) or an org override in `enabledFlagOverrides`.\n5. **The colon rule** (`search-service.ts:69`): if `q` contains `:` and advanced search is off, it throws **\"Field-scoped search is not included in this plan\"**.\n6. **`searchRepo.searchDocuments`**:\n   - Filters: `orgPredicate`, `LIKE %q%` on `content`, plus the optional `kinds` and `projectId` filters.\n   - Runs a `count()` for `total`.\n   - Fetches rows ordered by `indexed_at DESC, id DESC`, paged by cursor (`keysetPredicate`, `probeLimit`, `toPage`).\n7. **Each row becomes a `SearchHit`**:\n   - `title`: the first line of `content`\n   - `snippet`: `snippetAround`, 60 characters either side of a case-insensitive match\n   - `href`: `hrefFor`, e.g. `/issues/<id>`\n\n## 5. When a valid-looking query is refused\n\nThe main case is the colon rule in step 5. Suppose the new title is \"Hotfix: login loop\" and the colleague's org is on growth or lower with no override. Searching `Hotfix: login` passes the schema, tenant scope, permission and rate-limit checks, then `search()` throws. The same happens to searches containing a URL or a time like `10:30`.\n\nThe client doesn't expect this. `parseSearchQuery`'s own comment says that with the flag off \"a colon in a title still finds the title\", so it passes the colon through unchanged. The refusal is still intended on the server, though: `tests/services/search-service.test.ts` expects `\"status:PlainMatchWorks\"` to be rejected on a growth tenant.\n\nHow the refusal reaches the user depends on the entry point:\n- **`searchAction`:** `withAction` turns it into `{ ok: false, code: \"internal_error\" }`, and `SearchDialog` renders `result.ok ? result.data : []`. The user just sees no results.\n- **`/api/search`:** `errorResponse` returns it as an error response.\n- **Search page:** the error propagates to the error boundary.\n\nThe other ways a query gets refused:\n- the org's rate-limit bucket is empty\n- `q` is longer than 200 characters, or empty\n- the org doesn't match the actor's (tenant scope)\n- the user lacks `issue:read` or `org:read`\n- on `/api/search` only, `command_palette` is off (it is always on and can't be overridden, so this doesn't happen in practice)\n\nKinds the plan doesn't allow are silently narrowed to `issue`, not refused.",
+  "ttft_ms": 1371,
+  "type": "result",
+  "duration_ms": 125232,
+  "uuid": "82c14a35-7c88-4bfe-9d94-9d853a39b3b3",
+  "ttft_stream_ms": 805,
+  "time_to_request_ms": 35,
+  "first_content_frame_ms": 805,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

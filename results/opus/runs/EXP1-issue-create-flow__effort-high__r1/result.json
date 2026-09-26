@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 248637,
+  "stop_reason": "end_turn",
+  "session_id": "37b727da-51d7-4d8b-bd5f-e98fa33d37de",
+  "total_cost_usd": 0.7715785,
+  "usage": {
+    "input_tokens": 12,
+    "cache_creation_input_tokens": 24444,
+    "cache_read_input_tokens": 289355,
+    "output_tokens": 5543,
+    "output_tokens_details": {
+      "thinking_tokens": 1290
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 24444,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 3051,
+        "cache_read_input_tokens": 59102,
+        "cache_creation_input_tokens": 2572,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2572
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 70,
+      "outputTokens": 19400,
+      "cacheReadInputTokens": 1322730,
+      "cacheCreationInputTokens": 99471,
+      "webSearchRequests": 0,
+      "costUSD": 0.7715785,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 3387,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 11,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here's the complete flow, traced through the actual source.\n\n## 1. The client submits without a `<form action>`\n\nThe page at `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx` is a Server Component. Before it even renders the form, it does two gate checks itself: `loadProjectContext(orgSlug, projectSlug)` resolves the org/project/`Actor`, then `can(actor, \"issue:create\", {...})` from `src/lib/permissions.ts` runs — if that's `false` it calls `notFound()` and the form is never shown. It then re-checks the org's plan quota (`getPlanLimits(org.plan)` from `src/config/plan-limits.ts` against `listIssues(actor, {includeArchived: true})`), rendering a \"This project is full\" screen instead of the form if the project is at capacity. If both checks pass, it renders `<IssueForm ... onSubmit={createIssueAction} />`, passing the Server Action itself as a prop.\n\n`IssueForm` (`src/components/domain/issue/issue-form.tsx`, `\"use client\"`) uses `react-hook-form` with `zodResolver(createIssueSchema)` — the same Zod schema that will be re-applied server-side. On submit it calls `useFormAction` (`src/hooks/use-form-action.ts`), whose `submit()` invokes the `onSubmit` prop (`createIssueAction`) and turns the returned `ActionResult` into pending/error UI state — there's no throw-based handling for expected failures.\n\n## 2. The Server Action\n\n`src/actions/issues/create-issue.ts` (`\"use server\"`) builds its handler with the shared `withAction(createIssueSchema, handler, {revalidate: [\"issues\"], cacheProfile: \"minutes\"})` wrapper from `src/actions/_lib/with-action.ts`, and exports `createIssueAction(raw)` which just calls that wrapped function. `withAction` is the funnel every mutation goes through and runs, in order:\n\n1. **Input validation** — `schema.safeParse(raw)` against `createIssueSchema` (`src/schemas/issue.ts`). Any failure short-circuits straight to an error `ActionResult` via `toActionResult`.\n2. **Session/actor resolution** — `resolveActorFor()`. Since the parsed payload carries `orgId`, it calls `requireActorFor(orgId)` (`src/lib/actor.ts`), which reads the session cookie through `getSessionPrincipal()` (`src/lib/session.ts` — a custom cookie-based session, not NextAuth: it reads `SESSION_COOKIE_NAME` via `cookies()`, resolves it through `resolveSession(token)` in `src/server/services/session-service.ts`, and checks `expiresAt` against `Date.now()`), then translates the org id to the org's slug and calls `resolveActorForOrg`, finishing with `assertOrgScope(actor, orgId)` (`src/lib/tenant.ts`) as a tenant guard. No session ⇒ `UnauthorizedError`/`UnauthorizedActionError`; no membership ⇒ `NoMembershipError`.\n\nOnly once an `Actor` exists does `withAction` call the handler body defined in `create-issue.ts`:\n\n3. **Authorization** — `can(actor, \"issue:create\", {kind:\"issue\", orgId, projectId, issueId:\"\", authorId:actor.userId, assigneeId})` from `src/lib/permissions.ts`. Its decision order (in `explain()`) is: cross-tenant guard (`actor.orgId === resource.orgId`) → platform-staff bypass → `ROLE_MATRIX[\"issue:create\"] = \"member\"` rank check → ownership escalation (n/a for creation). A `false` result throws `ForbiddenActionError(\"issue:create\")`.\n4. **Plan-quota gate** — `assertProjectHasRoom(actor, input)` re-derives the org's plan limits and issue count and throws `PlanLimitError` if the project is full (defense-in-depth against the same check the page already did, closing the race where two people submit concurrently).\n5. **The actual write** — `await createIssue(actor, input)`.\n\n## 3. Service-layer write, `src/server/services/issue-service.ts::createIssue`\n\nThis function re-does its own gates independently of the action layer (defense in depth): `assertOrgScope(actor, input.orgId)`, load the project via `projectRepo.findProjectById` + `requireFound` (404 if missing), `assertNotArchived(\"Project\", ...)` (`src/lib/soft-delete.ts`, refuses writes into an archived project), `assertCan(actor, \"issue:create\", projectResource(project))` (the throwing twin of `can()`), then a second, independent plan-quota check via `wouldExceedLimit(org.plan, \"issuesPerProject\", used)` (`src/config/plan-limits.ts`).\n\nOnce past all of that, it allocates a per-project sequence number with `issueRepo.nextIssueNumber(orgId, projectId)` (max existing number + 1, including archived issues, to keep numbers unique against the `issues_project_number_idx`) and calls `issueRepo.insertIssue(input, actor.userId, number)`.\n\n## 4. The database row\n\n`src/server/repositories/issue-repository.ts::insertIssue` uses Drizzle ORM against SQLite (`getDb()`). It does `db.insert(issues).values({...}).returning().get()` into the `issues` table (`src/server/db/schema/issues.ts`), writing `id` (`newId()`), `orgId`, `projectId`, `number`, `title`, `description`, `status`, `priority`, `authorId` (the creating user), `assigneeId`, `parentId`, `estimate`, `dueAt`, `startedAt: null`, `completedAt: null`, and `createdAt`/`updatedAt` both set to the same write-time ISO stamp. If `labelIds` were selected, a second insert populates the `issue_labels` join table. The row is mapped back to an `Issue` via `toIssue()`.\n\n## 5. What happens after the write\n\nBack in `createIssue`, still before returning: `await emit(\"issue.created\", {actorId, orgId, issueId, projectId, title, assigneeId, priority})` via the in-process pub/sub bus `src/lib/event-bus.ts`. This is `await`ed, and internally uses `Promise.allSettled` so one failing subscriber can't fail the others or the request. Subscribers were attached once at process start by `registerEventHandlers()` (`src/server/services/event-registry.ts`, invoked from `src/instrumentation.ts`):\n\n- **Audit/activity log** — `activity-service.ts`'s listener calls `record(orgId, \"issue.created\", ...)` → inserts a row into `activity_events`.\n- **Search index** — `search-service.ts`'s listener re-reads the issue and upserts it into the `search_index` table.\n- **Usage counters** — `usage-service.ts`'s listener increments `issuesUsed` on `organization_usage`.\n- **Webhooks** — `webhook-service.ts`'s listener enqueues one row per subscribed endpoint into `webhook_deliveries`; actual HTTP delivery is drained later by the cron route `src/app/api/cron/webhook-delivery/route.ts`, not synchronously.\n- **Notifications** — `notification-service.ts` is imported (so it's attached) but only reacts to `issue.assigned`/`issue.overdue`/etc. — plain issue creation sends no notification.\n\nOnly after `emit` resolves does `createIssue` return the `Issue` to the action handler. Back in `create-issue.ts`, the handler calls `revalidateTagged([orgTag, projectTag, issueTag], CACHE_PROFILES.minutes)` (`src/lib/cache.ts` → Next's `revalidateTag`). Control returns to `withAction`, which does a second, generic revalidation pass for `options.revalidate = [\"issues\"]`, then wraps the result with `stamp()` (adding a `submittedAt` timestamp) and returns `{ok: true, data: issue, submittedAt}`.\n\nOn the client, `useFormAction` receives that `ActionResult`, clears any error state, and calls `IssueForm`'s `onSuccess`, which does `form.reset()`. There is no `redirect()` — the user stays on the \"New issue\" page with a cleared form. Notably, no rate limiting is applied anywhere in this particular path.",
+  "ttft_ms": 3251,
+  "type": "result",
+  "duration_ms": 66456,
+  "uuid": "6d52edaa-32c9-4705-a7d7-04b4317995cb",
+  "ttft_stream_ms": 1501,
+  "time_to_request_ms": 24,
+  "first_content_frame_ms": 1502,
+  "queued_turn_count": 0,
+  "result_index": 1
+}

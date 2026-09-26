@@ -1,0 +1,102 @@
+{
+  "duration_api_ms": 207640,
+  "stop_reason": "end_turn",
+  "session_id": "7d890992-9810-4fc0-9f3d-2f1844f737bb",
+  "total_cost_usd": 0.5838077999999999,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 14037,
+    "cache_read_input_tokens": 294857,
+    "output_tokens": 3759,
+    "output_tokens_details": {
+      "thinking_tokens": 319
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 14037,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2254,
+        "cache_read_input_tokens": 47279,
+        "cache_creation_input_tokens": 1660,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1660
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5": {
+      "inputTokens": 54,
+      "outputTokens": 16222,
+      "cacheReadInputTokens": 931624,
+      "cacheCreationInputTokens": 76017,
+      "webSearchRequests": 0,
+      "costUSD": 0.5838077999999999,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 64000,
+      "thinkingTokens": 2902,
+      "canonicalModel": "claude-sonnet-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "origin": {
+    "kind": "task-notification"
+  },
+  "subagent_stats": {
+    "spawned": 1,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 1
+    },
+    "started_in_background": 1,
+    "max_depth": 1,
+    "spawned_by_subagents": 0,
+    "completed": 1,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {
+      "Explore": 1
+    }
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Confirmed. This matches, so I have everything verified to write the answer now.\n\n---\n\nHere's the path from a browser click to a (would-be) HTTP call at the customer's endpoint, and back through retries.\n\n**What puts the delivery in motion.** The issue-creation UI is a client component, `IssueForm` (`src/components/domain/issue/issue-form.tsx`), whose submit handler calls a Next.js Server Action, `createIssueAction`, defined in `src/actions/issues/create-issue.ts`. That action is wrapped by `withAction` (checks the actor/permissions), does a plan-quota check via `assertProjectHasRoom`, and then calls the real business logic: `createIssue(actor, input)` in `src/server/services/issue-service.ts`. `createIssue` (lines 42–81) runs its own gates — tenant scope, the `issue:create` permission, the project's existence/not-archived state, and the per-project issue quota — allocates the next issue number, inserts the row via `issueRepo.insertIssue`, and then, at line 71, calls `await emit(\"issue.created\", { ...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority })`. That `emit` call, from `src/lib/event-bus.ts`, is the actual trigger: it looks up every handler subscribed to `\"issue.created\"` and runs them via `Promise.allSettled`, so a downstream failure (e.g. in webhook fan-out) can't fail the issue creation itself.\n\n**How the app works out which endpoints care.** Event handlers are registered once at process boot: `src/instrumentation.ts`'s `register()` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which in turn calls `registerWebhookListeners()` in `src/server/services/webhook-service.ts`. That function subscribes a handler to `\"issue.created\"` (among other event types) that calls `enqueueForOrg(payload.orgId, \"issue.created\", JSON.stringify(payload))`. `enqueueForOrg` (same file, lines 141–156) is the subscriber-resolution step: it loads every webhook endpoint belonging to that org via `webhookRepo.listEndpoints(orgId)`, skips any endpoint that's disabled, parses each endpoint's `eventTypes` JSON column and skips endpoints that never subscribed to `\"issue.created\"`, and for every remaining match inserts a row via `webhookRepo.enqueueDelivery(orgId, endpoint.id, eventType, payload)` into the `webhookDeliveries` table (`src/server/db/schema/webhooks.ts`), with `status: \"pending\"` and `attempts: 0`. This all still happens synchronously inside the same `emit` call, but it's just a DB insert — no network I/O yet — so the original request returns quickly.\n\n**What actually performs the send.** The \"sender\" is `runWebhookDeliveryJob` in `src/server/jobs/webhook-delivery-job.ts`. It's invoked either by the in-process scheduler (`src/server/jobs/scheduler.ts`'s `tick()`, which enqueues a `\"webhook-delivery\"` job every minute, drained by `src/server/jobs/queue.ts`'s `drain()`) or by an external cron hitting `src/app/api/cron/webhook-delivery/route.ts`, which validates a shared secret via `assertCronSecret` and then calls the job directly. The job claims up to 25 pending rows via `webhookRepo.claimPendingDeliveries`, checks that the org's plan still includes webhooks, resolves the matching endpoint, and computes `signPayload(endpoint.secret, delivery.payload)`. Notably, there is no actual outbound HTTP request anywhere in this codebase — a `grep` for `fetch(` across `src` returns nothing, and the job file's own comment says as much: \"There is no outbound HTTP in Taskflow — the corpus builds and runs offline — so 'delivery' means computing the signature the receiver would verify and logging the attempt.\" So \"sending\" here is `logger.info(\"webhook delivered\", {...signature, backoffMs...})` followed by `webhookRepo.markDelivered(...)`, which unconditionally succeeds once the pre-flight checks pass.\n\n**What happens on failure.** The retry scaffolding is fully built even though nothing currently fails on the network layer. Inside `runWebhookDeliveryJob`, deliveries whose org plan no longer allows webhooks, or whose endpoint is missing/disabled, or that have exceeded `MAX_ATTEMPTS = 6`, are immediately dead-lettered via `webhookRepo.markDeliveryFailed` (status `\"failed\"`, with a truncated error message). `claimPendingDeliveries` bumps `attempts` on every claim, so anything left `pending` would be re-claimed on the next scheduler tick or cron invocation — that's the retry loop. The intended pacing is `backoffMs(attempts)` in the same file: 1s, 2s, 4s… capped at 5 minutes; it's currently only logged, not enforced as a gate, since every claim resolves in the same pass. Separately, at the job-queue level, `src/server/jobs/queue.ts`'s `drain()` retries the job invocation itself (not individual deliveries) up to 5 times with its own exponential backoff (capped at 60s) if `runWebhookDeliveryJob` throws.\n\n**How the receiver verifies authenticity.** `signPayload(secret, payload)` in `src/server/services/webhook-service.ts` computes `createHmac(\"sha256\", secret).update(payload, \"utf8\").digest(\"hex\")` — an HMAC-SHA256 over the exact JSON payload string, hex-encoded. The per-endpoint secret is a 32-byte random token minted once in `createWebhook` (same file) and stored in `webhookEndpoints.secret`; it's never rotated in place — rotating means deleting and recreating the endpoint. Since no real HTTP request is ever sent, there's also no `X-Taskflow-Signature`-style header actually attached to anything; the signature is only surfaced via the delivery job's log line (truncated to 16 hex chars) and via `src/app/api/webhooks/[endpointId]/test/route.ts`, a \"send test payload\" endpoint that computes the same `signPayload` and returns the signature directly in its JSON response body, explicitly so a customer can \"verify their own check against a known-good pair without waiting for a real event.\" There's no customer-facing docs page describing HMAC verification — the only Markdown file in the repo is `CLAUDE.md` — so the verification contract lives only in code comments on `signPayload` and the test route.",
+  "ttft_ms": 3223,
+  "type": "result",
+  "duration_ms": 53077,
+  "uuid": "8d2f32a4-05d6-42f3-9343-05d809ecba95",
+  "ttft_stream_ms": 1428,
+  "time_to_request_ms": 8,
+  "first_content_frame_ms": 1428,
+  "queued_turn_count": 0,
+  "result_index": 1
+}
