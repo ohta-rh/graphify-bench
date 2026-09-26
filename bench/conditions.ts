@@ -557,6 +557,38 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     effort: "low",
     note: "As `opus-effort-medium`, one notch down: `effort-low` on Opus 5.5.",
   },
+  {
+    name: "effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "high",
+    note:
+      "Baseline with `--effort high` spelled out. It equals the harness default, so the arm is `baseline` " +
+      "re-measured on the current CLI under a name that pairs it with `opus-effort-high`.",
+  },
+  {
+    name: "effort-xhigh",
+    overlays: ["baseline"],
+    corpus: "v1",
+    effort: "xhigh",
+    note: "As `effort-high`, one notch up: baseline with `--effort xhigh`.",
+  },
+  {
+    name: "opus-effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: OPUS_MODEL,
+    effort: "high",
+    note: "`effort-high` on Opus 5.5 — only the model differs.",
+  },
+  {
+    name: "opus-effort-xhigh",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: OPUS_MODEL,
+    effort: "xhigh",
+    note: "`effort-xhigh` on Opus 5.5 — only the model differs.",
+  },
 ] as const;
 
 const BY_NAME = new Map(CONDITIONS.map((c) => [c.name, c]));

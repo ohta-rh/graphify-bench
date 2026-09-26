@@ -565,6 +565,8 @@ describe("runtime lever arms", () => {
   it.each([
     ["opus-effort-medium", "effort-medium"],
     ["opus-effort-low", "effort-low"],
+    ["opus-effort-high", "effort-high"],
+    ["opus-effort-xhigh", "effort-xhigh"],
   ])("%s is %s with only the model swapped", (opus, sonnet) => {
     const o = getCondition(opus);
     const s = getCondition(sonnet);
