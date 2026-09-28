@@ -1,0 +1,693 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -10,6 +10,7 @@
+ 
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
++  "organization.ownership_transferred": "handed over the organization",
+   "project.created": "created a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -50,6 +50,7 @@
+   project_archived: "Project archived",
+   plan_limit_reached: "Plan limit reached",
+   digest_ready: "Daily digest ready",
++  ownership_handover: "Workspace handed over to me",
+ };
+ 
+ export function NotificationPreferencesForm(
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -15,6 +15,22 @@
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
++export type OwnershipHandoverRefusal =
++  | "self"
++  | "pending_exists"
++  | "nothing_pending"
++  | "expired";
++
++/** A workspace handover that cannot proceed; mapped to `conflict`. */
++export class OwnershipHandoverError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly reason: OwnershipHandoverRefusal) {
++    super(`Ownership handover refused: ${reason}`);
++    this.name = "OwnershipHandoverError";
++  }
++}
++
+ export const HTTP_STATUS_BY_CODE: Readonly<Record<ErrorCode, number>> = {
+   unauthorized: 401,
+   forbidden: 403,
+@@ -34,6 +50,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof OwnershipHandoverError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -96,6 +113,14 @@
+     };
+   }
+ 
++  if (error instanceof OwnershipHandoverError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { reason: error.reason },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/lib/permissions.ts b/src/lib/permissions.ts
+--- a/src/lib/permissions.ts
++++ b/src/lib/permissions.ts
+@@ -26,6 +26,7 @@
+   "org:read": "viewer",
+   "org:update": "admin",
+   "org:delete": "owner",
++  "org:transfer": "owner",
+   "org:manage_billing": "owner",
+   "org:manage_flags": "admin",
+   "member:read": "viewer",
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -9,6 +9,7 @@
+ 
+ export const activityActionSchema = z.enum([
+   "organization.updated",
++  "organization.ownership_transferred",
+   "project.created",
+   "project.updated",
+   "project.archived",
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -19,6 +19,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "ownership_handover",
+ ]);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -67,6 +67,17 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS organizations_slug_idx ON organizations (slug)`,
+   `CREATE INDEX IF NOT EXISTS organizations_owner_idx ON organizations (owner_id)`,
++  `CREATE TABLE IF NOT EXISTS ownership_handovers (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     from_user_id TEXT NOT NULL,
++     to_user_id TEXT NOT NULL,
++     status TEXT NOT NULL DEFAULT 'pending',
++     expires_at TEXT NOT NULL,
++     resolved_at TEXT,
++     created_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS ownership_handovers_org_status_idx ON ownership_handovers (org_id, status)`,
+   `CREATE TABLE IF NOT EXISTS organization_usage (
+      org_id TEXT PRIMARY KEY NOT NULL,
+      seats_used INTEGER NOT NULL DEFAULT 0,
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -13,6 +13,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "ownership_handover",
+ ] as const;
+ 
+ export const notifications = sqliteTable(
+diff --git a/src/server/db/schema/organizations.ts b/src/server/db/schema/organizations.ts
+--- a/src/server/db/schema/organizations.ts
++++ b/src/server/db/schema/organizations.ts
+@@ -42,6 +42,29 @@
+   measuredAt: text("measured_at").notNull(),
+ });
+ 
++/** Offers to hand a workspace to another member; at most one is pending. */
++export const ownershipHandovers = sqliteTable(
++  "ownership_handovers",
++  {
++    id: idColumn(),
++    orgId: text("org_id").notNull(),
++    fromUserId: text("from_user_id").notNull(),
++    toUserId: text("to_user_id").notNull(),
++    status: text("status", {
++      enum: ["pending", "accepted", "declined", "canceled", "expired"],
++    })
++      .notNull()
++      .default("pending"),
++    expiresAt: text("expires_at").notNull(),
++    resolvedAt: text("resolved_at"),
++    createdAt: text("created_at").notNull(),
++  },
++  (table) => [
++    index("ownership_handovers_org_status_idx").on(table.orgId, table.status),
++  ],
++);
++
+ export type OrganizationRow = typeof organizations.$inferSelect;
++export type OwnershipHandoverRow = typeof ownershipHandovers.$inferSelect;
+ export type NewOrganizationRow = typeof organizations.$inferInsert;
+ export type OrganizationUsageRow = typeof organizationUsage.$inferSelect;
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -114,6 +114,22 @@
+   return toOrganization(row);
+ }
+ 
++/** Moves the recorded owner; roles are the member repository's business. */
++export async function updateOwner(
++  orgId: OrgId,
++  ownerId: UserId,
++): Promise<Organization> {
++  const row = getDb()
++    .update(organizations)
++    .set({ ownerId, updatedAt: toIsoTimestamp(new Date()) })
++    .where(eq(organizations.id, orgId))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Organization ${orgId} not found`);
++  return toOrganization(row);
++}
++
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+   const row = getDb()
+     .update(organizations)
+diff --git a/src/server/repositories/ownership-handover-repository.ts b/src/server/repositories/ownership-handover-repository.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/repositories/ownership-handover-repository.ts
+@@ -0,0 +1,117 @@
++/**
++ * Workspace ownership handovers. At most one row per organization is
++ * `pending`; the service resolves it before it opens another.
++ */
++import { and, eq, or } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, ownershipHandovers } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import { brandId, brandStamp, brandStampOrNull } from "./_mappers";
++import type { OwnershipHandoverRow } from "@/server/db/schema/organizations";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
++import type {
++  OwnershipHandover,
++  OwnershipHandoverStatus,
++} from "@/types/organization";
++
++function toHandover(row: OwnershipHandoverRow): OwnershipHandover {
++  return {
++    id: row.id,
++    orgId: brandId<OrgId>(row.orgId),
++    fromUserId: brandId<UserId>(row.fromUserId),
++    toUserId: brandId<UserId>(row.toUserId),
++    status: row.status,
++    expiresAt: brandStamp(row.expiresAt),
++    createdAt: brandStamp(row.createdAt),
++    resolvedAt: brandStampOrNull(row.resolvedAt),
++  };
++}
++
++export async function insertHandover(
++  orgId: OrgId,
++  fromUserId: UserId,
++  toUserId: UserId,
++  expiresAt: IsoTimestamp,
++): Promise<OwnershipHandover> {
++  const row = getDb()
++    .insert(ownershipHandovers)
++    .values({
++      id: newId(),
++      orgId,
++      fromUserId,
++      toUserId,
++      status: "pending",
++      expiresAt,
++      resolvedAt: null,
++      createdAt: toIsoTimestamp(new Date()),
++    })
++    .returning()
++    .get();
++
++  return toHandover(row);
++}
++
++/** The row still marked pending, expired or not; the service decides which. */
++export async function findPendingHandover(
++  orgId: OrgId,
++): Promise<OwnershipHandover | null> {
++  const row = getDb()
++    .select()
++    .from(ownershipHandovers)
++    .where(
++      and(
++        orgPredicate(ownershipHandovers.orgId, orgId),
++        eq(ownershipHandovers.status, "pending"),
++      ),
++    )
++    .get();
++  return row ? toHandover(row) : null;
++}
++
++export async function resolveHandover(
++  orgId: OrgId,
++  handoverId: string,
++  status: Exclude<OwnershipHandoverStatus, "pending">,
++  at: IsoTimestamp,
++): Promise<OwnershipHandover> {
++  const row = getDb()
++    .update(ownershipHandovers)
++    .set({ status, resolvedAt: at })
++    .where(
++      and(
++        orgPredicate(ownershipHandovers.orgId, orgId),
++        eq(ownershipHandovers.id, handoverId),
++      ),
++    )
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Ownership handover ${handoverId} not found`);
++  return toHandover(row);
++}
++
++/** Cancels every pending handover the user is either side of. */
++export async function cancelHandoversInvolving(
++  orgId: OrgId,
++  userId: UserId,
++  at: IsoTimestamp,
++): Promise<number> {
++  const rows = getDb()
++    .update(ownershipHandovers)
++    .set({ status: "canceled", resolvedAt: at })
++    .where(
++      and(
++        orgPredicate(ownershipHandovers.orgId, orgId),
++        eq(ownershipHandovers.status, "pending"),
++        or(
++          eq(ownershipHandovers.fromUserId, userId),
++          eq(ownershipHandovers.toUserId, userId),
++        ),
++      ),
++    )
++    .returning({ id: ownershipHandovers.id })
++    .all();
++
++  return rows.length;
++}
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -222,6 +222,16 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("organization.ownership_transferred", (payload) =>
++      record(payload.orgId, "organization.ownership_transferred", {
++        actorId: payload.actorId,
++        subjectKind: "organization",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Ownership handed from ${payload.fromUserId} to ${payload.toUserId}`,
++        metadata: { fromUserId: payload.fromUserId, toUserId: payload.toUserId },
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -6,7 +6,9 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as handoverRepo from "@/server/repositories/ownership-handover-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import { toIsoTimestamp } from "@/types/common";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
+@@ -95,6 +97,14 @@
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
+ 
++  // A handover needs both parties in the workspace; whichever side leaves
++  // takes the offer with them.
++  await handoverRepo.cancelHandoversInvolving(
++    input.orgId,
++    removed.userId,
++    toIsoTimestamp(new Date()),
++  );
++
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+     memberId: removed.id,
+diff --git a/src/server/services/organization-service.ts b/src/server/services/organization-service.ts
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -3,17 +3,27 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, uniqueSlug, assertValidSlug
+  */
++import { OwnershipHandoverError } from "@/lib/errors";
+ import { emit } from "@/lib/event-bus";
+-import { assertCan } from "@/lib/permissions";
++import { assertCan, PermissionDeniedError } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as handoverRepo from "@/server/repositories/ownership-handover-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { toIsoTimestamp } from "@/types/common";
+ import { record } from "./activity-service";
+-import { envelope, orgResource, requireFound } from "./_support";
++import { notify } from "./notification-service";
++import {
++  actorEnvelope,
++  envelope,
++  NotFoundError,
++  orgResource,
++  requireFound,
++} from "./_support";
+ import type {
+   CreateOrganizationInput,
+   DeleteOrganizationInput,
+@@ -21,8 +31,15 @@
+ } from "@/schemas/organization";
+ import type { OrgId, UserId } from "@/types/common";
+ import type { Actor } from "@/types/member";
+-import type { Organization, OrganizationSummary } from "@/types/organization";
++import type {
++  Organization,
++  OrganizationSummary,
++  OwnershipHandover,
++} from "@/types/organization";
+ 
++/** How long the offered member has to accept a handover. */
++const HANDOVER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
++
+ /**
+  * Creates an organization and everything it cannot exist without: the owner's
+  * membership row and a subscription. Sign-up and "create another workspace"
+@@ -100,6 +117,199 @@
+   return orgRepo.archiveOrg(input.orgId);
+ }
+ 
++/**
++ * Offers the workspace to another member. Only the recorded owner may do
++ * this — holding the owner role is necessary but not sufficient, because the
++ * recorded owner is who the product treats as "the owner" (new-member alerts,
++ * billing contact) and that is what moves on acceptance.
++ */
++export async function initiateOwnershipHandover(
++  actor: Actor,
++  orgId: OrgId,
++  toUserId: UserId,
++): Promise<OwnershipHandover> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "org:transfer", orgResource(orgId));
++  const org = await assertRecordedOwner(actor, orgId);
++
++  if (toUserId === actor.userId) throw new OwnershipHandoverError("self");
++
++  const target = await memberRepo.findMember(orgId, toUserId);
++  if (!target || target.status !== "active") {
++    throw new NotFoundError("Member", toUserId);
++  }
++
++  const now = new Date();
++  const existing = await livePendingHandover(orgId, now);
++  if (existing) throw new OwnershipHandoverError("pending_exists");
++
++  const handover = await handoverRepo.insertHandover(
++    orgId,
++    actor.userId,
++    toUserId,
++    toIsoTimestamp(new Date(now.getTime() + HANDOVER_TTL_MS)),
++  );
++
++  await notify(orgId, "ownership_handover", [toUserId], {
++    title: "You have been offered ownership of a workspace",
++    body: `${org.name} can be yours once you accept`,
++    href: "/settings/members",
++    actorId: actor.userId,
++  });
++
++  return handover;
++}
++
++/**
++ * The offered member takes the workspace. The promotion happens before the
++ * demotion: the workspace must keep an owner at every point, and the former
++ * owner steps down to admin only once the new one is in place.
++ */
++export async function acceptOwnershipHandover(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<Organization> {
++  assertOrgScope(actor, orgId);
++
++  const now = new Date();
++  const handover = await requireLivePending(orgId, now);
++  if (handover.toUserId !== actor.userId) {
++    throw new OwnershipHandoverError("nothing_pending");
++  }
++
++  const target = requireFound(
++    await memberRepo.findMember(orgId, handover.toUserId),
++    "Member",
++    handover.toUserId,
++  );
++  const previous = await memberRepo.findMember(orgId, handover.fromUserId);
++
++  if (target.role !== "owner") {
++    const promoted = await memberRepo.updateMemberRole(orgId, target.id, "owner");
++    await emit("member.role_changed", {
++      ...actorEnvelope(actor),
++      memberId: promoted.id,
++      from: target.role,
++      to: promoted.role,
++    });
++  }
++
++  const org = await orgRepo.updateOwner(orgId, handover.toUserId);
++
++  if (previous && previous.role === "owner") {
++    const demoted = await memberRepo.updateMemberRole(orgId, previous.id, "admin");
++    await emit("member.role_changed", {
++      ...actorEnvelope(actor),
++      memberId: demoted.id,
++      from: previous.role,
++      to: demoted.role,
++    });
++  }
++
++  await handoverRepo.resolveHandover(orgId, handover.id, "accepted", toIsoTimestamp(now));
++
++  await emit("organization.ownership_transferred", {
++    ...actorEnvelope(actor),
++    fromUserId: handover.fromUserId,
++    toUserId: handover.toUserId,
++  });
++
++  return org;
++}
++
++export async function declineOwnershipHandover(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<OwnershipHandover> {
++  assertOrgScope(actor, orgId);
++
++  const now = new Date();
++  const handover = await requireLivePending(orgId, now);
++  if (handover.toUserId !== actor.userId) {
++    throw new OwnershipHandoverError("nothing_pending");
++  }
++
++  return handoverRepo.resolveHandover(orgId, handover.id, "declined", toIsoTimestamp(now));
++}
++
++export async function cancelOwnershipHandover(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<OwnershipHandover> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "org:transfer", orgResource(orgId));
++  await assertRecordedOwner(actor, orgId);
++
++  const now = new Date();
++  const handover = await requireLivePending(orgId, now);
++
++  return handoverRepo.resolveHandover(orgId, handover.id, "canceled", toIsoTimestamp(now));
++}
++
++/** The open offer for this workspace, if there is one that has not expired. */
++export async function getPendingOwnershipHandover(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<OwnershipHandover | null> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "org:read", orgResource(orgId));
++  return livePendingHandover(orgId, new Date());
++}
++
++/**
++ * Holding the owner role is necessary but not sufficient: the recorded owner
++ * is who the product treats as "the owner", and only they offer or withdraw.
++ */
++async function assertRecordedOwner(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<Organization> {
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  if (org.ownerId !== actor.userId) {
++    throw new PermissionDeniedError("org:transfer", {
++      allowed: false,
++      action: "org:transfer",
++      resourceKind: "organization",
++      reason: "denied_by_role",
++    });
++  }
++  return org;
++}
++
++/**
++ * The pending row, or `null` once it has expired — an expired offer is
++ * rewritten as such on the way past, so it never blocks a new one.
++ */
++async function livePendingHandover(
++  orgId: OrgId,
++  now: Date,
++): Promise<OwnershipHandover | null> {
++  const pending = await handoverRepo.findPendingHandover(orgId);
++  if (!pending) return null;
++
++  if (pending.expiresAt <= toIsoTimestamp(now)) {
++    await handoverRepo.resolveHandover(orgId, pending.id, "expired", toIsoTimestamp(now));
++    return null;
++  }
++
++  return pending;
++}
++
++async function requireLivePending(
++  orgId: OrgId,
++  now: Date,
++): Promise<OwnershipHandover> {
++  const pending = await handoverRepo.findPendingHandover(orgId);
++  if (!pending) throw new OwnershipHandoverError("nothing_pending");
++
++  if (pending.expiresAt <= toIsoTimestamp(now)) {
++    await handoverRepo.resolveHandover(orgId, pending.id, "expired", toIsoTimestamp(now));
++    throw new OwnershipHandoverError("expired");
++  }
++
++  return pending;
++}
++
+ /** The header/shell payload: the org plus the counters the sidebar shows. */
+ export async function getOrganizationSummary(
+   actor: Actor,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -10,6 +10,7 @@
+  *  bus keys so `ActivityService` can map one to the other mechanically. */
+ export type ActivityAction =
+   | "organization.updated"
++  | "organization.ownership_transferred"
+   | "project.created"
+   | "project.updated"
+   | "project.archived"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -81,6 +81,10 @@
+     to: Role;
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "organization.ownership_transferred": EventEnvelope & {
++    fromUserId: UserId;
++    toUserId: UserId;
++  };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -17,7 +17,8 @@
+   | "member_joined"
+   | "project_archived"
+   | "plan_limit_reached"
+-  | "digest_ready";
++  | "digest_ready"
++  | "ownership_handover";
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 
+diff --git a/src/types/organization.ts b/src/types/organization.ts
+--- a/src/types/organization.ts
++++ b/src/types/organization.ts
+@@ -7,6 +7,25 @@
+ } from "./common";
+ import type { PlanId } from "./billing";
+ 
++export type OwnershipHandoverStatus =
++  | "pending"
++  | "accepted"
++  | "declined"
++  | "canceled"
++  | "expired";
++
++/** An offer by the workspace owner to hand the workspace to another member. */
++export interface OwnershipHandover {
++  readonly id: string;
++  readonly orgId: OrgId;
++  readonly fromUserId: UserId;
++  readonly toUserId: UserId;
++  readonly status: OwnershipHandoverStatus;
++  readonly expiresAt: IsoTimestamp;
++  readonly createdAt: IsoTimestamp;
++  readonly resolvedAt: IsoTimestamp | null;
++}
++
+ export interface Organization extends Timestamps, SoftDeletable {
+   readonly id: OrgId;
+   readonly name: string;
+diff --git a/src/types/permission.ts b/src/types/permission.ts
+--- a/src/types/permission.ts
++++ b/src/types/permission.ts
+@@ -18,6 +18,7 @@
+   | "org:read"
+   | "org:update"
+   | "org:delete"
++  | "org:transfer"
+   | "org:manage_billing"
+   | "org:manage_flags"
+   | "member:read"

@@ -1,0 +1,363 @@
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -6,7 +6,7 @@
+ import { and, eq, isNull, like } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+-import { archivePatch } from "@/lib/soft-delete";
++import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+@@ -14,28 +14,38 @@
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
+-import type { OrgId, UserId } from "@/types/common";
++import type { ArchiveScope, OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
+ 
+-export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
++/**
++ * Id lookup. Live organizations only unless the caller explicitly asks for a
++ * closed one: closing is final, so every service, job and listener that starts
++ * from an org id sees a closed workspace as absent. Only the closing path
++ * itself needs the archived row (to report a second closing as a conflict).
++ */
++export async function findOrgById(
++  orgId: OrgId,
++  scope: ArchiveScope = {},
++): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+     .from(organizations)
+-    .where(eq(organizations.id, orgId))
++    .where(
++      and(
++        eq(organizations.id, orgId),
++        ...(shouldFilterArchived(scope) ? [isNull(organizations.archivedAt)] : []),
++      ),
++    )
+     .get();
+   return row ? toOrganization(row) : null;
+ }
+ 
+-/**
+- * Slug lookup for the `[orgSlug]` routes. A closed workspace keeps its slug
+- * and is returned like any other row; the caller sees `archivedAt` and
+- * decides what to render.
+- */
++/** Slug lookup for the `[orgSlug]` routes; a closed workspace is not found. */
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+     .from(organizations)
+-    .where(eq(organizations.slug, slug))
++    .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+   return row ? toOrganization(row) : null;
+ }
+@@ -48,7 +58,13 @@
+     .select({ org: organizations })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
+-    .where(and(eq(members.userId, userId), isNull(members.archivedAt)))
++    .where(
++      and(
++        eq(members.userId, userId),
++        isNull(members.archivedAt),
++        isNull(organizations.archivedAt),
++      ),
++    )
+     .all();
+ 
+   return rows.map((row) => toOrganization(row.org));
+@@ -125,7 +141,11 @@
+   return toOrganization(row);
+ }
+ 
+-/** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
++/**
++ * Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. Closed
++ * organizations are included on purpose: their slug stays reserved (the
++ * unique index still holds it), so a new workspace gets a suffixed one.
++ */
+ export async function listTakenOrgSlugs(
+   prefix: string,
+ ): Promise<readonly string[]> {
+diff --git a/src/server/repositories/webhook-repository.ts b/src/server/repositories/webhook-repository.ts
+--- a/src/server/repositories/webhook-repository.ts
++++ b/src/server/repositories/webhook-repository.ts
+@@ -177,6 +177,34 @@
+     .run();
+ }
+ 
++/**
++ * Fails every delivery of the org that is still pending. Used when a
++ * workspace is closed: nothing queued before the closing may still go out,
++ * and a failed row is never claimed again.
++ */
++export async function failPendingDeliveries(
++  orgId: OrgId,
++  error: string,
++): Promise<number> {
++  const rows = getDb()
++    .update(webhookDeliveries)
++    .set({
++      status: "failed",
++      lastError: error.slice(0, 500),
++      updatedAt: toIsoTimestamp(new Date()),
++    })
++    .where(
++      and(
++        orgPredicate(webhookDeliveries.orgId, orgId),
++        eq(webhookDeliveries.status, "pending"),
++      ),
++    )
++    .returning({ id: webhookDeliveries.id })
++    .all();
++
++  return rows.length;
++}
++
+ export async function markDeliveryFailed(
+   orgId: OrgId,
+   deliveryId: string,
+diff --git a/src/server/services/organization-service.ts b/src/server/services/organization-service.ts
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -6,12 +6,16 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import * as webhookRepo from "@/server/repositories/webhook-repository";
++import { toIsoTimestamp } from "@/types/common";
+ import { record } from "./activity-service";
+ import { envelope, orgResource, requireFound } from "./_support";
+ import type {
+@@ -88,16 +92,47 @@
+   assertCan(actor, "org:delete", orgResource(input.orgId));
+ 
+   const org = requireFound(
+-    await orgRepo.findOrgById(input.orgId),
++    await orgRepo.findOrgById(input.orgId, { includeArchived: true }),
+     "Organization",
+     input.orgId,
+   );
++  assertNotArchived("Organization", org.id, org);
+ 
+   if (org.slug !== input.confirmSlug) {
+     throw new Error("The confirmation does not match this organization's slug");
+   }
+ 
+-  return orgRepo.archiveOrg(input.orgId);
++  const closed = await orgRepo.archiveOrg(input.orgId);
++  const closedAt = closed.archivedAt ?? toIsoTimestamp(new Date());
++
++  // Closing is final: the subscription ends now rather than at period end,
++  // and nobody can still join through an invitation sent earlier.
++  if (await subscriptionRepo.findSubscription(input.orgId)) {
++    await subscriptionRepo.cancelSubscription(input.orgId, closedAt);
++  }
++  for (const invitation of await invitationRepo.listPendingInvitations(input.orgId)) {
++    await invitationRepo.revokeInvitation(input.orgId, invitation.id);
++  }
++  await webhookRepo.failPendingDeliveries(input.orgId, "organization is closed");
++
++  return closed;
++}
++
++/**
++ * True while the organization exists and has not been closed. Background
++ * jobs and unauthenticated flows (invitation acceptance) ask this before
++ * doing anything on behalf of a workspace; a request that carries an `Actor`
++ * never reaches a closed one, because no actor can be minted for it.
++ */
++export async function isOrganizationOpen(orgId: OrgId): Promise<boolean> {
++  return (await orgRepo.findOrgById(orgId)) !== null;
++}
++
++/** Throwing form of `isOrganizationOpen`, mapped to `not_found` by callers. */
++export async function requireOpenOrganization(
++  orgId: OrgId,
++): Promise<Organization> {
++  return requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
+ }
+ 
+ /** The header/shell payload: the org plus the counters the sidebar shows. */
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -14,6 +14,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { envelope, orgResource, requireFound } from "./_support";
++import { requireOpenOrganization } from "./organization-service";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+ import type { InvitationId, UserId } from "@/types/common";
+@@ -134,6 +135,9 @@
+     throw new Error("That invitation has expired");
+   }
+ 
++  // A closed workspace cannot be joined, however the invitation was kept.
++  await requireOpenOrganization(invitation.orgId);
++
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+   if (existing) return existing;
+ 
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -51,13 +51,17 @@
+ ): Promise<readonly Notification[]> {
+   if (recipients.length === 0) return [];
+ 
++  // A closed workspace produces nothing, whatever event still reaches the
++  // fan-out (a job sweep, a stray listener): the org lookup is live-only.
+   const org = await orgRepo.findOrgById(orgId);
++  if (!org) return [];
++
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+-    plan: org?.plan ?? "free",
++    plan: org.plan,
+     role: null,
+-    overrides: org?.settings.enabledFlagOverrides,
++    overrides: org.settings.enabledFlagOverrides,
+   };
+ 
+   const rows = [];
+diff --git a/src/server/services/session-service.ts b/src/server/services/session-service.ts
+--- a/src/server/services/session-service.ts
++++ b/src/server/services/session-service.ts
+@@ -97,6 +97,11 @@
+     throw new Error("You are not a member of that organization");
+   }
+ 
++  // A closed workspace is not found; the membership row alone proves nothing.
++  if (!(await orgRepo.findOrgById(input.orgId))) {
++    throw new Error("That organization has been closed");
++  }
++
+   const orgs = await orgRepo.listOrgsForUser(principal.userId);
+   const target = orgs.find((org) => org.id === input.orgId);
+   if (!target) throw new Error("You are not a member of that organization");
+diff --git a/src/server/jobs/overdue-issue-job.ts b/src/server/jobs/overdue-issue-job.ts
+--- a/src/server/jobs/overdue-issue-job.ts
++++ b/src/server/jobs/overdue-issue-job.ts
+@@ -8,6 +8,7 @@
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { isOrganizationOpen } from "@/server/services/organization-service";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -48,6 +49,9 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      // The usage table outlives a closed workspace; its reminders do not.
++      if (!(await isOrganizationOpen(orgId))) continue;
++
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+diff --git a/src/server/jobs/trial-expiry-job.ts b/src/server/jobs/trial-expiry-job.ts
+--- a/src/server/jobs/trial-expiry-job.ts
++++ b/src/server/jobs/trial-expiry-job.ts
+@@ -8,6 +8,7 @@
+ import { createLogger } from "@/lib/logger";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { isOrganizationOpen } from "@/server/services/organization-service";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -34,6 +35,10 @@
+ 
+     for (const subscription of expiring) {
+       const orgId = subscription.orgId as OrgId;
++      // Closing cancels the subscription, so a closed workspace normally
++      // never shows up here; the guard covers a row that was left trialing.
++      if (!(await isOrganizationOpen(orgId))) continue;
++
+       const usage = await usageRepo.getUsage(orgId);
+ 
+       if (
+diff --git a/src/server/jobs/search-reindex-job.ts b/src/server/jobs/search-reindex-job.ts
+--- a/src/server/jobs/search-reindex-job.ts
++++ b/src/server/jobs/search-reindex-job.ts
+@@ -7,6 +7,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { isOrganizationOpen } from "@/server/services/organization-service";
+ import {
+   indexComment,
+   indexIssue,
+@@ -28,6 +29,10 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
++    // Nothing of a closed workspace is searchable, so there is nothing to
++    // rebuild; the job reports zero work rather than resurrecting documents.
++    if (!(await isOrganizationOpen(orgId))) return;
++
+     const projects = await projectRepo.listProjects({
+       orgId,
+       limit: PAGE_SIZE,
+diff --git a/src/server/jobs/webhook-delivery-job.ts b/src/server/jobs/webhook-delivery-job.ts
+--- a/src/server/jobs/webhook-delivery-job.ts
++++ b/src/server/jobs/webhook-delivery-job.ts
+@@ -14,6 +14,7 @@
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ import type { OrgId } from "@/types/common";
++import type { Organization } from "@/types/organization";
+ 
+ /** How many deliveries one pass claims. */
+ const CLAIM_BATCH = 25;
+@@ -36,7 +37,18 @@
+     for (const delivery of claimed) {
+       const orgId = delivery.orgId as OrgId;
+ 
+-      if (!(await orgAllowsWebhooks(orgId))) {
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org) {
++        await webhookRepo.markDeliveryFailed(
++          orgId,
++          delivery.id,
++          "organization is closed",
++        );
++        result.failed += 1;
++        continue;
++      }
++
++      if (!orgAllowsWebhooks(org)) {
+         await webhookRepo.markDeliveryFailed(
+           orgId,
+           delivery.id,
+@@ -92,10 +104,7 @@
+   return Math.min(300_000, 2 ** (attempts - 1) * 1_000);
+ }
+ 
+-async function orgAllowsWebhooks(orgId: OrgId): Promise<boolean> {
+-  const org = await orgRepo.findOrgById(orgId);
+-  if (!org) return false;
+-
++function orgAllowsWebhooks(org: Organization): boolean {
+   if (getPlanLimits(org.plan).webhooks <= 0) return false;
+   return isEnabled("webhooks", buildFlagContext(null, org));
+ }

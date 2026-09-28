@@ -1,0 +1,586 @@
+--- a/src/app/api/export/activity/route.ts
++++ b/src/app/api/export/activity/route.ts
+@@ -5,34 +5,25 @@
+  * reading the feed in the UI and walking off with the whole audit trail are
+  * different privileges.
+  *
++ * The body comes from `ActivityService.exportActivity`, which walks every
++ * page inside the window: a route that reads one page would silently cap the
++ * download at that page's size.
++ *
+  * Must call (do not reimplement): can, isEnabled, toCsv
+  */
+ 
+ import { errorResponse, failure } from "@/app/api/_lib/responses";
+ import { getActor } from "@/lib/actor";
+-import { csvResponseHeaders, toCsv } from "@/lib/csv";
++import { csvResponseHeaders } from "@/lib/csv";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { can } from "@/lib/permissions";
+ import { exportActivitySchema } from "@/schemas/activity";
+-import { listActivity } from "@/server/services/activity-service";
++import { exportActivity } from "@/server/services/activity-service";
+ import { buildFlagContext } from "@/server/services/feature-flag-service";
+ import { getOrganizationSummary } from "@/server/services/organization-service";
+-import type { ActivityEvent } from "@/types/activity";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-const EXPORT_PAGE_LIMIT = 100;
+-
+-const COLUMNS: readonly string[] = [
+-  "occurredAt",
+-  "action",
+-  "actorId",
+-  "subjectKind",
+-  "subjectId",
+-  "projectId",
+-  "summary",
+-];
+-
+ export async function GET(request: Request): Promise<Response> {
+   try {
+     const url = new URL(request.url);
+@@ -61,40 +52,22 @@
+     if (!parsed.success) {
+       return failure(
+         "validation_failed",
+-        "since and until must be ISO-8601 timestamps.",
++        "since and until must be ISO-8601 timestamps, and until must not precede since.",
+       );
+     }
+ 
+-    const page = await listActivity(actor, {
+-      orgId: parsed.data.orgId,
+-      since: parsed.data.since,
+-      until: parsed.data.until,
+-      limit: EXPORT_PAGE_LIMIT,
+-    });
++    const body = await exportActivity(actor, parsed.data);
+ 
+     if (parsed.data.format === "json") {
+-      return Response.json({ items: page.items, total: page.total });
++      return new Response(body, {
++        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
++      });
+     }
+ 
+-    const csv = toCsv(page.items.map(toRow), COLUMNS);
+-    return new Response(csv, {
++    return new Response(body, {
+       headers: csvResponseHeaders(`taskflow-activity-${organization.slug}.csv`),
+     });
+   } catch (error) {
+     return errorResponse(error);
+   }
+ }
+-
+-function toRow(
+-  event: ActivityEvent,
+-): Record<string, string | number | boolean | null> {
+-  return {
+-    occurredAt: event.occurredAt,
+-    action: event.action,
+-    actorId: event.actorId,
+-    subjectKind: event.subjectKind,
+-    subjectId: event.subjectId,
+-    projectId: event.projectId,
+-    summary: event.summary,
+-  };
+-}
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -52,12 +52,17 @@
+   })
+   .extend(pageRequestSchema.shape);
+ 
+-export const exportActivitySchema = z.object({
+-  orgId: orgIdSchema,
+-  since: isoTimestampSchema,
+-  until: isoTimestampSchema,
+-  format: z.enum(["csv", "json"]).default("csv"),
+-});
++export const exportActivitySchema = z
++  .object({
++    orgId: orgIdSchema,
++    since: isoTimestampSchema,
++    until: isoTimestampSchema,
++    format: z.enum(["csv", "json"]).default("csv"),
++  })
++  .refine((value) => value.since <= value.until, {
++    message: "the range must not end before it starts",
++    path: ["until"],
++  });
+ 
+ export type ActivityFilterInput = z.infer<typeof activityFilterSchema>;
+ export type ExportActivityInput = z.infer<typeof exportActivitySchema>;
+--- a/src/server/repositories/activity-repository.ts
++++ b/src/server/repositories/activity-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * Append-only audit log. Never updated, never deleted before the plan's retention window.
+  */
+-import { and, count, desc, eq, gte, inArray, lt } from "drizzle-orm";
++import { and, count, desc, eq, gte, inArray, lt, lte } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { activityEvents, getDb } from "@/server/db";
+ import { orgPredicate } from "./base-repository";
+@@ -25,9 +25,7 @@
+       subjectId: event.subjectId,
+       projectId: event.projectId,
+       summary: event.summary,
+-      // The summary is the audited fact; the scalar bag is presentation-only
+-      // and is reconstructed by the readers that need it.
+-      metadata: "{}",
++      metadata: JSON.stringify(event.metadata),
+       occurredAt: event.occurredAt,
+     })
+     .returning()
+@@ -62,11 +60,11 @@
+     input.since === undefined
+       ? undefined
+       : gte(activityEvents.occurredAt, input.since),
+-    // Half-open on the right so consecutive windows tile without overlap:
+-    // [since, until) followed by [until, next).
++    // Both ends of the window are included: `until` is the last instant the
++    // caller asked for, not the first one they did not.
+     input.until === undefined
+       ? undefined
+-      : lt(activityEvents.occurredAt, input.until),
++      : lte(activityEvents.occurredAt, input.until),
+   );
+ 
+   const total = db
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -9,8 +9,8 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as activityRepo from "@/server/repositories/activity-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import { toIsoTimestamp } from "@/types/common";
+ import { activityResource } from "./_support";
+ import type { ActivityFilterInput, ExportActivityInput } from "@/schemas/activity";
+ import type {
+@@ -19,7 +19,7 @@
+   ActivityGroup,
+   ActivitySubjectKind,
+ } from "@/types/activity";
+-import type { OrgId, Page, ProjectId, UserId } from "@/types/common";
++import type { IsoTimestamp, IssueId, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
+ import type { Actor } from "@/types/member";
+ 
+@@ -29,6 +29,8 @@
+   subjectId: string;
+   projectId: ProjectId | null;
+   summary: string;
++  /** When the action happened — the event's time, never the write time. */
++  occurredAt: IsoTimestamp;
+   metadata?: Readonly<Record<string, string | number | boolean | null>>;
+ };
+ 
+@@ -39,9 +41,14 @@
+   "actorId",
+   "subjectKind",
+   "subjectId",
++  "projectId",
+   "summary",
++  "details",
+ ] as const;
+ 
++/** Rows fetched per round trip while walking an export. */
++const EXPORT_PAGE_SIZE = 100;
++
+ /**
+  * Appends one audit row. Deliberately takes no `Actor`: the writer is usually
+  * an event handler running outside a request, and the row's `actorId` comes
+@@ -61,7 +68,7 @@
+     projectId: input.projectId,
+     summary: input.summary,
+     metadata: input.metadata ?? {},
+-    occurredAt: toIsoTimestamp(new Date()),
++    occurredAt: input.occurredAt,
+   });
+ }
+ 
+@@ -94,7 +101,8 @@
+ 
+ /**
+  * CSV (or JSON) export of the audit log. Gated twice: on `activity:export`
+- * for the role, and on the `csv_export` flag for the plan.
++ * for the role, and on the `csv_export` flag for the plan. The export covers
++ * every row inside the window, both ends included, however many there are.
+  */
+ export async function exportActivity(
+   actor: Actor,
+@@ -103,6 +111,10 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "activity:export", activityResource(input.orgId));
+ 
++  if (input.until < input.since) {
++    throw new Error("The export range ends before it starts");
++  }
++
+   const org = await orgRepo.findOrgById(input.orgId);
+   const flagEnabled = isEnabled("csv_export", {
+     orgId: input.orgId,
+@@ -116,32 +128,65 @@
+     throw new Error("CSV export is not included in this plan");
+   }
+ 
+-  const page = await activityRepo.listActivity({
++  const items = await listAllActivity({
+     orgId: input.orgId,
+     since: input.since,
+     until: input.until,
+-    limit: 100,
+-    cursor: null,
+   });
+ 
+   if (input.format === "json") {
+-    return JSON.stringify(page.items, null, 2);
++    return JSON.stringify(items, null, 2);
+   }
+ 
+   return toCsv(
+-    page.items.map((event) => ({
++    items.map((event) => ({
+       occurredAt: event.occurredAt,
+       action: event.action,
+       actorId: event.actorId,
+       subjectKind: event.subjectKind,
+       subjectId: event.subjectId,
++      projectId: event.projectId,
+       summary: event.summary,
++      details: JSON.stringify(event.metadata),
+     })),
+     [...EXPORT_COLUMNS],
+   );
+ }
+ 
+ /**
++ * Walks every page of a filter, newest first. The cursor (not the timestamp)
++ * is what advances the walk, so rows that share an `occurredAt` — common, as
++ * one action fans out into several events — are neither skipped nor repeated.
++ */
++export async function listAllActivity(
++  filter: Omit<ActivityFilterInput, "limit" | "cursor">,
++): Promise<readonly ActivityEvent[]> {
++  const items: ActivityEvent[] = [];
++  let cursor: string | null = null;
++
++  do {
++    const page: Page<ActivityEvent> = await activityRepo.listActivity({
++      ...filter,
++      limit: EXPORT_PAGE_SIZE,
++      cursor,
++    });
++    items.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++
++  return items;
++}
++
++/** The project an issue belongs to, for rows about things inside an issue. */
++async function projectOfIssue(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<ProjectId | null> {
++  const issue = await issueRepo.findIssueById(orgId, issueId);
++  return issue?.projectId ?? null;
++}
++
++/**
+  * Attaches one handler per audited event type. Called once from
+  * `event-registry`; the returned function detaches all of them, which is what
+  * the test suite uses to keep the bus clean between cases.
+@@ -155,8 +200,20 @@
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+         summary: `Created project ${payload.name}`,
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("project.updated", (payload) =>
++      record(payload.orgId, "project.updated", {
++        actorId: payload.actorId,
++        subjectKind: "project",
++        subjectId: payload.projectId,
++        projectId: payload.projectId,
++        summary: `Updated project settings (${payload.changedFields.join(", ")})`,
++        occurredAt: payload.occurredAt,
++        metadata: { changedFields: payload.changedFields.join(",") },
++      }).then(() => undefined),
++    ),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
+@@ -164,8 +221,20 @@
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+         summary: `Archived project with ${payload.issuesArchived} issues`,
++        occurredAt: payload.occurredAt,
++        metadata: { issuesArchived: payload.issuesArchived },
+       }).then(() => undefined),
+     ),
++    subscribe("project.restored", (payload) =>
++      record(payload.orgId, "project.restored", {
++        actorId: payload.actorId,
++        subjectKind: "project",
++        subjectId: payload.projectId,
++        projectId: payload.projectId,
++        summary: "Restored project",
++        occurredAt: payload.occurredAt,
++      }).then(() => undefined),
++    ),
+     subscribe("issue.created", (payload) =>
+       record(payload.orgId, "issue.created", {
+         actorId: payload.actorId,
+@@ -173,40 +242,89 @@
+         subjectId: payload.issueId,
+         projectId: payload.projectId,
+         summary: `Created issue "${payload.title}"`,
++        occurredAt: payload.occurredAt,
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.updated", (payload) =>
++      record(payload.orgId, "issue.updated", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: `Updated issue (${payload.changedFields.join(", ")})`,
++        occurredAt: payload.occurredAt,
++        metadata: { changedFields: payload.changedFields.join(",") },
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+-        // A status move is a fact about the issue, not about the project's
+-        // structure; the project column is reserved for structural changes.
+-        projectId: null,
++        projectId: payload.projectId,
+         summary: `Status ${payload.from} → ${payload.to}`,
++        occurredAt: payload.occurredAt,
+         metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+-        // The row is about the assignee: that is who the feed should name.
+-        actorId: payload.assigneeId,
++        actorId: payload.actorId,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+         projectId: payload.projectId,
+         summary: `Assigned to ${payload.assigneeId}`,
++        occurredAt: payload.occurredAt,
++        metadata: {
++          assigneeId: payload.assigneeId,
++          previousAssigneeId: payload.previousAssigneeId,
++        },
+       }).then(() => undefined),
+     ),
+-    subscribe("comment.created", (payload) =>
+-      record(payload.orgId, "comment.created", {
++    subscribe("issue.archived", (payload) =>
++      record(payload.orgId, "issue.archived", {
+         actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: "Archived issue",
++        occurredAt: payload.occurredAt,
++      }).then(() => undefined),
++    ),
++    subscribe("comment.created", async (payload) => {
++      await record(payload.orgId, "comment.created", {
++        actorId: payload.actorId,
+         subjectKind: "comment",
+         subjectId: payload.commentId,
+-        projectId: null,
++        projectId: await projectOfIssue(payload.orgId, payload.issueId),
+         summary: `Commented on issue ${payload.issueId}`,
+-      }).then(() => undefined),
+-    ),
++        occurredAt: payload.occurredAt,
++        metadata: { issueId: payload.issueId },
++      });
++    }),
++    subscribe("comment.updated", async (payload) => {
++      await record(payload.orgId, "comment.updated", {
++        actorId: payload.actorId,
++        subjectKind: "comment",
++        subjectId: payload.commentId,
++        projectId: await projectOfIssue(payload.orgId, payload.issueId),
++        summary: `Edited a comment on issue ${payload.issueId}`,
++        occurredAt: payload.occurredAt,
++        metadata: { issueId: payload.issueId },
++      });
++    }),
++    subscribe("comment.deleted", async (payload) => {
++      await record(payload.orgId, "comment.deleted", {
++        actorId: payload.actorId,
++        subjectKind: "comment",
++        subjectId: payload.commentId,
++        projectId: await projectOfIssue(payload.orgId, payload.issueId),
++        summary: `Deleted a comment on issue ${payload.issueId}`,
++        occurredAt: payload.occurredAt,
++        metadata: { issueId: payload.issueId },
++      });
++    }),
+     subscribe("member.invited", (payload) =>
+       record(payload.orgId, "member.invited", {
+         actorId: payload.actorId,
+@@ -214,8 +332,21 @@
+         subjectId: payload.email,
+         projectId: null,
+         summary: `Invited ${payload.email} as ${payload.role}`,
++        occurredAt: payload.occurredAt,
++        metadata: { role: payload.role },
+       }).then(() => undefined),
+     ),
++    subscribe("member.joined", (payload) =>
++      record(payload.orgId, "member.joined", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: `Joined as ${payload.role}`,
++        occurredAt: payload.occurredAt,
++        metadata: { userId: payload.userId, role: payload.role },
++      }).then(() => undefined),
++    ),
+     subscribe("member.role_changed", (payload) =>
+       record(payload.orgId, "member.role_changed", {
+         actorId: payload.actorId,
+@@ -223,8 +354,21 @@
+         subjectId: payload.memberId,
+         projectId: null,
+         summary: `Role ${payload.from} → ${payload.to}`,
++        occurredAt: payload.occurredAt,
++        metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
++    subscribe("member.removed", (payload) =>
++      record(payload.orgId, "member.removed", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: "Removed a member",
++        occurredAt: payload.occurredAt,
++        metadata: { userId: payload.userId },
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+@@ -232,8 +376,21 @@
+         subjectId: payload.orgId,
+         projectId: null,
+         summary: `Plan ${payload.from} → ${payload.to}`,
++        occurredAt: payload.occurredAt,
++        metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
++    subscribe("flag.toggled", (payload) =>
++      record(payload.orgId, "flag.toggled", {
++        actorId: payload.actorId,
++        subjectKind: "feature_flag",
++        subjectId: payload.flag,
++        projectId: null,
++        summary: `${payload.enabled ? "Enabled" : "Disabled"} ${payload.flag}`,
++        occurredAt: payload.occurredAt,
++        metadata: { flag: payload.flag, enabled: payload.enabled },
++      }).then(() => undefined),
++    ),
+   ];
+ 
+   return () => {
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -107,7 +107,15 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const updated = await commentRepo.updateComment(input);
++
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++  });
++
++  return updated;
+ }
+ 
+ /**
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -71,6 +71,7 @@
+     subjectId: updated.id,
+     projectId: null,
+     summary: `${updated.name} settings updated`,
++    occurredAt: updated.updatedAt,
+   });
+ 
+   return updated;
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+   actorEnvelope,
++  changedFields,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -85,7 +86,17 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+-  return projectRepo.updateProject(input);
++  const updated = await projectRepo.updateProject(input);
++
++  await emit("project.updated", {
++    ...actorEnvelope(actor),
++    projectId: updated.id,
++    changedFields: changedFields(project, updated).filter(
++      (field) => field !== "updatedAt",
++    ),
++  });
++
++  return updated;
+ }
+ 
+ /**
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -31,6 +31,10 @@
+     name: string;
+     slug: string;
+   };
++  "project.updated": EventEnvelope & {
++    projectId: ProjectId;
++    changedFields: readonly string[];
++  };
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
+@@ -72,6 +76,7 @@
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
+   };
++  "comment.updated": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };

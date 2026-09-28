@@ -1,0 +1,420 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -27,6 +27,8 @@
+   "member.joined": "joined the organization",
+   "member.role_changed": "changed a role",
+   "member.removed": "removed a member",
++  "member.suspended": "suspended a member",
++  "member.reinstated": "reinstated a member",
+   "billing.plan_changed": "changed the plan",
+   "flag.toggled": "toggled a feature flag",
+ };
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -26,6 +26,8 @@
+   "member.joined",
+   "member.role_changed",
+   "member.removed",
++  "member.suspended",
++  "member.reinstated",
+   "billing.plan_changed",
+   "flag.toggled",
+ ]);
+diff --git a/src/server/repositories/member-repository.ts b/src/server/repositories/member-repository.ts
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -13,7 +13,7 @@
+ import { toMember, toUser } from "./_mappers";
+ import type { ListMembersInput } from "@/schemas/member";
+ import type { IsoTimestamp, MemberId, OrgId, Page, UserId } from "@/types/common";
+-import type { Member, MemberWithUser, Role } from "@/types/member";
++import type { Member, MemberStatus, MemberWithUser, Role } from "@/types/member";
+ 
+ /**
+  * A removed member is archived, never deleted, and no read ever surfaces one:
+@@ -100,20 +100,41 @@
+   );
+ }
+ 
+-/** The seat count every plan check compares against. */
++/**
++ * The seat count every plan check compares against. A seat is held by every
++ * membership that has not been removed — a suspended member keeps theirs, so
++ * the predicate is "live", not "status = active".
++ */
+ export async function countActiveMembers(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+     .from(members)
++    .where(and(orgPredicate(members.orgId, orgId), liveMemberPredicate()))
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Flips a live membership between `active` and `suspended`. */
++export async function setMemberStatus(
++  orgId: OrgId,
++  memberId: MemberId,
++  status: MemberStatus,
++): Promise<Member> {
++  const row = getDb()
++    .update(members)
++    .set({ status, updatedAt: toIsoTimestamp(new Date()) })
+     .where(
+       and(
+         orgPredicate(members.orgId, orgId),
+-        eq(members.status, "active"),
++        eq(members.id, memberId),
+         liveMemberPredicate(),
+       ),
+     )
++    .returning()
+     .get();
+-  return row?.value ?? 0;
++
++  if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
++  return toMember(row);
+ }
+ 
+ export async function insertMember(
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -35,7 +35,8 @@
+   return row ? toOrganization(row) : null;
+ }
+ 
+-/** Every org the user still holds a live membership in. */
++/** Every org the user still holds an active membership in. A suspended
++ *  membership keeps its row but the workspace disappears from the switcher. */
+ export async function listOrgsForUser(
+   userId: UserId,
+ ): Promise<readonly Organization[]> {
+@@ -46,6 +47,7 @@
+     .where(
+       and(
+         eq(members.userId, userId),
++        eq(members.status, "active"),
+         isNull(members.archivedAt),
+         isNull(organizations.archivedAt),
+       ),
+diff --git a/src/server/repositories/usage-repository.ts b/src/server/repositories/usage-repository.ts
+--- a/src/server/repositories/usage-repository.ts
++++ b/src/server/repositories/usage-repository.ts
+@@ -49,16 +49,12 @@
+ ): Promise<OrganizationUsage> {
+   const db = getDb();
+ 
++  // A seat belongs to every membership that has not been removed; a
++  // suspended member keeps theirs, so the status is deliberately not filtered.
+   const seats = db
+     .select({ value: count() })
+     .from(members)
+-    .where(
+-      and(
+-        eq(members.orgId, orgId),
+-        eq(members.status, "active"),
+-        isNull(members.archivedAt),
+-      ),
+-    )
++    .where(and(eq(members.orgId, orgId), isNull(members.archivedAt)))
+     .get();
+ 
+   const projectCount = db
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -222,6 +222,24 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("member.suspended", (payload) =>
++      record(payload.orgId, "member.suspended", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: `Suspended member ${payload.userId}`,
++      }).then(() => undefined),
++    ),
++    subscribe("member.reinstated", (payload) =>
++      record(payload.orgId, "member.reinstated", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: `Reinstated member ${payload.userId}`,
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -176,8 +176,11 @@
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
++  // Only active members can be mentioned: a suspended member's handle does
++  // not resolve, and a client-supplied id for one is dropped the same way.
+   const members = await memberRepo.listMembers({
+     orgId,
++    status: "active",
+     limit: MENTION_LOOKUP_LIMIT,
+     cursor: null,
+   });
+diff --git a/src/server/services/digest-service.ts b/src/server/services/digest-service.ts
+--- a/src/server/services/digest-service.ts
++++ b/src/server/services/digest-service.ts
+@@ -5,6 +5,7 @@
+  */
+ import { isEnabled } from "@/lib/feature-flags";
+ import { DIGEST_MAX_ENTRIES } from "@/config/constants";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -65,7 +66,17 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  const subscribers = await preferenceRepo.listDigestSubscribers(orgId);
++
++  // A suspended member receives nothing, the digest included. Their unread
++  // rows are left alone so they are digested once the member is reinstated.
++  const recipients: UserId[] = [];
++  for (const userId of subscribers) {
++    const member = await memberRepo.findMember(orgId, userId);
++    if (member !== null && member.status === "suspended") continue;
++    recipients.push(userId);
++  }
++  return recipients;
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertNotSuspended } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -65,6 +66,10 @@
+     );
+   }
+ 
++  if (input.assigneeId !== null) {
++    await assertNotSuspended(input.orgId, input.assigneeId);
++  }
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -161,6 +166,10 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  if (input.assigneeId !== null) {
++    await assertNotSuspended(input.orgId, input.assigneeId);
++  }
++
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -20,6 +20,116 @@
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+ 
++/**
++ * Thrown when work is handed to a suspended member. A suspension is a
++ * temporary state, so this is a `conflict` rather than a permission problem.
++ */
++export class MemberSuspendedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly userId: UserId) {
++    super(`Member ${userId} is suspended`);
++    this.name = "MemberSuspendedError";
++  }
++}
++
++/** Input shared by suspension and reinstatement. */
++export type SuspendMemberInput = { orgId: OrgId; memberId: MemberId };
++
++/**
++ * Suspends a member: they keep their row, role and seat but cannot act, be
++ * notified, be mentioned or be assigned work until reinstated. Guarded like a
++ * removal, with the same self/rank/last-owner rules a removal implies.
++ */
++export async function suspendMember(
++  actor: Actor,
++  input: SuspendMemberInput,
++): Promise<Member> {
++  const member = await loadSuspendable(actor, input);
++  if (member.status === "suspended") return member;
++
++  if (member.role === "owner") {
++    await assertAnotherActiveOwner(input.orgId, member.id);
++  }
++
++  const suspended = await memberRepo.setMemberStatus(
++    input.orgId,
++    member.id,
++    "suspended",
++  );
++
++  await emit("member.suspended", {
++    ...actorEnvelope(actor),
++    memberId: suspended.id,
++    userId: suspended.userId,
++  });
++
++  return suspended;
++}
++
++/** Lifts a suspension. Idempotent on an already-active member. */
++export async function reinstateMember(
++  actor: Actor,
++  input: SuspendMemberInput,
++): Promise<Member> {
++  const member = await loadSuspendable(actor, input);
++  if (member.status === "active") return member;
++
++  const reinstated = await memberRepo.setMemberStatus(
++    input.orgId,
++    member.id,
++    "active",
++  );
++
++  await emit("member.reinstated", {
++    ...actorEnvelope(actor),
++    memberId: reinstated.id,
++    userId: reinstated.userId,
++  });
++
++  return reinstated;
++}
++
++/**
++ * The guards suspension and reinstatement share: tenant scope, a live (not
++ * removed) membership, the `member:remove` permission, never oneself, and
++ * never someone whose role outranks the actor's.
++ */
++async function loadSuspendable(
++  actor: Actor,
++  input: SuspendMemberInput,
++): Promise<Member> {
++  assertOrgScope(actor, input.orgId);
++
++  const found = await memberRepo.findMemberById(input.orgId, input.memberId);
++  const member = requireFound(
++    found !== null && found.archivedAt === null ? found : null,
++    "Member",
++    input.memberId,
++  );
++  assertCan(actor, "member:remove", memberResource(member));
++
++  if (member.userId === actor.userId) {
++    throw new Error("You cannot suspend or reinstate yourself");
++  }
++  if (!hasRoleAtLeast(actor.role, member.role)) {
++    throw new Error(`A ${actor.role} cannot suspend or reinstate a ${member.role}`);
++  }
++
++  return member;
++}
++
++/** Throws `MemberSuspendedError` when the user's membership is suspended. */
++export async function assertNotSuspended(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member !== null && member.status === "suspended") {
++    throw new MemberSuspendedError(userId);
++  }
++}
++
+ export async function listMembers(
+   actor: Actor,
+   input: ListMembersInput,
+@@ -134,9 +244,22 @@
+   const member = await memberRepo.findMemberById(orgId, memberId);
+   if (!member || member.role !== "owner") return;
+ 
++  await assertAnotherActiveOwner(orgId, memberId);
++}
++
++/**
++ * Throws unless an owner other than `memberId` remains who is not suspended.
++ * A suspended owner cannot act, so they do not keep the workspace ownable —
++ * demotion, removal and suspension all count only the active owners.
++ */
++async function assertAnotherActiveOwner(
++  orgId: OrgId,
++  memberId: MemberId,
++): Promise<void> {
+   const page = await memberRepo.listMembers({
+     orgId,
+     role: "owner",
++    status: "active",
+     limit: OWNER_SCAN_LIMIT,
+     cursor: null,
+   });
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+@@ -65,6 +66,10 @@
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
+ 
++    // A suspended member receives nothing on any channel until reinstated.
++    const membership = await memberRepo.findMember(orgId, recipientId);
++    if (membership !== null && membership.status === "suspended") continue;
++
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+       recipientId,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -27,6 +27,8 @@
+   | "member.joined"
+   | "member.role_changed"
+   | "member.removed"
++  | "member.suspended"
++  | "member.reinstated"
+   | "billing.plan_changed"
+   | "flag.toggled";
+ 
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -81,6 +81,8 @@
+     to: Role;
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.suspended": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.reinstated": EventEnvelope & { memberId: MemberId; userId: UserId };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;

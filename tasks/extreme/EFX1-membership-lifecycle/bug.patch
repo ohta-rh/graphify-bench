@@ -1,0 +1,73 @@
+--- a/src/server/repositories/invitation-repository.ts
++++ b/src/server/repositories/invitation-repository.ts
+@@ -11,7 +11,11 @@
+ import type { InvitationId, IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Invitation } from "@/types/member";
+ 
+-const MS_PER_DAY = 24 * 60 * 60 * 1000;
++/**
++ * Unit behind `expiresInDays`. Invite links are short-lived credentials, so
++ * the schema's whole-number validity is applied per hour rather than per day.
++ */
++const EXPIRY_UNIT_MS = 60 * 60 * 1000;
+ 
+ export async function insertInvitation(
+   orgId: OrgId,
+@@ -21,7 +25,7 @@
+ ): Promise<Invitation> {
+   const stamp = toIsoTimestamp(new Date());
+   const expiresAt = toIsoTimestamp(
+-    new Date(Date.now() + input.expiresInDays * MS_PER_DAY),
++    new Date(Date.now() + input.expiresInDays * EXPIRY_UNIT_MS),
+   );
+ 
+   const row = getDb()
+@@ -122,7 +126,11 @@
+   return toInvitation(row);
+ }
+ 
+-/** Pending invites hold a seat, so the seat quota counts them. */
++/**
++ * Pending invites hold a seat, so the seat quota counts them. An unaccepted
++ * row keeps its seat whether or not it was withdrawn — a revoke-and-reinvite
++ * loop must not be a way of queueing more people than the plan allows.
++ */
+ export async function countPendingInvitations(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+@@ -131,7 +139,6 @@
+       and(
+         orgPredicate(invitations.orgId, orgId),
+         isNull(invitations.acceptedAt),
+-        isNull(invitations.revokedAt),
+       ),
+     )
+     .get();
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -130,7 +130,9 @@
+       orgId,
+       userId,
+       role,
+-      status: "active",
++      // A membership created on someone else's behalf starts in the
++      // `invited` state; the first sign-in through the org promotes it.
++      status: invitedBy === null ? "active" : "invited",
+       invitedBy,
+       joinedAt: stamp,
+       lastSeenAt: null,
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -189,9 +189,11 @@
+ 
+   await invitationRepo.revokeInvitation(actor.orgId, invitationId);
+ 
++  // A re-issued link starts at the lowest invitable role; whoever resends it
++  // can promote the person once they have joined.
+   return inviteMember(actor, {
+     orgId: actor.orgId,
+     email: previous.email,
+-    role: previous.role === "owner" ? "admin" : previous.role,
++    role: "member",
+   });
+ }

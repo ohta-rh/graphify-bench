@@ -138,15 +138,41 @@ An original, LLM-generated multi-tenant project/issue-management SaaS, built for
 
 ## Tasks
 
-65 tasks in three files, all with mechanical or rubric keys (`pnpm keys:derive --check` reproduces all 34 derived keys).
+105 tasks in six files, all with mechanical, rubric or hidden-test keys (`pnpm keys:derive --check` reproduces all 34 derived keys).
 
 | File | Tasks | Categories |
 |---|---|---|
 | [`tasks/tasks.json`](tasks/tasks.json) | 15 | locate, reference, explain, impact, fix (3 each) |
 | [`tasks/tasks-ext.json`](tasks/tasks-ext.json) | 30 | same, 6 each |
 | [`tasks/tasks-docs.json`](tasks/tasks-docs.json) | 20 | locate, reference, explain, impact, **discrepancy** (4 each) |
+| [`tasks/tasks-hard.json`](tasks/tasks-hard.json) | 16 | fix, implement (8 each), hidden-test graded |
+| [`tasks/tasks-ultra.json`](tasks/tasks-ultra.json) | 12 | fix, implement (6 each), hidden-test graded |
+| [`tasks/tasks-extreme.json`](tasks/tasks-extreme.json) | 12 | fix, implement (6 each), hidden-test graded, Fable-authored |
 
 Graders: set F1 against key paths (locate, reference, impact, discrepancy), a blind Haiku judge with a 5-element rubric (explain), and an injected bug whose Vitest spec must go red → green (fix). Seven tasks are deliberately grep-trivial controls. Token savings are only claimed on the iso-accuracy subset, following [arXiv:2608.13568](https://arxiv.org/html/2608.13568).
+
+### Hidden-test sets: the design concept
+
+The first 65 tasks were built to ask whether an *index* saves tokens, so they are mostly retrieval questions; by the time they were used to compare *models*, every arm sat at the same ~84% ceiling (Haiku 4.5 included). The three later sets exist to separate models, and each was designed from what the previous one failed to show.
+
+**What every hidden-test task shares.**
+
+- **Graded only by a spec the agent never sees.** `task.hidden` copies `tasks/<set>/<ID>/hidden.test.ts` into the run directory *after* the agent exits, overwriting anything at that path, and `spec` runs only that file. Pass = exit 0. No LLM judge, so no rubric ceiling.
+- **The visible suite gives nothing away.** With the bug patch applied (fix tasks) or on the pristine corpus (implement tasks), `tsc` is clean and all 617 visible tests pass, so running the tests does not point at the defect.
+- **Validated independently, not on the author's word.** Every task ships a reference `solution.patch`, and each one is re-checked by a separate script on a fresh clone. The script confirms three things: the bug state is green on the visible suite and red on the hidden spec; the solution applies with `git apply`; and the solution then passes the hidden spec twice, the full suite and `tsc`. Authors also record two or three plausible partial solutions that still fail (`VALIDATION.md`).
+- **Fair.** The hidden spec checks only behaviour the prompt plus the codebase's conventions determine. New exports it calls are pinned by name and signature. Error kinds are either stated or follow an existing convention.
+- **No cheating.** The filesystem is not sandboxed, so a run could in principle read this repository's reference solutions. From the ultra set on, every prompt carries [`tasks/ultra/RULES.txt`](tasks/ultra/RULES.txt): work only in the working copy, never look for grading tests or solutions, never make tests pass by tampering or special-casing. [`scripts/audit-scope.py`](scripts/audit-scope.py) checks every transcript for paths outside the run's own clone and for any mention of benchmark artefacts. It found 0 violations in the 693 code-45 and hard runs; files an agent writes under `/tmp` for its own experiments are counted separately and are not violations.
+- **Selection is never by outcome.** No task was kept or dropped because of how any model scored on it; difficulty is set by design, so no set is tilted toward or against a model.
+
+**How the sets differ, and why.**
+
+| set | written by | what the prompt gives | what the reference solution touches | what it was meant to fix |
+|---|---|---|---|---|
+| hard | Opus subagents | symptoms (fix) or a spec with pinned exports (implement); ~1,300 chars | ≥3 files, ≥2 layers | the 45-task ceiling |
+| ultra | Opus subagents | detailed specs: exact exports, module paths and every rule; ~3,300 chars, ~14 code names per prompt | ≥5 files, ≥3 layers, 3–4 interacting defects or a subsystem | Opus scoring 32/32 on hard at every effort |
+| extreme | Fable 5.1 subagents | symptom-only incident reports or product specs; no existing file, function or table named, only new exports pinned | ≥8 files, ≥3 layers, ≥15 hidden cases, one deliberate trap each | ultra being solved by both models alike |
+
+**Why the ultra set did not separate the models, and what the extreme set tests.** Both models answered the ultra tasks at 95–96% (interim, 130 of 192 runs), and at matched effort Sonnet 5 cost about half as much. Compared across sets, the ultra prompts are what changed. They are 2.5× longer and name ~14 identifiers. Sonnet, which delegated exploration to a subagent in 25–69% of runs on the other sets, delegated in 0% of ultra runs. And the Opus/Sonnet token ratio flipped from 0.23–0.47 to 1.16–1.63. The working hypothesis is that Opus 5.5's advantage is *discovery*: finding the right places with few turns, not implementing a known change. When the prompt does the discovery for the agent, a cheaper model keeps up. The extreme set removes that help on purpose (symptoms and product policy only, plus a trap that a careful near-complete fix falls into), so it tests the hypothesis directly. Its authoring briefs are in [`tasks/briefs/`](tasks/briefs/).
 
 ## Running it
 

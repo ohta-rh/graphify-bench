@@ -1,0 +1,347 @@
+--- a/src/actions/auth/login.ts
++++ b/src/actions/auth/login.ts
+@@ -32,7 +32,11 @@
+   }
+ 
+   try {
+-    const verdict = await consumeRateLimit(ANONYMOUS_ORG_ID, LOGIN_BUCKET);
++    // Throttled per account: one hammered address must not lock everyone out.
++    const verdict = await consumeRateLimit(
++      ANONYMOUS_ORG_ID,
++      `${LOGIN_BUCKET}:${parsed.data.email}`,
++    );
+     if (!verdict.allowed) {
+       throw new RateLimitedError(LOGIN_BUCKET, verdict.resetAt);
+     }
+--- a/src/actions/auth/reset-password.ts
++++ b/src/actions/auth/reset-password.ts
+@@ -36,7 +36,11 @@
+   }
+ 
+   try {
+-    const verdict = await consumeRateLimit(ANONYMOUS_ORG_ID, RESET_BUCKET);
++    // Throttled per address: one hammered account must not block everyone's resets.
++    const verdict = await consumeRateLimit(
++      ANONYMOUS_ORG_ID,
++      `${RESET_BUCKET}:${parsed.data.email}`,
++    );
+     if (!verdict.allowed) {
+       throw new RateLimitedError(RESET_BUCKET, verdict.resetAt);
+     }
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,12 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Lifetime of a session created without "remember me". */
++export const SESSION_TTL_DEFAULT_HOURS: number = 24;
++
++/** Lifetime of a session created with "remember me" ticked. */
++export const SESSION_TTL_REMEMBERED_DAYS: number = 30;
++
++/** How long a password-reset link stays usable after it is sent. */
++export const PASSWORD_RESET_TTL_MINUTES: number = 60;
+--- a/src/lib/rate-limit.ts
++++ b/src/lib/rate-limit.ts
+@@ -25,6 +25,7 @@
+   "comment:create": { capacity: 60, refillPerMinute: 20 },
+   "issue:create": { capacity: 60, refillPerMinute: 20 },
+   "search:query": { capacity: 120, refillPerMinute: 60 },
++  "auth:login": { capacity: 10, refillPerMinute: 2 },
+   "auth:password-reset": { capacity: 5, refillPerMinute: 1 },
+   "webhook:deliver": { capacity: 100, refillPerMinute: 50 },
+ };
+@@ -32,6 +33,22 @@
+ /** Applied to any key not in the table above. */
+ const DEFAULT_BUCKET: RateLimitConfig = { capacity: 30, refillPerMinute: 10 };
+ 
++/**
++ * A key may carry a per-subject suffix (`auth:login:<address>`), so the
++ * configuration is looked up by the longest declared prefix: the shape of the
++ * bucket is declared once, and each subject gets its own copy of it.
++ */
++function declaredConfig(bucketKey: string): RateLimitConfig | undefined {
++  let key = bucketKey;
++  for (;;) {
++    const config = RATE_LIMIT_BUCKETS[key];
++    if (config) return config;
++    const cut = key.lastIndexOf(":");
++    if (cut <= 0) return undefined;
++    key = key.slice(0, cut);
++  }
++}
++
+ type BucketState = { tokens: number; updatedAt: number };
+ 
+ const buckets = new Map<string, BucketState>();
+@@ -45,7 +62,7 @@
+ }
+ 
+ export function getBucketConfig(bucketKey: string): RateLimitConfig {
+-  return RATE_LIMIT_BUCKETS[bucketKey] ?? DEFAULT_BUCKET;
++  return declaredConfig(bucketKey) ?? DEFAULT_BUCKET;
+ }
+ 
+ /**
+--- a/src/server/repositories/_password-reset-repository.ts
++++ b/src/server/repositories/_password-reset-repository.ts
+@@ -6,7 +6,7 @@
+  * entry owns it, and `AuthService` cannot implement a real reset flow without
+  * somewhere to keep the single-use token.
+  */
+-import { and, eq, gt } from "drizzle-orm";
++import { and, eq, gt, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, passwordResetTokens } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -46,10 +46,7 @@
+   };
+ }
+ 
+-/**
+- * Returns the token only while it is unexpired. Consuming a token retires it
+- * through `consumeResetToken`, so the used marker needs no second check here.
+- */
++/** Returns the token only while it is unused and unexpired. */
+ export async function findLiveResetToken(
+   tokenHash: string,
+ ): Promise<ResetToken | null> {
+@@ -59,6 +56,7 @@
+     .where(
+       and(
+         eq(passwordResetTokens.tokenHash, tokenHash),
++        isNull(passwordResetTokens.usedAt),
+         gt(passwordResetTokens.expiresAt, new Date().toISOString()),
+       ),
+     )
+@@ -73,6 +71,23 @@
+   };
+ }
+ 
++/**
++ * Retires every unused token of one account. Issuing a new link is what calls
++ * this, so only the most recent email holds a working link.
++ */
++export async function retireResetTokensForUser(userId: UserId): Promise<number> {
++  const stamp = toIsoTimestamp(new Date());
++  const rows = getDb()
++    .update(passwordResetTokens)
++    .set({ usedAt: stamp, updatedAt: stamp })
++    .where(
++      and(eq(passwordResetTokens.userId, userId), isNull(passwordResetTokens.usedAt)),
++    )
++    .returning({ id: passwordResetTokens.id })
++    .all();
++  return rows.length;
++}
++
+ /** Single use: consuming a token is what stops a reset link being replayed. */
+ export async function consumeResetToken(id: string): Promise<void> {
+   const stamp = toIsoTimestamp(new Date());
+--- a/src/server/repositories/session-repository.ts
++++ b/src/server/repositories/session-repository.ts
+@@ -89,17 +89,28 @@
+   getDb().delete(sessions).where(eq(sessions.id, sessionId)).run();
+ }
+ 
+-/**
+- * Housekeeping sweep; returns how many rows it removed. A row that predates
+- * the sweep is stale by definition — the cookie is re-issued on every sign-in,
+- * so anything older than `now` has been superseded.
+- */
++/** Sign-out: removes exactly the session behind one cookie. */
++export async function revokeSessionByTokenHash(tokenHash: string): Promise<void> {
++  getDb().delete(sessions).where(eq(sessions.tokenHash, tokenHash)).run();
++}
++
++/** Every session of one account — a password reset ends them all. */
++export async function revokeSessionsForUser(userId: UserId): Promise<number> {
++  const rows = getDb()
++    .delete(sessions)
++    .where(eq(sessions.userId, userId))
++    .returning({ id: sessions.id })
++    .all();
++  return rows.length;
++}
++
++/** Housekeeping sweep of rows past their expiry; returns how many it removed. */
+ export async function purgeExpiredSessions(
+   now: IsoTimestamp,
+ ): Promise<number> {
+   const rows = getDb()
+     .delete(sessions)
+-    .where(lt(sessions.createdAt, now))
++    .where(lt(sessions.expiresAt, now))
+     .returning({ id: sessions.id })
+     .all();
+   return rows.length;
+--- a/src/server/services/auth-service.ts
++++ b/src/server/services/auth-service.ts
+@@ -8,6 +8,7 @@
+  * Registration still publishes `member.joined` — through
+  * `OrganizationService.createOrganization`, which owns that membership row.
+  */
++import { PASSWORD_RESET_TTL_MINUTES } from "@/config/constants";
+ import {
+   hashPassword,
+   hashToken,
+@@ -43,12 +44,17 @@
+  */
+ const ANONYMOUS_ORG = "00000000000000000000000000" as OrgId;
+ 
++/** How long a password-reset link stays usable. */
++const RESET_TTL_MS = PASSWORD_RESET_TTL_MINUTES * 60 * 1000;
++
+ /**
+- * How long a password-reset link stays usable. Links are minted per request
+- * and opened straight from the inbox, so a short fuse costs nothing and keeps
+- * a leaked mailbox from being useful later.
++ * The throttles are per account, not per endpoint: a burst of attempts on
++ * one address must not lock everybody else out. Addresses are compared
++ * case-insensitively everywhere else, so the bucket key is normalised too.
+  */
+-const RESET_TTL_MS = 60 * 1000;
++function accountBucket(bucket: string, email: string): string {
++  return `${bucket}:${email.trim().toLowerCase()}`;
++}
+ 
+ /**
+  * Registration creates the user and their first workspace in one step — a
+@@ -92,7 +98,10 @@
+ export async function login(
+   input: LoginInput,
+ ): Promise<{ user: User; token: string }> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, LOGIN_BUCKET);
++  const verdict = await consumeRateLimit(
++    ANONYMOUS_ORG,
++    accountBucket(LOGIN_BUCKET, input.email),
++  );
+   if (!verdict.allowed) {
+     throw new Error("Too many sign-in attempts; try again shortly");
+   }
+@@ -105,7 +114,9 @@
+     throw new Error("Those credentials did not match");
+   }
+ 
+-  const { token } = await createSessionToken(user.id);
++  const { token } = await createSessionToken(user.id, {
++    rememberMe: input.rememberMe,
++  });
+ 
+   return { user, token };
+ }
+@@ -118,16 +129,23 @@
+  * Always resolves, whether or not the address is known — telling an anonymous
+  * caller which emails have accounts is an enumeration oracle. Only the token's
+  * hash is stored; the raw value exists solely inside the email that carries it.
++ * Issuing a new link retires every earlier unused one for the account: the
++ * newest email is the only one that works.
+  */
+ export async function requestPasswordReset(
+   input: PasswordResetRequestInput,
+ ): Promise<void> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, RESET_BUCKET);
++  const verdict = await consumeRateLimit(
++    ANONYMOUS_ORG,
++    accountBucket(RESET_BUCKET, input.email),
++  );
+   if (!verdict.allowed) return;
+ 
+   const user = await userRepo.findUserByEmail(input.email);
+   if (!user) return;
+ 
++  await resetTokenRepo.retireResetTokensForUser(user.id);
++
+   const token = randomToken(32);
+   await resetTokenRepo.issueResetToken(
+     user.id,
+@@ -147,7 +165,8 @@
+ /**
+  * Consumes a reset token and rewrites the password hash. The token is marked
+  * used before the new hash is written, so a replay of the same link cannot
+- * overwrite a password the user has since changed again.
++ * overwrite a password the user has since changed again. Every session of the
++ * account is ended: whoever held the old password must sign in again.
+  */
+ export async function confirmPasswordReset(
+   input: PasswordResetConfirmInput,
+@@ -167,6 +186,7 @@
+     stored.userId,
+     await hashPassword(input.password),
+   );
++  await sessionRepo.revokeSessionsForUser(stored.userId);
+ 
+   const user = await userRepo.findUserById(stored.userId);
+   if (!user) throw new Error("That reset link is no longer valid");
+--- a/src/server/services/session-service.ts
++++ b/src/server/services/session-service.ts
+@@ -3,6 +3,10 @@
+  *
+  * Must call (do not reimplement): assertOrgScope
+  */
++import {
++  SESSION_TTL_DEFAULT_HOURS,
++  SESSION_TTL_REMEMBERED_DAYS,
++} from "@/config/constants";
+ import { hashToken, randomToken } from "@/lib/hash";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+@@ -13,24 +17,31 @@
+ import type { IsoTimestamp, UserId } from "@/types/common";
+ import type { Actor, SessionPrincipal } from "@/types/member";
+ 
+-/** How long a freshly issued session cookie stays valid. */
+-const SESSION_TTL_DAYS = 30;
+-const MS_PER_DAY = 24 * 60 * 60 * 1000;
++const MS_PER_HOUR = 60 * 60 * 1000;
++const MS_PER_DAY = 24 * MS_PER_HOUR;
+ 
+ /** Length in bytes of the raw session token handed to the browser. */
+ const TOKEN_BYTES = 32;
+ 
++export type CreateSessionOptions = {
++  /** A ticked "remember me" box: the long lifetime instead of the day-long one. */
++  readonly rememberMe?: boolean;
++};
++
+ /**
+  * Mints a session. Only the hash reaches the database, so a dump of the
+- * `sessions` table cannot be replayed as a login.
++ * `sessions` table cannot be replayed as a login. The lifetime is a day unless
++ * the sign-in asked to be remembered.
+  */
+ export async function createSessionToken(
+   userId: UserId,
++  options: CreateSessionOptions = {},
+ ): Promise<{ token: string; expiresAt: IsoTimestamp }> {
+   const token = randomToken(TOKEN_BYTES);
+-  const expiresAt = toIsoTimestamp(
+-    new Date(Date.now() + SESSION_TTL_DAYS * MS_PER_DAY),
+-  );
++  const ttlMs = options.rememberMe
++    ? SESSION_TTL_REMEMBERED_DAYS * MS_PER_DAY
++    : SESSION_TTL_DEFAULT_HOURS * MS_PER_HOUR;
++  const expiresAt = toIsoTimestamp(new Date(Date.now() + ttlMs));
+ 
+   await sessionRepo.createSession(userId, hashToken(token), expiresAt);
+ 
+@@ -108,13 +119,10 @@
+ }
+ 
+ /**
+- * Logs a session out. The row is removed by expiring it: `SessionPrincipal`
+- * exposes no session id, so the sweep is what actually clears the row, and the
+- * cookie is dropped by the caller either way.
++ * Logs one session out: the row behind this token is removed, and only that
++ * row — the same account's other devices stay signed in. Idempotent: an
++ * unknown or already-ended token is a no-op.
+  */
+ export async function destroySession(token: string): Promise<void> {
+-  const principal = await resolveSession(token);
+-  if (!principal) return;
+-
+-  await sessionRepo.purgeExpiredSessions(toIsoTimestamp(new Date()));
++  await sessionRepo.revokeSessionByTokenHash(hashToken(token));
+ }

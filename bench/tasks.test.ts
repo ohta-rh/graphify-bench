@@ -664,34 +664,36 @@ describe("tasks-hard.json", () => {
 });
 
 // ---------------------------------------------------------------------------
-// tasks-ultra.json — the set built to find Opus 5.5's ceiling
+// tasks-ultra.json / tasks-extreme.json — the sets built to find Opus 5.5's ceiling
 // ---------------------------------------------------------------------------
 
-describe("tasks-ultra.json", () => {
-  const ultra = loadTasks("tasks-ultra.json");
-  const rules = fs.readFileSync(path.join(TASKS_DIR, "ultra", "RULES.txt"), "utf8").trim();
+for (const set of ["ultra", "extreme"] as const) {
+  describe(`tasks-${set}.json`, () => {
+    const tasks = loadTasks(`tasks-${set}.json`);
+    const rules = fs.readFileSync(path.join(TASKS_DIR, "ultra", "RULES.txt"), "utf8").trim();
 
-  it("has 12 hidden-test tasks, 6 fix and 6 implement", () => {
-    expect(ultra).toHaveLength(12);
-    expect(ultra.filter((t) => t.category === "fix")).toHaveLength(6);
-    expect(ultra.filter((t) => t.category === "implement")).toHaveLength(6);
-    for (const t of ultra) {
-      expect(t.grader, t.id).toBe("vitest");
-      expect(t.hidden, t.id).toEqual([{ from: `ultra/${t.id}/hidden.test.ts`, to: `tests/hidden/${t.id}.test.ts` }]);
-      expect(fs.existsSync(path.resolve(TASKS_DIR, t.hidden![0]!.from)), t.id).toBe(true);
-      expect(fs.existsSync(path.join(CORPUS_ROOT, t.spec!)), t.id).toBe(false);
-      expect(fs.existsSync(path.join(TASKS_DIR, "ultra", t.id, "solution.patch")), t.id).toBe(true);
-      if (t.category === "fix") expect(fs.existsSync(path.resolve(TASKS_DIR, t.patch ?? "")), t.id).toBe(true);
-    }
-  });
+    it("has 12 hidden-test tasks, 6 fix and 6 implement", () => {
+      expect(tasks).toHaveLength(12);
+      expect(tasks.filter((t) => t.category === "fix")).toHaveLength(6);
+      expect(tasks.filter((t) => t.category === "implement")).toHaveLength(6);
+      for (const t of tasks) {
+        expect(t.grader, t.id).toBe("vitest");
+        expect(t.hidden, t.id).toEqual([{ from: `${set}/${t.id}/hidden.test.ts`, to: `tests/hidden/${t.id}.test.ts` }]);
+        expect(fs.existsSync(path.resolve(TASKS_DIR, t.hidden![0]!.from)), t.id).toBe(true);
+        expect(fs.existsSync(path.join(CORPUS_ROOT, t.spec!)), t.id).toBe(false);
+        expect(fs.existsSync(path.join(TASKS_DIR, set, t.id, "solution.patch")), t.id).toBe(true);
+        if (t.category === "fix") expect(fs.existsSync(path.resolve(TASKS_DIR, t.patch ?? "")), t.id).toBe(true);
+      }
+    });
 
-  // The anti-cheating rules are part of every prompt, and the answer-format
-  // tail still comes last so the category contract is unchanged.
-  it("states the anti-cheating rules in every prompt, just before the tail line", () => {
-    for (const t of ultra) {
-      const lines = t.prompt.trimEnd().split("\n");
-      expect(t.prompt, t.id).toContain(rules);
-      expect(lines.at(-1), t.id).toMatch(/^This is an? `(fix|implement)` task: edit the code and stop/);
-    }
+    // The anti-cheating rules are part of every prompt, and the answer-format
+    // tail still comes last so the category contract is unchanged.
+    it("states the anti-cheating rules in every prompt, just before the tail line", () => {
+      for (const t of tasks) {
+        const lines = t.prompt.trimEnd().split("\n");
+        expect(t.prompt, t.id).toContain(rules);
+        expect(lines.at(-1), t.id).toMatch(/^This is an? `(fix|implement)` task: edit the code and stop/);
+      }
+    });
   });
-});
+}

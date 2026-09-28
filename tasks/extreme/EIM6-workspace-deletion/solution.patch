@@ -1,0 +1,522 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -10,6 +10,8 @@
+ 
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
++  "organization.deleted": "deleted the organization",
++  "organization.restored": "restored the organization",
+   "project.created": "created a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+diff --git a/src/config/constants.ts b/src/config/constants.ts
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Days a deleted workspace stays restorable before the sweep purges it. */
++export const DELETED_WORKSPACE_RETENTION_DAYS: number = 30;
+diff --git a/src/lib/permissions.ts b/src/lib/permissions.ts
+--- a/src/lib/permissions.ts
++++ b/src/lib/permissions.ts
+@@ -26,6 +26,7 @@
+   "org:read": "viewer",
+   "org:update": "admin",
+   "org:delete": "owner",
++  "org:restore": "owner",
+   "org:manage_billing": "owner",
+   "org:manage_flags": "admin",
+   "member:read": "viewer",
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -9,6 +9,8 @@
+ 
+ export const activityActionSchema = z.enum([
+   "organization.updated",
++  "organization.deleted",
++  "organization.restored",
+   "project.created",
+   "project.updated",
+   "project.archived",
+diff --git a/src/server/jobs/cleanup-archived-job.ts b/src/server/jobs/cleanup-archived-job.ts
+--- a/src/server/jobs/cleanup-archived-job.ts
++++ b/src/server/jobs/cleanup-archived-job.ts
+@@ -3,6 +3,7 @@
+  *
+  * Must call (do not reimplement): getPlanLimits, isArchived
+  */
++import { DELETED_WORKSPACE_RETENTION_DAYS } from "@/config/constants";
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { createLogger } from "@/lib/logger";
+ import { isArchived } from "@/lib/soft-delete";
+@@ -32,11 +33,31 @@
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
++    // Deleted workspaces first: those past their restore window go for good.
++    // They are enumerated on their own, because the usage-driven list below
++    // is exactly the list every job skips deleted workspaces on.
++    const purgeCutoff = toIsoTimestamp(
++      new Date(now.getTime() - DELETED_WORKSPACE_RETENTION_DAYS * MS_PER_DAY),
++    );
++    for (const org of await orgRepo.listDeletedOrgsBefore(purgeCutoff)) {
++      try {
++        await orgRepo.purgeOrg(org.id);
++        result.processed += 1;
++      } catch (error) {
++        result.failed += 1;
++        logger.error("workspace purge failed", {
++          orgId: org.id,
++          reason: error instanceof Error ? error.message : String(error),
++        });
++      }
++    }
++
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+-      if (!org) continue;
++      // A deleted workspace keeps every row as it was, so a restore is whole.
++      if (!org || org.archivedAt !== null) continue;
+ 
+       const { retentionDays } = getPlanLimits(org.plan);
+       const cutoff = toIsoTimestamp(
+diff --git a/src/server/jobs/overdue-issue-job.ts b/src/server/jobs/overdue-issue-job.ts
+--- a/src/server/jobs/overdue-issue-job.ts
++++ b/src/server/jobs/overdue-issue-job.ts
+@@ -7,6 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -48,6 +49,10 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      // A deleted workspace is inert until it is restored or purged.
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
++
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+diff --git a/src/server/jobs/trial-expiry-job.ts b/src/server/jobs/trial-expiry-job.ts
+--- a/src/server/jobs/trial-expiry-job.ts
++++ b/src/server/jobs/trial-expiry-job.ts
+@@ -6,6 +6,7 @@
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -34,6 +35,11 @@
+ 
+     for (const subscription of expiring) {
+       const orgId = subscription.orgId as OrgId;
++
++      // A deleted workspace keeps its plan until it is restored or purged.
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
++
+       const usage = await usageRepo.getUsage(orgId);
+ 
+       if (
+diff --git a/src/server/jobs/usage-rollup-job.ts b/src/server/jobs/usage-rollup-job.ts
+--- a/src/server/jobs/usage-rollup-job.ts
++++ b/src/server/jobs/usage-rollup-job.ts
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): recomputeUsage
+  */
+ import { createLogger } from "@/lib/logger";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { recomputeUsage } from "@/server/services/usage-service";
+ import { runJob } from "./types";
+@@ -25,6 +26,10 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      // A deleted workspace's counters are frozen until it is restored.
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
++
+       try {
+         const usage = await recomputeUsage(orgId);
+         result.processed += 1;
+diff --git a/src/server/jobs/webhook-delivery-job.ts b/src/server/jobs/webhook-delivery-job.ts
+--- a/src/server/jobs/webhook-delivery-job.ts
++++ b/src/server/jobs/webhook-delivery-job.ts
+@@ -36,6 +36,16 @@
+     for (const delivery of claimed) {
+       const orgId = delivery.orgId as OrgId;
+ 
++      if (await orgIsDeleted(orgId)) {
++        await webhookRepo.markDeliveryFailed(
++          orgId,
++          delivery.id,
++          "the organization has been deleted",
++        );
++        result.failed += 1;
++        continue;
++      }
++
+       if (!(await orgAllowsWebhooks(orgId))) {
+         await webhookRepo.markDeliveryFailed(
+           orgId,
+@@ -92,6 +102,12 @@
+   return Math.min(300_000, 2 ** (attempts - 1) * 1_000);
+ }
+ 
++/** A deleted workspace delivers nothing, whatever its plan says. */
++async function orgIsDeleted(orgId: OrgId): Promise<boolean> {
++  const org = await orgRepo.findOrgById(orgId);
++  return org === null || org.archivedAt !== null;
++}
++
+ async function orgAllowsWebhooks(orgId: OrgId): Promise<boolean> {
+   const org = await orgRepo.findOrgById(orgId);
+   if (!org) return false;
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -3,18 +3,41 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNotNull, isNull, like, lte } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+-import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { archivePatch, restorePatch } from "@/lib/soft-delete";
++import {
++  activityEvents,
++  attachments,
++  comments,
++  getDb,
++  invitations,
++  invoices,
++  issueLabels,
++  issues,
++  labels,
++  members,
++  notificationPreferences,
++  notifications,
++  organizationUsage,
++  organizations,
++  projectMembers,
++  projects,
++  rateLimitBuckets,
++  searchIndex,
++  sessions,
++  subscriptions,
++  webhookDeliveries,
++  webhookEndpoints,
++} from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
+-import type { OrgId, UserId } from "@/types/common";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
+ 
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+@@ -126,6 +149,77 @@
+   return toOrganization(row);
+ }
+ 
++/** Brings a deleted organization back; the row keeps everything else. */
++export async function restoreOrg(orgId: OrgId): Promise<Organization> {
++  const row = getDb()
++    .update(organizations)
++    .set(restorePatch())
++    .where(eq(organizations.id, orgId))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Organization ${orgId} not found`);
++  return toOrganization(row);
++}
++
++/**
++ * The purge's own work list: workspaces deleted at or before `cutoff`. Kept
++ * apart from the usage-driven job list on purpose — a deleted workspace is
++ * skipped by every other job, so it must be found some other way.
++ */
++export async function listDeletedOrgsBefore(
++  cutoff: IsoTimestamp,
++): Promise<readonly Organization[]> {
++  const rows = getDb()
++    .select()
++    .from(organizations)
++    .where(
++      and(
++        isNotNull(organizations.archivedAt),
++        lte(organizations.archivedAt, cutoff),
++      ),
++    )
++    .all();
++  return rows.map(toOrganization);
++}
++
++/**
++ * Removes every trace of one workspace. Users are global and stay; a session
++ * pinned to the purged workspace merely loses its active org. Runs in one
++ * transaction so a crash cannot leave a half-purged tenant behind.
++ */
++export async function purgeOrg(orgId: OrgId): Promise<void> {
++  const db = getDb();
++  db.transaction((tx) => {
++    tx.delete(webhookDeliveries).where(eq(webhookDeliveries.orgId, orgId)).run();
++    tx.delete(webhookEndpoints).where(eq(webhookEndpoints.orgId, orgId)).run();
++    tx.delete(searchIndex).where(eq(searchIndex.orgId, orgId)).run();
++    tx.delete(rateLimitBuckets).where(eq(rateLimitBuckets.orgId, orgId)).run();
++    tx.delete(activityEvents).where(eq(activityEvents.orgId, orgId)).run();
++    tx.delete(notificationPreferences)
++      .where(eq(notificationPreferences.orgId, orgId))
++      .run();
++    tx.delete(notifications).where(eq(notifications.orgId, orgId)).run();
++    tx.delete(attachments).where(eq(attachments.orgId, orgId)).run();
++    tx.delete(comments).where(eq(comments.orgId, orgId)).run();
++    tx.delete(issueLabels).where(eq(issueLabels.orgId, orgId)).run();
++    tx.delete(labels).where(eq(labels.orgId, orgId)).run();
++    tx.delete(issues).where(eq(issues.orgId, orgId)).run();
++    tx.delete(projectMembers).where(eq(projectMembers.orgId, orgId)).run();
++    tx.delete(projects).where(eq(projects.orgId, orgId)).run();
++    tx.delete(invitations).where(eq(invitations.orgId, orgId)).run();
++    tx.delete(members).where(eq(members.orgId, orgId)).run();
++    tx.delete(invoices).where(eq(invoices.orgId, orgId)).run();
++    tx.delete(subscriptions).where(eq(subscriptions.orgId, orgId)).run();
++    tx.delete(organizationUsage).where(eq(organizationUsage.orgId, orgId)).run();
++    tx.update(sessions)
++      .set({ activeOrgId: null, updatedAt: toIsoTimestamp(new Date()) })
++      .where(eq(sessions.activeOrgId, orgId))
++      .run();
++    tx.delete(organizations).where(eq(organizations.id, orgId)).run();
++  });
++}
++
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+ export async function listTakenOrgSlugs(
+   prefix: string,
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -148,6 +148,24 @@
+  */
+ export function registerActivityListeners(): Unsubscribe {
+   const offs: Unsubscribe[] = [
++    subscribe("organization.deleted", (payload) =>
++      record(payload.orgId, "organization.deleted", {
++        actorId: payload.actorId,
++        subjectKind: "organization",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Deleted workspace ${payload.slug}`,
++      }).then(() => undefined),
++    ),
++    subscribe("organization.restored", (payload) =>
++      record(payload.orgId, "organization.restored", {
++        actorId: payload.actorId,
++        subjectKind: "organization",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Restored workspace ${payload.slug}`,
++      }).then(() => undefined),
++    ),
+     subscribe("project.created", (payload) =>
+       record(payload.orgId, "project.created", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -8,12 +8,13 @@
+ import { hashToken, randomToken } from "@/lib/hash";
+ import { assertCan } from "@/lib/permissions";
+ import { consumeRateLimit } from "@/lib/rate-limit";
++import { isArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { envelope, orgResource, requireFound } from "./_support";
++import { NotFoundError, envelope, orgResource, requireFound } from "./_support";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+ import type { InvitationId, UserId } from "@/types/common";
+@@ -134,6 +135,12 @@
+     throw new Error("That invitation has expired");
+   }
+ 
++  // A deleted workspace cannot be joined; the invitation simply waits.
++  const org = await orgRepo.findOrgById(invitation.orgId);
++  if (org === null || isArchived(org)) {
++    throw new NotFoundError("Organization", invitation.orgId);
++  }
++
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+   if (existing) return existing;
+ 
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -52,6 +52,9 @@
+   if (recipients.length === 0) return [];
+ 
+   const org = await orgRepo.findOrgById(orgId);
++  // A deleted workspace is inert: nothing is created for it.
++  if (org !== null && org.archivedAt !== null) return [];
++
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+diff --git a/src/server/services/organization-service.ts b/src/server/services/organization-service.ts
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -3,9 +3,12 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, uniqueSlug, assertValidSlug
+  */
++import { DELETED_WORKSPACE_RETENTION_DAYS } from "@/config/constants";
++import { parseIso } from "@/lib/date";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
++import { assertNotArchived, isArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -13,7 +16,13 @@
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { record } from "./activity-service";
+-import { envelope, orgResource, requireFound } from "./_support";
++import {
++  NotFoundError,
++  actorEnvelope,
++  envelope,
++  orgResource,
++  requireFound,
++} from "./_support";
+ import type {
+   CreateOrganizationInput,
+   DeleteOrganizationInput,
+@@ -96,10 +105,66 @@
+   if (org.slug !== input.confirmSlug) {
+     throw new Error("The confirmation does not match this organization's slug");
+   }
++  assertNotArchived("Organization", org.id, org);
+ 
+-  return orgRepo.archiveOrg(input.orgId);
++  const deleted = await orgRepo.archiveOrg(input.orgId);
++
++  await emit("organization.deleted", {
++    ...actorEnvelope(actor),
++    slug: deleted.slug,
++  });
++
++  return deleted;
+ }
+ 
++const MS_PER_DAY = 24 * 60 * 60 * 1000;
++
++/** True once the restore window after `archivedAt` has closed. */
++export function isDeletionExpired(
++  org: Organization,
++  now: Date = new Date(),
++): boolean {
++  if (org.archivedAt === null) return false;
++  return (
++    parseIso(org.archivedAt).getTime() +
++      DELETED_WORKSPACE_RETENTION_DAYS * MS_PER_DAY <=
++    now.getTime()
++  );
++}
++
++/**
++ * Brings a deleted workspace back inside its restore window. No `Actor` can
++ * be resolved for a deleted workspace, so the caller is identified by user
++ * id and the decision is taken against their stored membership.
++ */
++export async function restoreOrganization(
++  userId: UserId,
++  orgId: OrgId,
++): Promise<Organization> {
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  if (!isArchived(org)) return org;
++
++  // Past the window the workspace is gone, whether or not the purge has run.
++  if (isDeletionExpired(org)) throw new NotFoundError("Organization", orgId);
++
++  const member = requireFound(
++    await memberRepo.findMember(orgId, userId),
++    "Organization",
++    orgId,
++  );
++  const actor: Actor = { userId, orgId, role: member.role };
++  assertCan(actor, "org:restore", orgResource(orgId));
++
++  const restored = await orgRepo.restoreOrg(orgId);
++
++  await emit("organization.restored", {
++    ...actorEnvelope(actor),
++    slug: restored.slug,
++  });
++
++  return restored;
++}
++
+ /** The header/shell payload: the org plus the counters the sidebar shows. */
+ export async function getOrganizationSummary(
+   actor: Actor,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -10,6 +10,8 @@
+  *  bus keys so `ActivityService` can map one to the other mechanically. */
+ export type ActivityAction =
+   | "organization.updated"
++  | "organization.deleted"
++  | "organization.restored"
+   | "project.created"
+   | "project.updated"
+   | "project.archived"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -26,6 +26,8 @@
+  * derive their handler signatures from it.
+  */
+ export interface TaskflowEventMap {
++  "organization.deleted": EventEnvelope & { slug: string };
++  "organization.restored": EventEnvelope & { slug: string };
+   "project.created": EventEnvelope & {
+     projectId: ProjectId;
+     name: string;
+diff --git a/src/types/permission.ts b/src/types/permission.ts
+--- a/src/types/permission.ts
++++ b/src/types/permission.ts
+@@ -18,6 +18,7 @@
+   | "org:read"
+   | "org:update"
+   | "org:delete"
++  | "org:restore"
+   | "org:manage_billing"
+   | "org:manage_flags"
+   | "member:read"

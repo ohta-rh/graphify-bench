@@ -1,0 +1,440 @@
+diff --git a/src/lib/tenant.ts b/src/lib/tenant.ts
+--- a/src/lib/tenant.ts
++++ b/src/lib/tenant.ts
+@@ -28,6 +28,18 @@
+ export function assertOrgScope(actor: Actor, orgId: OrgId): void {
+   if (actor.orgId !== orgId) {
+     throw new TenantScopeError(actor.orgId, orgId);
++  }
++}
++
++/**
++ * Throws unless a row another write points at belongs to `orgId`. References
++ * (a label, a parent issue, a parent comment) are looked up by id alone so
++ * that "in another workspace" can be told apart from "does not exist"; this
++ * is the check that turns the former into a scope violation.
++ */
++export function assertReferenceInOrg(orgId: OrgId, row: TenantScoped): void {
++  if (row.orgId !== orgId) {
++    throw new TenantScopeError(orgId, row.orgId);
+   }
+ }
+ 
+diff --git a/src/server/services/_support.ts b/src/server/services/_support.ts
+--- a/src/server/services/_support.ts
++++ b/src/server/services/_support.ts
+@@ -6,9 +6,11 @@
+  * Neither re-implements a cross-cutting concern — they are adapters onto
+  * `@/lib/permissions` and `@/lib/event-bus`.
+  */
++import { isArchived } from "@/lib/soft-delete";
++import { assertReferenceInOrg } from "@/lib/tenant";
+ import { toIsoTimestamp } from "@/types/common";
+ import type { Comment } from "@/types/comment";
+-import type { OrgId, UserId } from "@/types/common";
++import type { OrgId, SoftDeletable, TenantScoped, UserId } from "@/types/common";
+ import type { EventEnvelope } from "@/types/event";
+ import type { Issue } from "@/types/issue";
+ import type { Actor, Member } from "@/types/member";
+@@ -39,6 +41,36 @@
+     throw new NotFoundError(entity, id);
+   }
+   return value;
++}
++
++/**
++ * Resolves a row that a write in `orgId` points at. Missing is `not_found`;
++ * another workspace is a scope violation, checked before anything else so a
++ * foreign row is never reported as merely missing.
++ */
++export function requireReference<T extends TenantScoped>(
++  orgId: OrgId,
++  row: T | null | undefined,
++  entity: string,
++  id: string,
++): T {
++  const found = requireFound(row, entity, id);
++  assertReferenceInOrg(orgId, found);
++  return found;
++}
++
++/** `requireReference` for soft-deletable rows: an archived one is not found. */
++export function requireLiveReference<T extends TenantScoped & SoftDeletable>(
++  orgId: OrgId,
++  row: T | null | undefined,
++  entity: string,
++  id: string,
++): T {
++  const found = requireReference(orgId, row, entity, id);
++  if (isArchived(found)) {
++    throw new NotFoundError(entity, id);
++  }
++  return found;
+ }
+ 
+ export function orgResource(orgId: OrgId): PermissionResource {
+diff --git a/src/server/repositories/label-repository.ts b/src/server/repositories/label-repository.ts
+--- a/src/server/repositories/label-repository.ts
++++ b/src/server/repositories/label-repository.ts
+@@ -67,6 +67,23 @@
+   return toLabel(row);
+ }
+ 
++/**
++ * Reference lookup: the rows for `labelIds` whatever organization they belong
++ * to. Deliberately not tenant-scoped — the caller uses the row's `orgId` to
++ * refuse a foreign label as a scope violation rather than as "missing".
++ */
++export async function findLabelsByIds(
++  labelIds: readonly LabelId[],
++): Promise<readonly IssueLabel[]> {
++  if (labelIds.length === 0) return [];
++  const rows = getDb()
++    .select()
++    .from(labels)
++    .where(inArray(labels.id, [...labelIds]))
++    .all();
++  return rows.map(toLabel);
++}
++
+ /** Labels are hard deleted; the join rows go with them. */
+ export async function deleteLabel(
+   orgId: OrgId,
+@@ -123,6 +140,9 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        // The label itself must be the org's own: a join row pointing at a
++        // foreign label (however it got there) never decorates an issue.
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -70,6 +70,18 @@
+   return toIssue(row, (labels[row.id] ?? []).map((label) => label.id));
+ }
+ 
++/**
++ * Reference lookup for `parentId`: the row whatever organization it belongs
++ * to. Not tenant-scoped on purpose — the caller uses `orgId` on the row to
++ * refuse a foreign parent as a scope violation rather than as "missing".
++ */
++export async function findIssueForReference(
++  issueId: IssueId,
++): Promise<Issue | null> {
++  const row = getDb().select().from(issues).where(eq(issues.id, issueId)).get();
++  return row ? toIssue(row) : null;
++}
++
+ export async function findIssueByNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+diff --git a/src/server/repositories/comment-repository.ts b/src/server/repositories/comment-repository.ts
+--- a/src/server/repositories/comment-repository.ts
++++ b/src/server/repositories/comment-repository.ts
+@@ -35,6 +35,21 @@
+   return row ? toComment(row) : null;
+ }
+ 
++/**
++ * Reference lookup for a reply's `parentId`: the row whatever organization
++ * it belongs to, so the caller can tell a foreign parent from a missing one.
++ */
++export async function findCommentForReference(
++  commentId: CommentId,
++): Promise<Comment | null> {
++  const row = getDb()
++    .select()
++    .from(comments)
++    .where(eq(comments.id, commentId))
++    .get();
++  return row ? toComment(row) : null;
++}
++
+ export async function listComments(
+   input: ListCommentsInput,
+ ): Promise<Page<CommentWithAuthor>> {
+diff --git a/src/server/repositories/member-repository.ts b/src/server/repositories/member-repository.ts
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -43,6 +43,26 @@
+   return row ? toMember(row) : null;
+ }
+ 
++/** True when `userId` currently holds an active, live membership in the org. */
++export async function isActiveMember(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<boolean> {
++  const row = getDb()
++    .select({ id: members.id })
++    .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.userId, userId),
++        eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .get();
++  return row !== undefined;
++}
++
+ export async function findMemberById(
+   orgId: OrgId,
+   memberId: MemberId,
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -8,7 +8,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+-import { actorEnvelope, memberResource, requireFound } from "./_support";
++import { actorEnvelope, memberResource, NotFoundError, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
+@@ -120,6 +120,20 @@
+ }
+ 
+ /**
++ * Guard for every write that points at a person — assignee, project lead.
++ * Users are global, so there is no "foreign" user: anyone who is not a
++ * current member of the workspace is simply not found.
++ */
++export async function assertActiveMember(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  if (!(await memberRepo.isActiveMember(orgId, userId))) {
++    throw new NotFoundError("Member", userId);
++  }
++}
++
++/**
+  * Throws when applying `nextRole` to `memberId` would leave the organization
+  * without an owner. Exported because both the demote and the remove path need
+  * it, and the invariant must not be stated twice.
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,12 +14,16 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertActiveMember } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
++  requireLiveReference,
++  requireReference,
+ } from "./_support";
+ import type {
+   AssignIssueInput,
+@@ -29,7 +33,7 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, LabelId, OrgId, Page, ProjectId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -65,6 +69,16 @@
+     );
+   }
+ 
++  // Everything the new issue points at must be usable from this workspace,
++  // and it is checked before a number is taken or a row written.
++  if (input.assigneeId !== null) {
++    await assertActiveMember(input.orgId, input.assigneeId);
++  }
++  if (input.parentId !== null) {
++    await requireParentIssue(input.orgId, input.projectId, input.parentId);
++  }
++  await requireLabels(input.orgId, input.labelIds);
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -94,6 +108,10 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  if (input.labelIds !== undefined) {
++    await requireLabels(input.orgId, input.labelIds);
++  }
++
+   const after = await issueRepo.updateIssue(input);
+ 
+   await emit("issue.updated", {
+@@ -160,6 +178,10 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++
++  if (input.assigneeId !== null) {
++    await assertActiveMember(input.orgId, input.assigneeId);
++  }
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -265,6 +287,40 @@
+   return issueRepo.listIssues(input);
+ }
+ 
++/**
++ * A parent must be a live issue of the same project. A foreign one is a scope
++ * violation; a missing, archived or other-project one is not found.
++ */
++async function requireParentIssue(
++  orgId: OrgId,
++  projectId: ProjectId,
++  parentId: IssueId,
++): Promise<void> {
++  const parent = requireLiveReference(
++    orgId,
++    await issueRepo.findIssueForReference(parentId),
++    "Issue",
++    parentId,
++  );
++  if (parent.projectId !== projectId) {
++    throw new NotFoundError("Issue", parentId);
++  }
++}
++
++/** Every label must be one of the workspace's own; checked as a whole. */
++async function requireLabels(
++  orgId: OrgId,
++  labelIds: readonly LabelId[],
++): Promise<void> {
++  if (labelIds.length === 0) return;
++
++  const rows = await labelRepo.findLabelsByIds(labelIds);
++  const byId = new Map(rows.map((row) => [row.id, row]));
++  for (const labelId of labelIds) {
++    requireReference(orgId, byId.get(labelId) ?? null, "Label", labelId);
++  }
++}
++
+ export async function getBoard(
+   actor: Actor,
+   orgId: OrgId,
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -12,6 +12,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { assertActiveMember } from "./member-service";
+ import {
+   actorEnvelope,
+   orgResource,
+@@ -53,6 +54,10 @@
+     );
+   }
+ 
++  if (input.leadId !== null) {
++    await assertActiveMember(input.orgId, input.leadId);
++  }
++
+   const slug = await suggestProjectSlug(input.orgId, input.name);
+ 
+   const project = await projectRepo.insertProject({
+@@ -84,6 +89,10 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== undefined && input.leadId !== null) {
++    await assertActiveMember(input.orgId, input.leadId);
++  }
+ 
+   return projectRepo.updateProject(input);
+ }
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -16,7 +16,9 @@
+   actorEnvelope,
+   commentResource,
+   issueResource,
++  NotFoundError,
+   requireFound,
++  requireLiveReference,
+ } from "./_support";
+ import type {
+   CreateCommentInput,
+@@ -56,6 +58,10 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId !== null) {
++    await requireParentComment(input.orgId, input.issueId, input.parentId);
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -168,10 +174,32 @@
+ }
+ 
+ /**
++ * A reply attaches to a live, top-level comment on the same issue. A foreign
++ * parent is a scope violation; a missing, deleted, other-issue or
++ * reply-to-a-reply parent is not found.
++ */
++async function requireParentComment(
++  orgId: OrgId,
++  issueId: IssueId,
++  parentId: NonNullable<Comment["parentId"]>,
++): Promise<void> {
++  const parent = requireLiveReference(
++    orgId,
++    await commentRepo.findCommentForReference(parentId),
++    "Comment",
++    parentId,
++  );
++  if (parent.issueId !== issueId || parent.parentId !== null) {
++    throw new NotFoundError("Comment", parentId);
++  }
++}
++
++/**
+  * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
++ * parsed out of the body server-side. The server list wins on disagreement,
++ * and only current members survive: a mention of anyone else — a typo, a
++ * former member, a stranger — is dropped rather than failing the write, so
++ * nobody outside the workspace is ever notified from here.
+  */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+@@ -184,7 +212,11 @@
+     cursor: null,
+   });
+ 
+-  const resolved = resolveMentions(body, members.items);
+-
+-  return [...new Set([...resolved, ...clientProvided])];
+-}
++  const active = members.items.filter((member) => member.status === "active");
++  const resolved = resolveMentions(body, active);
++  const known = new Set(active.map((member) => member.userId));
++
++  return [
++    ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
++  ];
++}

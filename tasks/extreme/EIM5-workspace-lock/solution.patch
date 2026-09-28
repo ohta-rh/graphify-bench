@@ -1,0 +1,522 @@
+diff --git a/src/lib/billing-lock.ts b/src/lib/billing-lock.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/billing-lock.ts
+@@ -0,0 +1,58 @@
++/**
++ * Workspace lock: the rule that turns a subscription row into "may this
++ * workspace be written to right now?".
++ *
++ * A workspace is read-only while it is not in good standing. The decision is
++ * pure and instant-based so services, route handlers and the billing page all
++ * answer the same way; `BillingService.assertWorkspaceWritable()` is the
++ * throwing form the write paths call.
++ */
++import { parseIso } from "@/lib/date";
++import type { Subscription, WorkspaceLockReason } from "@/types/billing";
++import type { OrgId } from "@/types/common";
++
++/** Thrown by a write on a locked workspace; mapped to `plan_limit_exceeded`. */
++export class WorkspaceLockedError extends Error {
++  readonly code = "plan_limit_exceeded" as const;
++
++  constructor(
++    readonly orgId: OrgId,
++    readonly reason: WorkspaceLockReason,
++  ) {
++    super(`Workspace ${orgId} is read-only (${reason})`);
++    this.name = "WorkspaceLockedError";
++  }
++}
++
++/**
++ * Why the workspace is locked at `now`, or `null` when it may be written to.
++ *
++ * - no subscription row, or an `active` one: writable
++ * - `past_due`: locked
++ * - `trialing`: locked once the trial's period end has been reached
++ * - `canceled`: locked once `cancelAt` has been reached; a cancellation
++ *   scheduled for the end of the paid period keeps the workspace writable
++ *   until then. A canceled row without a `cancelAt` counts as canceled now.
++ */
++export function lockReasonFor(
++  subscription: Subscription | null,
++  now: Date = new Date(),
++): WorkspaceLockReason | null {
++  if (subscription === null) return null;
++
++  switch (subscription.status) {
++    case "active":
++      return null;
++    case "past_due":
++      return "past_due";
++    case "trialing":
++      return parseIso(subscription.currentPeriodEnd).getTime() <= now.getTime()
++        ? "trial_ended"
++        : null;
++    case "canceled":
++      if (subscription.cancelAt === null) return "canceled";
++      return parseIso(subscription.cancelAt).getTime() <= now.getTime()
++        ? "canceled"
++        : null;
++  }
++}
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -7,6 +7,7 @@
+  * client. Everything funnels through `toAppError()` so one thrown class maps
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
++import { WorkspaceLockedError } from "@/lib/billing-lock";
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+@@ -35,6 +36,7 @@
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
++    error instanceof WorkspaceLockedError ||
+     error instanceof ZodError
+   );
+ }
+@@ -96,6 +98,14 @@
+     };
+   }
+ 
++  if (error instanceof WorkspaceLockedError) {
++    return {
++      code: "plan_limit_exceeded",
++      message: "This workspace is read-only until its billing is resolved.",
++      meta: { orgId: error.orgId, reason: error.reason },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/server/services/attachment-service.ts b/src/server/services/attachment-service.ts
+--- a/src/server/services/attachment-service.ts
++++ b/src/server/services/attachment-service.ts
+@@ -11,6 +11,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { issueResource, requireFound } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type {
+   CreateAttachmentInput,
+   DeleteAttachmentInput,
+@@ -56,6 +57,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -102,6 +104,7 @@
+     attachment.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+diff --git a/src/server/services/billing-service.ts b/src/server/services/billing-service.ts
+--- a/src/server/services/billing-service.ts
++++ b/src/server/services/billing-service.ts
+@@ -8,6 +8,7 @@
+   getPlanLimits,
+   wouldExceedLimit,
+ } from "@/config/plan-limits";
++import { WorkspaceLockedError, lockReasonFor } from "@/lib/billing-lock";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -69,10 +70,26 @@
+       limits.priceCentsPerSeatMonthly *
+       subscription.seats *
+       (subscription.interval === "annual" ? 12 : 1),
++    lockReason: lockReasonFor(subscription),
+   };
+ }
+ 
+ /**
++ * The write gate every user-initiated mutation passes after its permission
++ * check. Billing itself is exempt — it is the way out of the lock — as are
++ * reads and a member's own notification housekeeping.
++ */
++export async function assertWorkspaceWritable(
++  orgId: OrgId,
++  now: Date = new Date(),
++): Promise<void> {
++  const reason = lockReasonFor(await subscriptionRepo.findSubscription(orgId), now);
++  if (reason !== null) {
++    throw new WorkspaceLockedError(orgId, reason);
++  }
++}
++
++/**
+  * The one place a quota is evaluated. Every guard elsewhere calls this rather
+  * than reading `PLAN_LIMITS` itself, so a new plan dimension needs changing in
+  * exactly two files: `plan-limits.ts` and `usageFor()` below.
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -12,6 +12,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import { assertWorkspaceWritable } from "./billing-service";
+ import {
+   actorEnvelope,
+   commentResource,
+@@ -54,6 +55,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Issue", issue.id, issue);
+ 
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+@@ -101,6 +103,7 @@
+     input.commentId,
+   );
+   assertCan(actor, "comment:update", commentResource(comment));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Comment", comment.id, comment);
+ 
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+@@ -127,6 +130,7 @@
+     input.commentId,
+   );
+   assertCan(actor, "comment:delete", commentResource(comment));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Comment", comment.id, comment);
+ 
+   const { archivedAt } = archivePatch();
+diff --git a/src/server/services/feature-flag-service.ts b/src/server/services/feature-flag-service.ts
+--- a/src/server/services/feature-flag-service.ts
++++ b/src/server/services/feature-flag-service.ts
+@@ -9,6 +9,7 @@
+ import { getFlagDefinition } from "@/config/feature-flags";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { actorEnvelope, orgResource, requireFound } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type { ToggleFeatureFlagInput } from "@/schemas/feature-flag";
+ import type { FeatureFlagSnapshot, FlagContext } from "@/types/feature-flag";
+ import type { Actor } from "@/types/member";
+@@ -54,6 +55,7 @@
+   input: ToggleFeatureFlagInput,
+ ): Promise<Organization> {
+   assertCan(actor, "org:manage_flags", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -14,6 +14,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { envelope, orgResource, requireFound } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+ import type { InvitationId, UserId } from "@/types/common";
+@@ -49,6 +50,7 @@
+ ): Promise<readonly Invitation[]> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "member:invite", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const verdict = await consumeRateLimit(
+     input.orgId,
+@@ -134,6 +136,9 @@
+     throw new Error("That invitation has expired");
+   }
+ 
++  // The token is good; the workspace still has to be writable to join it.
++  await assertWorkspaceWritable(invitation.orgId);
++
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+   if (existing) return existing;
+ 
+@@ -165,6 +170,7 @@
+   invitationId: InvitationId,
+ ): Promise<Invitation> {
+   assertCan(actor, "member:invite", orgResource(actor.orgId));
++  await assertWorkspaceWritable(actor.orgId);
+   return invitationRepo.revokeInvitation(actor.orgId, invitationId);
+ }
+ 
+@@ -178,6 +184,7 @@
+ ): Promise<Invitation> {
+   assertOrgScope(actor, actor.orgId);
+   assertCan(actor, "member:invite", orgResource(actor.orgId));
++  await assertWorkspaceWritable(actor.orgId);
+ 
+   const previous = requireFound(
+     await invitationRepo
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertWorkspaceWritable } from "./billing-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -52,6 +53,7 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -92,6 +94,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(before));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Issue", before.id, before);
+ 
+   const after = await issueRepo.updateIssue(input);
+@@ -121,6 +124,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(before));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Issue", before.id, before);
+ 
+   if (before.status === input.status) return before;
+@@ -159,6 +163,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Issue", before.id, before);
+ 
+   const after = await issueRepo.setIssueAssignee(
+@@ -201,6 +206,7 @@
+     issueId,
+   );
+   assertCan(actor, "issue:archive", issueResource(issue));
++  await assertWorkspaceWritable(orgId);
+   assertNotArchived("Issue", issue.id, issue);
+ 
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
+diff --git a/src/server/services/label-service.ts b/src/server/services/label-service.ts
+--- a/src/server/services/label-service.ts
++++ b/src/server/services/label-service.ts
+@@ -7,6 +7,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as labelRepo from "@/server/repositories/label-repository";
+ import { orgResource } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
+ import type { LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+@@ -28,6 +29,7 @@
+ ): Promise<IssueLabel> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:update", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const existing = await labelRepo.listLabels(input.orgId);
+   if (existing.some((label) => label.name === input.name)) {
+@@ -43,6 +45,7 @@
+ ): Promise<IssueLabel> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:update", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+   return labelRepo.updateLabel(input);
+ }
+ 
+@@ -57,5 +60,6 @@
+ ): Promise<void> {
+   assertOrgScope(actor, orgId);
+   assertCan(actor, "project:archive", orgResource(orgId));
++  await assertWorkspaceWritable(orgId);
+   await labelRepo.deleteLabel(orgId, labelId);
+ }
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -9,6 +9,7 @@
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
+@@ -49,6 +50,7 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:update_role", memberResource(member));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   if (!hasRoleAtLeast(actor.role, input.role)) {
+     throw new Error(
+@@ -90,6 +92,7 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:remove", memberResource(member));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   await assertLastOwnerRetained(input.orgId, input.memberId, "member");
+ 
+diff --git a/src/server/services/organization-service.ts b/src/server/services/organization-service.ts
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -3,6 +3,7 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, uniqueSlug, assertValidSlug
+  */
++import { lockReasonFor } from "@/lib/billing-lock";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
+@@ -13,6 +14,7 @@
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { record } from "./activity-service";
++import { assertWorkspaceWritable } from "./billing-service";
+ import { envelope, orgResource, requireFound } from "./_support";
+ import type {
+   CreateOrganizationInput,
+@@ -60,6 +62,7 @@
+ ): Promise<Organization> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "org:update", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const updated = await orgRepo.updateOrg(input.orgId, input);
+ 
+@@ -119,6 +122,7 @@
+     usage: await usageRepo.getUsage(orgId),
+     memberCount: await memberRepo.countActiveMembers(orgId),
+     projectCount: await projectRepo.countProjects(orgId),
++    lockReason: lockReasonFor(await subscriptionRepo.findSubscription(orgId)),
+   };
+ }
+ 
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -12,6 +12,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { assertWorkspaceWritable } from "./billing-service";
+ import {
+   actorEnvelope,
+   orgResource,
+@@ -39,6 +40,7 @@
+ ): Promise<Project> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -83,6 +85,7 @@
+     input.projectId,
+   );
+   assertCan(actor, "project:update", projectResource(project));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Project", project.id, project);
+ 
+   return projectRepo.updateProject(input);
+@@ -104,6 +107,7 @@
+     input.projectId,
+   );
+   assertCan(actor, "project:archive", projectResource(project));
++  await assertWorkspaceWritable(input.orgId);
+   assertNotArchived("Project", project.id, project);
+ 
+   const issuesArchived = input.archiveIssues
+@@ -138,6 +142,7 @@
+     projectId,
+   );
+   assertCan(actor, "project:archive", projectResource(project));
++  await assertWorkspaceWritable(orgId);
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+ 
+diff --git a/src/server/services/webhook-service.ts b/src/server/services/webhook-service.ts
+--- a/src/server/services/webhook-service.ts
++++ b/src/server/services/webhook-service.ts
+@@ -13,6 +13,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as webhookRepo from "@/server/repositories/webhook-repository";
+ import { requireFound, webhookResource } from "./_support";
++import { assertWorkspaceWritable } from "./billing-service";
+ import type {
+   CreateWebhookInput,
+   DeleteWebhookInput,
+@@ -47,6 +48,7 @@
+ ): Promise<WebhookEndpointRow> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "webhook:manage", webhookResource(input.orgId, null));
++  await assertWorkspaceWritable(input.orgId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -72,6 +74,7 @@
+ ): Promise<WebhookEndpointRow> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "webhook:manage", webhookResource(input.orgId, input.webhookId));
++  await assertWorkspaceWritable(input.orgId);
+   return webhookRepo.updateEndpoint(input);
+ }
+ 
+@@ -81,6 +84,7 @@
+ ): Promise<void> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "webhook:manage", webhookResource(input.orgId, input.webhookId));
++  await assertWorkspaceWritable(input.orgId);
+   await webhookRepo.deleteEndpoint(input.orgId, input.webhookId);
+ }
+ 
+diff --git a/src/types/billing.ts b/src/types/billing.ts
+--- a/src/types/billing.ts
++++ b/src/types/billing.ts
+@@ -64,9 +64,13 @@
+   readonly paidAt: IsoTimestamp | null;
+ }
+ 
++/** Why a workspace is read-only; `null` on the billing summary means writable. */
++export type WorkspaceLockReason = "past_due" | "canceled" | "trial_ended";
++
+ export interface BillingSummary {
+   readonly orgId: OrgId;
+   readonly subscription: Subscription;
+   readonly checks: readonly LimitCheck[];
+   readonly upcomingInvoiceCents: number;
++  readonly lockReason: WorkspaceLockReason | null;
+ }
+diff --git a/src/types/organization.ts b/src/types/organization.ts
+--- a/src/types/organization.ts
++++ b/src/types/organization.ts
+@@ -5,7 +5,7 @@
+   Timestamps,
+   UserId,
+ } from "./common";
+-import type { PlanId } from "./billing";
++import type { PlanId, WorkspaceLockReason } from "./billing";
+ 
+ export interface Organization extends Timestamps, SoftDeletable {
+   readonly id: OrgId;
+@@ -42,4 +42,6 @@
+   readonly usage: OrganizationUsage;
+   readonly memberCount: number;
+   readonly projectCount: number;
++  /** Non-null while the workspace is read-only; the shell renders a banner. */
++  readonly lockReason: WorkspaceLockReason | null;
+ }

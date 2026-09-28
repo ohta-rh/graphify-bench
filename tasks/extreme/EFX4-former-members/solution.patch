@@ -1,0 +1,499 @@
+diff --git a/src/types/member.ts b/src/types/member.ts
+--- a/src/types/member.ts
++++ b/src/types/member.ts
+@@ -87,3 +87,15 @@
+ export function hasRoleAtLeast(role: Role, atLeast: Role): boolean {
+   return ROLE_RANK[role] >= ROLE_RANK[atLeast];
+ }
++
++/**
++ * The one definition of "is this person currently a member": the row is live
++ * and its status is `active`. A removed membership fails both halves; every
++ * check that asks "may this person be notified / assigned / act" goes through
++ * here rather than reading one column.
++ */
++export function isActiveMembership(
++  member: Pick<Member, "status" | "archivedAt">,
++): boolean {
++  return member.status === "active" && member.archivedAt === null;
++}
+diff --git a/src/server/repositories/member-repository.ts b/src/server/repositories/member-repository.ts
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -3,9 +3,9 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
++import { archivePatch, restorePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+@@ -26,9 +26,9 @@
+ }
+ 
+ /**
+- * The (org, user) lookup behind every actor resolution. The pair is unique,
+- * so the row itself says whether the membership is usable: callers read
+- * `status`, and an ended membership keeps its `archivedAt` for the audit log.
++ * The (org, user) lookup behind every actor resolution. Live rows only: a
++ * removed membership must never be minted into an `Actor`, whatever its
++ * `status` column says.
+  */
+ export async function findMember(
+   orgId: OrgId,
+@@ -37,9 +37,78 @@
+   const row = getDb()
+     .select()
+     .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.userId, userId),
++        liveMemberPredicate(),
++      ),
++    )
++    .get();
++  return row ? toMember(row) : null;
++}
++
++/**
++ * Same lookup including removed memberships. Only the re-join path needs
++ * this: the (org, user) pair is unique, so a person who comes back must get
++ * their original row reactivated rather than a second one inserted.
++ */
++export async function findMembership(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<Member | null> {
++  const row = getDb()
++    .select()
++    .from(members)
+     .where(and(orgPredicate(members.orgId, orgId), eq(members.userId, userId)))
+     .get();
+   return row ? toMember(row) : null;
++}
++
++/** True when `userId` currently holds an active, live membership in the org. */
++export async function isActiveMember(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<boolean> {
++  const row = getDb()
++    .select({ id: members.id })
++    .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.userId, userId),
++        eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .get();
++  return row !== undefined;
++}
++
++/**
++ * Narrows a candidate list to the users who are active members of the org,
++ * preserving order. The notification fan-out and the digest run through this
++ * so nobody is addressed after they left.
++ */
++export async function filterActiveMemberIds(
++  orgId: OrgId,
++  userIds: readonly UserId[],
++): Promise<readonly UserId[]> {
++  if (userIds.length === 0) return [];
++  const rows = getDb()
++    .select({ userId: members.userId })
++    .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        inArray(members.userId, [...userIds]),
++        eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .all();
++  const active = new Set(rows.map((row) => row.userId));
++  return userIds.filter((userId) => active.has(userId));
+ }
+ 
+ export async function findMemberById(
+@@ -158,18 +227,43 @@
+   return toMember(row);
+ }
+ 
+-/**
+- * Removal is a soft delete so the audit log keeps pointing at a real row.
+- * `status` is left as it was: it records what the membership was, and
+- * `archivedAt` alone says that it ended.
+- */
++/** Removal is a soft delete so the audit log keeps pointing at a real row. */
+ export async function archiveMember(
+   orgId: OrgId,
+   memberId: MemberId,
+ ): Promise<Member> {
+   const row = getDb()
+     .update(members)
+-    .set(archivePatch())
++    .set({ ...archivePatch(), status: "suspended" })
++    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
++  return toMember(row);
++}
++
++/**
++ * Brings a removed membership back: same row, same id, the role and inviter of
++ * the invitation that re-admitted the person, and a fresh `joinedAt`.
++ */
++export async function reactivateMember(
++  orgId: OrgId,
++  memberId: MemberId,
++  role: Role,
++  invitedBy: UserId | null,
++  at: IsoTimestamp,
++): Promise<Member> {
++  const row = getDb()
++    .update(members)
++    .set({
++      ...restorePatch(new Date(at)),
++      status: "active",
++      role,
++      invitedBy,
++      joinedAt: at,
++      lastSeenAt: null,
++    })
+     .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
+     .returning()
+     .get();
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -480,6 +480,32 @@
+   return toIssue(row);
+ }
+ 
++/**
++ * Cascade behind `MemberService.removeMember`: live issues assigned to the
++ * person who left become unassigned. Returns the row count.
++ */
++export async function unassignIssuesForUser(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<number> {
++  const rows = getDb()
++    .update(issues)
++    .set({ assigneeId: null, updatedAt: toIsoTimestamp(new Date()) })
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.assigneeId, userId),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      ),
++    )
++    .returning({ id: issues.id })
++    .all();
++
++  return rows.length;
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -22,7 +22,7 @@
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+-import type { ArchiveScope, OrgId, Page, ProjectId } from "@/types/common";
++import type { ArchiveScope, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Project, ProjectStats } from "@/types/project";
+ 
+ export async function findProjectById(
+@@ -205,6 +205,24 @@
+   return toProject(row);
+ }
+ 
++/**
++ * Cascade behind `MemberService.removeMember`: projects led by the person who
++ * left have no lead afterwards. Returns the row count.
++ */
++export async function clearLeadForUser(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<number> {
++  const rows = getDb()
++    .update(projects)
++    .set({ leadId: null, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.leadId, userId)))
++    .returning({ id: projects.id })
++    .all();
++
++  return rows.length;
++}
++
+ /** Includes archived slugs — a restored project must not collide. */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -5,10 +5,13 @@
+  */
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+-import { actorEnvelope, memberResource, requireFound } from "./_support";
++import { actorEnvelope, memberResource, NotFoundError, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
+@@ -49,6 +52,7 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:update_role", memberResource(member));
++  assertNotArchived("Member", member.id, member);
+ 
+   if (!hasRoleAtLeast(actor.role, input.role)) {
+     throw new Error(
+@@ -90,10 +94,16 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:remove", memberResource(member));
++  assertNotArchived("Member", member.id, member);
+ 
+   await assertLastOwnerRetained(input.orgId, input.memberId, "member");
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
++
++  // Nothing may keep pointing at someone who left: their open work becomes
++  // unassigned and the projects they led have no lead, from this moment.
++  await issueRepo.unassignIssuesForUser(input.orgId, removed.userId);
++  await projectRepo.clearLeadForUser(input.orgId, removed.userId);
+ 
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+@@ -117,6 +127,20 @@
+   if (!member || member.status !== "active") return null;
+ 
+   return { userId, orgId, role: member.role };
++}
++
++/**
++ * Guard for every write that points at a person — assignee, project lead —
++ * so only a current member of the workspace can be referenced. Someone who
++ * left, or who never joined, is "not found" here.
++ */
++export async function assertActiveMember(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  if (!(await memberRepo.isActiveMember(orgId, userId))) {
++    throw new NotFoundError("Member", userId);
++  }
+ }
+ 
+ /**
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertActiveMember } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -65,6 +66,10 @@
+     );
+   }
+ 
++  if (input.assigneeId !== null) {
++    await assertActiveMember(input.orgId, input.assigneeId);
++  }
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -160,6 +165,10 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++
++  if (input.assigneeId !== null) {
++    await assertActiveMember(input.orgId, input.assigneeId);
++  }
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -12,6 +12,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { assertActiveMember } from "./member-service";
+ import {
+   actorEnvelope,
+   orgResource,
+@@ -53,6 +54,10 @@
+     );
+   }
+ 
++  if (input.leadId !== null) {
++    await assertActiveMember(input.orgId, input.leadId);
++  }
++
+   const slug = await suggestProjectSlug(input.orgId, input.name);
+ 
+   const project = await projectRepo.insertProject({
+@@ -84,6 +89,10 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== undefined && input.leadId !== null) {
++    await assertActiveMember(input.orgId, input.leadId);
++  }
+ 
+   return projectRepo.updateProject(input);
+ }
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+@@ -51,6 +52,13 @@
+ ): Promise<readonly Notification[]> {
+   if (recipients.length === 0) return [];
+ 
++  // Only current members are addressed: a person who left the workspace is
++  // dropped here, whatever list of watchers, assignees or mentions named them.
++  const members = await memberRepo.filterActiveMemberIds(orgId, [
++    ...new Set(recipients),
++  ]);
++  if (members.length === 0) return [];
++
+   const org = await orgRepo.findOrgById(orgId);
+   const flags: FlagContext = {
+     orgId,
+@@ -62,7 +70,7 @@
+ 
+   const rows = [];
+ 
+-  for (const recipientId of new Set(recipients)) {
++  for (const recipientId of members) {
+     if (recipientId === payload.actorId) continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+diff --git a/src/server/services/digest-service.ts b/src/server/services/digest-service.ts
+--- a/src/server/services/digest-service.ts
++++ b/src/server/services/digest-service.ts
+@@ -5,6 +5,7 @@
+  */
+ import { isEnabled } from "@/lib/feature-flags";
+ import { DIGEST_MAX_ENTRIES } from "@/config/constants";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -65,7 +66,9 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  // Preference rows outlive the membership; only current members get mail.
++  const subscribers = await preferenceRepo.listDigestSubscribers(orgId);
++  return memberRepo.filterActiveMemberIds(orgId, subscribers);
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -13,6 +13,7 @@
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
++import { isActiveMembership } from "@/types/member";
+ import { envelope, orgResource, requireFound } from "./_support";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+@@ -134,20 +135,42 @@
+     throw new Error("That invitation has expired");
+   }
+ 
+-  const existing = await memberRepo.findMember(invitation.orgId, userId);
+-  if (existing) return existing;
+-
+-  const member = await memberRepo.insertMember(
+-    invitation.orgId,
+-    userId,
+-    invitation.role,
+-    invitation.invitedBy,
+-  );
++  const now = toIsoTimestamp(new Date());
++
++  // An invitation is single-use whoever accepts it: it is consumed even when
++  // the person is already a member, in which case nothing else changes.
++  const existing = await memberRepo.findMembership(invitation.orgId, userId);
++  if (existing && isActiveMembership(existing)) {
++    await invitationRepo.markInvitationAccepted(
++      invitation.orgId,
++      invitation.id,
++      now,
++    );
++    return existing;
++  }
++
++  // A former member comes back as the member the workspace knew — the same
++  // row, with the role and inviter of the invitation that re-admitted them —
++  // rather than as a second membership for the same person.
++  const member = existing
++    ? await memberRepo.reactivateMember(
++        invitation.orgId,
++        existing.id,
++        invitation.role,
++        invitation.invitedBy,
++        now,
++      )
++    : await memberRepo.insertMember(
++        invitation.orgId,
++        userId,
++        invitation.role,
++        invitation.invitedBy,
++      );
+ 
+   await invitationRepo.markInvitationAccepted(
+     invitation.orgId,
+     invitation.id,
+-    toIsoTimestamp(new Date()),
++    now,
+   );
+ 
+   await emit("member.joined", {

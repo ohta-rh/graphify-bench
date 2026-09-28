@@ -1,0 +1,513 @@
+diff --git a/src/lib/permissions.ts b/src/lib/permissions.ts
+--- a/src/lib/permissions.ts
++++ b/src/lib/permissions.ts
+@@ -32,6 +32,7 @@
+   "member:invite": "admin",
+   "member:update_role": "admin",
+   "member:remove": "admin",
++  "member:set_absence": "admin",
+   "project:create": "member",
+   "project:read": "viewer",
+   "project:update": "member",
+@@ -61,6 +62,7 @@
+   "comment:update": true,
+   "comment:delete": true,
+   "notification:manage": true,
++  "member:set_absence": true,
+ };
+ 
+ function isOwnedByActor(
+diff --git a/src/schemas/member.ts b/src/schemas/member.ts
+--- a/src/schemas/member.ts
++++ b/src/schemas/member.ts
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ import {
+   emailSchema,
++  isoTimestampSchema,
+   memberIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+@@ -65,6 +66,17 @@
+   timezone: z.string().min(1).max(64).optional(),
+ });
+ 
++/** Out-of-office window for one member, with an optional stand-in. */
++export const setAbsenceSchema = z.object({
++  orgId: orgIdSchema,
++  userId: userIdSchema,
++  delegateUserId: userIdSchema.nullable().default(null),
++  startsAt: isoTimestampSchema,
++  endsAt: isoTimestampSchema,
++  note: z.string().max(200).nullable().default(null),
++});
++
++export type SetAbsenceInput = z.infer<typeof setAbsenceSchema>;
+ export type InviteMemberInput = z.infer<typeof inviteMemberSchema>;
+ export type InviteMembersInput = z.infer<typeof inviteMembersSchema>;
+ export type UpdateMemberRoleInput = z.infer<typeof updateMemberRoleSchema>;
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -90,6 +90,18 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS members_org_user_idx ON members (org_id, user_id)`,
+   `CREATE INDEX IF NOT EXISTS members_org_role_idx ON members (org_id, role)`,
++  `CREATE TABLE IF NOT EXISTS member_absences (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     delegate_user_id TEXT,
++     starts_at TEXT NOT NULL,
++     ends_at TEXT NOT NULL,
++     note TEXT,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS member_absences_pk ON member_absences (org_id, user_id)`,
++  `CREATE INDEX IF NOT EXISTS member_absences_delegate_idx ON member_absences (org_id, delegate_user_id)`,
+   `CREATE TABLE IF NOT EXISTS invitations (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff --git a/src/server/db/schema/members.ts b/src/server/db/schema/members.ts
+--- a/src/server/db/schema/members.ts
++++ b/src/server/db/schema/members.ts
+@@ -52,6 +52,25 @@
+   ],
+ );
+ 
++/** One out-of-office window per member and organization. */
++export const memberAbsences = sqliteTable(
++  "member_absences",
++  {
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    delegateUserId: text("delegate_user_id"),
++    startsAt: text("starts_at").notNull(),
++    endsAt: text("ends_at").notNull(),
++    note: text("note"),
++    ...timestampColumns,
++  },
++  (table) => [
++    uniqueIndex("member_absences_pk").on(table.orgId, table.userId),
++    index("member_absences_delegate_idx").on(table.orgId, table.delegateUserId),
++  ],
++);
++
+ export type MemberRow = typeof members.$inferSelect;
++export type MemberAbsenceRow = typeof memberAbsences.$inferSelect;
+ export type NewMemberRow = typeof members.$inferInsert;
+ export type InvitationRow = typeof invitations.$inferSelect;
+diff --git a/src/server/repositories/member-absence-repository.ts b/src/server/repositories/member-absence-repository.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/repositories/member-absence-repository.ts
+@@ -0,0 +1,108 @@
++/**
++ * Out-of-office windows, one per (org, member).
++ */
++import { and, eq } from "drizzle-orm";
++import { getDb, memberAbsences } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import { brandId, brandStamp } from "./_mappers";
++import type { MemberAbsenceRow } from "@/server/db/schema/members";
++import type { SetAbsenceInput } from "@/schemas/member";
++import type { OrgId, UserId } from "@/types/common";
++import type { MemberAbsence } from "@/types/member";
++
++function toAbsence(row: MemberAbsenceRow): MemberAbsence {
++  return {
++    orgId: brandId<OrgId>(row.orgId),
++    userId: brandId<UserId>(row.userId),
++    delegateUserId:
++      row.delegateUserId === null ? null : brandId<UserId>(row.delegateUserId),
++    startsAt: brandStamp(row.startsAt),
++    endsAt: brandStamp(row.endsAt),
++    note: row.note,
++  };
++}
++
++export async function findAbsence(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<MemberAbsence | null> {
++  const row = getDb()
++    .select()
++    .from(memberAbsences)
++    .where(
++      and(
++        orgPredicate(memberAbsences.orgId, orgId),
++        eq(memberAbsences.userId, userId),
++      ),
++    )
++    .get();
++  return row ? toAbsence(row) : null;
++}
++
++/** Setting an absence again replaces the previous window wholesale. */
++export async function upsertAbsence(
++  input: SetAbsenceInput,
++): Promise<MemberAbsence> {
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb()
++    .insert(memberAbsences)
++    .values({
++      orgId: input.orgId,
++      userId: input.userId,
++      delegateUserId: input.delegateUserId,
++      startsAt: input.startsAt,
++      endsAt: input.endsAt,
++      note: input.note,
++      createdAt: stamp,
++      updatedAt: stamp,
++    })
++    .onConflictDoUpdate({
++      target: [memberAbsences.orgId, memberAbsences.userId],
++      set: {
++        delegateUserId: input.delegateUserId,
++        startsAt: input.startsAt,
++        endsAt: input.endsAt,
++        note: input.note,
++        updatedAt: stamp,
++      },
++    })
++    .returning()
++    .get();
++
++  return toAbsence(row);
++}
++
++export async function deleteAbsence(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  getDb()
++    .delete(memberAbsences)
++    .where(
++      and(
++        orgPredicate(memberAbsences.orgId, orgId),
++        eq(memberAbsences.userId, userId),
++      ),
++    )
++    .run();
++}
++
++/** Drops `delegateUserId` wherever it names a member who has left. */
++export async function clearDelegate(
++  orgId: OrgId,
++  delegateUserId: UserId,
++): Promise<number> {
++  const rows = getDb()
++    .update(memberAbsences)
++    .set({ delegateUserId: null, updatedAt: toIsoTimestamp(new Date()) })
++    .where(
++      and(
++        orgPredicate(memberAbsences.orgId, orgId),
++        eq(memberAbsences.delegateUserId, delegateUserId),
++      ),
++    )
++    .returning({ userId: memberAbsences.userId })
++    .all();
++  return rows.length;
++}
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { activeDelegateFor } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -29,11 +30,25 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+ /**
++ * Who actually gets an issue that is being given to `requested`: the stand-in
++ * while the member is away, except when someone takes an issue themselves.
++ */
++async function effectiveAssignee(
++  actor: Actor,
++  orgId: OrgId,
++  requested: UserId | null,
++): Promise<UserId | null> {
++  if (requested === null || requested === actor.userId) return requested;
++  const delegate = await activeDelegateFor(orgId, requested, new Date());
++  return delegate ?? requested;
++}
++
++/**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+  * Only then is a number allocated and `issue.created` published — everything
+@@ -66,7 +81,12 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const assigneeId = await effectiveAssignee(actor, input.orgId, input.assigneeId);
++  const issue = await issueRepo.insertIssue(
++    { ...input, assigneeId },
++    actor.userId,
++    number,
++  );
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -161,13 +181,14 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  const assigneeId = await effectiveAssignee(actor, input.orgId, input.assigneeId);
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+-    input.assigneeId,
++    assigneeId,
+   );
+ 
+-  if (input.assigneeId === null) {
++  if (assigneeId === null) {
+     await emit("issue.updated", {
+       ...actorEnvelope(actor),
+       issueId: after.id,
+@@ -182,7 +203,7 @@
+     issueId: after.id,
+     projectId: after.projectId,
+     previousAssigneeId: before.assigneeId,
+-    assigneeId: input.assigneeId,
++    assigneeId,
+   });
+ 
+   return after;
+diff --git a/src/server/services/member-service.ts b/src/server/services/member-service.ts
+--- a/src/server/services/member-service.ts
++++ b/src/server/services/member-service.ts
+@@ -6,16 +6,25 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as absenceRepo from "@/server/repositories/member-absence-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import { toIsoTimestamp } from "@/types/common";
+ import { hasRoleAtLeast } from "@/types/member";
+-import { actorEnvelope, memberResource, requireFound } from "./_support";
++import { actorEnvelope, memberResource, NotFoundError, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
++  SetAbsenceInput,
+   UpdateMemberRoleInput,
+ } from "@/schemas/member";
+ import type { MemberId, OrgId, Page, UserId } from "@/types/common";
+-import type { Actor, Member, MemberWithUser, Role } from "@/types/member";
++import type {
++  Actor,
++  Member,
++  MemberAbsence,
++  MemberWithUser,
++  Role,
++} from "@/types/member";
+ 
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+@@ -95,6 +104,11 @@
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
+ 
++  // Whoever leaves takes their own absence with them and stops standing in
++  // for anyone else.
++  await absenceRepo.deleteAbsence(input.orgId, removed.userId);
++  await absenceRepo.clearDelegate(input.orgId, removed.userId);
++
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+     memberId: removed.id,
+@@ -105,6 +119,96 @@
+ }
+ 
+ /**
++ * Records an out-of-office window. Members set their own; the
++ * `member:set_absence` action covers everyone else's and, through the usual
++ * ownership escalation, the member's own row.
++ */
++export async function setAbsence(
++  actor: Actor,
++  input: SetAbsenceInput,
++): Promise<MemberAbsence> {
++  assertOrgScope(actor, input.orgId);
++
++  const member = await requireActiveMember(input.orgId, input.userId);
++  assertCan(actor, "member:set_absence", memberResource(member));
++
++  if (input.endsAt <= input.startsAt) {
++    throw new Error("An absence must end after it starts");
++  }
++
++  if (input.delegateUserId !== null) {
++    if (input.delegateUserId === input.userId) {
++      throw new Error("A member cannot be their own delegate");
++    }
++    await requireActiveMember(input.orgId, input.delegateUserId);
++  }
++
++  return absenceRepo.upsertAbsence(input);
++}
++
++export async function clearAbsence(
++  actor: Actor,
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  assertOrgScope(actor, orgId);
++
++  const member = await requireActiveMember(orgId, userId);
++  assertCan(actor, "member:set_absence", memberResource(member));
++
++  await absenceRepo.deleteAbsence(orgId, userId);
++}
++
++/** The member's absence while it has not ended yet; scheduled ones included. */
++export async function getAbsence(
++  actor: Actor,
++  orgId: OrgId,
++  userId: UserId,
++): Promise<MemberAbsence | null> {
++  assertOrgScope(actor, orgId);
++
++  const member = await requireActiveMember(orgId, userId);
++  assertCan(actor, "member:read", memberResource(member));
++
++  const absence = await absenceRepo.findAbsence(orgId, userId);
++  if (!absence) return null;
++  return absence.endsAt > toIsoTimestamp(new Date()) ? absence : null;
++}
++
++/**
++ * The stand-in for `userId` at instant `at`, or `null` when the member is not
++ * away then, named nobody, or the delegate is no longer an active member.
++ * Not chained: a delegate's own absence is never followed.
++ */
++export async function activeDelegateFor(
++  orgId: OrgId,
++  userId: UserId,
++  at: Date,
++): Promise<UserId | null> {
++  const absence = await absenceRepo.findAbsence(orgId, userId);
++  if (!absence || absence.delegateUserId === null) return null;
++
++  const instant = toIsoTimestamp(at);
++  if (instant < absence.startsAt || instant >= absence.endsAt) return null;
++
++  const delegate = await memberRepo.findMember(orgId, absence.delegateUserId);
++  if (!delegate || delegate.status !== "active") return null;
++
++  return absence.delegateUserId;
++}
++
++async function requireActiveMember(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<Member> {
++  const member = await memberRepo.findMember(orgId, userId);
++  if (!member || member.status !== "active") {
++    throw new NotFoundError("Member", userId);
++  }
++  return member;
++}
++
++/**
+  * Turns a (user, org) pair into the `Actor` every service method takes. The
+  * only place an `Actor` is minted from stored state — jobs and the session
+  * layer both come through here.
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -12,6 +12,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import { toIsoTimestamp } from "@/types/common";
++import { activeDelegateFor } from "./member-service";
+ import { notificationResource, requireFound } from "./_support";
+ import type {
+   ListNotificationsInput,
+@@ -192,7 +193,13 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
++    // An away assignee's stand-in gets the alert in their place.
++    const delegate = await activeDelegateFor(
++      payload.orgId,
++      payload.assigneeId,
++      new Date(payload.occurredAt),
++    );
++    await notify(payload.orgId, "issue_overdue", [delegate ?? payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+@@ -214,10 +221,22 @@
+     });
+ 
+     if (payload.mentionedUserIds.length > 0) {
++      // A mention of an away member also reaches their stand-in. One list,
++      // one call: `notify()` de-duplicates recipients only within a call.
++      const recipients = [...payload.mentionedUserIds];
++      for (const mentioned of payload.mentionedUserIds) {
++        const delegate = await activeDelegateFor(
++          payload.orgId,
++          mentioned,
++          new Date(payload.occurredAt),
++        );
++        if (delegate !== null) recipients.push(delegate);
++      }
++
+       await notify(
+         payload.orgId,
+         "comment_mention",
+-        payload.mentionedUserIds,
++        recipients,
+         {
+           title: "You were mentioned",
+           body: `You were mentioned on issue ${payload.issueId}`,
+diff --git a/src/types/member.ts b/src/types/member.ts
+--- a/src/types/member.ts
++++ b/src/types/member.ts
+@@ -51,6 +51,18 @@
+   readonly user: User;
+ }
+ 
++/**
++ * A member's out-of-office window. While it is in effect, new assignments
++ * and the alerts addressed to the member are redirected to the delegate.
++ */
++export interface MemberAbsence extends TenantScoped {
++  readonly userId: UserId;
++  readonly delegateUserId: UserId | null;
++  readonly startsAt: IsoTimestamp;
++  readonly endsAt: IsoTimestamp;
++  readonly note: string | null;
++}
++
+ export interface Invitation extends Timestamps, TenantScoped {
+   readonly id: InvitationId;
+   readonly email: string;
+diff --git a/src/types/permission.ts b/src/types/permission.ts
+--- a/src/types/permission.ts
++++ b/src/types/permission.ts
+@@ -24,6 +24,7 @@
+   | "member:invite"
+   | "member:update_role"
+   | "member:remove"
++  | "member:set_absence"
+   | "project:create"
+   | "project:read"
+   | "project:update"

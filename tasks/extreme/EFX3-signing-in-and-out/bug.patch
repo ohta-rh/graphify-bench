@@ -1,0 +1,70 @@
+--- a/src/server/repositories/_password-reset-repository.ts
++++ b/src/server/repositories/_password-reset-repository.ts
+@@ -6,7 +6,7 @@
+  * entry owns it, and `AuthService` cannot implement a real reset flow without
+  * somewhere to keep the single-use token.
+  */
+-import { and, eq, gt, isNull } from "drizzle-orm";
++import { and, eq, gt } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, passwordResetTokens } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -46,7 +46,10 @@
+   };
+ }
+ 
+-/** Returns the token only while it is unused and unexpired. */
++/**
++ * Returns the token only while it is unexpired. Consuming a token retires it
++ * through `consumeResetToken`, so the used marker needs no second check here.
++ */
+ export async function findLiveResetToken(
+   tokenHash: string,
+ ): Promise<ResetToken | null> {
+@@ -56,7 +59,6 @@
+     .where(
+       and(
+         eq(passwordResetTokens.tokenHash, tokenHash),
+-        isNull(passwordResetTokens.usedAt),
+         gt(passwordResetTokens.expiresAt, new Date().toISOString()),
+       ),
+     )
+--- a/src/server/repositories/session-repository.ts
++++ b/src/server/repositories/session-repository.ts
+@@ -89,13 +89,17 @@
+   getDb().delete(sessions).where(eq(sessions.id, sessionId)).run();
+ }
+ 
+-/** Housekeeping sweep; returns how many rows the scheduler removed. */
++/**
++ * Housekeeping sweep; returns how many rows it removed. A row that predates
++ * the sweep is stale by definition — the cookie is re-issued on every sign-in,
++ * so anything older than `now` has been superseded.
++ */
+ export async function purgeExpiredSessions(
+   now: IsoTimestamp,
+ ): Promise<number> {
+   const rows = getDb()
+     .delete(sessions)
+-    .where(lt(sessions.expiresAt, now))
++    .where(lt(sessions.createdAt, now))
+     .returning({ id: sessions.id })
+     .all();
+   return rows.length;
+--- a/src/server/services/auth-service.ts
++++ b/src/server/services/auth-service.ts
+@@ -43,8 +43,12 @@
+  */
+ const ANONYMOUS_ORG = "00000000000000000000000000" as OrgId;
+ 
+-/** How long a password-reset link stays usable. */
+-const RESET_TTL_MS = 60 * 60 * 1000;
++/**
++ * How long a password-reset link stays usable. Links are minted per request
++ * and opened straight from the inbox, so a short fuse costs nothing and keeps
++ * a leaked mailbox from being useful later.
++ */
++const RESET_TTL_MS = 60 * 1000;
+ 
+ /**
+  * Registration creates the user and their first workspace in one step — a
