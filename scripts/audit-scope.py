@@ -11,8 +11,9 @@ audit reads each transcript's tool inputs and reports:
   - any mention of the benchmark's own artefacts (repository name, hidden
     specs, reference solutions, bug patches, answer keys).
 
-Files the agent itself writes under /tmp are counted separately and are not a
-violation: they are scratch, not a route to the answer.
+Files the agent itself writes under /tmp, and Claude Code's own persisted
+tool output for the run's session, are counted separately and are not a
+violation: they are the agent's own scratch and output, not a route to the answer.
 
 The run's own clone is inferred as the most frequent `bench-scratch/<uuid>`
 prefix in its transcript. Output is one line per flagged tool call; exit status
@@ -27,6 +28,9 @@ import re
 import sys
 
 SCRATCH = re.compile(r"bench-scratch/([0-9a-f-]{36})")
+# Claude Code persists an oversized tool result under the run's own session
+# directory and tells the agent where; reading it back is reading its own output.
+OWN_SESSION_OUTPUT = re.compile(r"/\.claude/projects/[^/]*bench-scratch-([0-9a-f-]{36})/\1/tool-results/")
 ABS = re.compile(r"(?<![\w.~-])(/(?:Users|home|private|var|tmp|Volumes|opt|etc)/[^\s'\"`;|&)]*)")
 ALLOWED_PREFIXES = (
     "/opt/homebrew/",  # toolchain binaries
@@ -67,11 +71,15 @@ def audit_run(transcript):
         if LEAK.search(text):
             reasons.append("benchmark-artefact:" + LEAK.search(text).group(0))
         for path in ABS.findall(text):
+            path = path.rstrip("\\")  # JSON escaping can leave a trailing backslash
+            if OWN_SESSION_OUTPUT.search(path):
+                notes.append("own-session-output")
+                continue
             if own_id and own_id in path:
                 continue
             if path.startswith(ALLOWED_PREFIXES):
                 continue
-            if path.startswith("/tmp/") or path.startswith("/private/tmp/"):
+            if path in ("/tmp", "/private/tmp") or path.startswith(("/tmp/", "/private/tmp/")):
                 notes.append("tmp-scratch:" + path[:80])  # agent's own scratch file, not a leak
                 continue
             m = SCRATCH.search(path)
@@ -95,7 +103,7 @@ def main(dirs):
                 run = transcript.split("/")[-2]
                 for name, reasons, text in flagged:
                     print(f"{run}\t{name}\t{'; '.join(reasons)}\t{text}")
-    print(f"# audited {total} runs, {bad} flagged, {scratch} wrote their own /tmp scratch files", file=sys.stderr)
+    print(f"# audited {total} runs, {bad} flagged, {scratch} used their own /tmp scratch or persisted session output", file=sys.stderr)
     return 1 if bad else 0
 
 
