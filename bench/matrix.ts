@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { collectRun } from "./collect.js";
 import { overlayDirs, resolveCondition } from "./conditions.js";
-import { REPO_ROOT, readEnv, runDir, runId } from "./lib/env.js";
+import { REPO_ROOT, RESULTS_DIR, readEnv, runDir, runId } from "./lib/env.js";
+import { retryDelayMs, runApiFailure } from "./lib/quota.js";
 import { shuffle } from "./lib/rng.js";
 import { executeRun } from "./run.js";
 import { parseTaskFile, type Task } from "../tasks/tasks.schema.js";
@@ -28,8 +29,27 @@ export function enumerateCells(tasks: Task[], conditions: string[], reps: number
 }
 
 /** A run is complete once metrics.json exists — that is the resume marker. */
+/**
+ * A cell is complete when its run reached the model. A run that ended in an
+ * `api_error` (quota exhausted, transport failure) has metrics but measured
+ * nothing, so it stays pending and is retried.
+ */
 export function isComplete(id: string): boolean {
-  return fs.existsSync(path.join(runDir(id), "metrics.json"));
+  return fs.existsSync(path.join(runDir(id), "metrics.json")) && runApiFailure(runDir(id)) === null;
+}
+
+/** Most retries a single cell gets before the matrix gives up on it. */
+export const MAX_API_RETRIES = 30;
+
+/**
+ * Move a run that hit an API failure out of `runs/` into `quarantine/`, so it is
+ * kept as evidence but can never be collected, graded or analysed as a result.
+ */
+export function quarantineRun(id: string, stamp: string): string {
+  const dest = path.join(RESULTS_DIR, "quarantine", `${id}__${stamp}`);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.renameSync(runDir(id), dest);
+  return dest;
 }
 
 interface Cli {
@@ -64,7 +84,7 @@ export function parseCli(argv: string[]): Cli {
     .split(",")
     .map((c) => c.trim())
     .filter(Boolean);
-  const concurrency = Math.min(3, Math.max(1, Number(flag(argv, "concurrency") ?? "1")));
+  const concurrency = Math.min(8, Math.max(1, Number(flag(argv, "concurrency") ?? "1")));
   const tasksFiles = (flag(argv, "tasks") ?? "tasks/tasks.json")
     .split(",")
     .map((s) => s.trim())
@@ -132,14 +152,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  let index = 0;
+  const queue = [...pending];
+  const attempts = new Map<string, number>();
+  let finished = 0;
   let failures = 0;
+  let pausedUntil = 0;
   const startedAll = Date.now();
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const worker = async (): Promise<void> => {
     for (;;) {
-      const i = index++;
-      const cell = pending[i];
+      while (Date.now() < pausedUntil) await sleep(Math.min(pausedUntil - Date.now(), 60_000));
+      const cell = queue.shift();
       if (!cell) return;
       const started = Date.now();
       const meta = await executeRun({
@@ -157,9 +181,26 @@ async function main(): Promise<void> {
       } catch (err) {
         meta.error = meta.error ?? `collect failed: ${String(err)}`;
       }
+      const failure = runApiFailure(runDir(cell.id));
+      if (failure) {
+        const tries = (attempts.get(cell.id) ?? 0) + 1;
+        attempts.set(cell.id, tries);
+        const moved = quarantineRun(cell.id, new Date().toISOString().replace(/[:.]/g, "-"));
+        const delay = retryDelayMs(failure);
+        pausedUntil = Math.max(pausedUntil, Date.now() + delay);
+        console.log(
+          `[retry ${tries}/${MAX_API_RETRIES}] ${cell.id} api_error (${failure.quota ? "quota" : "transport"}): ` +
+            `${(failure.message.split("\n")[0] ?? "").slice(0, 120)} -> ${path.relative(REPO_ROOT, moved)}; ` +
+            `all workers paused until ${new Date(pausedUntil).toISOString()}`,
+        );
+        if (tries < MAX_API_RETRIES) queue.push(cell);
+        else failures++;
+        continue;
+      }
+      finished++;
       if (meta.error) failures++;
       console.log(
-        `[${i + 1}/${pending.length}] ${cell.id} ${((Date.now() - started) / 1000).toFixed(1)}s ` +
+        `[${finished}/${pending.length}] ${cell.id} ${((Date.now() - started) / 1000).toFixed(1)}s ` +
           `${metricsSummary}${meta.error ? ` ERROR: ${meta.error.split("\n")[0]}` : ""}`,
       );
     }
@@ -167,7 +208,8 @@ async function main(): Promise<void> {
 
   await Promise.all(Array.from({ length: Math.min(cli.concurrency, pending.length || 1) }, worker));
   console.log(
-    `[matrix] done in ${((Date.now() - startedAll) / 60_000).toFixed(1)} min; ${pending.length - failures} ok, ${failures} with errors`,
+    `[matrix] done in ${((Date.now() - startedAll) / 60_000).toFixed(1)} min; ${finished - failures} ok, ${failures} with errors, ` +
+      `${pending.length - finished} not measured`,
   );
   if (failures > 0) process.exitCode = 1;
 }

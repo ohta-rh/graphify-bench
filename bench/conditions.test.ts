@@ -10,6 +10,7 @@ import {
   LEAN_TOOLS,
   LEAN_TOOLS_ARGS,
   OPUS_MODEL,
+  SONNET55_MODEL,
   assertRegistryMatchesDisk,
   conditionNames,
   effectiveEffort,
@@ -567,10 +568,14 @@ describe("runtime lever arms", () => {
     ["opus-effort-low", "effort-low"],
     ["opus-effort-high", "effort-high"],
     ["opus-effort-xhigh", "effort-xhigh"],
+    ["sonnet55-effort-low", "effort-low"],
+    ["sonnet55-effort-medium", "effort-medium"],
+    ["sonnet55-effort-high", "effort-high"],
+    ["sonnet55-effort-xhigh", "effort-xhigh"],
   ])("%s is %s with only the model swapped", (opus, sonnet) => {
     const o = getCondition(opus);
     const s = getCondition(sonnet);
-    expect(o.model).toBe(OPUS_MODEL);
+    expect(o.model).toBe(opus.startsWith("sonnet55") ? SONNET55_MODEL : OPUS_MODEL);
     expect(s.model).toBeUndefined();
     expect(o.overlays).toEqual(s.overlays);
     expect(o.effort).toBe(s.effort);

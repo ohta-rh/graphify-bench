@@ -121,6 +121,9 @@ export const HAIKU_MODEL = "claude-haiku-4-5";
 /** The exact Opus model id used for the model-swap arms. */
 export const OPUS_MODEL = "claude-opus-5-5";
 
+/** Sonnet 5.5, measured beside Sonnet 5 at the same effort levels. */
+export const SONNET55_MODEL = "claude-sonnet-5-5";
+
 /**
  * The built-in tools the `lean-tools` family leaves in the request.
  *
@@ -588,6 +591,38 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     model: OPUS_MODEL,
     effort: "xhigh",
     note: "`effort-xhigh` on Opus 5.5 — only the model differs.",
+  },
+  {
+    name: "sonnet55-effort-low",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: SONNET55_MODEL,
+    effort: "low",
+    note: "`effort-low` on Sonnet 5.5 — only the model differs.",
+  },
+  {
+    name: "sonnet55-effort-medium",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: SONNET55_MODEL,
+    effort: "medium",
+    note: "`effort-medium` on Sonnet 5.5 — only the model differs.",
+  },
+  {
+    name: "sonnet55-effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: SONNET55_MODEL,
+    effort: "high",
+    note: "`effort-high` on Sonnet 5.5 — only the model differs.",
+  },
+  {
+    name: "sonnet55-effort-xhigh",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: SONNET55_MODEL,
+    effort: "xhigh",
+    note: "`effort-xhigh` on Sonnet 5.5 — only the model differs.",
   },
 ] as const;
 
