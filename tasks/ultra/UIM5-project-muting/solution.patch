@@ -1,0 +1,398 @@
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -211,6 +211,7 @@
+      body TEXT NOT NULL,
+      href TEXT NOT NULL,
+      actor_id TEXT,
++     project_id TEXT,
+      read_at TEXT,
+      channels TEXT NOT NULL DEFAULT '["in_app"]',
+      created_at TEXT NOT NULL,
+@@ -227,6 +228,14 @@
+      digest_only INTEGER NOT NULL DEFAULT 0
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS notification_preferences_pk ON notification_preferences (org_id, user_id, kind)`,
++  `CREATE TABLE IF NOT EXISTS project_mutes (
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     muted_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS project_mutes_pk ON project_mutes (org_id, project_id, user_id)`,
++  `CREATE INDEX IF NOT EXISTS project_mutes_org_user_idx ON project_mutes (org_id, user_id)`,
+   `CREATE TABLE IF NOT EXISTS activity_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -26,6 +26,8 @@
+     body: text("body").notNull(),
+     href: text("href").notNull(),
+     actorId: text("actor_id"),
++    /** The project the notification is about, when there is one. */
++    projectId: text("project_id"),
+     readAt: text("read_at"),
+     /** JSON array of `NotificationChannel`. */
+     channels: text("channels").notNull().default('["in_app"]'),
+@@ -58,7 +60,23 @@
+   ],
+ );
+ 
++/** A member's personal mute of one project's notifications. */
++export const projectMutes = sqliteTable(
++  "project_mutes",
++  {
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    userId: text("user_id").notNull(),
++    mutedAt: text("muted_at").notNull(),
++  },
++  (table) => [
++    uniqueIndex("project_mutes_pk").on(table.orgId, table.projectId, table.userId),
++    index("project_mutes_org_user_idx").on(table.orgId, table.userId),
++  ],
++);
++
+ export type NotificationRow = typeof notifications.$inferSelect;
+ export type NewNotificationRow = typeof notifications.$inferInsert;
+ export type NotificationPreferenceRow =
+   typeof notificationPreferences.$inferSelect;
++export type ProjectMuteRow = typeof projectMutes.$inferSelect;
+diff --git a/src/server/repositories/_mappers.ts b/src/server/repositories/_mappers.ts
+--- a/src/server/repositories/_mappers.ts
++++ b/src/server/repositories/_mappers.ts
+@@ -268,6 +268,7 @@
+     body: row.body,
+     href: row.href,
+     actorId: row.actorId === null ? null : brandId<UserId>(row.actorId),
++    projectId: row.projectId === null ? null : brandId<ProjectId>(row.projectId),
+     readAt: brandStampOrNull(row.readAt),
+     channels: parseJsonArray<NotificationChannel>(row.channels),
+     createdAt: brandStamp(row.createdAt),
+diff --git a/src/server/repositories/notification-preference-repository.ts b/src/server/repositories/notification-preference-repository.ts
+--- a/src/server/repositories/notification-preference-repository.ts
++++ b/src/server/repositories/notification-preference-repository.ts
+@@ -2,11 +2,11 @@
+  * Per-user, per-kind delivery matrix consulted before every fan-out.
+  */
+ import { and, eq } from "drizzle-orm";
+-import { getDb, notificationPreferences } from "@/server/db";
++import { getDb, notificationPreferences, projectMutes } from "@/server/db";
+ import { orgPredicate } from "./base-repository";
+ import { brandId, toPreference } from "./_mappers";
+ import type { UpdateNotificationPreferenceInput } from "@/schemas/notification";
+-import type { OrgId, UserId } from "@/types/common";
++import type { IsoTimestamp, OrgId, ProjectId, UserId } from "@/types/common";
+ import type {
+   NotificationKind,
+   NotificationPreference,
+@@ -100,3 +100,71 @@
+ 
+   return rows.map((row) => brandId<UserId>(row.userId));
+ }
++
++/** Idempotent: muting an already-muted project keeps the original row. */
++export async function insertProjectMute(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++  at: IsoTimestamp,
++): Promise<void> {
++  getDb()
++    .insert(projectMutes)
++    .values({ orgId, userId, projectId, mutedAt: at })
++    .onConflictDoNothing()
++    .run();
++}
++
++export async function deleteProjectMute(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<void> {
++  getDb()
++    .delete(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .run();
++}
++
++/** The projects one member has muted in this org. */
++export async function listMutedProjectIds(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<readonly ProjectId[]> {
++  const rows = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++      ),
++    )
++    .all();
++  return rows.map((row) => brandId<ProjectId>(row.projectId));
++}
++
++export async function isProjectMuted(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<boolean> {
++  const row = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .get();
++  return row !== undefined;
++}
+diff --git a/src/server/repositories/notification-repository.ts b/src/server/repositories/notification-repository.ts
+--- a/src/server/repositories/notification-repository.ts
++++ b/src/server/repositories/notification-repository.ts
+@@ -20,8 +20,8 @@
+ 
+ type NewNotification = Omit<
+   Notification,
+-  "id" | "createdAt" | "updatedAt" | "readAt"
+->;
++  "id" | "createdAt" | "updatedAt" | "readAt" | "projectId"
++> & { projectId?: Notification["projectId"] };
+ 
+ export async function listNotifications(
+   input: ListNotificationsInput,
+@@ -107,6 +107,7 @@
+         body: input.body,
+         href: input.href,
+         actorId: input.actorId,
++        projectId: input.projectId ?? null,
+         readAt: null,
+         channels: JSON.stringify(input.channels),
+         createdAt: stamp,
+diff --git a/src/server/services/digest-service.ts b/src/server/services/digest-service.ts
+--- a/src/server/services/digest-service.ts
++++ b/src/server/services/digest-service.ts
+@@ -41,8 +41,19 @@
+     windowStart,
+   );
+ 
++  // Muting is read when the digest is built, so it also covers
++  // notifications created before the project was muted. The cap applies to
++  // what is left.
++  const muted = new Set<string>(
++    await preferenceRepo.listMutedProjectIds(orgId, recipientId),
++  );
++
+   const entries: DigestEntry[] = unread
+     .filter((notification) => notification.createdAt <= windowEnd)
++    .filter(
++      (notification) =>
++        notification.projectId === null || !muted.has(notification.projectId),
++    )
+     .map((notification) => ({
+       notificationId: notification.id,
+       kind: notification.kind,
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -11,14 +11,19 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { notificationResource, requireFound } from "./_support";
++import {
++  notificationResource,
++  projectResource,
++  requireFound,
++} from "./_support";
+ import type {
+   ListNotificationsInput,
+   MarkNotificationReadInput,
+   UpdateNotificationPreferenceInput,
+ } from "@/schemas/notification";
+-import type { OrgId, Page, UserId } from "@/types/common";
++import type { OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { FlagContext } from "@/types/feature-flag";
+ import type { Actor } from "@/types/member";
+ import type {
+@@ -33,10 +38,22 @@
+   body: string;
+   href: string;
+   actorId: UserId | null;
++  /** The project the notification is about; drives per-project muting. */
++  projectId?: ProjectId | null;
+ };
+ 
+ /** Channels used when a recipient has never touched their preferences. */
+ const DEFAULT_CHANNELS: readonly NotificationChannel[] = ["in_app", "email"];
++
++/**
++ * Kinds addressed to the recipient personally. A muted project still
++ * delivers these, in-app only; every other kind about it is dropped.
++ */
++const PERSONAL_KINDS: ReadonlySet<NotificationKind> = new Set([
++  "issue_assigned",
++  "comment_mention",
++  "issue_overdue",
++]);
+ 
+ /**
+  * Writes one notification row per recipient, each with the channel set that
+@@ -70,7 +87,17 @@
+       recipientId,
+       kind,
+     );
+-    const channels = resolveChannels(preference, flags);
++    let channels = resolveChannels(preference, flags);
++
++    const projectId = payload.projectId ?? null;
++    if (
++      projectId !== null &&
++      (await preferenceRepo.isProjectMuted(orgId, recipientId, projectId))
++    ) {
++      if (!PERSONAL_KINDS.has(kind)) continue;
++      channels = channels.filter((channel) => channel !== "email");
++    }
++
+     if (channels.length === 0) continue;
+ 
+     rows.push({
+@@ -81,6 +108,7 @@
+       body: payload.body,
+       href: payload.href,
+       actorId: payload.actorId,
++      projectId: payload.projectId ?? null,
+       channels,
+     });
+   }
+@@ -149,6 +177,55 @@
+ }
+ 
+ /**
++ * Mutes one project for the acting member. Personal: it only changes what
++ * the actor receives. Idempotent.
++ */
++export async function muteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  assertOrgScope(actor, orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++  await preferenceRepo.insertProjectMute(
++    orgId,
++    actor.userId,
++    project.id,
++    toIsoTimestamp(new Date()),
++  );
++}
++
++/** Lifts the actor's mute of one project. Idempotent. */
++export async function unmuteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  assertOrgScope(actor, orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++  await preferenceRepo.deleteProjectMute(orgId, actor.userId, project.id);
++}
++
++/** The projects the actor has muted in this org. */
++export async function listMutedProjectIds(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly ProjectId[]> {
++  assertOrgScope(actor, orgId);
++  return preferenceRepo.listMutedProjectIds(orgId, actor.userId);
++}
++
++/**
+  * Turns a stored preference into the channels one notification will use.
+  * `digestOnly` suppresses the immediate email but keeps the in-app row, and
+  * the email channel additionally requires the org's `digest_email` plan flag.
+@@ -187,6 +264,7 @@
+       body: `Issue ${payload.issueId} is now yours`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
++      projectId: payload.projectId,
+     });
+   });
+ 
+@@ -197,6 +275,7 @@
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: null,
++      projectId: payload.projectId,
+     });
+   });
+ 
+@@ -206,11 +285,15 @@
+       ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+       : [];
+ 
++    // `comment.created` does not carry the project; the issue does.
++    const projectId = issue?.projectId ?? null;
++
+     await notify(payload.orgId, "comment_created", watchers, {
+       title: "New comment",
+       body: `A comment was added to issue ${payload.issueId}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
++      projectId,
+     });
+ 
+     if (payload.mentionedUserIds.length > 0) {
+@@ -223,6 +306,7 @@
+           body: `You were mentioned on issue ${payload.issueId}`,
+           href: `/issues/${payload.issueId}`,
+           actorId: payload.actorId,
++          projectId,
+         },
+       );
+     }
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -1,6 +1,7 @@
+ import type {
+   IsoTimestamp,
+   NotificationId,
++  ProjectId,
+   TenantScoped,
+   Timestamps,
+   UserId,
+@@ -29,6 +30,8 @@
+   readonly body: string;
+   readonly href: string;
+   readonly actorId: UserId | null;
++  /** The project this notification is about; `null` for org-level ones. */
++  readonly projectId: ProjectId | null;
+   readonly readAt: IsoTimestamp | null;
+   readonly channels: readonly NotificationChannel[];
+ }

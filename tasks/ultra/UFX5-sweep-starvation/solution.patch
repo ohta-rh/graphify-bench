@@ -1,0 +1,269 @@
+diff --git a/src/server/jobs/cleanup-archived-job.ts b/src/server/jobs/cleanup-archived-job.ts
+--- a/src/server/jobs/cleanup-archived-job.ts
++++ b/src/server/jobs/cleanup-archived-job.ts
+@@ -10,12 +10,10 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { runJob } from "./types";
++import { forEachLiveOrg, runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-const ORG_BATCH = 25;
+ const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+@@ -32,11 +30,9 @@
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+-
+-    for (const orgId of orgIds) {
++    await forEachLiveOrg(async (orgId) => {
+       const org = await orgRepo.findOrgById(orgId);
+-      if (!org) continue;
++      if (!org) return;
+ 
+       const { retentionDays } = getPlanLimits(org.plan);
+       const cutoff = toIsoTimestamp(
+@@ -68,6 +64,6 @@
+           reason: error instanceof Error ? error.message : String(error),
+         });
+       }
+-    }
++    });
+   });
+ }
+diff --git a/src/server/jobs/digest-email-job.ts b/src/server/jobs/digest-email-job.ts
+--- a/src/server/jobs/digest-email-job.ts
++++ b/src/server/jobs/digest-email-job.ts
+@@ -7,17 +7,15 @@
+ import { createLogger } from "@/lib/logger";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+ import { buildDigest, listDigestRecipients, renderDigest } from "@/server/services/digest-service";
+ import { sendEmail } from "@/server/services/email-service";
+ import { buildFlagContext } from "@/server/services/feature-flag-service";
+ import { toIsoTimestamp } from "@/types/common";
+-import { runJob } from "./types";
++import { forEachLiveOrg, runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ import type { Organization } from "@/types/organization";
+ 
+-const ORG_BATCH = 50;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("digest-email-job");
+@@ -29,13 +27,11 @@
+  */
+ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
+   return runJob("digest-email", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    await forEachLiveOrg(async (orgId) => {
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || !shouldRunForOrg(org, now)) return;
+ 
+-    for (const orgId of orgIds) {
+-      const org = await orgRepo.findOrgById(orgId);
+-      if (!org || !shouldRunForOrg(org, now)) continue;
+-
+-      if (!isEnabled("digest_email", buildFlagContext(null, org))) continue;
++      if (!isEnabled("digest_email", buildFlagContext(null, org))) return;
+ 
+       const windowEnd = toIsoTimestamp(now);
+       const windowStart = toIsoTimestamp(new Date(now.getTime() - MS_PER_DAY));
+@@ -73,7 +69,7 @@
+           });
+         }
+       }
+-    }
++    });
+   });
+ }
+ 
+diff --git a/src/server/jobs/overdue-issue-job.ts b/src/server/jobs/overdue-issue-job.ts
+--- a/src/server/jobs/overdue-issue-job.ts
++++ b/src/server/jobs/overdue-issue-job.ts
+@@ -7,13 +7,9 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { runJob } from "./types";
++import { forEachLiveOrg, runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+-
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+ 
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+@@ -45,9 +41,8 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+-    for (const orgId of orgIds) {
++    await forEachLiveOrg(async (orgId) => {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+@@ -74,6 +69,6 @@
+           });
+         }
+       }
+-    }
++    });
+   });
+ }
+diff --git a/src/server/jobs/types.ts b/src/server/jobs/types.ts
+--- a/src/server/jobs/types.ts
++++ b/src/server/jobs/types.ts
+@@ -1,8 +1,30 @@
+ /**
+  * Result envelope every job returns to the scheduler.
+  */
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import type { IsoTimestamp } from "@/types/common";
++import type { IsoTimestamp, OrgId } from "@/types/common";
++
++/** Page size used while walking the tenant list. */
++const ORG_PAGE = 100;
++
++/**
++ * Visits every live organization once, in a stable order. The sweeps
++ * (overdue alerts, digests, retention) must reach every tenant on every run;
++ * only the usage rollup is deliberately bounded, and it has its own list.
++ */
++export async function forEachLiveOrg(
++  visit: (orgId: OrgId) => Promise<void>,
++): Promise<void> {
++  let after: OrgId | null = null;
++
++  for (;;) {
++    const page: readonly OrgId[] = await orgRepo.listLiveOrgIds(after, ORG_PAGE);
++    for (const orgId of page) await visit(orgId);
++    if (page.length < ORG_PAGE) return;
++    after = page[page.length - 1] ?? null;
++  }
++}
+ 
+ export type JobResult = {
+   kind: string;
+diff --git a/src/server/jobs/usage-rollup-job.ts b/src/server/jobs/usage-rollup-job.ts
+--- a/src/server/jobs/usage-rollup-job.ts
++++ b/src/server/jobs/usage-rollup-job.ts
+@@ -9,7 +9,7 @@
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** Organizations recounted per pass; the list puts the busiest tenants first. */
++/** Organizations recounted per pass; the list is least recently recounted first. */
+ const ORG_BATCH = 25;
+ 
+ const logger = createLogger("usage-rollup-job");
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, asc, eq, gt, isNull, like } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -126,6 +126,31 @@
+   return toOrganization(row);
+ }
+ 
++/**
++ * One keyset page of live (not deleted) organization ids in id order, after
++ * `afterId`. The background sweeps walk every tenant with this; unlike the
++ * usage rollup's list it is neither bounded nor ordered by activity.
++ */
++export async function listLiveOrgIds(
++  afterId: OrgId | null,
++  limit: number,
++): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(
++      and(
++        isNull(organizations.archivedAt),
++        afterId === null ? undefined : gt(organizations.id, afterId),
++      ),
++    )
++    .orderBy(asc(organizations.id))
++    .limit(Math.max(1, limit))
++    .all();
++
++  return rows.map((row) => row.id as OrgId);
++}
++
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+ export async function listTakenOrgSlugs(
+   prefix: string,
+diff --git a/src/server/repositories/usage-repository.ts b/src/server/repositories/usage-repository.ts
+--- a/src/server/repositories/usage-repository.ts
++++ b/src/server/repositories/usage-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
++import { and, asc, count, eq, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -100,7 +100,9 @@
+ 
+ /**
+  * Cheap delta applied on the write path so a quota check right after a create
+- * sees the new number without waiting for the rollup.
++ * sees the new number without waiting for the rollup. It deliberately leaves
++ * `measured_at` alone: that column records the last full recount, and it is
++ * what orders the rollup's work list.
+  */
+ export async function incrementUsage(
+   orgId: OrgId,
+@@ -120,7 +122,6 @@
+       projectsUsed: current.projectsUsed + (patch.projectsUsed ?? 0),
+       issuesUsed: current.issuesUsed + (patch.issuesUsed ?? 0),
+       storageMbUsed: current.storageMbUsed + (patch.storageMbUsed ?? 0),
+-      measuredAt: toIsoTimestamp(new Date()),
+     })
+     .where(eq(organizationUsage.orgId, orgId))
+     .returning()
+@@ -130,9 +131,9 @@
+ }
+ 
+ /**
+- * The rollup job's work list, most recently measured first: every write nudges
+- * `measured_at`, so the top of this list is where the tenants that are
+- * actually changing — and therefore drifting — are.
++ * The rollup job's work list: the least recently recounted orgs first, so
++ * successive bounded passes cycle through every tenant. `measured_at` is only
++ * ever moved by `recomputeUsage()`, never by an incremental delta.
+  */
+ export async function listOrgIdsForRollup(
+   limit: number,
+@@ -140,7 +141,7 @@
+   const rows = getDb()
+     .select({ orgId: organizationUsage.orgId })
+     .from(organizationUsage)
+-    .orderBy(desc(organizationUsage.measuredAt))
++    .orderBy(asc(organizationUsage.measuredAt), asc(organizationUsage.orgId))
+     .limit(Math.max(1, limit))
+     .all();
+ 

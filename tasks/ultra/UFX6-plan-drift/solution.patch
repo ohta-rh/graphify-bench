@@ -1,0 +1,284 @@
+diff --git a/src/lib/rate-limit.ts b/src/lib/rate-limit.ts
+--- a/src/lib/rate-limit.ts
++++ b/src/lib/rate-limit.ts
+@@ -72,12 +72,18 @@
+  * Spends `cost` tokens from the bucket, refilling first for the elapsed time.
+  * Async because the production limiter is expected to move behind a store —
+  * every call site already awaits it.
++ *
++ * `plan` is the org's current plan as the caller just read it. Passing it is
++ * what keeps the bucket size in step with plan changes; without it the last
++ * plan recorded for the org (or `free`) applies.
+  */
+ export async function consumeRateLimit(
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  plan?: PlanId,
+ ): Promise<RateLimitVerdict> {
++  if (plan !== undefined) setOrgPlan(orgId, plan);
+   const config = configFor(orgId, bucketKey);
+   const key = `${orgId}:${bucketKey}`;
+   const nowMs = Date.now();
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -7,15 +7,39 @@
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizations, subscriptions } from "@/server/db";
++import type { OrganizationRow } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
++import type { PlanId } from "@/types/billing";
+ import type { OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
++
++/**
++ * The subscription is the authority on which plan an org is on; the
++ * `organizations.plan` column is a denormalised copy that older write paths
++ * left stale. Every organization this repository hands out carries the
++ * subscription's plan, falling back to the column only for an org that has
++ * no subscription row at all.
++ */
++function subscribedPlan(orgId: string): PlanId | null {
++  const row = getDb()
++    .select({ plan: subscriptions.plan })
++    .from(subscriptions)
++    .where(eq(subscriptions.orgId, orgId))
++    .get();
++  return row?.plan ?? null;
++}
++
++function hydrate(row: OrganizationRow): Organization {
++  const org = toOrganization(row);
++  const plan = subscribedPlan(row.id);
++  return plan === null || plan === org.plan ? org : { ...org, plan };
++}
+ 
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+@@ -23,7 +47,7 @@
+     .from(organizations)
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? hydrate(row) : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+@@ -32,7 +56,7 @@
+     .from(organizations)
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? hydrate(row) : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -52,7 +76,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return rows.map((row) => hydrate(row.org));
+ }
+ 
+ /**
+@@ -83,7 +107,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return hydrate(row);
+ }
+ 
+ export async function updateOrg(
+@@ -111,7 +135,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return hydrate(row);
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+@@ -123,7 +147,7 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  return hydrate(row);
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+diff --git a/src/server/repositories/subscription-repository.ts b/src/server/repositories/subscription-repository.ts
+--- a/src/server/repositories/subscription-repository.ts
++++ b/src/server/repositories/subscription-repository.ts
+@@ -1,9 +1,9 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, subscriptions } from "@/server/db";
++import { getDb, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { toSubscription } from "./_mappers";
+@@ -57,19 +57,36 @@
+   return toSubscription(row);
+ }
+ 
+-/** A plan change ends the trial: the org has made a deliberate choice. */
++/**
++ * A plan change ends the trial: the org has made a deliberate choice. The
++ * subscription is the authority on the plan; the denormalised
++ * `organizations.plan` copy is refreshed in the same transaction so the two
++ * never disagree on disk.
++ */
+ export async function updateSubscriptionPlan(
+   orgId: OrgId,
+   plan: PlanId,
+   interval: BillingInterval,
+ ): Promise<Subscription> {
+   const stamp = toIsoTimestamp(new Date());
+-  const row = getDb()
+-    .update(subscriptions)
+-    .set({ plan, interval, status: "active", updatedAt: stamp })
+-    .where(orgPredicate(subscriptions.orgId, orgId))
+-    .returning()
+-    .get();
++
++  const row = getDb().transaction((tx) => {
++    const updated = tx
++      .update(subscriptions)
++      .set({ plan, interval, status: "active", updatedAt: stamp })
++      .where(orgPredicate(subscriptions.orgId, orgId))
++      .returning()
++      .get();
++
++    if (updated) {
++      tx.update(organizations)
++        .set({ plan, updatedAt: stamp })
++        .where(eq(organizations.id, orgId))
++        .run();
++    }
++
++    return updated;
++  });
+ 
+   if (!row) throw new Error(`Subscription for org ${orgId} not found`);
+   return toSubscription(row);
+@@ -112,8 +129,9 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Only subscriptions still on trial qualify: choosing a plan ends the trial
++ * (see `updateSubscriptionPlan`), and the period end of such a subscription
++ * is a renewal date, not a trial deadline.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -123,6 +141,7 @@
+     .from(subscriptions)
+     .where(
+       and(
++        eq(subscriptions.status, "trialing"),
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+         ne(subscriptions.plan, "free"),
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -12,6 +12,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import {
+   actorEnvelope,
+   commentResource,
+@@ -56,7 +57,13 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+-  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
++  const org = await orgRepo.findOrgById(input.orgId);
++  const verdict = await consumeRateLimit(
++    input.orgId,
++    COMMENT_CREATE_BUCKET,
++    1,
++    org?.plan ?? "free",
++  );
+   if (!verdict.allowed) {
+     throw new Error(
+       `Comment rate limit reached; try again after ${verdict.resetAt}`,
+diff --git a/src/server/services/invitation-service.ts b/src/server/services/invitation-service.ts
+--- a/src/server/services/invitation-service.ts
++++ b/src/server/services/invitation-service.ts
+@@ -50,22 +50,23 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "member:invite", orgResource(input.orgId));
+ 
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++
+   const verdict = await consumeRateLimit(
+     input.orgId,
+     INVITE_BUCKET,
+     input.invites.length,
++    org.plan,
+   );
+   if (!verdict.allowed) {
+     throw new Error(
+       `Invite rate limit reached; try again after ${verdict.resetAt}`,
+     );
+   }
+-
+-  const org = requireFound(
+-    await orgRepo.findOrgById(input.orgId),
+-    "Organization",
+-    input.orgId,
+-  );
+ 
+   const seatsUsed =
+     (await memberRepo.countActiveMembers(input.orgId)) +
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -50,14 +50,19 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+ 
+-  const verdict = await consumeRateLimit(input.orgId, SEARCH_QUERY_BUCKET);
++  const org = await orgRepo.findOrgById(input.orgId);
++
++  const verdict = await consumeRateLimit(
++    input.orgId,
++    SEARCH_QUERY_BUCKET,
++    1,
++    org?.plan ?? "free",
++  );
+   if (!verdict.allowed) {
+     throw new Error(
+       `Search rate limit reached; try again after ${verdict.resetAt}`,
+     );
+   }
+-
+-  const org = await orgRepo.findOrgById(input.orgId);
+   const advanced = isEnabled("advanced_search", {
+     orgId: input.orgId,
+     userId: actor.userId,

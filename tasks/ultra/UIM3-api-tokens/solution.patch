@@ -1,0 +1,622 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+index 7701588..5291cd9 100644
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -29,6 +29,8 @@ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "member.removed": "removed a member",
+   "billing.plan_changed": "changed the plan",
+   "flag.toggled": "toggled a feature flag",
++  "api_token.created": "created an API token",
++  "api_token.revoked": "revoked an API token",
+ };
+ 
+ export function activityLabel(action: ActivityAction): string {
+diff --git a/src/lib/permissions.ts b/src/lib/permissions.ts
+index 663ad9e..f14a391 100644
+--- a/src/lib/permissions.ts
++++ b/src/lib/permissions.ts
+@@ -52,6 +52,8 @@ export const ROLE_MATRIX: Readonly<Record<PermissionAction, Role>> = {
+   "notification:read": "viewer",
+   "notification:manage": "viewer",
+   "webhook:manage": "admin",
++  "api_token:create_write": "member",
++  "api_token:manage": "admin",
+ };
+ 
+ /** Actions an actor may perform on their own content regardless of role rank. */
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+index 54bb6b8..19f0875 100644
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -28,6 +28,8 @@ export const activityActionSchema = z.enum([
+   "member.removed",
+   "billing.plan_changed",
+   "flag.toggled",
++  "api_token.created",
++  "api_token.revoked",
+ ]);
+ 
+ export const activitySubjectKindSchema = z.enum([
+@@ -38,6 +40,7 @@ export const activitySubjectKindSchema = z.enum([
+   "member",
+   "subscription",
+   "feature_flag",
++  "api_token",
+ ]);
+ 
+ export const activityFilterSchema = z
+diff --git a/src/schemas/api-token.ts b/src/schemas/api-token.ts
+new file mode 100644
+index 0000000..7bc847f
+--- /dev/null
++++ b/src/schemas/api-token.ts
+@@ -0,0 +1,13 @@
++import { z } from "zod";
++import { orgIdSchema } from "./common";
++
++export const apiTokenScopeSchema = z.enum(["read", "write"]);
++
++export const createApiTokenSchema = z.object({
++  orgId: orgIdSchema,
++  name: z.string().trim().min(1).max(80),
++  scope: apiTokenScopeSchema,
++  expiresInDays: z.number().int().min(1).max(365),
++});
++
++export type CreateApiTokenInput = z.input<typeof createApiTokenSchema>;
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+index 2fe7659..28c4b7c 100644
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -312,6 +312,22 @@ const SCHEMA_STATEMENTS: readonly string[] = [
+      indexed_at TEXT NOT NULL
+    )`,
+   `CREATE INDEX IF NOT EXISTS search_index_org_kind_idx ON search_index (org_id, subject_kind)`,
++  `CREATE TABLE IF NOT EXISTS api_tokens (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     name TEXT NOT NULL,
++     scope TEXT NOT NULL,
++     token_hash TEXT NOT NULL,
++     prefix TEXT NOT NULL,
++     expires_at TEXT NOT NULL,
++     last_used_at TEXT,
++     revoked_at TEXT,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash_idx ON api_tokens (token_hash)`,
++  `CREATE INDEX IF NOT EXISTS api_tokens_org_user_idx ON api_tokens (org_id, user_id)`,
+ ];
+ 
+ /**
+diff --git a/src/server/db/schema/activity.ts b/src/server/db/schema/activity.ts
+index 3d8c916..59d1132 100644
+--- a/src/server/db/schema/activity.ts
++++ b/src/server/db/schema/activity.ts
+@@ -17,6 +17,7 @@ export const activityEvents = sqliteTable(
+         "member",
+         "subscription",
+         "feature_flag",
++        "api_token",
+       ],
+     }).notNull(),
+     subjectId: text("subject_id").notNull(),
+diff --git a/src/server/db/schema/api-tokens.ts b/src/server/db/schema/api-tokens.ts
+new file mode 100644
+index 0000000..e3cb18d
+--- /dev/null
++++ b/src/server/db/schema/api-tokens.ts
+@@ -0,0 +1,26 @@
++import { index, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++/** Personal API tokens. Only the SHA-256 of the raw token is stored. */
++export const apiTokens = sqliteTable(
++  "api_tokens",
++  {
++    id: idColumn(),
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    name: text("name").notNull(),
++    scope: text("scope", { enum: ["read", "write"] }).notNull(),
++    tokenHash: text("token_hash").notNull(),
++    prefix: text("prefix").notNull(),
++    expiresAt: text("expires_at").notNull(),
++    lastUsedAt: text("last_used_at"),
++    revokedAt: text("revoked_at"),
++    ...timestampColumns,
++  },
++  (table) => [
++    uniqueIndex("api_tokens_hash_idx").on(table.tokenHash),
++    index("api_tokens_org_user_idx").on(table.orgId, table.userId),
++  ],
++);
++
++export type ApiTokenRow = typeof apiTokens.$inferSelect;
+diff --git a/src/server/db/schema/index.ts b/src/server/db/schema/index.ts
+index 8b7c658..9241728 100644
+--- a/src/server/db/schema/index.ts
++++ b/src/server/db/schema/index.ts
+@@ -14,3 +14,4 @@ export * from "./notifications";
+ export * from "./activity";
+ export * from "./billing";
+ export * from "./webhooks";
++export * from "./api-tokens";
+diff --git a/src/server/repositories/api-token-repository.ts b/src/server/repositories/api-token-repository.ts
+new file mode 100644
+index 0000000..be9a5e1
+--- /dev/null
++++ b/src/server/repositories/api-token-repository.ts
+@@ -0,0 +1,165 @@
++/**
++ * Personal API tokens. Everything is org-scoped except the lookup by hash,
++ * which is how an incoming request finds its token in the first place.
++ */
++import { and, count, desc, eq, gt, isNull } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { apiTokens, getDb } from "@/server/db";
++import { orgPredicate } from "./base-repository";
++import type { ApiTokenRow } from "@/server/db/schema/api-tokens";
++import type { ApiToken, ApiTokenScope } from "@/types/api-token";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
++
++/** A stored token plus its hash, for the authentication path only. */
++export type StoredApiToken = ApiToken & { readonly tokenHash: string };
++
++function toApiToken(row: ApiTokenRow): ApiToken {
++  return {
++    id: row.id,
++    orgId: row.orgId as OrgId,
++    userId: row.userId as UserId,
++    name: row.name,
++    scope: row.scope,
++    prefix: row.prefix,
++    expiresAt: row.expiresAt as IsoTimestamp,
++    lastUsedAt: row.lastUsedAt as IsoTimestamp | null,
++    revokedAt: row.revokedAt as IsoTimestamp | null,
++    createdAt: row.createdAt as IsoTimestamp,
++  };
++}
++
++export async function insertApiToken(input: {
++  orgId: OrgId;
++  userId: UserId;
++  name: string;
++  scope: ApiTokenScope;
++  tokenHash: string;
++  prefix: string;
++  expiresAt: IsoTimestamp;
++  createdAt: IsoTimestamp;
++}): Promise<ApiToken> {
++  const row = getDb()
++    .insert(apiTokens)
++    .values({
++      id: newId(),
++      ...input,
++      lastUsedAt: null,
++      revokedAt: null,
++      updatedAt: input.createdAt,
++    })
++    .returning()
++    .get();
++  return toApiToken(row);
++}
++
++export async function findApiTokenById(
++  orgId: OrgId,
++  tokenId: string,
++): Promise<ApiToken | null> {
++  const row = getDb()
++    .select()
++    .from(apiTokens)
++    .where(and(orgPredicate(apiTokens.orgId, orgId), eq(apiTokens.id, tokenId)))
++    .get();
++  return row ? toApiToken(row) : null;
++}
++
++export async function findApiTokenByHash(
++  tokenHash: string,
++): Promise<StoredApiToken | null> {
++  const row = getDb()
++    .select()
++    .from(apiTokens)
++    .where(eq(apiTokens.tokenHash, tokenHash))
++    .get();
++  return row ? { ...toApiToken(row), tokenHash: row.tokenHash } : null;
++}
++
++/** Newest first; ties on `created_at` fall back to the id. */
++export async function listApiTokensForUser(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<readonly ApiToken[]> {
++  return getDb()
++    .select()
++    .from(apiTokens)
++    .where(and(orgPredicate(apiTokens.orgId, orgId), eq(apiTokens.userId, userId)))
++    .orderBy(desc(apiTokens.createdAt), desc(apiTokens.id))
++    .all()
++    .map(toApiToken);
++}
++
++/** Tokens that could still authenticate at `now`: not revoked, not expired. */
++export async function countUsableApiTokens(
++  orgId: OrgId,
++  userId: UserId,
++  now: IsoTimestamp,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(apiTokens)
++    .where(
++      and(
++        orgPredicate(apiTokens.orgId, orgId),
++        eq(apiTokens.userId, userId),
++        isNull(apiTokens.revokedAt),
++        gt(apiTokens.expiresAt, now),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
++export async function markRevoked(
++  orgId: OrgId,
++  tokenId: string,
++  at: IsoTimestamp,
++): Promise<ApiToken> {
++  const row = getDb()
++    .update(apiTokens)
++    .set({ revokedAt: at, updatedAt: at })
++    .where(
++      and(
++        orgPredicate(apiTokens.orgId, orgId),
++        eq(apiTokens.id, tokenId),
++        isNull(apiTokens.revokedAt),
++      ),
++    )
++    .returning()
++    .get();
++  if (!row) throw new Error(`API token ${tokenId} is not revocable`);
++  return toApiToken(row);
++}
++
++/** Revokes every not-yet-revoked token of `userId` in `orgId`. */
++export async function revokeAllForUser(
++  orgId: OrgId,
++  userId: UserId,
++  at: IsoTimestamp,
++): Promise<readonly ApiToken[]> {
++  return getDb()
++    .update(apiTokens)
++    .set({ revokedAt: at, updatedAt: at })
++    .where(
++      and(
++        orgPredicate(apiTokens.orgId, orgId),
++        eq(apiTokens.userId, userId),
++        isNull(apiTokens.revokedAt),
++      ),
++    )
++    .returning()
++    .all()
++    .map(toApiToken);
++}
++
++export async function touchLastUsed(
++  orgId: OrgId,
++  tokenId: string,
++  at: IsoTimestamp,
++): Promise<void> {
++  getDb()
++    .update(apiTokens)
++    .set({ lastUsedAt: at, updatedAt: at })
++    .where(and(orgPredicate(apiTokens.orgId, orgId), eq(apiTokens.id, tokenId)))
++    .run();
++}
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+index 2ec0002..84f8acf 100644
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -231,6 +231,26 @@ export function registerActivityListeners(): Unsubscribe {
+         summary: `Plan ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("api_token.created", (payload) =>
++      record(payload.orgId, "api_token.created", {
++        actorId: payload.actorId,
++        subjectKind: "api_token",
++        subjectId: payload.tokenId,
++        projectId: null,
++        summary: `Created ${payload.scope} API token "${payload.name}"`,
++        metadata: { scope: payload.scope, userId: payload.userId },
++      }).then(() => undefined),
++    ),
++    subscribe("api_token.revoked", (payload) =>
++      record(payload.orgId, "api_token.revoked", {
++        actorId: payload.actorId,
++        subjectKind: "api_token",
++        subjectId: payload.tokenId,
++        projectId: null,
++        summary: "Revoked an API token",
++        metadata: { userId: payload.userId },
++      }).then(() => undefined),
++    ),
+   ];
+ 
+   return () => {
+diff --git a/src/server/services/api-token-service.ts b/src/server/services/api-token-service.ts
+new file mode 100644
+index 0000000..116a079
+--- /dev/null
++++ b/src/server/services/api-token-service.ts
+@@ -0,0 +1,168 @@
++/**
++ * Personal API tokens: minting (shown once, stored hashed), listing,
++ * revocation, and turning a presented token back into an `Actor`.
++ *
++ * Must call (do not reimplement): assertCan, assertOrgScope, emit, subscribe, hashToken, resolveActor
++ */
++import { emit, subscribe } from "@/lib/event-bus";
++import { hashToken, randomToken } from "@/lib/hash";
++import { assertCan } from "@/lib/permissions";
++import { assertOrgScope } from "@/lib/tenant";
++import { createApiTokenSchema } from "@/schemas/api-token";
++import * as apiTokenRepo from "@/server/repositories/api-token-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import { toIsoTimestamp } from "@/types/common";
++import { actorEnvelope, envelope, orgResource, requireFound } from "./_support";
++import { resolveActor } from "./member-service";
++import type { CreateApiTokenInput } from "@/schemas/api-token";
++import type { ApiToken } from "@/types/api-token";
++import type { OrgId, UserId } from "@/types/common";
++import type { Unsubscribe } from "@/types/event";
++import type { Actor } from "@/types/member";
++
++/** Tokens one user may hold per organization that can still authenticate. */
++export const MAX_USABLE_TOKENS = 5;
++
++const TOKEN_PREFIX = "tfk_";
++const DISPLAY_PREFIX_LENGTH = 12;
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++export async function createApiToken(
++  actor: Actor,
++  raw: CreateApiTokenInput,
++): Promise<{ token: string; apiToken: ApiToken }> {
++  const input = createApiTokenSchema.parse(raw);
++  assertOrgScope(actor, input.orgId);
++  if (input.scope === "write") {
++    assertCan(actor, "api_token:create_write", orgResource(input.orgId));
++  }
++
++  const now = new Date();
++  const stamp = toIsoTimestamp(now);
++  const usable = await apiTokenRepo.countUsableApiTokens(
++    input.orgId,
++    actor.userId,
++    stamp,
++  );
++  if (usable >= MAX_USABLE_TOKENS) {
++    throw new Error(
++      `At most ${MAX_USABLE_TOKENS} active API tokens per member; revoke one first`,
++    );
++  }
++
++  const token = `${TOKEN_PREFIX}${randomToken(24)}`;
++  const apiToken = await apiTokenRepo.insertApiToken({
++    orgId: input.orgId,
++    userId: actor.userId,
++    name: input.name,
++    scope: input.scope,
++    tokenHash: hashToken(token),
++    prefix: token.slice(0, DISPLAY_PREFIX_LENGTH),
++    expiresAt: toIsoTimestamp(new Date(now.getTime() + input.expiresInDays * DAY_MS)),
++    createdAt: stamp,
++  });
++
++  await emit("api_token.created", {
++    ...actorEnvelope(actor),
++    tokenId: apiToken.id,
++    userId: apiToken.userId,
++    name: apiToken.name,
++    scope: apiToken.scope,
++  });
++
++  return { token, apiToken };
++}
++
++export async function listApiTokens(
++  actor: Actor,
++  orgId: OrgId,
++  userId: UserId = actor.userId,
++): Promise<readonly ApiToken[]> {
++  assertOrgScope(actor, orgId);
++  if (userId !== actor.userId) {
++    assertCan(actor, "api_token:manage", orgResource(orgId));
++  }
++  return apiTokenRepo.listApiTokensForUser(orgId, userId);
++}
++
++export async function revokeApiToken(
++  actor: Actor,
++  orgId: OrgId,
++  tokenId: string,
++): Promise<ApiToken> {
++  assertOrgScope(actor, orgId);
++
++  const token = requireFound(
++    await apiTokenRepo.findApiTokenById(orgId, tokenId),
++    "ApiToken",
++    tokenId,
++  );
++  if (token.userId !== actor.userId) {
++    assertCan(actor, "api_token:manage", orgResource(orgId));
++  }
++  if (token.revokedAt !== null) return token;
++
++  const revoked = await apiTokenRepo.markRevoked(
++    orgId,
++    token.id,
++    toIsoTimestamp(new Date()),
++  );
++
++  await emit("api_token.revoked", {
++    ...actorEnvelope(actor),
++    tokenId: revoked.id,
++    userId: revoked.userId,
++  });
++
++  return revoked;
++}
++
++/**
++ * The credential check for API requests. `null` for anything that must not
++ * authenticate; otherwise the actor the request runs as — read tokens are
++ * capped at `viewer`, write tokens carry the member's role as of now.
++ */
++export async function authenticateApiToken(token: string): Promise<Actor | null> {
++  if (!token.startsWith(TOKEN_PREFIX)) return null;
++
++  const stored = await apiTokenRepo.findApiTokenByHash(hashToken(token));
++  if (!stored) return null;
++
++  const now = toIsoTimestamp(new Date());
++  if (stored.revokedAt !== null || stored.expiresAt <= now) return null;
++
++  const org = await orgRepo.findOrgById(stored.orgId);
++  if (!org || org.archivedAt !== null) return null;
++
++  const member = await resolveActor(stored.userId, stored.orgId);
++  if (!member) return null;
++
++  await apiTokenRepo.touchLastUsed(stored.orgId, stored.id, now);
++
++  return {
++    userId: stored.userId,
++    orgId: stored.orgId,
++    role: stored.scope === "read" ? "viewer" : member.role,
++  };
++}
++
++/** A removed member's tokens die with the membership, in that org only. */
++export function registerApiTokenListeners(): Unsubscribe {
++  const off = subscribe("member.removed", async (payload) => {
++    const revoked = await apiTokenRepo.revokeAllForUser(
++      payload.orgId,
++      payload.userId,
++      toIsoTimestamp(new Date()),
++    );
++
++    for (const token of revoked) {
++      await emit("api_token.revoked", {
++        ...envelope(payload.orgId, payload.actorId),
++        tokenId: token.id,
++        userId: token.userId,
++      });
++    }
++  });
++
++  return off;
++}
+diff --git a/src/server/services/event-registry.ts b/src/server/services/event-registry.ts
+index f2a9508..0f10e5d 100644
+--- a/src/server/services/event-registry.ts
++++ b/src/server/services/event-registry.ts
+@@ -8,6 +8,7 @@ import { createLogger } from "@/lib/logger";
+ import { enqueue } from "@/server/jobs/queue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { registerActivityListeners } from "./activity-service";
++import { registerApiTokenListeners } from "./api-token-service";
+ import { registerSearchListeners } from "./search-service";
+ import { registerUsageListeners } from "./usage-service";
+ import { registerWebhookListeners } from "./webhook-service";
+@@ -38,6 +39,7 @@ export function registerEventHandlers(): void {
+     registerSearchListeners(),
+     registerUsageListeners(),
+     registerWebhookListeners(),
++    registerApiTokenListeners(),
+     registerDigestBridge(),
+   ];
+ 
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+index 4cb2e68..4e179be 100644
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -28,7 +28,9 @@ export type ActivityAction =
+   | "member.role_changed"
+   | "member.removed"
+   | "billing.plan_changed"
+-  | "flag.toggled";
++  | "flag.toggled"
++  | "api_token.created"
++  | "api_token.revoked";
+ 
+ export type ActivitySubjectKind =
+   | "organization"
+@@ -37,7 +39,8 @@ export type ActivitySubjectKind =
+   | "comment"
+   | "member"
+   | "subscription"
+-  | "feature_flag";
++  | "feature_flag"
++  | "api_token";
+ 
+ export interface ActivityEvent extends TenantScoped {
+   readonly id: ActivityId;
+diff --git a/src/types/api-token.ts b/src/types/api-token.ts
+new file mode 100644
+index 0000000..38fef93
+--- /dev/null
++++ b/src/types/api-token.ts
+@@ -0,0 +1,16 @@
++import type { IsoTimestamp, TenantScoped, UserId } from "./common";
++
++export type ApiTokenScope = "read" | "write";
++
++/** A personal API token as the app shows it: never the secret, never its hash. */
++export interface ApiToken extends TenantScoped {
++  readonly id: string;
++  readonly userId: UserId;
++  readonly name: string;
++  readonly scope: ApiTokenScope;
++  readonly prefix: string;
++  readonly expiresAt: IsoTimestamp;
++  readonly lastUsedAt: IsoTimestamp | null;
++  readonly revokedAt: IsoTimestamp | null;
++  readonly createdAt: IsoTimestamp;
++}
+diff --git a/src/types/event.ts b/src/types/event.ts
+index c76de02..5f312c7 100644
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -88,6 +88,13 @@ export interface TaskflowEventMap {
+     used: number;
+   };
+   "flag.toggled": EventEnvelope & { flag: FeatureFlagKey; enabled: boolean };
++  "api_token.created": EventEnvelope & {
++    tokenId: string;
++    userId: UserId;
++    name: string;
++    scope: "read" | "write";
++  };
++  "api_token.revoked": EventEnvelope & { tokenId: string; userId: UserId };
+   "digest.due": EventEnvelope & { recipientId: UserId; windowStart: IsoTimestamp };
+   "search.reindex_requested": EventEnvelope & {
+     subjectKind: "issue" | "comment" | "project";
+diff --git a/src/types/permission.ts b/src/types/permission.ts
+index 88234d5..d96a407 100644
+--- a/src/types/permission.ts
++++ b/src/types/permission.ts
+@@ -43,7 +43,9 @@ export type PermissionAction =
+   | "activity:export"
+   | "notification:read"
+   | "notification:manage"
+-  | "webhook:manage";
++  | "webhook:manage"
++  | "api_token:create_write"
++  | "api_token:manage";
+ 
+ /**
+  * The object a permission is asked about. Discriminated on `kind` so the

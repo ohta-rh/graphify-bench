@@ -1,0 +1,652 @@
+diff --git a/src/config/plan-limits.ts b/src/config/plan-limits.ts
+index 79357ef..8e20cb9 100644
+--- a/src/config/plan-limits.ts
++++ b/src/config/plan-limits.ts
+@@ -19,6 +19,8 @@ export interface PlanLimits {
+   readonly apiRequestsPerHour: number;
+   readonly webhooks: number;
+   readonly retentionDays: number;
++  /** Recurring-issue rules per organization, paused ones included. */
++  readonly recurringIssues: number;
+   readonly includedFlags: readonly FeatureFlagKey[];
+   readonly priceCentsPerSeatMonthly: number;
+ }
+@@ -36,6 +38,7 @@ export const PLAN_LIMITS: Readonly<Record<PlanId, PlanLimits>> = {
+     apiRequestsPerHour: 100,
+     webhooks: 0,
+     retentionDays: 30,
++    recurringIssues: 0,
+     includedFlags: ["command_palette"],
+     priceCentsPerSeatMonthly: 0,
+   },
+@@ -48,6 +51,7 @@ export const PLAN_LIMITS: Readonly<Record<PlanId, PlanLimits>> = {
+     apiRequestsPerHour: 1_000,
+     webhooks: 2,
+     retentionDays: 90,
++    recurringIssues: 3,
+     includedFlags: ["command_palette", "kanban_board", "csv_export"],
+     priceCentsPerSeatMonthly: 900,
+   },
+@@ -60,6 +64,7 @@ export const PLAN_LIMITS: Readonly<Record<PlanId, PlanLimits>> = {
+     apiRequestsPerHour: 10_000,
+     webhooks: 10,
+     retentionDays: 365,
++    recurringIssues: 25,
+     includedFlags: [
+       "command_palette",
+       "kanban_board",
+@@ -80,6 +85,7 @@ export const PLAN_LIMITS: Readonly<Record<PlanId, PlanLimits>> = {
+     apiRequestsPerHour: 100_000,
+     webhooks: UNLIMITED,
+     retentionDays: 2_555,
++    recurringIssues: UNLIMITED,
+     includedFlags: [
+       "command_palette",
+       "kanban_board",
+diff --git a/src/lib/date.ts b/src/lib/date.ts
+index 1b5440b..eb49646 100644
+--- a/src/lib/date.ts
++++ b/src/lib/date.ts
+@@ -115,3 +115,53 @@ export function digestWindow(
+     end: toIsoTimestamp(end),
+   };
+ }
++
++/* ------------------------------------------------ calendar days in a zone */
++
++const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
++
++/** True for a real `YYYY-MM-DD` calendar date (no rollover like 02-30). */
++export function isCalendarDate(value: string): boolean {
++  if (!CALENDAR_DATE.test(value)) return false;
++  const parsed = new Date(`${value}T00:00:00.000Z`);
++  return (
++    !Number.isNaN(parsed.getTime()) &&
++    parsed.toISOString().slice(0, 10) === value
++  );
++}
++
++/** True when `Intl` knows `timezone` as an IANA zone name. */
++export function isValidTimeZone(timezone: string): boolean {
++  if (timezone.trim() === "") return false;
++  try {
++    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** The `YYYY-MM-DD` calendar date that `at` falls on in `timezone`. */
++export function calendarDateIn(timezone: string, at: Date): string {
++  const parts = new Intl.DateTimeFormat("en-CA", {
++    timeZone: timezone,
++    year: "numeric",
++    month: "2-digit",
++    day: "2-digit",
++  }).formatToParts(at);
++  const part = (type: string) =>
++    parts.find((candidate) => candidate.type === type)?.value ?? "";
++  return `${part("year")}-${part("month")}-${part("day")}`;
++}
++
++/** Shifts a `YYYY-MM-DD` date by whole days. */
++export function addCalendarDays(date: string, days: number): string {
++  const base = new Date(`${date}T00:00:00.000Z`);
++  return new Date(base.getTime() + days * DAY_MS).toISOString().slice(0, 10);
++}
++
++/** ISO weekday of a `YYYY-MM-DD` date: 1 = Monday … 7 = Sunday. */
++export function isoWeekday(date: string): number {
++  const day = new Date(`${date}T00:00:00.000Z`).getUTCDay();
++  return day === 0 ? 7 : day;
++}
+diff --git a/src/schemas/recurring-issue.ts b/src/schemas/recurring-issue.ts
+new file mode 100644
+index 0000000..34a6be3
+--- /dev/null
++++ b/src/schemas/recurring-issue.ts
+@@ -0,0 +1,32 @@
++import { z } from "zod";
++import { isCalendarDate, isValidTimeZone } from "@/lib/date";
++import { issuePrioritySchema } from "./issue";
++import { orgIdSchema, projectIdSchema, userIdSchema } from "./common";
++
++export const recurrenceCadenceSchema = z.enum(["daily", "weekly"]);
++
++export const createRecurringIssueSchema = z
++  .object({
++    orgId: orgIdSchema,
++    projectId: projectIdSchema,
++    title: z.string().min(3).max(180),
++    priority: issuePrioritySchema.default("none"),
++    assigneeId: userIdSchema.nullable().default(null),
++    cadence: recurrenceCadenceSchema,
++    weekday: z.number().int().min(1).max(7).nullable().default(null),
++    timezone: z.string().refine(isValidTimeZone, "must be an IANA time zone"),
++    startsOn: z.string().refine(isCalendarDate, "must be a YYYY-MM-DD date"),
++  })
++  .refine(
++    (input) => (input.cadence === "weekly") === (input.weekday !== null),
++    { message: "weekday is required for weekly rules and only for them", path: ["weekday"] },
++  );
++
++export const setRecurringIssuePausedSchema = z.object({
++  orgId: orgIdSchema,
++  recurringIssueId: z.string().min(1),
++  paused: z.boolean(),
++});
++
++export type CreateRecurringIssueInput = z.input<typeof createRecurringIssueSchema>;
++export type SetRecurringIssuePausedInput = z.infer<typeof setRecurringIssuePausedSchema>;
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+index 2fe7659..9c7663c 100644
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -312,6 +312,24 @@ const SCHEMA_STATEMENTS: readonly string[] = [
+      indexed_at TEXT NOT NULL
+    )`,
+   `CREATE INDEX IF NOT EXISTS search_index_org_kind_idx ON search_index (org_id, subject_kind)`,
++  `CREATE TABLE IF NOT EXISTS recurring_issues (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     title TEXT NOT NULL,
++     priority TEXT NOT NULL DEFAULT 'none',
++     assignee_id TEXT,
++     cadence TEXT NOT NULL,
++     weekday INTEGER,
++     timezone TEXT NOT NULL,
++     starts_on TEXT NOT NULL,
++     last_occurrence_on TEXT,
++     paused INTEGER NOT NULL DEFAULT 0,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS recurring_issues_org_idx ON recurring_issues (org_id)`,
+ ];
+ 
+ /**
+diff --git a/src/server/db/schema/index.ts b/src/server/db/schema/index.ts
+index 8b7c658..569ee9a 100644
+--- a/src/server/db/schema/index.ts
++++ b/src/server/db/schema/index.ts
+@@ -14,3 +14,4 @@ export * from "./notifications";
+ export * from "./activity";
+ export * from "./billing";
+ export * from "./webhooks";
++export * from "./recurring-issues";
+diff --git a/src/server/db/schema/recurring-issues.ts b/src/server/db/schema/recurring-issues.ts
+new file mode 100644
+index 0000000..0faa20b
+--- /dev/null
++++ b/src/server/db/schema/recurring-issues.ts
+@@ -0,0 +1,29 @@
++import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const recurringIssues = sqliteTable(
++  "recurring_issues",
++  {
++    id: idColumn(),
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    title: text("title").notNull(),
++    priority: text("priority", {
++      enum: ["none", "low", "medium", "high", "urgent"],
++    })
++      .notNull()
++      .default("none"),
++    assigneeId: text("assignee_id"),
++    cadence: text("cadence", { enum: ["daily", "weekly"] }).notNull(),
++    weekday: integer("weekday"),
++    timezone: text("timezone").notNull(),
++    startsOn: text("starts_on").notNull(),
++    lastOccurrenceOn: text("last_occurrence_on"),
++    paused: integer("paused", { mode: "boolean" }).notNull().default(false),
++    createdBy: text("created_by").notNull(),
++    ...timestampColumns,
++  },
++  (table) => [index("recurring_issues_org_idx").on(table.orgId)],
++);
++
++export type RecurringIssueRow = typeof recurringIssues.$inferSelect;
+diff --git a/src/server/jobs/index.ts b/src/server/jobs/index.ts
+index c0d2b22..f3cb9df 100644
+--- a/src/server/jobs/index.ts
++++ b/src/server/jobs/index.ts
+@@ -27,6 +27,7 @@ export type { JobResult } from "./types";
+ export { runCleanupArchivedJob } from "./cleanup-archived-job";
+ export { runDigestEmailJob, shouldRunForOrg } from "./digest-email-job";
+ export { runOverdueIssueJob } from "./overdue-issue-job";
++export { runRecurringIssueJob } from "./recurring-issue-job";
+ export { runSearchReindexJob } from "./search-reindex-job";
+ export { runTrialExpiryJob } from "./trial-expiry-job";
+ export { runUsageRollupJob } from "./usage-rollup-job";
+diff --git a/src/server/jobs/queue.ts b/src/server/jobs/queue.ts
+index d55a415..db73322 100644
+--- a/src/server/jobs/queue.ts
++++ b/src/server/jobs/queue.ts
+@@ -20,7 +20,8 @@ export type JobKind =
+   | "usage-rollup"
+   | "search-reindex"
+   | "cleanup-archived"
+-  | "trial-expiry";
++  | "trial-expiry"
++  | "recurring-issues";
+ 
+ /** Attempts after which a job is dropped rather than retried again. */
+ const MAX_ATTEMPTS = 5;
+@@ -159,5 +160,10 @@ async function runHandler(job: QueuedJob): Promise<void> {
+       await runTrialExpiryJob(now);
+       return;
+     }
++    case "recurring-issues": {
++      const { runRecurringIssueJob } = await import("./recurring-issue-job");
++      await runRecurringIssueJob(now);
++      return;
++    }
+   }
+ }
+diff --git a/src/server/jobs/recurring-issue-job.ts b/src/server/jobs/recurring-issue-job.ts
+new file mode 100644
+index 0000000..08e94dc
+--- /dev/null
++++ b/src/server/jobs/recurring-issue-job.ts
+@@ -0,0 +1,71 @@
++/**
++ * Files the issue for each recurring-issue rule's latest started occurrence.
++ * Missed occurrences are never back-filled; re-running is a no-op.
++ *
++ * Must call (do not reimplement): createIssue, resolveActor, can
++ */
++import { createLogger } from "@/lib/logger";
++import { can } from "@/lib/permissions";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { projectResource } from "@/server/services/_support";
++import { createIssue } from "@/server/services/issue-service";
++import { resolveActor } from "@/server/services/member-service";
++import { latestOccurrenceOn } from "@/server/services/recurring-issue-service";
++import { runJob } from "./types";
++import type { JobResult } from "./types";
++
++const logger = createLogger("recurring-issue-job");
++
++export async function runRecurringIssueJob(now: Date): Promise<JobResult> {
++  return runJob("recurring-issues", async (result) => {
++    for (const rule of await recurringRepo.listRunnableRecurringIssues()) {
++      const occurrence = latestOccurrenceOn(rule, now);
++      if (occurrence === null) continue;
++      if (rule.lastOccurrenceOn !== null && occurrence <= rule.lastOccurrenceOn) {
++        continue;
++      }
++
++      const project = await projectRepo.findProjectById(rule.orgId, rule.projectId);
++      if (!project || project.archivedAt !== null) continue;
++
++      const actor = await resolveActor(rule.createdBy, rule.orgId);
++      if (!actor || !can(actor, "issue:create", projectResource(project))) {
++        await recurringRepo.setRecurringIssuePaused(rule.orgId, rule.id, true);
++        continue;
++      }
++
++      const assignee =
++        rule.assigneeId === null
++          ? null
++          : await memberRepo.findMember(rule.orgId, rule.assigneeId);
++
++      try {
++        await createIssue(actor, {
++          orgId: rule.orgId,
++          projectId: rule.projectId,
++          title: `${rule.title} (${occurrence})`,
++          description: null,
++          status: "backlog",
++          priority: rule.priority,
++          assigneeId: assignee && assignee.status === "active" ? assignee.userId : null,
++          parentId: null,
++          estimate: null,
++          dueAt: null,
++          labelIds: [],
++        });
++      } catch (error) {
++        result.failed += 1;
++        logger.warn("recurring issue not created", {
++          recurringIssueId: rule.id,
++          reason: error instanceof Error ? error.message : String(error),
++        });
++        continue;
++      }
++
++      await recurringRepo.markOccurrence(rule.orgId, rule.id, occurrence);
++      result.processed += 1;
++    }
++  });
++}
+diff --git a/src/server/jobs/scheduler.ts b/src/server/jobs/scheduler.ts
+index 26ca0a3..0f738a5 100644
+--- a/src/server/jobs/scheduler.ts
++++ b/src/server/jobs/scheduler.ts
+@@ -18,6 +18,7 @@ const CADENCE_MINUTES: Readonly<Record<JobKind, number>> = {
+   "search-reindex": 1_440,
+   "cleanup-archived": 1_440,
+   "trial-expiry": 360,
++  "recurring-issues": 15,
+ };
+ 
+ const logger = createLogger("job-scheduler");
+diff --git a/src/server/repositories/recurring-issue-repository.ts b/src/server/repositories/recurring-issue-repository.ts
+new file mode 100644
+index 0000000..cb3adb1
+--- /dev/null
++++ b/src/server/repositories/recurring-issue-repository.ts
+@@ -0,0 +1,139 @@
++/**
++ * Recurring-issue rules. Reads are org-scoped except the job's sweep, which
++ * walks every organization's runnable rules.
++ */
++import { and, asc, count, eq } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, recurringIssues } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import type { RecurringIssueRow } from "@/server/db/schema/recurring-issues";
++import type { IsoTimestamp, OrgId, ProjectId, UserId } from "@/types/common";
++import type { IssuePriority } from "@/types/issue";
++import type { RecurrenceCadence, RecurringIssue } from "@/types/recurring-issue";
++
++export type NewRecurringIssue = {
++  orgId: OrgId;
++  projectId: ProjectId;
++  title: string;
++  priority: IssuePriority;
++  assigneeId: UserId | null;
++  cadence: RecurrenceCadence;
++  weekday: number | null;
++  timezone: string;
++  startsOn: string;
++};
++
++function toRecurringIssue(row: RecurringIssueRow): RecurringIssue {
++  return {
++    id: row.id,
++    orgId: row.orgId as OrgId,
++    projectId: row.projectId as ProjectId,
++    title: row.title,
++    priority: row.priority,
++    assigneeId: row.assigneeId === null ? null : (row.assigneeId as UserId),
++    cadence: row.cadence,
++    weekday: row.weekday,
++    timezone: row.timezone,
++    startsOn: row.startsOn,
++    lastOccurrenceOn: row.lastOccurrenceOn,
++    paused: row.paused,
++    createdBy: row.createdBy as UserId,
++    createdAt: row.createdAt as IsoTimestamp,
++    updatedAt: row.updatedAt as IsoTimestamp,
++  };
++}
++
++export async function insertRecurringIssue(
++  input: NewRecurringIssue,
++  createdBy: UserId,
++): Promise<RecurringIssue> {
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb()
++    .insert(recurringIssues)
++    .values({
++      id: newId(),
++      ...input,
++      lastOccurrenceOn: null,
++      paused: false,
++      createdBy,
++      createdAt: stamp,
++      updatedAt: stamp,
++    })
++    .returning()
++    .get();
++  return toRecurringIssue(row);
++}
++
++export async function findRecurringIssueById(
++  orgId: OrgId,
++  id: string,
++): Promise<RecurringIssue | null> {
++  const row = getDb()
++    .select()
++    .from(recurringIssues)
++    .where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id)))
++    .get();
++  return row ? toRecurringIssue(row) : null;
++}
++
++export async function listRecurringIssues(
++  orgId: OrgId,
++): Promise<readonly RecurringIssue[]> {
++  return getDb()
++    .select()
++    .from(recurringIssues)
++    .where(orgPredicate(recurringIssues.orgId, orgId))
++    .orderBy(asc(recurringIssues.createdAt), asc(recurringIssues.id))
++    .all()
++    .map(toRecurringIssue);
++}
++
++export async function countRecurringIssues(orgId: OrgId): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(recurringIssues)
++    .where(orgPredicate(recurringIssues.orgId, orgId))
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Every rule that is not paused, across organizations — the job's sweep. */
++export async function listRunnableRecurringIssues(): Promise<
++  readonly RecurringIssue[]
++> {
++  return getDb()
++    .select()
++    .from(recurringIssues)
++    .where(eq(recurringIssues.paused, false))
++    .orderBy(asc(recurringIssues.createdAt), asc(recurringIssues.id))
++    .all()
++    .map(toRecurringIssue);
++}
++
++export async function setRecurringIssuePaused(
++  orgId: OrgId,
++  id: string,
++  paused: boolean,
++): Promise<RecurringIssue> {
++  const row = getDb()
++    .update(recurringIssues)
++    .set({ paused, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id)))
++    .returning()
++    .get();
++  if (!row) throw new Error(`Recurring issue ${id} not found`);
++  return toRecurringIssue(row);
++}
++
++export async function markOccurrence(
++  orgId: OrgId,
++  id: string,
++  occurrence: string,
++): Promise<void> {
++  getDb()
++    .update(recurringIssues)
++    .set({ lastOccurrenceOn: occurrence, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id)))
++    .run();
++}
+diff --git a/src/server/services/recurring-issue-service.ts b/src/server/services/recurring-issue-service.ts
+new file mode 100644
+index 0000000..d31eb35
+--- /dev/null
++++ b/src/server/services/recurring-issue-service.ts
+@@ -0,0 +1,124 @@
++/**
++ * Recurring-issue rules: creation under the plan's rule quota, pausing, and
++ * the occurrence arithmetic the recurring-issue job runs on.
++ *
++ * Must call (do not reimplement): assertCan, assertOrgScope, assertNotArchived, getPlanLimits
++ */
++import { getPlanLimits } from "@/config/plan-limits";
++import { addCalendarDays, calendarDateIn, isoWeekday } from "@/lib/date";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import {
++  createRecurringIssueSchema,
++  setRecurringIssuePausedSchema,
++} from "@/schemas/recurring-issue";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { orgResource, projectResource, requireFound } from "./_support";
++import type {
++  CreateRecurringIssueInput,
++  SetRecurringIssuePausedInput,
++} from "@/schemas/recurring-issue";
++import type { OrgId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { RecurringIssue } from "@/types/recurring-issue";
++
++export async function createRecurringIssue(
++  actor: Actor,
++  raw: CreateRecurringIssueInput,
++): Promise<RecurringIssue> {
++  const input = createRecurringIssueSchema.parse(raw);
++  assertOrgScope(actor, input.orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++  assertCan(actor, "issue:create", projectResource(project));
++
++  if (input.assigneeId !== null) {
++    const assignee = await memberRepo.findMember(input.orgId, input.assigneeId);
++    if (!assignee || assignee.status !== "active") {
++      throw new Error("The assignee must be an active member of the organization");
++    }
++  }
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const used = await recurringRepo.countRecurringIssues(input.orgId);
++  if (used + 1 > getPlanLimits(org.plan).recurringIssues) {
++    throw new Error(`Plan ${org.plan} allows no more recurring issues`);
++  }
++
++  return recurringRepo.insertRecurringIssue(
++    {
++      orgId: input.orgId,
++      projectId: input.projectId,
++      title: input.title,
++      priority: input.priority,
++      assigneeId: input.assigneeId,
++      cadence: input.cadence,
++      weekday: input.weekday,
++      timezone: input.timezone,
++      startsOn: input.startsOn,
++    },
++    actor.userId,
++  );
++}
++
++export async function setRecurringIssuePaused(
++  actor: Actor,
++  raw: SetRecurringIssuePausedInput,
++): Promise<RecurringIssue> {
++  const input = setRecurringIssuePausedSchema.parse(raw);
++  assertOrgScope(actor, input.orgId);
++
++  const rule = requireFound(
++    await recurringRepo.findRecurringIssueById(input.orgId, input.recurringIssueId),
++    "RecurringIssue",
++    input.recurringIssueId,
++  );
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, rule.projectId),
++    "Project",
++    rule.projectId,
++  );
++  assertCan(actor, "issue:create", projectResource(project));
++
++  return recurringRepo.setRecurringIssuePaused(input.orgId, rule.id, input.paused);
++}
++
++export async function listRecurringIssues(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly RecurringIssue[]> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "issue:read", orgResource(orgId));
++  return recurringRepo.listRecurringIssues(orgId);
++}
++
++/**
++ * The most recent occurrence day that has started by `now` in the rule's
++ * time zone, or `null` when the rule has no started occurrence yet.
++ */
++export function latestOccurrenceOn(
++  rule: Pick<RecurringIssue, "cadence" | "weekday" | "timezone" | "startsOn">,
++  now: Date,
++): string | null {
++  const today = calendarDateIn(rule.timezone, now);
++  if (today < rule.startsOn) return null;
++  if (rule.cadence === "daily") return today;
++
++  const weekday = rule.weekday ?? 1;
++  const back = (isoWeekday(today) - weekday + 7) % 7;
++  const occurrence = addCalendarDays(today, -back);
++  return occurrence < rule.startsOn ? null : occurrence;
++}
+diff --git a/src/types/recurring-issue.ts b/src/types/recurring-issue.ts
+new file mode 100644
+index 0000000..72f7465
+--- /dev/null
++++ b/src/types/recurring-issue.ts
+@@ -0,0 +1,31 @@
++import type {
++  OrgId,
++  ProjectId,
++  TenantScoped,
++  Timestamps,
++  UserId,
++} from "./common";
++import type { IssuePriority } from "./issue";
++
++export type RecurrenceCadence = "daily" | "weekly";
++
++/**
++ * A rule that files one issue per occurrence. Occurrences are calendar days
++ * (`YYYY-MM-DD`) in the rule's own IANA time zone.
++ */
++export interface RecurringIssue extends Timestamps, TenantScoped {
++  readonly id: string;
++  readonly orgId: OrgId;
++  readonly projectId: ProjectId;
++  readonly title: string;
++  readonly priority: IssuePriority;
++  readonly assigneeId: UserId | null;
++  readonly cadence: RecurrenceCadence;
++  /** ISO weekday, 1 = Monday … 7 = Sunday; `null` for daily rules. */
++  readonly weekday: number | null;
++  readonly timezone: string;
++  readonly startsOn: string;
++  readonly lastOccurrenceOn: string | null;
++  readonly paused: boolean;
++  readonly createdBy: UserId;
++}

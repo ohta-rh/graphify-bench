@@ -1,0 +1,214 @@
+diff --git a/src/server/jobs/overdue-issue-job.ts b/src/server/jobs/overdue-issue-job.ts
+--- a/src/server/jobs/overdue-issue-job.ts
++++ b/src/server/jobs/overdue-issue-job.ts
+@@ -7,13 +7,10 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+-
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+ 
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+@@ -21,11 +18,13 @@
+ const logger = createLogger("overdue-issue-job");
+ 
+ /**
+- * Issues already announced this process's lifetime. A later sweep still
+- * finds a still-open, still-overdue issue — this is what keeps the job from
+- * re-emitting `issue.overdue` for it on every pass.
++ * Issues announced and still overdue at the last sweep, per organization. A
++ * later sweep still finds a still-open, still-overdue issue — this is what
++ * keeps the job from re-emitting `issue.overdue` for it on every pass. An
++ * issue that a sweep no longer finds overdue (closed, archived, due date
++ * moved out) is forgotten, so it is announced again if it lapses again.
+  */
+-const reported = new Set<string>();
++const reported = new Map<string, Set<string>>();
+ 
+ /** Test-only: clears the reported set so a fresh scenario starts empty. */
+ export function resetOverdueTracking(): void {
+@@ -45,14 +44,22 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    // Every live workspace, including one whose usage has never been
++    // measured; a deleted workspace is never swept.
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
++      const current = new Set(overdue.map((issue) => issue.id as string));
++      const announced = reported.get(orgId) ?? new Set<string>();
++      for (const issueId of announced) {
++        if (!current.has(issueId)) announced.delete(issueId);
++      }
++      reported.set(orgId, announced);
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
+-        if (reported.has(issue.id)) continue;
++        if (announced.has(issue.id)) continue;
+ 
+         try {
+           await emit("issue.overdue", {
+@@ -64,7 +71,7 @@
+             dueAt: issue.dueAt,
+             assigneeId: issue.assigneeId,
+           });
+-          reported.add(issue.id);
++          announced.add(issue.id);
+           result.processed += 1;
+         } catch (error) {
+           result.failed += 1;
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,7 +13,7 @@
+   isNull,
+   like,
+   lt,
+-  ne,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -24,7 +24,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -54,7 +54,7 @@
+ import type { SQL } from "drizzle-orm";
+ 
+ /** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+-const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++const TERMINAL_STATUSES: readonly IssueStatus[] = CLOSED_ISSUE_STATUSES;
+ 
+ export async function findIssueById(
+   orgId: OrgId,
+@@ -425,9 +425,7 @@
+         status === "in_progress" && current.startedAt === null
+           ? stamp
+           : current.startedAt,
+-      completedAt: TERMINAL_STATUSES.includes(status)
+-        ? stamp
+-        : current.completedAt,
++      completedAt: TERMINAL_STATUSES.includes(status) ? stamp : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -521,7 +519,7 @@
+           livePredicate(issues.archivedAt, {}),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+-          ne(issues.status, "done"),
++          notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         ),
+       ),
+     )
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, asc, eq, isNull, like } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -126,6 +126,21 @@
+   return toOrganization(row);
+ }
+ 
++/**
++ * Every organization that has not been deleted, oldest first. Cross-tenant by
++ * design: background sweeps walk this list, whether or not the org has ever
++ * had its usage measured.
++ */
++export async function listActiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .orderBy(asc(organizations.createdAt), asc(organizations.id))
++    .all();
++  return rows.map((row) => row.id as OrgId);
++}
++
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+ export async function listTakenOrgSlugs(
+   prefix: string,
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -3,7 +3,18 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import {
++  and,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNotNull,
++  like,
++  lt,
++  notInArray,
++  sql,
++} from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -12,6 +23,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { getDb, issues, projects } from "@/server/db";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -231,7 +243,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, [...CLOSED_ISSUE_STATUSES])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -242,6 +254,7 @@
+     .where(
+       and(
+         scope,
++        notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
+       ),
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,

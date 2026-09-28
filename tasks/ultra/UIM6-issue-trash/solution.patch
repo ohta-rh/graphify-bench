@@ -1,0 +1,482 @@
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -10,7 +10,7 @@
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+-import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { AlreadyArchivedError, RestoreRefusedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+@@ -34,6 +34,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof RestoreRefusedError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -96,6 +97,14 @@
+     };
+   }
+ 
++  if (error instanceof RestoreRefusedError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { entity: error.entity, id: error.id, reason: error.reason },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/lib/soft-delete.ts b/src/lib/soft-delete.ts
+--- a/src/lib/soft-delete.ts
++++ b/src/lib/soft-delete.ts
+@@ -58,6 +58,22 @@
+   }
+ }
+ 
++export type RestoreRefusal = "not_archived" | "expired" | "project_archived" | "quota";
++
++/** Thrown when an archived row cannot be brought back. */
++export class RestoreRefusedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly entity: string,
++    readonly id: string,
++    readonly reason: RestoreRefusal,
++  ) {
++    super(`${entity} ${id} cannot be restored (${reason}).`);
++    this.name = "RestoreRefusedError";
++  }
++}
++
+ /** Guard for archive actions, so double-archiving is a domain-level conflict. */
+ export function assertNotArchived(
+   entity: string,
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -118,6 +118,7 @@
+      color TEXT NOT NULL DEFAULT '#6366f1',
+      starts_at TEXT,
+      target_date TEXT,
++     issue_sequence INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived_at TEXT
+diff --git a/src/server/db/schema/projects.ts b/src/server/db/schema/projects.ts
+--- a/src/server/db/schema/projects.ts
++++ b/src/server/db/schema/projects.ts
+@@ -1,4 +1,4 @@
+-import { index, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
++import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+ import {
+   idColumn,
+   softDeleteColumns,
+@@ -25,6 +25,8 @@
+     color: text("color").notNull().default("#6366f1"),
+     startsAt: text("starts_at"),
+     targetDate: text("target_date"),
++    /** Highest issue number ever handed out, surviving purged issues. */
++    issueSequence: integer("issue_sequence").notNull().default(0),
+     ...timestampColumns,
+     ...softDeleteColumns,
+   },
+diff --git a/src/server/jobs/cleanup-archived-job.ts b/src/server/jobs/cleanup-archived-job.ts
+--- a/src/server/jobs/cleanup-archived-job.ts
++++ b/src/server/jobs/cleanup-archived-job.ts
+@@ -6,6 +6,7 @@
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { createLogger } from "@/lib/logger";
+ import { isArchived } from "@/lib/soft-delete";
++import type { IssueId } from "@/types/common";
+ import * as activityRepo from "@/server/repositories/activity-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -16,8 +17,8 @@
+ import type { JobResult } from "@/server/jobs/types";
+ 
+ const ORG_BATCH = 25;
+-const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
++const BYTES_PER_MB = 1024 * 1024;
+ 
+ const logger = createLogger("cleanup-archived-job");
+ 
+@@ -26,9 +27,10 @@
+  * promises and no longer: the cut-off comes from `retentionDays`, so an
+  * enterprise tenant keeps years of history where a free one keeps a month.
+  *
+- * Only the search documents are actually dropped here — the issue rows stay,
+- * because the audit log still points at them — while the audit rows past the
+- * window are purged outright.
++ * Issues archived past the window are purged for good — the row, its label
++ * links, comments and attachments — along with their search documents, and
++ * the attachments' megabytes go back to the storage quota. The audit rows
++ * past the window are purged outright, as before.
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+@@ -43,19 +45,37 @@
+         new Date(now.getTime() - retentionDays * MS_PER_DAY),
+       );
+ 
+-      const archived = await issueRepo.listIssues({
+-        orgId,
+-        limit: PAGE_SIZE,
+-        cursor: null,
+-        includeArchived: true,
+-      });
++      const expired = await issueRepo.listArchivedIssuesBefore(orgId, cutoff);
+ 
+-      for (const issue of archived.items) {
++      for (const issue of expired) {
+         if (!isArchived(issue)) continue;
+-        if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
+ 
+-        await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
+-        result.processed += 1;
++        try {
++          const purged = await issueRepo.purgeIssue(orgId, issue.id as IssueId);
++          if (!purged) continue;
++
++          await searchRepo.deleteSearchDocument(orgId, "issue", purged.issueId);
++          for (const commentId of purged.commentIds) {
++            await searchRepo.deleteSearchDocument(orgId, "comment", commentId);
++          }
++
++          const freedMb = purged.attachmentSizes.reduce(
++            (total, size) => total + Math.ceil(size / BYTES_PER_MB),
++            0,
++          );
++          if (freedMb > 0) {
++            await usageRepo.incrementUsage(orgId, { storageMbUsed: -freedMb });
++          }
++
++          result.processed += 1;
++        } catch (error) {
++          result.failed += 1;
++          logger.error("issue purge failed", {
++            orgId,
++            issueId: issue.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
++        }
+       }
+ 
+       try {
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  lte,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -22,7 +23,14 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issues,
++  projects,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -287,7 +295,8 @@
+ 
+ /**
+  * Next per-project issue number. Archived issues keep their number, so the
+- * max is taken over every row rather than the live ones.
++ * max is taken over every row rather than the live ones — and purged issues
++ * leave their number behind in the project's sequence, so it is never reused.
+  */
+ export async function nextIssueNumber(
+   orgId: OrgId,
+@@ -300,7 +309,12 @@
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const project = getDb()
++    .select({ sequence: projects.issueSequence })
++    .from(projects)
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId)))
++    .get();
++  return Math.max(row?.value ?? 0, project?.sequence ?? 0) + 1;
+ }
+ 
+ export async function insertIssue(
+@@ -527,3 +541,114 @@
+ 
+   return rows.map((row) => toIssue(row));
+ }
++
++/**
++ * Every issue archived at or before `cutoff`, across all projects. Unpaged on
++ * purpose: the retention sweep must see all of them, not the first page.
++ */
++export async function listArchivedIssuesBefore(
++  orgId: OrgId,
++  cutoff: IsoTimestamp,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        isNotNull(issues.archivedAt),
++        lte(issues.archivedAt, cutoff),
++      ),
++    )
++    .orderBy(issues.archivedAt)
++    .all();
++
++  return rows.map((row) => toIssue(row));
++}
++
++/** What a purge removed, so the caller can tidy the index and the counters. */
++export interface PurgedIssue {
++  readonly issueId: IssueId;
++  readonly commentIds: readonly string[];
++  readonly attachmentSizes: readonly number[];
++}
++
++/**
++ * Permanently deletes one issue with its label links, comments and
++ * attachments. The number it held is written to the project's sequence first
++ * so `nextIssueNumber` never hands it out again.
++ */
++export async function purgeIssue(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<PurgedIssue | null> {
++  const db = getDb();
++  const row = db
++    .select()
++    .from(issues)
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++    .get();
++  if (!row) return null;
++
++  const commentRows = db
++    .select({ id: comments.id })
++    .from(comments)
++    .where(
++      and(orgPredicate(comments.orgId, orgId), eq(comments.issueId, issueId)),
++    )
++    .all();
++  const attachmentRows = db
++    .select({ sizeBytes: attachments.sizeBytes })
++    .from(attachments)
++    .where(
++      and(
++        orgPredicate(attachments.orgId, orgId),
++        eq(attachments.issueId, issueId),
++      ),
++    )
++    .all();
++
++  db.transaction((tx) => {
++    tx.update(projects)
++      .set({
++        issueSequence: sql`max(${projects.issueSequence}, ${row.number})`,
++      })
++      .where(
++        and(
++          orgPredicate(projects.orgId, orgId),
++          eq(projects.id, row.projectId),
++        ),
++      )
++      .run();
++    tx.delete(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, orgId),
++          eq(issueLabels.issueId, issueId),
++        ),
++      )
++      .run();
++    tx.delete(comments)
++      .where(
++        and(orgPredicate(comments.orgId, orgId), eq(comments.issueId, issueId)),
++      )
++      .run();
++    tx.delete(attachments)
++      .where(
++        and(
++          orgPredicate(attachments.orgId, orgId),
++          eq(attachments.issueId, issueId),
++        ),
++      )
++      .run();
++    tx.delete(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .run();
++  });
++
++  return {
++    issueId,
++    commentIds: commentRows.map((comment) => comment.id),
++    attachmentSizes: attachmentRows.map((attachment) => attachment.sizeBytes),
++  };
++}
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -186,6 +186,15 @@
+         metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.restored", (payload) =>
++      record(payload.orgId, "issue.restored", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: "Restored issue from the trash",
++      }).then(() => undefined),
++    ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -3,10 +3,10 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, assertNotArchived
+  */
+-import { wouldExceedLimit } from "@/config/plan-limits";
++import { getPlanLimits, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { assertNotArchived, RestoreRefusedError } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -214,6 +214,69 @@
+   return archived;
+ }
+ 
++const MS_PER_DAY = 24 * 60 * 60 * 1000;
++
++/**
++ * Takes an issue back out of the trash. Same permission as archiving it; the
++ * refusals are checked after `can()`: the issue must be archived, still
++ * inside the plan's retention window, in a live project, and the project must
++ * have room for it under the per-project issue quota.
++ */
++export async function restoreIssue(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<Issue> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:archive", issueResource(issue));
++
++  if (issue.archivedAt === null) {
++    throw new RestoreRefusedError("Issue", issue.id, "not_archived");
++  }
++
++  const org = requireFound(
++    await orgRepo.findOrgById(orgId),
++    "Organization",
++    orgId,
++  );
++
++  const { retentionDays } = getPlanLimits(org.plan);
++  const archivedFor = Date.now() - new Date(issue.archivedAt).getTime();
++  if (archivedFor >= retentionDays * MS_PER_DAY) {
++    throw new RestoreRefusedError("Issue", issue.id, "expired");
++  }
++
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, issue.projectId),
++    "Project",
++    issue.projectId,
++  );
++  if (project.archivedAt !== null) {
++    throw new RestoreRefusedError("Issue", issue.id, "project_archived");
++  }
++
++  const used = await issueRepo.countIssues(orgId, issue.projectId);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new RestoreRefusedError("Issue", issue.id, "quota");
++  }
++
++  const restored = await issueRepo.restoreIssue(orgId, issueId);
++
++  await emit("issue.restored", {
++    ...actorEnvelope(actor),
++    issueId: restored.id,
++    projectId: restored.projectId,
++  });
++
++  return restored;
++}
++
+ /**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+  * `updated_at` — so a move is a status change plus a touch.
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -147,6 +147,10 @@
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
++    subscribe("issue.restored", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+         payload.orgId,
+diff --git a/src/server/services/usage-service.ts b/src/server/services/usage-service.ts
+--- a/src/server/services/usage-service.ts
++++ b/src/server/services/usage-service.ts
+@@ -77,6 +77,9 @@
+     subscribe("issue.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { issuesUsed: -1 });
+     }),
++    subscribe("issue.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { issuesUsed: 1 });
++    }),
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -61,6 +61,7 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.restored": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;

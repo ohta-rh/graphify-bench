@@ -1,0 +1,511 @@
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+index 9647668..2dbcd24 100644
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -50,6 +50,7 @@ const KIND_LABELS: Readonly<Record<NotificationKind, string>> = {
+   project_archived: "Project archived",
+   plan_limit_reached: "Plan limit reached",
+   digest_ready: "Daily digest ready",
++  issue_unblocked: "A blocked issue became unblocked",
+ };
+ 
+ export function NotificationPreferencesForm(
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+index fb407af..597ead6 100644
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -19,6 +19,7 @@ export const notificationKindSchema = z.enum([
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "issue_unblocked",
+ ]);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+index 2fe7659..0dfbf0b 100644
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -175,6 +175,15 @@ const SCHEMA_STATEMENTS: readonly string[] = [
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS issue_labels_pk ON issue_labels (issue_id, label_id)`,
+   `CREATE INDEX IF NOT EXISTS issue_labels_org_idx ON issue_labels (org_id)`,
++  `CREATE TABLE IF NOT EXISTS issue_dependencies (
++     org_id TEXT NOT NULL,
++     issue_id TEXT NOT NULL,
++     blocker_id TEXT NOT NULL,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS issue_dependencies_pk ON issue_dependencies (issue_id, blocker_id)`,
++  `CREATE INDEX IF NOT EXISTS issue_dependencies_org_blocker_idx ON issue_dependencies (org_id, blocker_id)`,
+   `CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff --git a/src/server/db/schema/issues.ts b/src/server/db/schema/issues.ts
+index e47db92..d20873a 100644
+--- a/src/server/db/schema/issues.ts
++++ b/src/server/db/schema/issues.ts
+@@ -70,6 +70,25 @@ export const issueLabels = sqliteTable(
+   ],
+ );
+ 
++/**
++ * "Blocked by" links between two issues of the same organization: `issueId`
++ * cannot be completed while `blockerId` is still open.
++ */
++export const issueDependencies = sqliteTable(
++  "issue_dependencies",
++  {
++    ...tenantColumns,
++    issueId: text("issue_id").notNull(),
++    blockerId: text("blocker_id").notNull(),
++    createdBy: text("created_by").notNull(),
++    createdAt: text("created_at").notNull(),
++  },
++  (table) => [
++    uniqueIndex("issue_dependencies_pk").on(table.issueId, table.blockerId),
++    index("issue_dependencies_org_blocker_idx").on(table.orgId, table.blockerId),
++  ],
++);
++
+ export const attachments = sqliteTable(
+   "attachments",
+   {
+@@ -88,4 +107,5 @@ export const attachments = sqliteTable(
+ export type IssueRow = typeof issues.$inferSelect;
+ export type NewIssueRow = typeof issues.$inferInsert;
+ export type LabelRow = typeof labels.$inferSelect;
++export type IssueDependencyRow = typeof issueDependencies.$inferSelect;
+ export type AttachmentRow = typeof attachments.$inferSelect;
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+index 7b731a0..920a402 100644
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -13,6 +13,7 @@ const NOTIFICATION_KINDS = [
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "issue_unblocked",
+ ] as const;
+ 
+ export const notifications = sqliteTable(
+diff --git a/src/server/repositories/issue-dependency-repository.ts b/src/server/repositories/issue-dependency-repository.ts
+new file mode 100644
+index 0000000..bd88bb8
+--- /dev/null
++++ b/src/server/repositories/issue-dependency-repository.ts
+@@ -0,0 +1,117 @@
++/**
++ * "Blocked by" links between issues. Every read and write is org-scoped.
++ */
++import { and, eq } from "drizzle-orm";
++import { getDb, issueDependencies } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import type { IssueDependencyRow } from "@/server/db/schema/issues";
++import type { IsoTimestamp, IssueId, OrgId, UserId } from "@/types/common";
++import type { IssueDependency } from "@/types/issue";
++
++function toDependency(row: IssueDependencyRow): IssueDependency {
++  return {
++    orgId: row.orgId as OrgId,
++    issueId: row.issueId as IssueId,
++    blockerId: row.blockerId as IssueId,
++    createdBy: row.createdBy as UserId,
++    createdAt: row.createdAt as IsoTimestamp,
++  };
++}
++
++export async function findDependency(
++  orgId: OrgId,
++  issueId: IssueId,
++  blockerId: IssueId,
++): Promise<IssueDependency | null> {
++  const row = getDb()
++    .select()
++    .from(issueDependencies)
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++        eq(issueDependencies.blockerId, blockerId),
++      ),
++    )
++    .get();
++  return row ? toDependency(row) : null;
++}
++
++export async function insertDependency(
++  orgId: OrgId,
++  issueId: IssueId,
++  blockerId: IssueId,
++  createdBy: UserId,
++): Promise<IssueDependency> {
++  getDb()
++    .insert(issueDependencies)
++    .values({
++      orgId,
++      issueId,
++      blockerId,
++      createdBy,
++      createdAt: toIsoTimestamp(new Date()),
++    })
++    .onConflictDoNothing()
++    .run();
++
++  const row = await findDependency(orgId, issueId, blockerId);
++  if (!row) throw new Error(`Dependency ${issueId} <- ${blockerId} not stored`);
++  return row;
++}
++
++export async function deleteDependency(
++  orgId: OrgId,
++  issueId: IssueId,
++  blockerId: IssueId,
++): Promise<boolean> {
++  const rows = getDb()
++    .delete(issueDependencies)
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++        eq(issueDependencies.blockerId, blockerId),
++      ),
++    )
++    .returning({ issueId: issueDependencies.issueId })
++    .all();
++  return rows.length > 0;
++}
++
++/** Ids of the issues that block `issueId`. */
++export async function listBlockerIds(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly IssueId[]> {
++  return getDb()
++    .select({ id: issueDependencies.blockerId })
++    .from(issueDependencies)
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++      ),
++    )
++    .all()
++    .map((row) => row.id as IssueId);
++}
++
++/** Ids of the issues that `blockerId` blocks. */
++export async function listBlockedIds(
++  orgId: OrgId,
++  blockerId: IssueId,
++): Promise<readonly IssueId[]> {
++  return getDb()
++    .select({ id: issueDependencies.issueId })
++    .from(issueDependencies)
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.blockerId, blockerId),
++      ),
++    )
++    .all()
++    .map((row) => row.id as IssueId);
++}
+diff --git a/src/server/services/event-registry.ts b/src/server/services/event-registry.ts
+index f2a9508..e71da1f 100644
+--- a/src/server/services/event-registry.ts
++++ b/src/server/services/event-registry.ts
+@@ -8,6 +8,7 @@ import { createLogger } from "@/lib/logger";
+ import { enqueue } from "@/server/jobs/queue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { registerActivityListeners } from "./activity-service";
++import { registerDependencyListeners } from "./issue-dependency-service";
+ import { registerSearchListeners } from "./search-service";
+ import { registerUsageListeners } from "./usage-service";
+ import { registerWebhookListeners } from "./webhook-service";
+@@ -38,6 +39,7 @@ export function registerEventHandlers(): void {
+     registerSearchListeners(),
+     registerUsageListeners(),
+     registerWebhookListeners(),
++    registerDependencyListeners(),
+     registerDigestBridge(),
+   ];
+ 
+diff --git a/src/server/services/issue-dependency-service.ts b/src/server/services/issue-dependency-service.ts
+new file mode 100644
+index 0000000..d0f0bef
+--- /dev/null
++++ b/src/server/services/issue-dependency-service.ts
+@@ -0,0 +1,214 @@
++/**
++ * "Blocked by" links between issues: who may add them, the no-cycle rule,
++ * the completion gate and the "your issue is unblocked" notification.
++ *
++ * Must call (do not reimplement): assertCan, assertOrgScope, assertNotArchived, subscribe, notify
++ */
++import { subscribe } from "@/lib/event-bus";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived, isArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
++import { issueResource, requireFound } from "./_support";
++import { notify } from "./notification-service";
++import type { IssueId, OrgId, UserId } from "@/types/common";
++import type { Unsubscribe } from "@/types/event";
++import type { Issue, IssueDependency, IssueStatus } from "@/types/issue";
++import type { Actor } from "@/types/member";
++
++export type IssueDependencyInput = {
++  orgId: OrgId;
++  issueId: IssueId;
++  blockerId: IssueId;
++};
++
++/** Raised when an issue is moved to `done` while open blockers remain. */
++export class IssueBlockedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly issueId: IssueId,
++    readonly blockerIds: readonly IssueId[],
++  ) {
++    super(`Issue ${issueId} is blocked by ${blockerIds.length} open issue(s)`);
++    this.name = "IssueBlockedError";
++  }
++}
++
++function isClosedStatus(status: IssueStatus): boolean {
++  return CLOSED_ISSUE_STATUSES.includes(status);
++}
++
++/** A blocker holds its dependants back while it is live and not closed. */
++function isOpen(issue: Issue): boolean {
++  return !isArchived(issue) && !isClosedStatus(issue.status);
++}
++
++/** The blockers of `issueId` that are still open. */
++export async function openBlockerIds(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly IssueId[]> {
++  const open: IssueId[] = [];
++  for (const blockerId of await dependencyRepo.listBlockerIds(orgId, issueId)) {
++    const blocker = await issueRepo.findIssueById(orgId, blockerId);
++    if (blocker && isOpen(blocker)) open.push(blocker.id);
++  }
++  return open;
++}
++
++/** Throws `IssueBlockedError` when `issueId` still has open blockers. */
++export async function assertNotBlocked(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<void> {
++  const open = await openBlockerIds(orgId, issueId);
++  if (open.length > 0) throw new IssueBlockedError(issueId, open);
++}
++
++export async function addBlocker(
++  actor: Actor,
++  input: IssueDependencyInput,
++): Promise<IssueDependency> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  const blocker = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.blockerId),
++    "Issue",
++    input.blockerId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++
++  if (issue.id === blocker.id) {
++    throw new Error("An issue cannot block itself");
++  }
++  assertNotArchived("Issue", issue.id, issue);
++  assertNotArchived("Issue", blocker.id, blocker);
++
++  const existing = await dependencyRepo.findDependency(
++    input.orgId,
++    issue.id,
++    blocker.id,
++  );
++  if (existing) return existing;
++
++  if (await isBlockedTransitively(input.orgId, blocker.id, issue.id)) {
++    throw new Error("Adding this blocker would create a dependency cycle");
++  }
++
++  return dependencyRepo.insertDependency(
++    input.orgId,
++    issue.id,
++    blocker.id,
++    actor.userId,
++  );
++}
++
++export async function removeBlocker(
++  actor: Actor,
++  input: IssueDependencyInput,
++): Promise<boolean> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++
++  return dependencyRepo.deleteDependency(input.orgId, issue.id, input.blockerId);
++}
++
++export async function listBlockers(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++
++  const blockers: Issue[] = [];
++  for (const blockerId of await dependencyRepo.listBlockerIds(orgId, issue.id)) {
++    const blocker = await issueRepo.findIssueById(orgId, blockerId);
++    if (blocker && !isArchived(blocker)) blockers.push(blocker);
++  }
++
++  return blockers.sort((a, b) =>
++    a.number !== b.number ? a.number - b.number : a.id < b.id ? -1 : 1,
++  );
++}
++
++/** True when `from` is blocked, directly or through a chain, by `target`. */
++async function isBlockedTransitively(
++  orgId: OrgId,
++  from: IssueId,
++  target: IssueId,
++): Promise<boolean> {
++  const seen = new Set<IssueId>();
++  const queue: IssueId[] = [from];
++
++  while (queue.length > 0) {
++    const current = queue.shift() as IssueId;
++    if (current === target) return true;
++    if (seen.has(current)) continue;
++    seen.add(current);
++    queue.push(...(await dependencyRepo.listBlockerIds(orgId, current)));
++  }
++
++  return false;
++}
++
++/**
++ * `blockerId` just went from open to closed: tell the assignee of every
++ * dependant that has no open blocker left.
++ */
++async function announceUnblocked(
++  orgId: OrgId,
++  blockerId: IssueId,
++  actorId: UserId | null,
++): Promise<void> {
++  for (const blockedId of await dependencyRepo.listBlockedIds(orgId, blockerId)) {
++    const blocked = await issueRepo.findIssueById(orgId, blockedId);
++    if (!blocked || !isOpen(blocked) || blocked.assigneeId === null) continue;
++    if ((await openBlockerIds(orgId, blocked.id)).length > 0) continue;
++
++    await notify(orgId, "issue_unblocked", [blocked.assigneeId], {
++      title: "An issue you are assigned to is unblocked",
++      body: `Issue ${blocked.id} has no open blockers left`,
++      href: `/issues/${blocked.id}`,
++      actorId,
++    });
++  }
++}
++
++export function registerDependencyListeners(): Unsubscribe {
++  const offs: Unsubscribe[] = [
++    subscribe("issue.status_changed", async (payload) => {
++      if (isClosedStatus(payload.from) || !isClosedStatus(payload.to)) return;
++      await announceUnblocked(payload.orgId, payload.issueId, payload.actorId);
++    }),
++    subscribe("issue.archived", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (!issue || isClosedStatus(issue.status)) return;
++      await announceUnblocked(payload.orgId, payload.issueId, payload.actorId);
++    }),
++  ];
++
++  return () => {
++    for (const off of offs) off();
++  };
++}
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+index 68b40d5..c49430b 100644
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -14,6 +14,7 @@ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertNotBlocked } from "./issue-dependency-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -125,6 +126,10 @@ export async function changeIssueStatus(
+ 
+   if (before.status === input.status) return before;
+ 
++  if (input.status === "done") {
++    await assertNotBlocked(input.orgId, before.id);
++  }
++
+   const after = await issueRepo.setIssueStatus(
+     input.orgId,
+     input.issueId,
+diff --git a/src/types/issue.ts b/src/types/issue.ts
+index 6ce2730..103571f 100644
+--- a/src/types/issue.ts
++++ b/src/types/issue.ts
+@@ -65,6 +65,14 @@ export interface IssueLabel extends TenantScoped {
+   readonly description: string | null;
+ }
+ 
++/** "`issueId` is blocked by `blockerId`" — both issues live in `orgId`. */
++export interface IssueDependency extends TenantScoped {
++  readonly issueId: IssueId;
++  readonly blockerId: IssueId;
++  readonly createdBy: UserId;
++  readonly createdAt: IsoTimestamp;
++}
++
+ export interface IssueAttachment extends Timestamps, TenantScoped {
+   readonly id: AttachmentId;
+   readonly issueId: IssueId;
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+index a7ff8b5..59295c3 100644
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -17,7 +17,8 @@ export type NotificationKind =
+   | "member_joined"
+   | "project_archived"
+   | "plan_limit_reached"
+-  | "digest_ready";
++  | "digest_ready"
++  | "issue_unblocked";
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 

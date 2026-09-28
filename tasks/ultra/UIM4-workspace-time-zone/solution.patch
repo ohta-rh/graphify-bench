@@ -1,0 +1,676 @@
+diff --git a/src/app/(dashboard)/[orgSlug]/@panel/page.tsx b/src/app/(dashboard)/[orgSlug]/@panel/page.tsx
+--- a/src/app/(dashboard)/[orgSlug]/@panel/page.tsx
++++ b/src/app/(dashboard)/[orgSlug]/@panel/page.tsx
+@@ -43,7 +43,7 @@
+     orgId: org.id,
+     limit: PANEL_ACTIVITY_LIMIT,
+   });
+-  const groups = groupByDay(page.items);
++  const groups = groupByDay(page.items, org.settings.timeZone);
+ 
+   return (
+     <section className="p-6">
+diff --git a/src/app/(dashboard)/[orgSlug]/activity/page.tsx b/src/app/(dashboard)/[orgSlug]/activity/page.tsx
+--- a/src/app/(dashboard)/[orgSlug]/activity/page.tsx
++++ b/src/app/(dashboard)/[orgSlug]/activity/page.tsx
+@@ -80,7 +80,7 @@
+         </p>
+       </header>
+ 
+-      <ActivityFeed groups={groupByDay(page.items)} actors={actors} actor={actor} />
++      <ActivityFeed groups={groupByDay(page.items, org.settings.timeZone)} actors={actors} actor={actor} />
+     </div>
+   );
+ }
+diff --git a/src/lib/date.ts b/src/lib/date.ts
+--- a/src/lib/date.ts
++++ b/src/lib/date.ts
+@@ -1,6 +1,6 @@
+ /**
+  * Timestamp helpers: ISO round-tripping, relative formatting, due-date and
+- * digest-window arithmetic.
++ * digest-window arithmetic, all of it on a workspace clock (an IANA time zone).
+  *
+  * Every timestamp in Taskflow is an `IsoTimestamp` (a UTC ISO-8601 string in
+  * a SQLite text column). Nothing outside this module constructs a `Date` from
+@@ -68,50 +68,189 @@
+   }).format(parseIso(value));
+ }
+ 
+-/** True when a due date exists and has already passed. */
++/**
++ * True when a due date exists and its calendar day — on the workspace clock —
++ * is already over. Due dates are whole days: an issue due today is not
++ * overdue until the day ends, whatever time of day `dueAt` names.
++ */
+ export function isOverdue(
+   dueAt: IsoTimestamp | null,
+   reference: Date = new Date(),
++  timeZone = "UTC",
+ ): boolean {
+   if (dueAt === null) return false;
+-  return parseIso(dueAt).getTime() < reference.getTime();
++  return (
++    parseIso(dueAt).getTime() <
++    parseIso(startOfLocalDay(reference, timeZone)).getTime()
++  );
+ }
+ 
+ export function addDays(value: IsoTimestamp, days: number): IsoTimestamp {
+   return toIsoTimestamp(new Date(parseIso(value).getTime() + days * DAY_MS));
+ }
+ 
+-/**
+- * The 24-hour window a digest covers, ending at today's `digestHourUtc`. If
+- * that hour has not arrived yet on `reference`'s day, the window is the one
+- * that ended yesterday — so a job run early never mails an empty digest and
+- * then skips the real one.
++/** True when `timeZone` is an IANA zone name `Intl` recognises. */
++export function isValidTimeZone(timeZone: string): boolean {
++  if (timeZone.length === 0) return false;
++  try {
++    new Intl.DateTimeFormat("en-US", { timeZone });
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** Throws a `RangeError` unless `timeZone` is a recognised IANA zone. */
++export function assertValidTimeZone(timeZone: string): void {
++  if (!isValidTimeZone(timeZone)) {
++    throw new RangeError(`Unknown time zone: "${timeZone}"`);
++  }
++}
++
++type WallClock = {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++};
++
++const formatters = new Map<string, Intl.DateTimeFormat>();
++
++function wallClock(instant: Date, timeZone: string): WallClock {
++  let formatter = formatters.get(timeZone);
++  if (!formatter) {
++    formatter = new Intl.DateTimeFormat("en-US", {
++      timeZone,
++      hourCycle: "h23",
++      year: "numeric",
++      month: "2-digit",
++      day: "2-digit",
++      hour: "2-digit",
++      minute: "2-digit",
++      second: "2-digit",
++    });
++    formatters.set(timeZone, formatter);
++  }
++
++  const parts: Record<string, number> = {};
++  for (const part of formatter.formatToParts(instant)) {
++    if (part.type !== "literal") parts[part.type] = Number(part.value);
++  }
++
++  return {
++    year: parts.year ?? 0,
++    month: parts.month ?? 1,
++    day: parts.day ?? 1,
++    hour: parts.hour ?? 0,
++    minute: parts.minute ?? 0,
++    second: parts.second ?? 0,
++  };
++}
++
++/** Milliseconds the zone's wall clock is ahead of UTC at `instant`. */
++function zoneOffsetMs(instant: Date, timeZone: string): number {
++  const wall = wallClock(instant, timeZone);
++  const asUtc = Date.UTC(
++    wall.year,
++    wall.month - 1,
++    wall.day,
++    wall.hour,
++    wall.minute,
++    wall.second,
++  );
++  return asUtc - Math.floor(instant.getTime() / 1000) * 1000;
++}
++
++/**
++ * The UTC instant at which the zone's wall clock reads the given local date
++ * and hour. `day` may overflow; it is normalised like `Date.UTC` does.
++ */
++function zonedInstant(
++  year: number,
++  month: number,
++  day: number,
++  hour: number,
++  timeZone: string,
++): Date {
++  const wallAsUtc = Date.UTC(year, month - 1, day, hour, 0, 0, 0);
++  let instant = wallAsUtc - zoneOffsetMs(new Date(wallAsUtc), timeZone);
++  instant = wallAsUtc - zoneOffsetMs(new Date(instant), timeZone);
++  return new Date(instant);
++}
++
++/** `YYYY-MM-DD` of the calendar day `value` falls on in `timeZone`. */
++export function localDate(value: IsoTimestamp, timeZone: string): string {
++  const wall = wallClock(parseIso(value), timeZone);
++  return [
++    String(wall.year).padStart(4, "0"),
++    String(wall.month).padStart(2, "0"),
++    String(wall.day).padStart(2, "0"),
++  ].join("-");
++}
++
++/** Local midnight, as a UTC instant, of the zone's day containing `reference`. */
++export function startOfLocalDay(
++  reference: Date,
++  timeZone: string,
++): IsoTimestamp {
++  return startOfLocalDayOffset(reference, timeZone, 0);
++}
++
++/**
++ * Local midnight `days` calendar days away from the zone's day containing
++ * `reference`. Calendar days, not multiples of 24 hours: across a DST change
++ * the distance is 23 or 25 hours.
++ */
++export function startOfLocalDayOffset(
++  reference: Date,
++  timeZone: string,
++  days: number,
++): IsoTimestamp {
++  const wall = wallClock(reference, timeZone);
++  return toIsoTimestamp(
++    zonedInstant(wall.year, wall.month, wall.day + days, 0, timeZone),
++  );
++}
++
++/** The hour (0-23) the zone's wall clock shows at `reference`. */
++export function localHour(reference: Date, timeZone: string): number {
++  return wallClock(reference, timeZone).hour;
++}
++
++/**
++ * The window a digest covers, ending at the most recent `digestHour:00` on the
++ * workspace clock. If that hour has not arrived yet on `reference`'s local
++ * day, the window is the one that ended the previous local day — so a job run
++ * early never mails an empty digest and then skips the real one. The window
++ * starts at the same local hour one calendar day earlier, so across a DST
++ * change it spans 23 or 25 hours.
+  */
+ export function digestWindow(
+-  digestHourUtc: number,
++  digestHour: number,
+   reference: Date,
++  timeZone = "UTC",
+ ): { start: IsoTimestamp; end: IsoTimestamp } {
+-  if (!Number.isInteger(digestHourUtc) || digestHourUtc < 0 || digestHourUtc > 23) {
+-    throw new RangeError(`digestHourUtc must be 0-23, got ${digestHourUtc}`);
+-  }
+-
+-  const end = new Date(
+-    Date.UTC(
+-      reference.getUTCFullYear(),
+-      reference.getUTCMonth(),
+-      reference.getUTCDate(),
+-      digestHourUtc,
+-      0,
+-      0,
+-      0,
+-    ),
+-  );
++  if (!Number.isInteger(digestHour) || digestHour < 0 || digestHour > 23) {
++    throw new RangeError(`digestHour must be 0-23, got ${digestHour}`);
++  }
++
++  const wall = wallClock(reference, timeZone);
++  let dayOffset = 0;
++  let end = zonedInstant(wall.year, wall.month, wall.day, digestHour, timeZone);
+   if (end.getTime() > reference.getTime()) {
+-    end.setUTCDate(end.getUTCDate() - 1);
+-  }
+-
+-  return {
+-    start: toIsoTimestamp(new Date(end.getTime() - DAY_MS)),
+-    end: toIsoTimestamp(end),
+-  };
+-}
++    dayOffset = -1;
++    end = zonedInstant(wall.year, wall.month, wall.day - 1, digestHour, timeZone);
++  }
++
++  const start = zonedInstant(
++    wall.year,
++    wall.month,
++    wall.day + dayOffset - 1,
++    digestHour,
++    timeZone,
++  );
++
++  return { start: toIsoTimestamp(start), end: toIsoTimestamp(end) };
++}
+diff --git a/src/schemas/organization.ts b/src/schemas/organization.ts
+--- a/src/schemas/organization.ts
++++ b/src/schemas/organization.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { isValidTimeZone } from "@/lib/date";
+ import { orgIdSchema } from "./common";
+ import { slugSchema } from "./slug";
+ import { planIdSchema } from "./billing";
+@@ -11,6 +12,10 @@
+   requireTwoFactor: z.boolean().default(false),
+   digestHourUtc: z.number().int().min(0).max(23).default(7),
+   enabledFlagOverrides: z.array(z.string()).default([]),
++  timeZone: z
++    .string()
++    .refine(isValidTimeZone, { message: "Unknown time zone" })
++    .default("UTC"),
+ });
+ 
+ export const createOrganizationSchema = z.object({
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -60,6 +60,7 @@
+      allow_public_projects INTEGER NOT NULL DEFAULT 0,
+      require_two_factor INTEGER NOT NULL DEFAULT 0,
+      digest_hour_utc INTEGER NOT NULL DEFAULT 7,
++     time_zone TEXT NOT NULL DEFAULT 'UTC',
+      enabled_flag_overrides TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+diff --git a/src/server/db/schema/organizations.ts b/src/server/db/schema/organizations.ts
+--- a/src/server/db/schema/organizations.ts
++++ b/src/server/db/schema/organizations.ts
+@@ -23,6 +23,7 @@
+       .notNull()
+       .default(false),
+     digestHourUtc: integer("digest_hour_utc").notNull().default(7),
++    timeZone: text("time_zone").notNull().default("UTC"),
+     enabledFlagOverrides: text("enabled_flag_overrides").notNull().default("[]"),
+     ...timestampColumns,
+     ...softDeleteColumns,
+diff --git a/src/server/jobs/cleanup-archived-job.ts b/src/server/jobs/cleanup-archived-job.ts
+--- a/src/server/jobs/cleanup-archived-job.ts
++++ b/src/server/jobs/cleanup-archived-job.ts
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): getPlanLimits, isArchived
+  */
+ import { getPlanLimits } from "@/config/plan-limits";
++import { startOfLocalDayOffset } from "@/lib/date";
+ import { createLogger } from "@/lib/logger";
+ import { isArchived } from "@/lib/soft-delete";
+ import * as activityRepo from "@/server/repositories/activity-repository";
+@@ -17,7 +18,6 @@
+ 
+ const ORG_BATCH = 25;
+ const PAGE_SIZE = 100;
+-const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("cleanup-archived-job");
+ 
+@@ -38,9 +38,13 @@
+       const org = await orgRepo.findOrgById(orgId);
+       if (!org) continue;
+ 
++      // Retention counts whole calendar days on the workspace clock: the
++      // cut-off is local midnight `retentionDays` days before today.
+       const { retentionDays } = getPlanLimits(org.plan);
+-      const cutoff = toIsoTimestamp(
+-        new Date(now.getTime() - retentionDays * MS_PER_DAY),
++      const cutoff = startOfLocalDayOffset(
++        now,
++        org.settings.timeZone,
++        -retentionDays,
+       );
+ 
+       const archived = await issueRepo.listIssues({
+diff --git a/src/server/jobs/digest-email-job.ts b/src/server/jobs/digest-email-job.ts
+--- a/src/server/jobs/digest-email-job.ts
++++ b/src/server/jobs/digest-email-job.ts
+@@ -3,6 +3,7 @@
+  *
+  * Must call (do not reimplement): isEnabled, buildDigest, sendEmail
+  */
++import { digestWindow, localHour } from "@/lib/date";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { createLogger } from "@/lib/logger";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+@@ -18,13 +19,12 @@
+ import type { Organization } from "@/types/organization";
+ 
+ const ORG_BATCH = 50;
+-const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("digest-email-job");
+ 
+ /**
+- * One pass per scheduler tick. Each org is only processed during the UTC hour
+- * it configured, so a tick that runs every few minutes still sends exactly one
++ * One pass per scheduler tick. Each org is only processed during the hour it
++ * configured, read on the workspace clock, so a tick that runs every few minutes still sends exactly one
+  * digest per day per recipient.
+  */
+ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
+@@ -37,8 +37,12 @@
+ 
+       if (!isEnabled("digest_email", buildFlagContext(null, org))) continue;
+ 
+-      const windowEnd = toIsoTimestamp(now);
+-      const windowStart = toIsoTimestamp(new Date(now.getTime() - MS_PER_DAY));
++      const { start: windowStart, end: windowEnd } = digestWindow(
++        org.settings.digestHourUtc,
++        now,
++        org.settings.timeZone,
++      );
++      const readAt = toIsoTimestamp(now);
+ 
+       for (const recipientId of await listDigestRecipients(orgId)) {
+         try {
+@@ -60,7 +64,7 @@
+           // is what keeps a later run inside the same window from sending
+           // the same digest twice.
+           for (const entry of bundle.entries) {
+-            await notificationRepo.markRead(orgId, entry.notificationId, windowEnd);
++            await notificationRepo.markRead(orgId, entry.notificationId, readAt);
+           }
+ 
+           result.processed += 1;
+@@ -78,10 +82,11 @@
+ }
+ 
+ /**
+- * True during the org's configured digest hour. Exported because the schedule
+- * decision is worth testing on its own, without a database.
++ * True during the org's configured digest hour on the workspace clock.
++ * Exported because the schedule decision is worth testing on its own, without
++ * a database.
+  */
+ export function shouldRunForOrg(org: Organization, now: Date): boolean {
+   if (org.archivedAt !== null) return false;
+-  return now.getUTCHours() === org.settings.digestHourUtc;
++  return localHour(now, org.settings.timeZone) === org.settings.digestHourUtc;
+ }
+diff --git a/src/server/jobs/overdue-issue-job.ts b/src/server/jobs/overdue-issue-job.ts
+--- a/src/server/jobs/overdue-issue-job.ts
++++ b/src/server/jobs/overdue-issue-job.ts
+@@ -3,10 +3,12 @@
+  *
+  * Must call (do not reimplement): emit, shouldFilterArchived
+  */
++import { startOfLocalDay } from "@/lib/date";
+ import { emit } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -48,7 +50,15 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+-      const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org) continue;
++
++      // Due dates are whole days on the workspace clock: an issue is overdue
++      // once the local day holding its due date has ended.
++      const overdue = await issueRepo.listOverdueIssues(
++        orgId,
++        startOfLocalDay(now, org.settings.timeZone),
++      );
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
+diff --git a/src/server/repositories/_mappers.ts b/src/server/repositories/_mappers.ts
+--- a/src/server/repositories/_mappers.ts
++++ b/src/server/repositories/_mappers.ts
+@@ -120,6 +120,7 @@
+       allowPublicProjects: row.allowPublicProjects,
+       requireTwoFactor: row.requireTwoFactor,
+       digestHourUtc: row.digestHourUtc,
++      timeZone: row.timeZone,
+       enabledFlagOverrides: parseJsonArray<string>(row.enabledFlagOverrides),
+     },
+     createdAt: brandStamp(row.createdAt),
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -503,10 +503,13 @@
+   return rows.length;
+ }
+ 
+-/** Live, still-open issues whose due date has passed. Drives the overdue job. */
++/**
++ * Live, still-open issues due before `dayStart` — the local midnight that
++ * starts the workspace's current day. Drives the overdue job.
++ */
+ export async function listOverdueIssues(
+   orgId: OrgId,
+-  now: IsoTimestamp,
++  dayStart: IsoTimestamp,
+ ): Promise<readonly Issue[]> {
+   const rows = getDb()
+     .select()
+@@ -517,7 +520,7 @@
+           orgPredicate(issues.orgId, orgId),
+           livePredicate(issues.archivedAt, {}),
+           isNotNull(issues.dueAt),
+-          lt(issues.dueAt, now),
++          lt(issues.dueAt, dayStart),
+           inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
+         ),
+       ),
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+ import { and, eq, isNull, like } from "drizzle-orm";
++import { assertValidTimeZone } from "@/lib/date";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -94,6 +95,7 @@
+   if (!current) throw new Error(`Organization ${orgId} not found`);
+ 
+   const settings = { ...current.settings, ...(patch.settings ?? {}) };
++  assertValidTimeZone(settings.timeZone);
+ 
+   const row = getDb()
+     .update(organizations)
+@@ -104,6 +106,7 @@
+       allowPublicProjects: settings.allowPublicProjects,
+       requireTwoFactor: settings.requireTwoFactor,
+       digestHourUtc: settings.digestHourUtc,
++      timeZone: settings.timeZone,
+       enabledFlagOverrides: JSON.stringify(settings.enabledFlagOverrides),
+       updatedAt: toIsoTimestamp(new Date()),
+     })
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -3,7 +3,19 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, inArray, isNotNull, like, lt, sql } from "drizzle-orm";
++import {
++  and,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNotNull,
++  like,
++  lt,
++  notInArray,
++  sql,
++} from "drizzle-orm";
++import { startOfLocalDay } from "@/lib/date";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -217,10 +229,16 @@
+   return rows.map((row) => row.slug);
+ }
+ 
+-/** Open/closed/overdue counters plus the last write, for the project card. */
++/**
++ * Open/closed/overdue counters plus the last write, for the project card.
++ * `overdueIssues` follows the one overdue rule: open issues whose due day, on
++ * the workspace clock, ended before `now`'s local day began.
++ */
+ export async function getProjectStats(
+   orgId: OrgId,
+   projectId: ProjectId,
++  timeZone = "UTC",
++  now: Date = new Date(),
+ ): Promise<ProjectStats> {
+   const db = getDb();
+   const scope = and(
+@@ -243,8 +261,9 @@
+     .where(
+       and(
+         scope,
++        notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         isNotNull(issues.dueAt),
+-        lt(issues.dueAt, toIsoTimestamp(new Date())),
++        lt(issues.dueAt, startOfLocalDay(now, timeZone)),
+       ),
+     )
+     .get();
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): assertCan, assertOrgScope, subscribe, isEnabled, toCsv
+  */
+ import { toCsv } from "@/lib/csv";
++import { localDate } from "@/lib/date";
+ import { subscribe } from "@/lib/event-bus";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+@@ -74,14 +75,17 @@
+   return activityRepo.listActivity(input);
+ }
+ 
+-/** Groups a feed page by calendar day, newest day first. */
++/**
++ * Groups a feed page by calendar day on the workspace clock, newest day first.
++ */
+ export function groupByDay(
+   events: readonly ActivityEvent[],
++  timeZone = "UTC",
+ ): readonly ActivityGroup[] {
+   const byDay = new Map<string, ActivityEvent[]>();
+ 
+   for (const event of events) {
+-    const day = event.occurredAt.slice(0, 10);
++    const day = localDate(event.occurredAt, timeZone);
+     const bucket = byDay.get(day) ?? [];
+     bucket.push(event);
+     byDay.set(day, bucket);
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -163,9 +163,11 @@
+   );
+   assertCan(actor, "project:read", projectResource(project));
+ 
++  const timeZone = await workspaceTimeZone(orgId);
++
+   return {
+     project,
+-    stats: await projectRepo.getProjectStats(orgId, project.id),
++    stats: await projectRepo.getProjectStats(orgId, project.id, timeZone),
+   };
+ }
+ 
+@@ -177,15 +179,26 @@
+   assertCan(actor, "project:read", orgResource(input.orgId));
+ 
+   const page = await projectRepo.listProjects(input);
++  const timeZone = await workspaceTimeZone(input.orgId);
+ 
+   const items = await Promise.all(
+     page.items.map(async (project) => ({
+       project,
+-      stats: await projectRepo.getProjectStats(input.orgId, project.id),
++      stats: await projectRepo.getProjectStats(
++        input.orgId,
++        project.id,
++        timeZone,
++      ),
+     })),
+   );
+ 
+   return { items, nextCursor: page.nextCursor, total: page.total };
++}
++
++/** The clock every day-boundary decision for this workspace is taken on. */
++async function workspaceTimeZone(orgId: OrgId): Promise<string> {
++  const org = await orgRepo.findOrgById(orgId);
++  return org?.settings.timeZone ?? "UTC";
+ }
+ 
+ /**
+diff --git a/src/types/organization.ts b/src/types/organization.ts
+--- a/src/types/organization.ts
++++ b/src/types/organization.ts
+@@ -22,7 +22,10 @@
+   readonly defaultIssueStatus: string;
+   readonly allowPublicProjects: boolean;
+   readonly requireTwoFactor: boolean;
++  /** Despite the name, an hour on the workspace clock (see `timeZone`). */
+   readonly digestHourUtc: number;
++  /** IANA zone name; every calendar-day decision uses this clock. */
++  readonly timeZone: string;
+   readonly enabledFlagOverrides: readonly string[];
+ }
+ 
+diff --git a/tests/components/command-groups.test.ts b/tests/components/command-groups.test.ts
+--- a/tests/components/command-groups.test.ts
++++ b/tests/components/command-groups.test.ts
+@@ -28,6 +28,7 @@
+       requireTwoFactor: false,
+       digestHourUtc: 8,
+       enabledFlagOverrides: [],
++      timeZone: "UTC",
+     },
+   };
+ }
+diff --git a/tests/helpers/factories.ts b/tests/helpers/factories.ts
+--- a/tests/helpers/factories.ts
++++ b/tests/helpers/factories.ts
+@@ -73,6 +73,7 @@
+       requireTwoFactor: false,
+       digestHourUtc: 8,
+       enabledFlagOverrides: [],
++      timeZone: "UTC",
+     },
+     ...overrides,
+   };
+diff --git a/tests/lib/date.test.ts b/tests/lib/date.test.ts
+--- a/tests/lib/date.test.ts
++++ b/tests/lib/date.test.ts
+@@ -44,7 +44,9 @@
+ 
+   it("treats a null due date as never overdue", () => {
+     expect(isOverdue(null, REFERENCE)).toBe(false);
+-    expect(isOverdue(iso("2026-03-15T11:59:59.000Z"), REFERENCE)).toBe(true);
++    expect(isOverdue(iso("2026-03-14T23:59:59.000Z"), REFERENCE)).toBe(true);
++    // Due dates are whole days: due earlier today is not overdue yet.
++    expect(isOverdue(iso("2026-03-15T11:59:59.000Z"), REFERENCE)).toBe(false);
+     expect(isOverdue(iso("2026-03-15T12:00:01.000Z"), REFERENCE)).toBe(false);
+   });
+ 

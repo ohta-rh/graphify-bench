@@ -1,0 +1,364 @@
+diff --git a/src/server/jobs/search-reindex-job.ts b/src/server/jobs/search-reindex-job.ts
+--- a/src/server/jobs/search-reindex-job.ts
++++ b/src/server/jobs/search-reindex-job.ts
+@@ -7,6 +7,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
+ import {
+   indexComment,
+   indexIssue,
+@@ -14,7 +15,7 @@
+ } from "@/server/services/search-service";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+-import type { OrgId } from "@/types/common";
++import type { IssueId, OrgId, ProjectId } from "@/types/common";
+ 
+ /** Rows read per page while walking the org's content. */
+ const PAGE_SIZE = 100;
+@@ -22,60 +23,64 @@
+ const logger = createLogger("search-reindex-job");
+ 
+ /**
+- * Walks one tenant's projects, issues and comments and re-upserts every
+- * document. Scoped to a single org on purpose: a full-fleet reindex is a
+- * sequence of these, so one slow tenant cannot stall the rest.
+- *
+- * Archived rows are read too: the rebuild is what brings a restored project's
+- * content back, so it hands every row to the index writers and leaves the
+- * "is this searchable?" decision to them.
++ * Rebuilds one tenant's documents from scratch: the org's existing entries are
++ * dropped first, so whatever an older build or a missed event left behind
++ * cannot survive, and then every live project, every live issue of those
++ * projects and every live comment on those issues is written — all pages of
++ * each, not just the first. Scoped to a single org on purpose: a full-fleet
++ * reindex is a sequence of these, so one slow tenant cannot stall the rest.
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
++    await searchRepo.deleteAllSearchDocuments(orgId);
+ 
+-    for (const project of projects.items) {
+-      try {
+-        await indexProject(orgId, project);
+-        result.processed += 1;
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index project", {
+-          projectId: project.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
++    let projectCursor: string | null = null;
++    for (;;) {
++      const projects = await projectRepo.listProjects({
++        orgId,
++        limit: PAGE_SIZE,
++        cursor: projectCursor,
++      });
++
++      for (const project of projects.items) {
++        try {
++          await indexProject(orgId, project);
++          result.processed += 1;
++          await reindexIssuesOf(orgId, project.id, result);
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index project", {
++            projectId: project.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
++        }
+       }
++
++      if (projects.nextCursor === null) break;
++      projectCursor = projects.nextCursor;
+     }
++  });
++}
+ 
++async function reindexIssuesOf(
++  orgId: OrgId,
++  projectId: ProjectId,
++  result: JobResult,
++): Promise<void> {
++  let issueCursor: string | null = null;
++  for (;;) {
+     const issues = await issueRepo.listIssues({
+       orgId,
++      projectId,
+       limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
++      cursor: issueCursor,
+     });
+ 
+     for (const issue of issues.items) {
+       try {
+         await indexIssue(orgId, issue);
+         result.processed += 1;
+-
+-        const comments = await commentRepo.listComments({
+-          orgId,
+-          issueId: issue.id,
+-          includeArchived: true,
+-          limit: PAGE_SIZE,
+-          cursor: null,
+-        });
+-
+-        for (const comment of comments.items) {
+-          await indexComment(orgId, comment);
+-          result.processed += 1;
+-        }
++        await reindexCommentsOf(orgId, issue.id, result);
+       } catch (error) {
+         result.failed += 1;
+         logger.error("failed to index issue", {
+@@ -84,5 +89,33 @@
+         });
+       }
+     }
+-  });
++
++    if (issues.nextCursor === null) return;
++    issueCursor = issues.nextCursor;
++  }
+ }
++
++async function reindexCommentsOf(
++  orgId: OrgId,
++  issueId: IssueId,
++  result: JobResult,
++): Promise<void> {
++  let commentCursor: string | null = null;
++  for (;;) {
++    const comments = await commentRepo.listComments({
++      orgId,
++      issueId,
++      includeArchived: false,
++      limit: PAGE_SIZE,
++      cursor: commentCursor,
++    });
++
++    for (const comment of comments.items) {
++      await indexComment(orgId, comment);
++      result.processed += 1;
++    }
++
++    if (comments.nextCursor === null) return;
++    commentCursor = comments.nextCursor;
++  }
++}
+diff --git a/src/server/repositories/search-repository.ts b/src/server/repositories/search-repository.ts
+--- a/src/server/repositories/search-repository.ts
++++ b/src/server/repositories/search-repository.ts
+@@ -120,6 +120,19 @@
+   );
+ }
+ 
++/**
++ * Removes every document one org has in the index. The first step of a
++ * rebuild; scoped by `org_id` like every other statement here.
++ */
++export async function deleteAllSearchDocuments(orgId: OrgId): Promise<number> {
++  const rows = getDb()
++    .delete(searchIndex)
++    .where(orgPredicate(searchIndex.orgId, orgId))
++    .returning({ id: searchIndex.id })
++    .all();
++  return rows.length;
++}
++
+ /** Drift alarm input: how many documents this org currently has indexed. */
+ export async function countIndexed(orgId: OrgId): Promise<number> {
+   const row = getDb()
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -85,7 +85,77 @@
+   };
+ }
+ 
++/** Rows read per page while walking an issue's comments or a project's issues. */
++const WALK_PAGE = 100;
++
++/*
++ * The searchability rule, applied by every writer below so that no caller —
++ * an event handler, the rebuild job, a reindex request — can put something
++ * into the index that the rule forbids:
++ *
++ *   a project is searchable while it is live;
++ *   an issue while it and its project are live;
++ *   a comment while it, its issue and that issue's project are live.
++ *
++ * Each writer upserts when the rule holds and removes the document when it
++ * does not, so calling one is always safe and always idempotent.
++ */
++
++async function isProjectLive(orgId: OrgId, projectId: Project["id"]): Promise<boolean> {
++  const project = await projectRepo.findProjectById(orgId, projectId);
++  return project !== null && project.archivedAt === null;
++}
++
++async function isIssueSearchable(orgId: OrgId, issue: Issue): Promise<boolean> {
++  return issue.archivedAt === null && (await isProjectLive(orgId, issue.projectId));
++}
++
++/** Every comment on an issue, deleted ones included, walking all pages. */
++async function commentsOf(
++  orgId: OrgId,
++  issueId: Issue["id"],
++  includeArchived: boolean,
++): Promise<readonly Comment[]> {
++  const out: Comment[] = [];
++  let cursor: string | null = null;
++  for (;;) {
++    const page = await commentRepo.listComments({
++      orgId,
++      issueId,
++      includeArchived,
++      limit: WALK_PAGE,
++      cursor,
++    });
++    out.push(...page.items);
++    if (page.nextCursor === null) return out;
++    cursor = page.nextCursor;
++  }
++}
++
++/** Every issue of a project, archived ones included, walking all pages. */
++async function issuesOf(orgId: OrgId, projectId: Project["id"]): Promise<readonly Issue[]> {
++  const out: Issue[] = [];
++  let cursor: string | null = null;
++  for (;;) {
++    const page = await issueRepo.listIssues({
++      orgId,
++      projectId,
++      includeArchived: true,
++      limit: WALK_PAGE,
++      cursor,
++    });
++    out.push(...page.items);
++    if (page.nextCursor === null) return out;
++    cursor = page.nextCursor;
++  }
++}
++
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
++  if (!(await isIssueSearchable(orgId, issue))) {
++    await removeIssueTree(orgId, issue.id);
++    return;
++  }
++
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "issue",
+@@ -99,12 +169,22 @@
+   orgId: OrgId,
+   comment: Comment,
+ ): Promise<void> {
++  const issue =
++    comment.archivedAt === null
++      ? await issueRepo.findIssueById(orgId, comment.issueId)
++      : null;
++
++  if (issue === null || !(await isIssueSearchable(orgId, issue))) {
++    await searchRepo.deleteSearchDocument(orgId, "comment", comment.id);
++    return;
++  }
++
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    issue.projectId,
+   );
+ }
+ 
+@@ -112,6 +192,11 @@
+   orgId: OrgId,
+   project: Project,
+ ): Promise<void> {
++  if (project.archivedAt !== null) {
++    await searchRepo.deleteSearchDocument(orgId, "project", project.id);
++    return;
++  }
++
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "project",
+@@ -127,6 +212,44 @@
+   subjectId: string,
+ ): Promise<void> {
+   await searchRepo.deleteSearchDocument(orgId, subjectKind, subjectId);
++}
++
++/** Drops an issue and every comment on it from the index. */
++async function removeIssueTree(orgId: OrgId, issueId: Issue["id"]): Promise<void> {
++  await searchRepo.deleteSearchDocument(orgId, "issue", issueId);
++  for (const comment of await commentsOf(orgId, issueId, true)) {
++    await searchRepo.deleteSearchDocument(orgId, "comment", comment.id);
++  }
++}
++
++/** Re-applies the rule to an issue and every comment on it. */
++export async function syncIssueTree(orgId: OrgId, issue: Issue): Promise<void> {
++  if (!(await isIssueSearchable(orgId, issue))) {
++    await removeIssueTree(orgId, issue.id);
++    return;
++  }
++
++  await indexIssue(orgId, issue);
++  for (const comment of await commentsOf(orgId, issue.id, true)) {
++    await indexComment(orgId, comment);
++  }
++}
++
++/** Re-applies the rule to a project and everything inside it. */
++export async function syncProjectTree(
++  orgId: OrgId,
++  projectId: Project["id"],
++): Promise<void> {
++  const project = await projectRepo.findProjectById(orgId, projectId);
++  if (!project) {
++    await searchRepo.deleteSearchDocument(orgId, "project", projectId);
++    return;
++  }
++
++  await indexProject(orgId, project);
++  for (const issue of await issuesOf(orgId, projectId)) {
++    await syncIssueTree(orgId, issue);
++  }
+ }
+ 
+ /**
+@@ -145,7 +268,7 @@
+       if (issue) await indexIssue(payload.orgId, issue);
+     }),
+     subscribe("issue.archived", async (payload) => {
+-      await removeFromIndex(payload.orgId, "issue", payload.issueId);
++      await removeIssueTree(payload.orgId, payload.issueId);
+     }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+@@ -165,7 +288,10 @@
+       if (project) await indexProject(payload.orgId, project);
+     }),
+     subscribe("project.archived", async (payload) => {
+-      await removeFromIndex(payload.orgId, "project", payload.projectId);
++      await syncProjectTree(payload.orgId, payload.projectId);
++    }),
++    subscribe("project.restored", async (payload) => {
++      await syncProjectTree(payload.orgId, payload.projectId);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+       if (payload.subjectKind !== "issue") return;

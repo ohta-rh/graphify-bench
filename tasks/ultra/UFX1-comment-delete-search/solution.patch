@@ -1,0 +1,226 @@
+diff --git a/src/server/jobs/search-reindex-job.ts b/src/server/jobs/search-reindex-job.ts
+--- a/src/server/jobs/search-reindex-job.ts
++++ b/src/server/jobs/search-reindex-job.ts
+@@ -14,12 +14,25 @@
+ } from "@/server/services/search-service";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+-import type { OrgId } from "@/types/common";
++import type { OrgId, Page } from "@/types/common";
+ 
+ /** Rows read per page while walking the org's content. */
+ const PAGE_SIZE = 100;
+ 
+ const logger = createLogger("search-reindex-job");
++
++/** Calls `visit` for every row of a cursor-paged listing, page by page. */
++async function forEachRow<T>(
++  fetchPage: (cursor: string | null) => Promise<Page<T>>,
++  visit: (row: T) => Promise<void>,
++): Promise<void> {
++  let cursor: string | null = null;
++  do {
++    const page = await fetchPage(cursor);
++    for (const row of page.items) await visit(row);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++}
+ 
+ /**
+  * Walks one tenant's live projects, issues and comments and re-upserts every
+@@ -28,57 +41,51 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-    });
++    await forEachRow(
++      (cursor) => projectRepo.listProjects({ orgId, limit: PAGE_SIZE, cursor }),
++      async (project) => {
++        try {
++          await indexProject(orgId, project);
++          result.processed += 1;
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index project", {
++            projectId: project.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
++        }
++      },
++    );
+ 
+-    for (const project of projects.items) {
+-      try {
+-        await indexProject(orgId, project);
+-        result.processed += 1;
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index project", {
+-          projectId: project.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
+-      }
+-    }
++    await forEachRow(
++      (cursor) => issueRepo.listIssues({ orgId, limit: PAGE_SIZE, cursor }),
++      async (issue) => {
++        try {
++          await indexIssue(orgId, issue);
++          result.processed += 1;
+ 
+-    // Archived issues are still readable from their permalink, so the
+-    // rebuild covers them as well; the thread walk below picks up every
+-    // comment in reading order, replies included, in a single query.
+-    const issues = await issueRepo.listIssues({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
+-
+-    for (const issue of issues.items) {
+-      try {
+-        await indexIssue(orgId, issue);
+-        result.processed += 1;
+-
+-        const thread = await commentRepo.listThread(orgId, issue.id);
+-        const comments = thread.flatMap((node) => [
+-          node.comment,
+-          ...node.replies,
+-        ]);
+-
+-        for (const comment of comments) {
+-          await indexComment(orgId, comment);
+-          result.processed += 1;
++          await forEachRow(
++            (cursor) =>
++              commentRepo.listComments({
++                orgId,
++                issueId: issue.id,
++                includeArchived: false,
++                limit: PAGE_SIZE,
++                cursor,
++              }),
++            async (comment) => {
++              await indexComment(orgId, comment);
++              result.processed += 1;
++            },
++          );
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index issue", {
++            issueId: issue.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
+         }
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index issue", {
+-          issueId: issue.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
+-      }
+-    }
++      },
++    );
+   });
+ }
+diff --git a/src/server/repositories/comment-repository.ts b/src/server/repositories/comment-repository.ts
+--- a/src/server/repositories/comment-repository.ts
++++ b/src/server/repositories/comment-repository.ts
+@@ -125,10 +125,33 @@
+       and(
+         orgPredicate(comments.orgId, orgId),
+         eq(comments.issueId, issueId),
++        isNull(comments.archivedAt),
+       ),
+     )
+     .get();
+   return row?.value ?? 0;
++}
++
++/**
++ * Every comment id on one issue, deleted ones included — the search index
++ * keeps one document per comment and has to drop all of them when the issue
++ * leaves the index.
++ */
++export async function listCommentIdsForIssue(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly CommentId[]> {
++  const rows = getDb()
++    .select({ id: comments.id })
++    .from(comments)
++    .where(
++      and(
++        orgPredicate(comments.orgId, orgId),
++        eq(comments.issueId, issueId),
++      ),
++    )
++    .all();
++  return rows.map((row) => row.id as CommentId);
+ }
+ 
+ export async function insertComment(
+diff --git a/src/server/repositories/search-repository.ts b/src/server/repositories/search-repository.ts
+--- a/src/server/repositories/search-repository.ts
++++ b/src/server/repositories/search-repository.ts
+@@ -75,6 +75,25 @@
+     .run();
+ }
+ 
++/** Bulk form of `deleteSearchDocument` for one subject kind. */
++export async function deleteSearchDocuments(
++  orgId: OrgId,
++  subjectKind: SearchSubjectKind,
++  subjectIds: readonly string[],
++): Promise<void> {
++  if (subjectIds.length === 0) return;
++  getDb()
++    .delete(searchIndex)
++    .where(
++      and(
++        orgPredicate(searchIndex.orgId, orgId),
++        eq(searchIndex.subjectKind, subjectKind),
++        inArray(searchIndex.subjectId, [...subjectIds]),
++      ),
++    )
++    .run();
++}
++
+ /**
+  * Substring match over the denormalised content column. Deliberately simple —
+  * the index is a convenience layer, not a search engine, and the tenant filter
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -146,6 +146,16 @@
+     }),
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
++      // An archived issue's discussion leaves the index with it.
++      const commentIds = await commentRepo.listCommentIdsForIssue(
++        payload.orgId,
++        payload.issueId,
++      );
++      await searchRepo.deleteSearchDocuments(
++        payload.orgId,
++        "comment",
++        commentIds,
++      );
+     }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+@@ -155,7 +165,7 @@
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
+     subscribe("comment.deleted", async (payload) => {
+-      await removeFromIndex(payload.orgId, "issue", payload.commentId);
++      await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+     subscribe("project.created", async (payload) => {
+       const project = await projectRepo.findProjectById(

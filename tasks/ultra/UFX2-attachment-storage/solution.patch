@@ -1,0 +1,184 @@
+diff --git a/src/server/jobs/trial-expiry-job.ts b/src/server/jobs/trial-expiry-job.ts
+--- a/src/server/jobs/trial-expiry-job.ts
++++ b/src/server/jobs/trial-expiry-job.ts
+@@ -38,13 +38,15 @@
+ 
+       if (
+         usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.projectsUsed > freeLimits.projects ||
++        usage.storageMbUsed > freeLimits.storageMb
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+           orgId,
+           seats: usage.seatsUsed,
+           projects: usage.projectsUsed,
++          storageMb: usage.storageMbUsed,
+         });
+         continue;
+       }
+diff --git a/src/server/repositories/attachment-repository.ts b/src/server/repositories/attachment-repository.ts
+--- a/src/server/repositories/attachment-repository.ts
++++ b/src/server/repositories/attachment-repository.ts
+@@ -27,6 +27,27 @@
+     .orderBy(asc(attachments.createdAt))
+     .all();
+   return rows.map(toAttachment);
++}
++
++/**
++ * One attachment by id, whatever the state of its issue — a delete arrives
++ * with nothing but the id.
++ */
++export async function findAttachmentById(
++  orgId: OrgId,
++  attachmentId: AttachmentId,
++): Promise<IssueAttachment | null> {
++  const row = getDb()
++    .select()
++    .from(attachments)
++    .where(
++      and(
++        orgPredicate(attachments.orgId, orgId),
++        eq(attachments.id, attachmentId),
++      ),
++    )
++    .get();
++  return row ? toAttachment(row) : null;
+ }
+ 
+ export async function insertAttachment(
+diff --git a/src/server/repositories/usage-repository.ts b/src/server/repositories/usage-repository.ts
+--- a/src/server/repositories/usage-repository.ts
++++ b/src/server/repositories/usage-repository.ts
+@@ -73,9 +73,14 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  // Each file is charged its own size rounded up to whole megabytes — the
++  // same rule the upload path applies — so the recount agrees with it.
++  const storage = db
++    .select({
++      value: sql<number | null>`sum((${attachments.sizeBytes} + ${sql.raw(String(BYTES_PER_MB - 1))}) / ${sql.raw(String(BYTES_PER_MB))})`,
++    })
+     .from(attachments)
++    .where(eq(attachments.orgId, orgId))
+     .get();
+ 
+   const next = {
+@@ -83,7 +88,7 @@
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed: Number(storage?.value ?? 0),
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff --git a/src/server/services/attachment-service.ts b/src/server/services/attachment-service.ts
+--- a/src/server/services/attachment-service.ts
++++ b/src/server/services/attachment-service.ts
+@@ -64,7 +64,7 @@
+   );
+ 
+   const usage = await usageRepo.getUsage(input.orgId);
+-  const requestedMb = Math.ceil(input.sizeBytes / BYTES_PER_MB);
++  const requestedMb = chargedMb(input.sizeBytes);
+ 
+   if (
+     wouldExceedLimit(org.plan, "storageMb", usage.storageMbUsed, requestedMb)
+@@ -84,8 +84,8 @@
+ }
+ 
+ /**
+- * Removing an attachment gives the megabytes back to the quota — only whole
+- * ones, so a removal can never push the counter below what is really stored.
++ * Removing an attachment gives back exactly what its upload was charged:
++ * its size rounded up to whole megabytes.
+  */
+ export async function removeAttachment(
+   actor: Actor,
+@@ -94,7 +94,7 @@
+   assertOrgScope(actor, input.orgId);
+ 
+   const attachment = requireFound(
+-    await findAttachment(input.orgId, input.attachmentId),
++    await attachmentRepo.findAttachmentById(input.orgId, input.attachmentId),
+     "Attachment",
+     input.attachmentId,
+   );
+@@ -108,30 +108,11 @@
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+-    storageMbUsed: -Math.floor(attachment.sizeBytes / BYTES_PER_MB),
++    storageMbUsed: -chargedMb(attachment.sizeBytes),
+   });
+ }
+ 
+-/**
+- * The attachment repository only reads by issue, because that is the only way
+- * the UI ever reaches one. A delete arrives with just an id, so the org's
+- * issues are walked until the row turns up.
+- */
+-async function findAttachment(
+-  orgId: OrgId,
+-  attachmentId: string,
+-): Promise<IssueAttachment | null> {
+-  const page = await issueRepo.listIssues({
+-    orgId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  for (const issue of page.items) {
+-    const rows = await attachmentRepo.listAttachments(orgId, issue.id);
+-    const match = rows.find((row) => row.id === attachmentId);
+-    if (match) return match;
+-  }
+-
+-  return null;
++/** What one file costs against the quota: its size in whole megabytes. */
++function chargedMb(sizeBytes: number): number {
++  return Math.ceil(sizeBytes / BYTES_PER_MB);
+ }
+diff --git a/src/server/services/billing-service.ts b/src/server/services/billing-service.ts
+--- a/src/server/services/billing-service.ts
++++ b/src/server/services/billing-service.ts
+@@ -11,7 +11,6 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+-import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as invoiceRepo from "@/server/repositories/invoice-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+@@ -221,13 +220,7 @@
+   return org.plan;
+ }
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+-/**
+- * Maps a quota dimension onto the counter that measures it. Storage is read
+- * from the attachment table itself: the cached counter only moves on the
+- * upload path, so it would lag behind what is actually stored.
+- */
++/** Maps a quota dimension onto the counter that measures it. */
+ async function usageFor(
+   orgId: OrgId,
+   resource: LimitedResource,
+@@ -242,9 +235,7 @@
+     case "issuesPerProject":
+       return usage.issuesUsed;
+     case "storageMb":
+-      return Math.round(
+-        (await attachmentRepo.sumStorageBytes(orgId)) / BYTES_PER_MB,
+-      );
++      return usage.storageMbUsed;
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
+     case "apiRequestsPerHour":
