@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 24232,
+  "stop_reason": "end_turn",
+  "session_id": "0a8ed4df-d285-4f17-ab3a-193f3f174c36",
+  "total_cost_usd": 0.1605684,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 24490,
+    "cache_read_input_tokens": 152852,
+    "output_tokens": 3201,
+    "output_tokens_details": {
+      "thinking_tokens": 77
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 24490,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2120,
+        "cache_read_input_tokens": 33191,
+        "cache_creation_input_tokens": 1758,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1758
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 3201,
+      "cacheReadInputTokens": 152852,
+      "cacheCreationInputTokens": 24490,
+      "webSearchRequests": 0,
+      "costUSD": 0.1605684,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 77,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "When an owner moves a workspace to a smaller plan, the request is checked for permission, then checked against current usage, then written to the subscription row, then announced as an event. The code has a real gap after the write: nothing updates `organizations.plan`, so many product paths keep using the old plan. I read the code and did not run it.\n\n## Order of execution\n\n1. **Entry point.** The billing page calls the server action `changePlanAction` in `src/actions/billing/change-plan.ts`. It is wrapped by `withAction` with `changePlanSchema` (`src/schemas/billing.ts`), which validates the input (`orgId`, `plan`, `interval`) and resolves the actor.\n\n2. **Who may do it.** Only owners can. The action calls `can(actor, \"org:manage_billing\", {kind: \"billing\", orgId})` and throws `ForbiddenActionError` if that fails. `src/lib/permissions.ts` maps `org:manage_billing` to the `owner` role, whereas `org:update` and `org:manage_flags` only need `admin`. The service repeats the check with `assertOrgScope` (the actor must belong to that org) and `assertCan` in `changePlan` in `src/server/services/billing-service.ts`.\n\n3. **What is compared against what.** The target plan's limits are compared with the org's live usage, using a requested delta of 0 so the question is only whether what is already used still fits.\n   - The limits come from `PLAN_LIMITS` in `src/config/plan-limits.ts`, read through `getLimit` and `wouldExceedLimit`. Enterprise uses `Infinity` for \"unlimited\".\n   - The usage counters come from `usageRepo.getUsage`, which records `seatsUsed`, `projectsUsed` and `storageMbUsed`. The webhook count comes from `webhookRepo.countEndpoints`.\n   - The action's `assertPlanFitsCurrentUsage` checks seats, projects and storage first, via `getUsage` in `usage-service`. It throws `PlanLimitError` with the resource, the limit and the amount used.\n   - The service's `changePlan` then runs the same comparison over `SUMMARY_RESOURCES`, which are seats, projects, storageMb and webhooks. It throws a plain `Error` such as \"Cannot move to starter: 12 seats exceeds its limit of 10\". So the webhook count is only enforced at the service layer.\n   - A downgrade is refused outright if any resource is over quota. Nothing is deleted or force-trimmed.\n\n4. **Where the plan is recorded.**\n   - `subscriptionRepo.updateSubscriptionPlan` in `src/server/repositories/subscription-repository.ts` updates the `subscriptions` row. It sets `plan`, `interval`, `status: \"active\"` and `updatedAt`.\n   - The `subscriptions` row is the authority. `planFor()` in `billing-service.ts` says so and reads it first, falling back to `organizations.plan` only if no subscription exists. `checkLimit`, `assertWithinLimit`, `getBillingSummary` and `updateSeats` all go through it.\n   - `organizations.plan` is a denormalised copy meant for display. I found nothing that updates it on a plan change: `updateSubscriptionPlan` touches only `subscriptions`. `trial-expiry-job.ts` does the same.\n\n5. **Consequences after the write.**\n   - `changePlan` emits `billing.plan_changed` with `from` (the old `planFor` value) and `to`.\n   - `activity-service` records it in the activity feed as \"changed the plan\".\n   - `webhook-service` enqueues it for the org's webhook endpoints.\n   - Back in the action, `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` and the `revalidate: [\"billing\"]` option refresh cached pages.\n   - `getBillingSummary` recomputes `upcomingInvoiceCents` from the new plan's `priceCentsPerSeatMonthly` × seats (× 12 if annual).\n\n## What changes outside the billing pages\n\nWhether these follow the new plan depends on which stored value they read.\n\n**Read `subscriptions.plan` through `planFor` / `checkLimit`:**\n- The dashboard shell in `app/(dashboard)/[orgSlug]/layout.tsx` (its limit banners).\n- The members page seat check.\n\n**Read `org.plan`, which is stale after a change:**\n- **Create paths:**\n  - Projects: `project-service` and `actions/projects/create-project.ts`.\n  - Issues: `issue-service` and `create-issue`.\n  - Invites: `invitation-service`, `invite-member`, `accept-invitation`.\n  - Attachments: `attachment-service` checks the storage quota.\n  - Webhook creation: `webhook-service` and `create-webhook`.\n- **Feature flags:** `lib/feature-flags.ts` gates on `planAtLeast(ctx.plan, minPlan)`. The plan is fed in by `feature-flag-service`, `hooks/flag-context.ts` and the search, notification and activity services. So features such as `kanban_board`, `csv_export`, `activity_feed`, `webhooks` and `advanced_search` appear or disappear with the plan, using each plan's `includedFlags`.\n- **Webhook delivery:** `webhook-delivery-job` skips delivery when `webhooks` is 0 for the plan, which is the case on `free`.\n- **Retention:** `cleanup-archived-job` deletes archived rows older than `retentionDays` (30, 90, 365 or 2555 days by plan).\n- **Rate limiting:** `lib/rate-limit.ts` uses `apiRequestsPerHour`.\n- **API and UI:** the `/api/orgs/[orgId]/usage` route, `hooks/use-plan-limits.ts`, the org switcher and `/orgs` page labels, and the webhooks, new-project and new-issue pages.\n\n## The gap\n\nBecause `organizations.plan` is not updated, everything in the second group keeps using the old plan's limits, flags, retention and rate limits after a downgrade. Only the subscription-based paths pick up the new plan. Unless something outside the files I read syncs the column, quotas and flags stay on the old tier after a downgrade.",
+  "ttft_ms": 1347,
+  "type": "result",
+  "duration_ms": 24773,
+  "uuid": "50a49b03-be4c-4ade-a9fa-9de36a50227d",
+  "ttft_stream_ms": 687,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 688,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 41507,
+  "stop_reason": "end_turn",
+  "session_id": "84684dc7-a45b-4948-8f5c-45b139e6abcf",
+  "total_cost_usd": 0.2167478,
+  "usage": {
+    "input_tokens": 20,
+    "cache_creation_input_tokens": 30118,
+    "cache_read_input_tokens": 264829,
+    "output_tokens": 4327,
+    "output_tokens_details": {
+      "thinking_tokens": 257
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 30118,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2203,
+        "cache_read_input_tokens": 39297,
+        "cache_creation_input_tokens": 1280,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1280
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 20,
+      "outputTokens": 4327,
+      "cacheReadInputTokens": 264829,
+      "cacheCreationInputTokens": 30118,
+      "webSearchRequests": 0,
+      "costUSD": 0.2167478,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 257,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 11,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Between the browser and the customer's endpoint there are two stages: a synchronous step that records a delivery row, and a background job that later drains the rows. One important caveat comes first: this codebase never makes an outbound HTTP call.\n\n## 1. What starts it\n\n1. The form in `src/components/domain/issue/issue-form.tsx` is rendered by `.../issues/new/page.tsx`. It passes `createIssueAction` as `onSubmit`.\n2. `useFormAction` (`src/hooks/use-form-action.ts`) calls that Server Action.\n3. `createIssueAction` in `src/actions/issues/create-issue.ts` runs through `withAction`. It validates the input with `createIssueSchema`, checks `can(actor, \"issue:create\")`, and checks the plan quota in `assertProjectHasRoom`.\n4. It then calls `createIssue` in `src/server/services/issue-service.ts`. That function checks tenant scope, the permission, the project and the quota again, then inserts the issue.\n5. The trigger is the last step of `createIssue`: `await emit(\"issue.created\", {...})`. `emit` lives in `src/lib/event-bus.ts`, an in-process typed pub/sub. It runs every subscriber with `Promise.allSettled`, so a failing handler never fails the issue creation.\n\nThe subscribers were attached earlier, at process start. `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts` and then `startScheduler()`. `registerEventHandlers` includes `registerWebhookListeners()`.\n\n## 2. Working out which endpoints should hear about it\n\n`registerWebhookListeners` in `src/server/services/webhook-service.ts` subscribes to `issue.created` and several other events. Its `issue.created` handler calls `enqueueForOrg(orgId, \"issue.created\", JSON.stringify(payload))`.\n\n`enqueueForOrg` does the fan-out:\n- It loads the org's endpoints with `webhookRepo.listEndpoints(orgId)`.\n- It skips endpoints that are not `enabled`.\n- It parses each endpoint's `eventTypes` JSON and skips endpoints that did not list this event type.\n- For each remaining endpoint it calls `webhookRepo.enqueueDelivery(...)` in `src/server/repositories/webhook-repository.ts`.\n\n`enqueueDelivery` inserts a `webhook_deliveries` row with `status: \"pending\"`, `attempts: 0` and the JSON payload as a string. The payload string is fixed at this point.\n\nPlan gating is not checked here. It happens when the endpoint is created (`createWebhook` checks the `webhooks` flag and the plan's endpoint count) and again in the job.\n\n## 3. What performs the send\n\nThe row is drained in the background, off the request path:\n- `startScheduler()` in `src/server/jobs/scheduler.ts` sets a 60-second interval. `tick()` enqueues a `webhook-delivery` job (its cadence is 1 minute) into the in-memory queue in `src/server/jobs/queue.ts`, then calls `drain()`.\n- `drain` calls `runHandler`, which dynamically imports `runWebhookDeliveryJob` from `src/server/jobs/webhook-delivery-job.ts`.\n- The route `src/app/api/cron/webhook-delivery/route.ts` is an alternative trigger. It checks `assertCronSecret` and calls the same `runWebhookDeliveryJob`.\n\n`runWebhookDeliveryJob` first calls `webhookRepo.claimPendingDeliveries(25)`, which selects pending rows oldest first and increments `attempts` on each. For each claimed row, it does this:\n1. `orgAllowsWebhooks` checks the org's plan (`getPlanLimits(...).webhooks`) and the feature flag. If either fails, the job calls `markDeliveryFailed`.\n2. If `delivery.attempts > MAX_ATTEMPTS` (6), the job calls `markDeliveryFailed` with \"giving up\".\n3. It looks up the endpoint. If the endpoint is missing or disabled, the job calls `markDeliveryFailed`.\n4. Otherwise it calls `signPayload(endpoint.secret, delivery.payload)`, logs \"webhook delivered\", and calls `markDelivered`.\n\nThe file's own comment says there is no outbound HTTP in Taskflow, because the corpus builds and runs offline. \"Delivery\" therefore means computing the signature and logging it. Nothing POSTs to the customer's URL.\n\n## 4. What happens when it doesn't succeed the first time\n\nThere are two retry layers, and neither retries an HTTP failure, because none can occur:\n- **Delivery-row layer.** A row is only terminal when it is `delivered` or `failed`. `claimPendingDeliveries` leaves a row `pending` and bumps `attempts`. Any pass that neither delivers nor fails it leaves it pending, so the next minute's tick picks it up again. It is marked `failed` once `attempts` exceeds 6.\n  - The job exports `backoffMs` (0, 1s, 2s, 4s, … capped at 5 minutes). It is only logged as `backoffMs`. Nothing stores a next-attempt time or skips rows that aren't due, so the backoff is not enforced.\n  - As written, the job also marks every valid row delivered on its first pass. In practice the retry path only matters if you add a real send that can fail.\n- **Job-queue layer.** In `queue.ts`, if `runWebhookDeliveryJob` throws, `drain` re-queues the job with its own backoff (1s, 2s, 4s, … capped at 60s). It drops the job after 5 attempts.\n\n## 5. How the receiver verifies it came from Taskflow\n\n`signPayload` in `webhook-service.ts` computes HMAC-SHA256 over the raw payload string, hex encoded, using the endpoint's secret. `createWebhook` mints that secret with `randomToken(32)`. It is never regenerated, so rotating it means deleting and recreating the endpoint. The receiver recomputes the HMAC over the exact bytes it received, using its copy of the secret, and compares.\n\nThe signature is not attached to anything real, because nothing is sent. The job only logs the first 16 characters of it. To let customers check their verification code, `src/app/api/webhooks/[endpointId]/test/route.ts` builds a `webhook.test` payload and returns the payload and its signature together in the response.",
+  "ttft_ms": 2154,
+  "type": "result",
+  "duration_ms": 41951,
+  "uuid": "194758c2-aedc-4276-9359-66cb54a97cef",
+  "ttft_stream_ms": 1614,
+  "time_to_request_ms": 23,
+  "first_content_frame_ms": 1614,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

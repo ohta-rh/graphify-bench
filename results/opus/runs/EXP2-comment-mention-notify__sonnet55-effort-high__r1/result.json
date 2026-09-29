@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 26744,
+  "stop_reason": "end_turn",
+  "session_id": "0e89b930-37ce-4662-844f-b11dca2bab4b",
+  "total_cost_usd": 0.1815988,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 28620,
+    "cache_read_input_tokens": 160304,
+    "output_tokens": 3503,
+    "output_tokens_details": {
+      "thinking_tokens": 198
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 28620,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2396,
+        "cache_read_input_tokens": 35560,
+        "cache_creation_input_tokens": 3519,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3519
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 3503,
+      "cacheReadInputTokens": 160304,
+      "cacheCreationInputTokens": 28620,
+      "webSearchRequests": 0,
+      "costUSD": 0.1815988,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 198,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 8,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "A typed `@someone` becomes an inbox row in four steps: the composer collects a first guess at who was mentioned, `createComment` re-resolves handles on the server, an event carries the resolved ids, and `notify()` applies each recipient's preferences. All paths below are under `src/`.\n\n## 1. Handle to real user\n\n**Client side (a hint only).** `components/domain/comment/comment-composer.tsx` uses `MentionTextarea` (`mention-textarea.tsx`, with `mention-query.ts`) to autocomplete `@handle`. It keeps a `mentioned: UserId[]` list and submits it as `mentionedUserIds`, which `schemas/comment.ts` validates as at most 50 user ids.\n\n**Action.** `actions/comments/create-comment.ts` (`createCommentAction`, wrapped by `withAction`) does the following:\n- It validates the input against `createCommentSchema`.\n- It checks `can(actor, \"comment:create\")` and calls `consumeRateLimit`.\n- It calls `createComment`, then revalidates the issue's cache tag.\n\nIt does no notification work itself.\n\n**Server resolution.** `createComment` in `server/services/comment-service.ts` runs in this order:\n1. `assertOrgScope`.\n2. Load the issue with `issueRepo.findIssueById`.\n3. `assertCan` and `assertNotArchived`.\n4. `consumeRateLimit` again.\n5. `resolveMentionedUsers`.\n\n`resolveMentionedUsers` loads up to `MENTION_LOOKUP_LIMIT` (100) org members with `memberRepo.listMembers`. It calls `resolveMentions(body, members.items)` from `lib/mentions.ts`, then unions the result with the client-supplied ids that belong to the loaded member list. Because only the first 100 members are scanned, a member beyond that limit can't be resolved from the body.\n\n`resolveMentions` works like this:\n- `extractMentions` strips fenced and inline code, then runs `MENTION_PATTERN`. The `@` must start the line or follow whitespace or an opening bracket, so `a@b.com` doesn't match. Handles are lowercased and de-duplicated.\n- `handleOf(member)` defines a handle as the lowercased local part of the member's email. A `Map<handle, userId>` is built from the org's members.\n- Handles with no matching member are silently dropped, so a typo never fails the comment.\n\n## 2. What carries the list forward\n\n`createComment` inserts the row with `commentRepo.insertComment`, storing the resolved `mentionedUserIds`. It then calls `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` on the in-process bus in `lib/event-bus.ts`. The event payload is what carries the list. The subscriber reads it and doesn't re-parse the markdown.\n\n`emit` runs every subscriber through `Promise.allSettled`, so a throwing handler is reported to the error sinks and doesn't fail the comment.\n\nThe subscriber is attached because `instrumentation.ts` imports `server/services/event-registry.ts`. That file does `import \"./notification-service\"`, and the module's `registerFanOut()` runs at load time and calls `subscribe(...)`. It is guarded by a `registered` flag.\n\n## 3. Fan-out: `notification-service.ts`\n\nThe `comment.created` subscriber does two things, in this order:\n1. It loads the issue and calls `notify(..., \"comment_created\", [author, assignee], …)` for the watchers.\n2. If `payload.mentionedUserIds.length > 0`, it calls `notify(orgId, \"comment_mention\", mentionedUserIds, { title: \"You were mentioned\", href: \"/issues/<id>\", actorId })`.\n\nSo a mentioned person who is also the issue author or assignee can get two rows, one per kind.\n\n## 4. What decides in-app, email, both, or nothing\n\nInside `notify()`:\n- **Empty list:** if the recipient list is empty, it returns immediately.\n- **Flag context:** it loads the org with `orgRepo.findOrgById` and builds a `FlagContext` from the plan and the org's flag overrides.\n- **Per recipient:** it de-duplicates ids with a `Set` and skips `recipientId === payload.actorId`, so you never notify yourself. It then reads `preferenceRepo.getPreference(orgId, recipientId, kind)` for the `comment_mention` kind.\n- **Channels:** it calls `resolveChannels(preference, flags)`:\n  - No preference row (`null`) gives `DEFAULT_CHANNELS`, which is `[\"in_app\", \"email\"]`, so both.\n  - Otherwise `inApp` adds `\"in_app\"`.\n  - `\"email\"` is added only if `preference.email` is set and either `digestOnly` is false or `isEnabled(\"digest_email\", flags)` is true. That flag is plan-gated in `config/feature-flags.ts` (minimum plan `growth`).\n  - So `digestOnly` on a plan without the flag drops email, while `digestOnly` with the flag keeps `\"email\"` in the row.\n- **Nothing:** if `channels.length === 0`, the recipient is skipped and no row is written.\n- **Persist:** the remaining rows go to `notificationRepo.insertNotifications`. It writes one row per recipient with `channels` stored as JSON, and `readAt` is null so it counts as unread. That row is what the inbox and bell read through `listNotifications` and `countUnread`.\n\n## What the `email` channel actually does\n\nNothing in this codebase sends a mention email at fan-out time. `channels` on the row is only a record of what was allowed. I found no caller of `renderEmail(\"mention\", …)`, so the `MentionEmail` template (`emails/mention-email.tsx`) is unused on this path.\n\nThe only email consumer is the digest. `jobs/digest-email-job.ts` (`runDigestEmailJob`) runs during each org's `digestHourUtc` and requires the `digest_email` flag. For each user returned by `listDigestRecipients` (anyone with a `digestOnly` preference), `buildDigest` in `digest-service.ts` collects their unread notifications from the last 24 hours. `renderDigest` and `sendEmail` then produce the email, and each digested notification is marked read.\n\n`sendEmail` in `email-service.ts` doesn't send anything either. It only writes a log line.\n\n## Summary of outcomes\n\n| Recipient state | Result |\n|---|---|\n| No preference row | In-app row with `channels` `[\"in_app\",\"email\"]` |\n| `inApp` on, `email` on, not `digestOnly` | Both channels recorded |\n| `digestOnly` with `digest_email` enabled | In-app row plus `email` recorded, and the digest email later covers it |\n| `digestOnly` without `digest_email` | In-app row only |\n| `inApp` off, `email` on | Row with `[\"email\"]` only |\n| Both off | No row |\n| Recipient is the commenter | Skipped |\n| Handle doesn't match any org member | Dropped before the event |",
+  "ttft_ms": 1337,
+  "type": "result",
+  "duration_ms": 27121,
+  "uuid": "84735096-84d4-4258-bfd9-a58fbfb8d3e6",
+  "ttft_stream_ms": 694,
+  "time_to_request_ms": 25,
+  "first_content_frame_ms": 694,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 28697,
+  "stop_reason": "end_turn",
+  "session_id": "cbafdf46-62f8-4d53-89a6-bef145d5afa9",
+  "total_cost_usd": 0.19106499999999998,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 31038,
+    "cache_read_input_tokens": 156625,
+    "output_tokens": 3556,
+    "output_tokens_details": {
+      "thinking_tokens": 347
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 31038,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2272,
+        "cache_read_input_tokens": 38600,
+        "cache_creation_input_tokens": 2897,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2897
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 3556,
+      "cacheReadInputTokens": 156625,
+      "cacheCreationInputTokens": 31038,
+      "webSearchRequests": 0,
+      "costUSD": 0.19106499999999998,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 347,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "When an owner downgrades, `updateSubscriptionPlan` changes only the subscription row. Nothing in the code I read updates `organizations.plan`, so many product features keep using the old plan. I traced this by reading the code and did not run anything.\n\n## 1. Who may do it\n\nThe path is `changePlanAction` in `src/actions/billing/change-plan.ts`. It is a `\"use server\"` function wrapped by `withAction`, which validates the input against `changePlanSchema` in `src/schemas/billing.ts`.\n\nPermission is checked three times:\n- **Action:** the wrapped handler calls `can(actor, \"org:manage_billing\", {kind:\"billing\", orgId})` and throws `ForbiddenActionError` if it fails.\n- **Service:** `changePlan` in `src/server/services/billing-service.ts` calls `assertOrgScope`, the cross-tenant guard. It then calls `assertCan(..., \"org:manage_billing\", ...)`.\n- **Role matrix:** `ROLE_MATRIX` in `src/lib/permissions.ts` sets `org:manage_billing` to `\"owner\"`. Admins and lower roles are refused.\n\nThe billing settings page (`settings/billing/page.tsx`) and `billing-plan-card.tsx` also call `can()` to decide whether to show the plan-change controls.\n\n## 2. What is compared with what\n\nThe comparison is the target plan's limits against current usage.\n\n**In the action:** `assertPlanFitsCurrentUsage` runs first.\n- It reads live usage through `getUsage` in `usage-service.ts`, which calls `usageRepo.getUsage`.\n- It takes seats, projects and storage MB, and calls `wouldExceedLimit(input.plan, resource, used, 0)`. The requested delta is 0, so the question is whether current use still fits.\n- The limits come from `PLAN_LIMITS` in `src/config/plan-limits.ts`, through `getPlanLimits` and `getLimit`.\n- If any resource doesn't fit, it throws `PlanLimitError`.\n\n**In the service:** `changePlan` repeats the check over `SUMMARY_RESOURCES`: seats, projects, storageMb and webhooks.\n- It uses its own `usageFor()`, which counts webhooks through `webhookRepo.countEndpoints`.\n- It throws a plain `Error` (\"Cannot move to X: …\") on a breach.\n- So the action guard doesn't cover webhooks, but the service check does.\n\nUpgrades pass trivially. Nothing compares plan rank, since `PLAN_ORDER` and `planAtLeast` aren't used here. A \"downgrade\" is any change where usage no longer fits.\n\n## 3. Where the plan is stored and which value wins\n\n- **Authoritative:** the `subscriptions` row, in `src/server/db/schema/billing.ts` and read through `subscription-repository.ts`. The comment on `planFor()` in `billing-service.ts` says so. `planFor()` reads `findSubscription(orgId).plan`. It falls back to `organizations.plan` only if no subscription exists.\n- **Written on change:** `subscriptionRepo.updateSubscriptionPlan` sets `plan`, `interval`, `status: \"active\"` (which ends any trial) and `updatedAt`.\n- **Denormalised copy:** `organizations.plan` was set at creation. `organizationService` calls `insertSubscription` and `orgRepo` inserts `input.plan`.\n- **Not synced:** I found no write to `organizations.plan` after creation. `changePlan` and `trial-expiry-job.ts` both update only the subscription.\n\n## 4. What happens afterwards\n\n1. `changePlan` emits `billing.plan_changed` with `from` and `to`. `from` is taken from `planFor()` before the write.\n2. `activity-service.ts` records \"Plan X → Y\" in the audit log. `webhook-service.ts` enqueues the event for the org's webhook endpoints.\n3. Back in the action, `revalidateTagged([orgTag(orgId)], CACHE_PROFILES.hours)` runs. `withAction` also revalidates `\"billing\"` with the `hours` cache profile.\n4. The action returns the new `Subscription`.\n\nThe trial-expiry job (`trial-expiry-job.ts`) is the other automatic downgrade. It moves expired trials to `free`, skips orgs over the free limits, and emits the same event.\n\n## 5. Behaviour elsewhere that depends on the plan\n\nTwo groups of code read the plan, and they read different stores.\n\n**Reads the subscription through `planFor`:**\n- `checkLimit` and `assertWithinLimit` use it.\n- `checkLimit` is used by the org layout shell (`[orgSlug]/layout.tsx`), the members page, the usage API route (`api/orgs/[orgId]/usage/route.ts`) and the seat-limit banner and meters.\n- `updateSeats` also checks against it.\n- These update immediately.\n\n**Reads `org.plan` directly:** each of these follows the org column, not the subscription.\n- **Quota guards:** the seat check in `invitation-service.ts`, the project limit in `project-service.ts`, the issues-per-project check in `issue-service.ts`, the storage check in `attachment-service.ts` and the webhook count in `webhook-service.ts`. The create-project, create-issue, create-webhook, invite and accept-invitation actions also read it, as do the \"new\" pages.\n- **Feature flags:** `feature-flag-service.ts`, `hooks/flag-context.ts` and `lib/feature-flags.ts`, where `planAtLeast(ctx.plan, minPlan)` gates kanban, CSV export, digest email, webhooks, advanced search and so on. Search and notification services build flag contexts from it too.\n- **Webhook delivery:** `webhook-delivery-job.ts` refuses delivery when `webhooks <= 0` on `org.plan`.\n- **Retention:** `cleanup-archived-job.ts` uses `retentionDays`.\n- **Usage warnings:** `usage-service.ts` `recomputeUsage` emits `billing.limit_exceeded` from `org.plan` limits.\n- **Display:** the org switcher, `use-plan-limits.ts` and the billing page headline.\n- **Rate limiting:** `lib/rate-limit.ts` `configFor` scales buckets by `apiRequestsPerHour`. It reads `planByOrg`, a separate in-memory map, and defaults to `free`.\n\n**Effect:** the subscription-based checks flip to the smaller plan right away. Guards, feature flags, retention, webhook delivery and much of the plan display keep using the old plan until `organizations.plan` changes.",
+  "ttft_ms": 1751,
+  "type": "result",
+  "duration_ms": 29081,
+  "uuid": "9ee71c35-ea8e-4c98-98c0-848a2b6bf2b4",
+  "ttft_stream_ms": 1285,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 1285,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

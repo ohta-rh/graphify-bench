@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 23326,
+  "stop_reason": "end_turn",
+  "session_id": "0160def1-0ce6-4ac7-bcde-e1afd4a7cf9d",
+  "total_cost_usd": 0.1436778,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 20868,
+    "cache_read_input_tokens": 150689,
+    "output_tokens": 3004,
+    "output_tokens_details": {
+      "thinking_tokens": 154
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 20868,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1875,
+        "cache_read_input_tokens": 30547,
+        "cache_creation_input_tokens": 780,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 780
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 3004,
+      "cacheReadInputTokens": 150689,
+      "cacheCreationInputTokens": 20868,
+      "webSearchRequests": 0,
+      "costUSD": 0.1436778,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 154,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here is the path from issue creation to the customer's endpoint. In the current code, the last two steps (the send and the retry) don't behave the way the comments describe.\n\n**1. Browser to service**\n- The form in `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx` submits to `createIssueAction` in `src/actions/issues/create-issue.ts`.\n- That runs inside `withAction`, which does schema validation and the `can` check. It then calls `assertProjectHasRoom` and `createIssue` in `src/server/services/issue-service.ts`.\n- `createIssue` checks org scope, the project, `assertCan(\"issue:create\")` and the plan quota. It then inserts the row via `issueRepo.insertIssue`.\n- Finally it calls `emit(\"issue.created\", …)` from `src/lib/event-bus.ts`. This is what puts delivery in motion. The action then revalidates the cache tags.\n\n**2. Wiring, done at startup**\n- `src/instrumentation.ts` `register()` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`.\n- That calls `registerWebhookListeners()` in `src/server/services/webhook-service.ts`, which subscribes to `issue.created`, `issue.status_changed`, `comment.created`, `billing.plan_changed` and `webhook.delivery_requested`.\n- `register()` also calls `startScheduler()`.\n- `emit` is in-process. It awaits every subscriber, and a throwing handler is reported to error sinks rather than failing the mutation.\n\n**3. Working out which endpoints hear about it**\n- The `issue.created` handler calls `enqueueForOrg(orgId, \"issue.created\", JSON.stringify(payload))`.\n- `enqueueForOrg` loads the org's endpoints with `webhookRepo.listEndpoints(orgId)`. It skips any endpoint that isn't `enabled`. It also skips any whose JSON `eventTypes` list doesn't include the event type.\n- For each remaining endpoint it calls `webhookRepo.enqueueDelivery`. That inserts a `webhook_deliveries` row (`src/server/db/schema/webhooks.ts`) with status `pending` and `attempts` 0.\n- The request path stops here, so a slow or dead customer endpoint never blocks the mutation.\n- `src/app/api/webhooks/inbound/route.ts` can also emit `webhook.delivery_requested`, which takes the same `enqueueForOrg` path.\n\n**4. What performs the send**\n- The trigger is `tick()` in `src/server/jobs/scheduler.ts`. It runs every 60s, and the `webhook-delivery` cadence is 1 minute.\n- `tick()` enqueues a job in `src/server/jobs/queue.ts`. `drain()` dispatches it, with a lazy import of `runWebhookDeliveryJob`.\n- `POST /api/cron/webhook-delivery` (`src/app/api/cron/webhook-delivery/route.ts`) is an external trigger for the same job. It is protected by `assertCronSecret`.\n- `runWebhookDeliveryJob` in `src/server/jobs/webhook-delivery-job.ts` runs inside `runJob`. It calls `webhookRepo.claimPendingDeliveries(25)`, which loads the oldest pending rows and increments `attempts` on each.\n- For each claimed row it checks the plan and flag with `orgAllowsWebhooks`. It then checks `attempts > MAX_ATTEMPTS` (6). Then it finds the endpoint and checks it still exists and is enabled. Any failed check calls `markDeliveryFailed`.\n- Otherwise it computes `signPayload(endpoint.secret, delivery.payload)` and logs it. It then calls `markDelivered`.\n- **No HTTP request is made.** The job's own comment says Taskflow has no outbound HTTP because the corpus runs offline. \"Delivery\" is computing the signature and writing a log line, so the customer's URL is never actually called.\n\n**5. When it doesn't succeed**\n- The design is that a row stays `pending`. Each claim bumps `attempts`, and after more than 6 attempts the row is marked `failed` with \"giving up after N attempts\". `backoffMs(attempts)` gives 0, then 1s, 2s, 4s and so on, capped at 5 minutes.\n- As written, nothing can fail, because there is no send. Every row that passes the guards goes straight to `delivered`.\n- `backoffMs` is only logged. Nothing uses it to delay a retry. A `pending` row would simply be picked up again on the next tick, roughly a minute later.\n- The permanent failures that do exist are plan or flag not allowing webhooks, the endpoint being missing or disabled, and the attempt cap.\n\n**6. How the receiver verifies it came from Taskflow**\n- `createWebhook` in `webhook-service.ts` mints a 32-byte secret with `randomToken` and stores it on the endpoint. It is never regenerated, so rotating it means deleting and recreating the endpoint.\n- `signPayload(secret, payload)` returns an HMAC-SHA256 hex digest of the raw JSON string.\n- The receiver recomputes the HMAC over the exact raw body bytes with its copy of the secret and compares. This only works if the body is sent byte-for-byte as it was signed.\n- The job never attaches the signature to a request, because there is no request. A real sender would also need to put the signature in a header.",
+  "ttft_ms": 1513,
+  "type": "result",
+  "duration_ms": 23724,
+  "uuid": "a665151c-ee6e-4763-94c8-c11ac31b4eab",
+  "ttft_stream_ms": 727,
+  "time_to_request_ms": 27,
+  "first_content_frame_ms": 727,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

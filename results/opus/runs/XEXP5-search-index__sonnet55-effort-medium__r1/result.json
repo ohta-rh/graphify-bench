@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 27931,
+  "stop_reason": "end_turn",
+  "session_id": "054b9534-9c98-4380-bfa8-807c6f16ccc2",
+  "total_cost_usd": 0.1656986,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 24984,
+    "cache_read_input_tokens": 150273,
+    "output_tokens": 3568,
+    "output_tokens_details": {
+      "thinking_tokens": 79
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 24984,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2329,
+        "cache_read_input_tokens": 33898,
+        "cache_creation_input_tokens": 1545,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1545
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 3568,
+      "cacheReadInputTokens": 150273,
+      "cacheCreationInputTokens": 24984,
+      "webSearchRequests": 0,
+      "costUSD": 0.1656986,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 79,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 8,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "When someone edits an issue title, the change reaches the search index through an event on an in-process bus, not through the edit code itself. Queries then read that index after a chain of checks.\n\n## Write side: keeping the index in step\n\n1. `updateIssue` in `src/server/services/issue-service.ts` checks `assertOrgScope`, `assertCan(\"issue:update\")` and `assertNotArchived`. It writes the row through `issueRepo.updateIssue`, then calls `emit(\"issue.updated\", …)`. The payload holds only IDs and `changedFields`. It does not carry the new title.\n2. `emit` in `src/lib/event-bus.ts` runs every subscriber for that event type with `Promise.allSettled`. A handler that throws is reported to the error sinks. It never fails the edit or the other handlers. This has one consequence: if indexing fails, the edit still succeeds and the index quietly goes stale.\n3. The subscribers are attached at process start. `registerEventHandlers()` in `src/server/services/event-registry.ts` is idempotent and is the only place that knows the full listener set. It calls `registerSearchListeners()` from `src/server/services/search-service.ts`, along with the activity, usage and webhook listeners.\n4. The `issue.updated` handler ignores the payload's content. It re-reads the row with `issueRepo.findIssueById(orgId, issueId)` and, if the row exists, calls `indexIssue`. Re-reading means a half-applied write can't be indexed as if it had succeeded.\n5. `indexIssue` builds the document text as `title + \"\\n\" + (description ?? \"\")` and calls `searchRepo.upsertSearchDocument` in `src/server/repositories/search-repository.ts`.\n6. `upsertSearchDocument` looks up an existing row by (org, kind, subject). It updates `content`, `projectId` and `indexedAt` if a row exists, and inserts one otherwise. That makes it idempotent.\n\nThe other listeners follow the same pattern:\n- `issue.created` re-reads the issue and indexes it.\n- `comment.created` re-reads the comment and indexes it.\n- `project.created` re-reads the project and indexes it.\n- `issue.archived`, `comment.deleted` and `project.archived` call `removeFromIndex`, which calls `deleteSearchDocument`.\n- `search.reindex_requested` re-indexes a single issue.\n\nI found no `project.updated` or `comment.updated` subscriber. Renaming a project or editing a comment therefore doesn't refresh the index until a reindex runs.\n\nThe safety net is `runSearchReindexJob(orgId)` in `src/server/jobs/search-reindex-job.ts`. The `search-reindex` case in `src/server/jobs/queue.ts` dispatches to it, and `scheduler.ts` runs it every 1,440 minutes. For one org it walks the projects, then the issues and each issue's comments, and calls `indexProject`, `indexIssue` and `indexComment`. It reads only one page of 100 of each. Each item is wrapped in try/catch, and failures are counted and logged.\n\n## What is stored\n\nThe `search_index` table is defined in `src/server/db/schema/webhooks.ts` and created in `src/server/db/migrate.ts`. It is one flat, denormalised row per indexed subject:\n- `id`\n- `org_id`, the tenant column\n- `subject_kind`, which is issue, comment or project\n- `subject_id`\n- `project_id`, nullable\n- `content`, the plain text: title plus description for issues, the body for comments, name plus description for projects\n- `indexed_at`\n\nThe only index is on `(org_id, subject_kind)`. There is no full-text engine, tokenisation or field structure.\n\n## Read side: what a query goes through\n\nThere are two entry points, `searchAction` in `src/actions/search/search.ts` and `GET /api/search` in `src/app/api/search/route.ts`. The route is the palette's per-keystroke fetch.\n\n**Action** (`searchAction`)\n1. `withAction` validates the input with `searchQuerySchema` from `src/schemas/search.ts`. That schema requires `q` to be 1–200 characters, defaults `kinds` to `[\"issue\"]`, and adds the paging fields.\n2. It checks `can(actor, \"org:read\")`.\n3. It builds the flag context with `getOrganizationSummary` and `buildFlagContext`.\n4. It narrows `kinds` to issues only when `advanced_search` is off. It narrows rather than rejects.\n\n**Route** (`GET /api/search`)\n1. It requires `orgSlug` and `q`, and calls `getActor`.\n2. It checks `can(org:read)`.\n3. It requires the `command_palette` flag.\n4. It picks `kinds` from `advanced_search` (all three when on, issues only when off) and parses with `searchQuerySchema`, using a limit of 10.\n\nBoth then call `search()` in `search-service.ts`, which does the following in order:\n1. `assertOrgScope` and `assertCan(actor, \"issue:read\")`.\n2. `consumeRateLimit(orgId, \"search:query\")` in `src/lib/rate-limit.ts`. This is a token bucket held in process. Its base is capacity 120 and 60 refills per minute, scaled by the org's plan through `apiRequestsPerHour`.\n3. It loads the org and evaluates `advanced_search` with `isEnabled`.\n4. **Colon check.** If `q` contains `:` and `advanced_search` is off, it throws \"Field-scoped search is not included in this plan\". The flag's strategy is `plan`, minimum `enterprise`, and it can be overridden per org.\n5. `searchRepo.searchDocuments` filters by org with `orgPredicate`, then `LIKE %q%` on `content`, then kinds and optional `projectId`. It also runs a `count()` for the total. Results are ordered by `indexed_at` descending then `id`, with keyset paging.\n6. Each row becomes a `SearchHit`. The title is the first line of `content`. `snippetAround` cuts about 60 characters either side of the match. `hrefFor` builds the link.\n\n## When a valid-looking query is refused\n\n- **Rate limit.** The bucket for that org is empty, so `search()` throws \"Search rate limit reached; try again after …\". Palette typing can drain it.\n- **Colon on a non-advanced plan.** Any `:` is rejected, even where the user meant it as plain text, such as `error: timeout` or a time like `10:30`. The comment says this is deliberate, so it isn't treated as literal text.\n- **Permissions and flags.** A missing `org:read` or `issue:read`, or the `command_palette` flag being off on the route, gives a forbidden response.\n- **Schema.** An empty query or one over 200 characters fails validation.\n\nThe route's `PALETTE_LIMIT` of 10 goes through the same schema, so it isn't a separate rejection case.",
+  "ttft_ms": 1430,
+  "type": "result",
+  "duration_ms": 28311,
+  "uuid": "14628aa3-6d32-41b1-9dc1-3fd3357c7321",
+  "ttft_stream_ms": 941,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 941,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

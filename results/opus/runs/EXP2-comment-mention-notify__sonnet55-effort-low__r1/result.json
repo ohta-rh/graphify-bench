@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 15464,
+  "stop_reason": "end_turn",
+  "session_id": "7824503a-3790-44da-a8d8-c8affbefab52",
+  "total_cost_usd": 0.106351,
+  "usage": {
+    "input_tokens": 10,
+    "cache_creation_input_tokens": 17004,
+    "cache_read_input_tokens": 92225,
+    "output_tokens": 1987,
+    "output_tokens_details": {
+      "thinking_tokens": 35
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 17004,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1506,
+        "cache_read_input_tokens": 26322,
+        "cache_creation_input_tokens": 1141,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1141
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 10,
+      "outputTokens": 1987,
+      "cacheReadInputTokens": 92225,
+      "cacheCreationInputTokens": 17004,
+      "webSearchRequests": 0,
+      "costUSD": 0.106351,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 35,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 5,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Here is the path from a typed `@someone` to a stored notification. Nothing in it sends an email. The email channel is only recorded on the row.\n\n**1. Entry point.** The comment form calls the server action `createCommentAction` in `src/actions/comments/create-comment.ts`. Its `withAction` wrapper validates the input with `createCommentSchema`. The action then checks `can(actor, \"comment:create\", …)`, charges the `comment:create` rate-limit bucket, and calls `createComment` in `src/server/services/comment-service.ts`. It does not touch notifications itself. Its header comment says the service emits the event and `NotificationService` subscribes to it. After the service returns, it revalidates the issue's cache tag.\n\n**2. Handle to real user.** Inside `createComment` the service runs `assertOrgScope`, loads the issue, and runs `assertCan` and `assertNotArchived`. It consumes the rate limit again, then calls the local `resolveMentionedUsers`.\n- `resolveMentionedUsers` loads up to `MENTION_LOOKUP_LIMIT` (100) members with `memberRepo.listMembers`.\n- It calls `resolveMentions(body, members)` from `src/lib/mentions.ts`.\n- `resolveMentions` calls `extractMentions`. That strips fenced and inline code, then applies `MENTION_PATTERN`. The `@` must start the line or follow whitespace or an opening bracket, so it never matches inside an email address. Handles are lowercased and de-duplicated.\n- A handle is `handleOf(member)`, which is the lowercased local part of the member's email. `resolveMentions` builds a map from handle to `userId` and looks up each extracted handle. Unknown handles are silently dropped.\n- The service then unions that server-resolved list with any client-supplied `input.mentionedUserIds`. The client ids are kept only if they belong to known members. This is the list that carries the mentions forward.\n\n**3. What carries the list forward.**\n- `commentRepo.insertComment` stores the resolved `mentionedUserIds` on the comment row.\n- `emit(\"comment.created\", { ...actorEnvelope(actor), commentId, issueId, mentionedUserIds })` publishes it on the event bus (`src/lib/event-bus`). The payload type is in `src/types/event.ts`. Subscribers read this list and never re-parse the markdown.\n\n**4. Fan-out.** `src/server/services/notification-service.ts` calls `registerFanOut()` at module load, which subscribes handlers to the bus. The `comment.created` handler does two things in order:\n- It loads the issue and sends a `comment_created` notification to the issue's author and assignee.\n- If `mentionedUserIds` is non-empty, it calls `notify(orgId, \"comment_mention\", mentionedUserIds, { title: \"You were mentioned\", href: \"/issues/<id>\", actorId, … })`.\n\n**5. What decides in-app, email, both or nothing.** This happens in `notify`, for each unique recipient:\n- **Self-mention:** a recipient equal to `payload.actorId` is skipped, so mentioning yourself produces nothing.\n- **Preferences:** `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")` fetches that user's preference for this notification kind.\n- **Channels:** `resolveChannels(preference, flags)` turns the preference into channels.\n  - With no stored preference, the default is `[\"in_app\", \"email\"]`, so both.\n  - Otherwise `preference.inApp` adds `\"in_app\"`.\n  - `\"email\"` is added only if `preference.email` is true and either `digestOnly` is false or `isEnabled(\"digest_email\", flags)` is true. The flags are built from the org's plan and its flag overrides.\n  - With `digestOnly` set and the flag off, the user gets in-app only.\n- **Nothing:** if the resulting channel list is empty, the recipient is skipped and no row is written.\n- **Persist:** the surviving rows, each carrying its `channels`, go to `notificationRepo.insertNotifications`. The in-app inbox reads these rows through `listNotifications`.\n\n**Email is not sent here.** The code I read never calls `sendEmail` or `renderEmail` from `notify`. The `\"email\"` entry in `channels` is only a marker on the stored row. I did not trace what consumes it. `email-service.ts` has a `mention` template, and `sendEmail` only writes the draft to the log.",
+  "ttft_ms": 1337,
+  "type": "result",
+  "duration_ms": 15762,
+  "uuid": "4ea537fd-f3c8-4b83-bb70-29ae53d963b7",
+  "ttft_stream_ms": 720,
+  "time_to_request_ms": 27,
+  "first_content_frame_ms": 720,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 21606,
+  "stop_reason": "end_turn",
+  "session_id": "16bccd56-ad1f-43c5-87a6-075f29b6dfbe",
+  "total_cost_usd": 0.132862,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 19226,
+    "cache_read_input_tokens": 142750,
+    "output_tokens": 2738,
+    "output_tokens_details": {
+      "thinking_tokens": 33
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 19226,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 1957,
+        "cache_read_input_tokens": 28036,
+        "cache_creation_input_tokens": 1649,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1649
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 2738,
+      "cacheReadInputTokens": 142750,
+      "cacheCreationInputTokens": 19226,
+      "webSearchRequests": 0,
+      "costUSD": 0.132862,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 33,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "An issue title edit reaches the search index through an event, and a query passes several gates before it runs.\n\n## Keeping the index in step with writes\n\n1. **Write.** `updateIssue` in `src/server/services/issue-service.ts` checks scope and permission, then calls `issueRepo.updateIssue`. It then awaits `emit(\"issue.updated\", …)`. The payload carries only ids and `changedFields`. It does not carry the new title.\n2. **Bus.** `emit` in `src/lib/event-bus.ts` runs every subscribed handler with `Promise.allSettled`. A failing handler goes to the `onHandlerError` sinks and is never rethrown. So a broken indexer can't fail the user's edit, but the index can silently fall behind.\n3. **Subscription.** `registerEventHandlers()` in `src/server/services/event-registry.ts` calls `registerSearchListeners()` once per process. It is idempotent, so a hot reload doesn't double-deliver events.\n4. **Handler.** The `issue.updated` handler in `search-service.ts` re-reads the row with `issueRepo.findIssueById`. It doesn't trust the payload. It then calls `indexIssue`.\n5. **Upsert.** `indexIssue` builds the content string and calls `searchRepo.upsertSearchDocument` in `src/server/repositories/search-repository.ts`. That function looks up the row by (org, kind, subject). It updates `content`, `projectId` and `indexedAt` if the row exists, and inserts a new row otherwise.\n\nThe same listener set covers other writes:\n- `issue.created` indexes the issue.\n- `issue.archived` calls `removeFromIndex`.\n- `comment.created` and `comment.deleted` index and remove comments.\n- `project.created` and `project.archived` index and remove projects.\n- `search.reindex_requested` re-indexes a single issue. It ignores any other kind.\n\nThere are two backstops. `runSearchReindexJob(orgId)` in `src/server/jobs/search-reindex-job.ts` re-upserts an org's projects, issues and comments. It is dispatched through `queue.ts`, and `scheduler.ts` sets its interval to 1,440. `countIndexed` supports drift detection.\n\nTwo gaps in the listeners:\n- There is no `project.updated` listener, so project renames don't reach the index.\n- There is no listener for comment edits.\n\n## What the copy stores\n\nThe `search_index` table is created in `src/server/db/migrate.ts`, with an index on `(org_id, subject_kind)`. Each row holds:\n- an id;\n- `orgId`;\n- `subjectKind` (`issue`, `comment` or `project`);\n- `subjectId`;\n- `projectId`, which is null for comments;\n- `content`;\n- `indexedAt`.\n\n`content` is one flattened text blob. For an issue it is `title\\ndescription`. For a comment it is the body. For a project it is `name\\ndescription`.\n\n## What a query goes through\n\n1. **Entry point.** The command palette calls `GET /api/search` in `src/app/api/search/route.ts`. A Server Action, `searchAction`, does the same gating.\n   - The route needs both `orgSlug` and `q`, or it returns `validation_failed`.\n   - `getActor(orgSlug)` resolves the caller.\n   - `can(actor, \"org:read\")` must pass, or the route returns `forbidden`.\n   - The `command_palette` flag must be enabled, or the route returns `forbidden`.\n   - `searchQuerySchema` (`src/schemas/search.ts`) validates the input: `q` is 1 to 200 characters, and `limit` and `cursor` are checked too. The route sets `kinds` to issue, comment and project if `advanced_search` is on, and to issue only otherwise. The limit is 10.\n2. **`search()` in `search-service.ts`.**\n   - `assertOrgScope` checks the org.\n   - `assertCan(actor, \"issue:read\")` checks permission.\n   - `consumeRateLimit(orgId, \"search:query\")` takes a token from a per-org bucket. If the bucket is empty it throws \"Search rate limit reached; try again after …\".\n   - The org is loaded and `advanced_search` is evaluated with the plan, role and flag overrides.\n   - The colon rule applies here.\n3. **`searchRepo.searchDocuments`.** It filters by org through `orgPredicate`, then by `content LIKE %q%`, then by kinds and an optional project. It runs a count and a keyset-paged query ordered by `indexedAt` descending, then id. That ordering is most recently indexed first, not relevance.\n4. **Result mapping.** `search()` maps each row to a `SearchHit`. The title is the first line of `content`. The snippet comes from `snippetAround`, which keeps 60 characters of context on each side. The href comes from `hrefFor`.\n\n## When a valid-looking query is refused\n\n- **Colon in the text.** If `q` contains `:` and `advanced_search` isn't enabled for the org's plan, `search()` throws \"Field-scoped search is not included in this plan\". The check is a plain `includes(\":\")`. So a title search like `fix: login` is refused on a plan without the flag, even though it isn't field syntax. The route's schema check passes it, and the refusal comes later from the service.\n- **Rate limit.** The per-org bucket is shared across users, so a burst from one person can block colleagues.\n- **Flag and permission gates.** These are `command_palette` off, missing `org:read` or `issue:read`, and a scope mismatch.\n- **Length.** A `q` over 200 characters or an empty `q` fails validation.\n\nBecause the route wraps everything in `errorResponse`, the service's plain `Error`s reach the client as whatever `errorResponse` maps them to. That mapping isn't in the files I read.",
+  "ttft_ms": 1480,
+  "type": "result",
+  "duration_ms": 21972,
+  "uuid": "579a2435-b308-43b7-86c0-d74b849c0fec",
+  "ttft_stream_ms": 776,
+  "time_to_request_ms": 27,
+  "first_content_frame_ms": 776,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

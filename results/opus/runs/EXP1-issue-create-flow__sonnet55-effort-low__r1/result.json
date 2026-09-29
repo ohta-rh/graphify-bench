@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 25960,
+  "stop_reason": "end_turn",
+  "session_id": "59831970-54fc-4041-ae6a-570bea42d759",
+  "total_cost_usd": 0.1865972,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 28879,
+    "cache_read_input_tokens": 186196,
+    "output_tokens": 3381,
+    "output_tokens_details": {
+      "thinking_tokens": 149
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 28879,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2416,
+        "cache_read_input_tokens": 38643,
+        "cache_creation_input_tokens": 695,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 695
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 16,
+      "outputTokens": 3381,
+      "cacheReadInputTokens": 186196,
+      "cacheCreationInputTokens": 28879,
+      "webSearchRequests": 0,
+      "costUSD": 0.1865972,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 149,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 8,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "When a signed-in member submits the new-issue form, the request goes through `createIssueAction`, then `withAction`, then `createIssue` in the service layer, then the repository insert, and finally an `issue.created` event that fans out to listeners. I read the code but didn't run it.\n\n## 1. Entry point and validation\n\n`src/components/domain/issue/issue-form.tsx` submits through the `useFormAction` hook (`src/hooks/use-form-action.ts`). That calls the Server Action `createIssueAction(raw)` in `src/actions/issues/create-issue.ts`. The action is a thin wrapper around `run`, which is built with `withAction(createIssueSchema, handler, { revalidate: [\"issues\"], cacheProfile: \"minutes\" })` from `src/actions/_lib/with-action.ts`.\n\n`runAction` in `withAction` does the following, in order:\n\n1. **Schema check.** It runs `createIssueSchema.safeParse(raw)` from `src/schemas/issue.ts`. The schema requires `orgId` and `projectId`. The title must be 3–200 characters. Description, status, priority, assignee, parent, estimate, due date and `labelIds` (at most 20) get defaults. A failure returns a stamped `ActionResult` error via `toActionResult` (`src/lib/errors.ts`) and nothing else runs.\n2. **Authentication and actor.** `resolveActorFor` sees `orgId` in the parsed input and calls `requireActorFor(orgId)` in `src/lib/actor.ts`.\n   - `getSessionPrincipal()` must return a session, otherwise it throws `UnauthorizedError`. The session's `activeOrgId` must be set.\n   - `findOrgById` looks up the org to get its slug, and `resolveActorForOrg` (`session-service`) builds the `Actor`. If the user has no membership, it throws `NoMembershipError`.\n   - `assertOrgScope(actor, orgId)` runs as a final check.\n3. **Handler.** It calls the action's handler with `(parsedInput, actor)`.\n4. **Revalidation and result.** After the handler returns, it calls `revalidateTagged([\"issues\"], \"minutes\")` and returns `{ ok: true, data, submittedAt }`.\n5. **Errors.** Any throw is mapped through `toActionResult` into an error result.\n\n## 2. Gates in the action handler\n\nBefore the service runs, the handler applies two checks of its own.\n\n- **Permission pre-check.** `can(actor, \"issue:create\", {...})` from `src/lib/permissions.ts`. The rule maps `issue:create` to the `member` role, so viewers are refused with `ForbiddenActionError`.\n- **Quota pre-check.** `assertProjectHasRoom` calls `getOrganizationSummary` to get the plan and `getPlanLimits(plan).issuesPerProject`. It then calls `listIssues(..., { limit: 1, includeArchived: true })` and compares `existing.total` to the limit, throwing `PlanLimitError` if the project is full. Archived issues count toward the quota.\n\n## 3. Gates in the service\n\n`createIssue(actor, input)` in `src/server/services/issue-service.ts` repeats the checks and adds the rest.\n\n1. `assertOrgScope(actor, input.orgId)` (`src/lib/tenant.ts`) throws `TenantScopeError` on a mismatch.\n2. `projectRepo.findProjectById` loads the project inside the org, and `requireFound` throws not-found if it's missing.\n3. `assertNotArchived(\"Project\", ...)` from `src/lib/soft-delete.ts` refuses archived projects.\n4. `assertCan(actor, \"issue:create\", projectResource(project))` is the permission check again, this time against the real project resource.\n5. `orgRepo.findOrgById` loads the org, and `issueRepo.countIssues` counts its issues. `wouldExceedLimit(org.plan, \"issuesPerProject\", used)` from `src/config/plan-limits.ts` throws a plain `Error` if the quota is exceeded. This duplicates the action's quota check.\n\n## 4. The database write\n\nThe write goes through `src/server/repositories/issue-repository.ts`.\n\n- `nextIssueNumber(orgId, projectId)` runs `max(issues.number) + 1`, scoped by `orgPredicate`.\n- `insertIssue(input, actor.userId, number)` inserts one row into `issues` (`src/server/db/schema/issues.ts`) with `.returning().get()`. The row gets a fresh `newId()`, the author set to the actor, `startedAt` and `completedAt` null, and `createdAt`/`updatedAt` set to the same timestamp.\n- If `labelIds` is non-empty, it then inserts `issueLabels` join rows.\n- `toIssue` maps the row to the `Issue` type.\n\nThe number allocation and the insert are separate statements with no transaction. Two concurrent creates could get the same number, unless the schema has a unique index that rejects the second.\n\n## 5. Event and side effects\n\nThe service calls `await emit(\"issue.created\", { ...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority })` on the bus in `src/lib/event-bus.ts`. Handlers run concurrently with `Promise.allSettled`. A failing handler is reported to the error sinks and never fails the create.\n\nThe listeners are attached once at process start. `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which wires:\n\n- **Activity** (`activity-service.ts`): records an `issue.created` activity entry, \"Created issue \"<title>\"\", with the priority in its metadata.\n- **Search** (`search-service.ts`): re-reads the issue and calls `indexIssue` to add it to the search index.\n- **Usage** (`usage-service.ts`): calls `usageRepo.incrementUsage(orgId, { issuesUsed: 1 })`.\n- **Webhooks** (`webhook-service.ts`): `enqueueForOrg` writes a delivery row for each enabled endpoint that subscribes to `issue.created`. The delivery job (`src/server/jobs/webhook-delivery-job.ts`) presumably sends them later.\n- **Notifications**: `notification-service.ts` has no `issue.created` subscriber. It only handles `issue.assigned`, `issue.overdue`, `comment.created` and `member.joined`. So creating an issue with an assignee does not notify that assignee.\n\n## 6. Return path\n\nThe service returns the `Issue` to the handler. The handler calls `revalidateTagged` for `orgTag`, `projectTag` and `issueTag(issue.id)`. `withAction` then calls it again for `\"issues\"`, and wraps the issue in a stamped `ActionResult` for the form.",
+  "ttft_ms": 1733,
+  "type": "result",
+  "duration_ms": 26319,
+  "uuid": "3cd187bf-be16-48d6-b200-dd501a6fbde8",
+  "ttft_stream_ms": 935,
+  "time_to_request_ms": 26,
+  "first_content_frame_ms": 935,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

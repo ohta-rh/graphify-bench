@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 26399,
+  "stop_reason": "end_turn",
+  "session_id": "444a0261-ce18-4d22-a8b4-e3263ea1538c",
+  "total_cost_usd": 0.170147,
+  "usage": {
+    "input_tokens": 18,
+    "cache_creation_input_tokens": 23365,
+    "cache_read_input_tokens": 206705,
+    "output_tokens": 3531,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 23365,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2374,
+        "cache_read_input_tokens": 32848,
+        "cache_creation_input_tokens": 976,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 976
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 18,
+      "outputTokens": 3531,
+      "cacheReadInputTokens": 206705,
+      "cacheCreationInputTokens": 23365,
+      "webSearchRequests": 0,
+      "costUSD": 0.170147,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 9,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "The digest pipeline has two possible triggers, and both end in `runDigestEmailJob(now)` in `src/server/jobs/digest-email-job.ts`. I read the code without running it.\n\n## 1. Triggers\n\n**In-process scheduler**\n- `src/instrumentation.ts` calls `startScheduler()` from `src/server/jobs/scheduler.ts`.\n- `startScheduler()` sets a 60-second `setInterval` that calls `tick(now)`.\n- `tick` checks `isDue(kind, now)` for each job kind. `digest-email` has a cadence of 60 minutes, and the first tick after boot is always due.\n- If it is due, `tick` calls `enqueue` with id `digest-email:<minute>`. The queue is module-level state in `queue.ts`.\n- `tick` then calls `drain()`. `runHandler` in `queue.ts` dynamically imports `digest-email-job` and calls `runDigestEmailJob(new Date())`.\n- A handler that throws is retried with exponential backoff, and dropped after 5 attempts.\n\n**HTTP cron**\n- `POST /api/cron/digest` (`src/app/api/cron/digest/route.ts`) first calls `assertCronSecret`, in `src/app/api/_lib/responses.ts`.\n- That check requires the `x-taskflow-cron` header to match `TASKFLOW_CRON_SECRET`. If the secret is unset, the route is disabled rather than open.\n- The route then calls `runDigestEmailJob(new Date())` directly and returns the `JobResult` as JSON.\n\n## 2. Which orgs are due\n\n`runDigestEmailJob` wraps its work in `runJob(\"digest-email\", …)` from `jobs/types.ts`, which tracks processed and failed counts. Inside it:\n\n1. `usageRepo.listOrgIdsForRollup(50)` returns up to `ORG_BATCH = 50` org ids, ordered by `measuredAt`. This is the org universe. Only orgs that have a row in `organizationUsage` are considered, and only the first 50.\n2. For each id, `orgRepo.findOrgById` loads the org. The org is skipped if it is missing.\n3. `shouldRunForOrg(org, now)` skips the org if it is archived (`archivedAt !== null`). Otherwise the org runs only when `now.getUTCHours() === org.settings.digestHourUtc`. `digestHourUtc` is set in the organization settings form.\n4. `isEnabled(\"digest_email\", buildFlagContext(null, org))` gates the org by plan. The flag is defined in `config/feature-flags.ts` with `minPlan: \"growth\"`, and `enabledFlagOverrides` on the org can force it on.\n\n## 3. Which people are subscribed\n\n`listDigestRecipients(orgId)` in `services/digest-service.ts` calls `preferenceRepo.listDigestSubscribers`. That is a distinct select of `userId` from `notificationPreferences` where the org matches and `digestOnly = true`. A user is subscribed if at least one notification kind is set to `digestOnly`. Users set this in `notification-preferences-form.tsx`. `actions/notifications/update-preferences.ts` blocks turning it on when the flag is off for the org.\n\n## 4. Assembling one person's digest\n\nThe job computes `windowEnd = now` and `windowStart = now − 24h`. For each recipient, in a try/catch, it does the following:\n\n1. `buildDigest(orgId, recipientId, windowStart, windowEnd)` in `digest-service.ts` reloads the org and re-checks the flag.\n2. It calls `notificationRepo.listUnreadSince`, which returns that recipient's notifications in the org with `readAt` null and `createdAt >= windowStart`, newest first.\n3. It drops any notification with `createdAt > windowEnd`.\n4. It maps each remaining notification to a `DigestEntry` (`notificationId`, `kind`, `title`, `href`, `occurredAt`) and keeps at most `DIGEST_MAX_ENTRIES = 50`.\n5. It returns `{ orgId, recipientId, entries, windowStart, windowEnd }`.\n\nThe notification rows were created earlier. Events on the bus (`issue.assigned`, `issue.overdue`, `comment.created`, and others) are handled in `notification-service.ts`. `registerFanOut` calls `notify()`, which does the following:\n- It skips the actor as a recipient.\n- It calls `resolveChannels(preference, flags)`, which checks the in-app and email channels.\n- It inserts rows with `insertNotifications`.\n- A `digestOnly` preference keeps the in-app row but suppresses the immediate email.\n\nAfter a bundle is built, the job does the following:\n1. `userRepo.findUserById` loads the recipient.\n2. `renderDigest(bundle, recipient)` calls `renderEmail(\"digest\", …)` in `email-service.ts`. The props are the recipient name, entry count, window, and the first entry's title as the headline.\n3. `sendEmail({ to, ...rendered })` runs. It currently only logs `email.sent`.\n4. `notificationRepo.markRead` is called for every entry, with `windowEnd` as the read time. This is what prevents the same digest being sent twice in one hour.\n5. `result.processed` is incremented.\n\n## 5. Subscribed but no email that day\n\n- **Org not eligible:**\n  - The org is missing.\n  - The org is archived.\n  - It is not the org's `digestHourUtc` hour in UTC. If the job doesn't run during that hour, the org is skipped for that day, and there is no catch-up.\n  - The org has no `organizationUsage` row.\n  - The org falls outside the first 50 ids.\n  - The org's plan is below growth and has no override. `buildDigest` also returns `null` in this case.\n- **Nothing to report:** `buildDigest` returns `null` when there are no unread notifications in the last 24 hours. Anything already read, including notifications marked read in the UI, is excluded. Notifications older than 24 hours are not included.\n- **`digestOnly` on but no notification:**\n  - The user's preference for a given kind may have `inApp` off and `digestOnly` on. In `resolveChannels`, that leaves no in-app channel, so no notification row exists to digest.\n  - `notify` skips a recipient who is the actor of the event.\n  - A `digestOnly` preference with `email` false also produces no email channel.\n- **User lookup fails:** `findUserById` returns null, so the job skips that recipient.\n- **Send or render errors:** an exception is caught, `failed` is incremented, and the error is logged. Entries stay unread, so the next run in the same hour would retry them. A later day's window would still cover them if they are under 24 hours old.\n- **Second run in the same hour:** if entries were already marked read, there is nothing left to send.\n\nOne thing to be aware of: only the first 50 entries are sent and marked read. Any beyond that stay unread and can appear in a later run inside their 24-hour window.",
+  "ttft_ms": 1474,
+  "type": "result",
+  "duration_ms": 26823,
+  "uuid": "135a4724-04dc-4e82-b124-a59dcc0319ae",
+  "ttft_stream_ms": 738,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 738,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

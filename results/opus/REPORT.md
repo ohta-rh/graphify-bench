@@ -1,6 +1,6 @@
 # graphify-bench results
 
-Generated 2026-09-26T05:25:30.842Z. 405 runs over 45 tasks, conditions: effort-high, effort-low, effort-low-nosub, effort-medium, effort-xhigh, opus-effort-high, opus-effort-low, opus-effort-medium, opus-effort-xhigh.
+Generated 2026-09-29T06:54:17.631Z. 585 runs over 45 tasks, conditions: effort-high, effort-low, effort-low-nosub, effort-medium, effort-xhigh, opus-effort-high, opus-effort-low, opus-effort-medium, opus-effort-xhigh, sonnet55-effort-high, sonnet55-effort-low, sonnet55-effort-medium, sonnet55-effort-xhigh.
 
 ## 1. Environment
 
@@ -12,7 +12,7 @@ Generated 2026-09-26T05:25:30.842Z. 405 runs over 45 tasks, conditions: effort-h
 
 - Bootstrap: B=2000, percentile 95% CI, seed `graphify-bench-bootstrap`, resampled over **tasks**.
 - Corpus: `corpus-v1`, tree hash (sha256) `4148d9b26fb31b95ab8424af1f88cfc7741bb655b3ad3bbb557a8c3c516c12da` (source: `docs/plan/CORPUS.md`).
-- Report generated: 2026-09-26.
+- Report generated: 2026-09-29.
 
 The `Model` line above is the harness default; arms that override it are listed here. Every field comes from the run's own `run.meta.json`, not from the report's assumptions.
 
@@ -27,6 +27,10 @@ The `Model` line above is the harness default; arms that override it are listed 
 | `opus-effort-low` | `claude-opus-5-5` | `baseline` | – | As `opus-effort-medium`, one notch down: `effort-low` on Opus 5.5. |
 | `opus-effort-medium` | `claude-opus-5-5` | `baseline` | – | `effort-medium` with one change: the model is Opus 5.5 instead of the harness default Sonnet 5. Overlay, effort and flags are identical, so the pair isolates the model at a fixed effort. |
 | `opus-effort-xhigh` | `claude-opus-5-5` | `baseline` | – | `effort-xhigh` on Opus 5.5 — only the model differs. |
+| `sonnet55-effort-high` | `claude-sonnet-5-5` | `baseline` | – | `effort-high` on Sonnet 5.5 — only the model differs. |
+| `sonnet55-effort-low` | `claude-sonnet-5-5` | `baseline` | – | `effort-low` on Sonnet 5.5 — only the model differs. |
+| `sonnet55-effort-medium` | `claude-sonnet-5-5` | `baseline` | – | `effort-medium` on Sonnet 5.5 — only the model differs. |
+| `sonnet55-effort-xhigh` | `claude-sonnet-5-5` | `baseline` | – | `effort-xhigh` on Sonnet 5.5 — only the model differs. |
 
 ## 2. Overall
 
@@ -41,6 +45,10 @@ The `Model` line above is the harness default; arms that override it are listed 
 | opus-effort-low | 45 | **104,202** (78,168–132,332) | 104,202 | 0.138 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 189 | 0 | 84.4% (38/45) | 121,364 |
 | opus-effort-medium | 45 | **119,567** (87,232–155,771) | 119,567 | 0.168 | 5.0 | 0 in 0 run(s) | 2 | 0 | 0 | 212 | 0 | 84.4% (38/45) | 147,596 |
 | opus-effort-xhigh | 45 | **144,863** (106,661–248,963) | 144,863 | 0.235 | 6.0 | 0 in 0 run(s) | 0 | 0 | 0 | 313 | 0 | 84.4% (38/45) | 274,361 |
+| sonnet55-effort-high | 45 | **124,327** (79,460–164,246) | 124,327 | 0.089 | 6.0 | 0 in 0 run(s) | 10 | 1 | 0 | 224 | 0 | 86.7% (39/45) | 150,851 |
+| sonnet55-effort-low | 45 | **80,852** (74,483–116,832) | 80,852 | 0.072 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 165 | 0 | 86.7% (39/45) | 107,969 |
+| sonnet55-effort-medium | 45 | **97,000** (74,877–140,953) | 97,000 | 0.075 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 191 | 0 | 88.9% (40/45) | 121,496 |
+| sonnet55-effort-xhigh | 45 | **134,815** (99,587–174,203) | 134,815 | 0.116 | 7.0 | 0 in 0 run(s) | 97 | 1 | 0 | 263 | 0 | 84.4% (38/45) | 211,021 |
 
 **`uncached_all` (PRIMARY) = Σ over every entry of `modelUsage` of (inputTokens + cacheReadInputTokens + cacheCreationInputTokens)** — it covers the main session *and* any subagent, so it is commensurable with `total_cost_usd`. `uncached_main` (secondary) is the same sum taken from `usage.*`, which the result JSON populates for the **main session only**; a run that spawned a subagent therefore reports less information volume there than it actually consumed. The `subagents` column lets the two be reconciled. Tool columns are totals across all runs of the condition. T2S (tokens-to-success) = total `uncached_all` of successful runs / number of successful runs.
 
@@ -57,6 +65,10 @@ Fixed overhead, reported separately so readers can subtract it (architecture.md 
 | opus-effort-low | 8,533 |
 | opus-effort-medium | 8,532 |
 | opus-effort-xhigh | 8,535 |
+| sonnet55-effort-high | 7,596 |
+| sonnet55-effort-low | 7,597 |
+| sonnet55-effort-medium | 7,593 |
+| sonnet55-effort-xhigh | 7,597 |
 
 ## 3. Paired difference (opus-effort-medium − baseline), all tasks
 
@@ -133,6 +145,10 @@ Section 5 reports what each category *cost*. This one reports whether it was *an
 | `opus-effort-low` | 9/9 · 1.000 | 9/9 · 1.000 | 5/9 · 0.905 | 6/9 · 0.867 | 9/9 · 0.990 |
 | `opus-effort-medium` | 9/9 · 1.000 | 9/9 · 1.000 | 4/9 · 0.897 | 7/9 · 0.889 | 9/9 · 0.986 |
 | `opus-effort-xhigh` | 9/9 · 0.978 | 9/9 · 1.000 | 5/9 · 0.913 | 6/9 · 0.833 | 9/9 · 0.986 |
+| `sonnet55-effort-high` | 9/9 · 1.000 | 9/9 · 1.000 | 5/9 · 0.916 | 7/9 · 0.956 | 9/9 · 0.986 |
+| `sonnet55-effort-low` | 9/9 · 1.000 | 9/9 · 1.000 | 6/9 · 0.915 | 6/9 · 0.900 | 9/9 · 0.990 |
+| `sonnet55-effort-medium` | 9/9 · 1.000 | 9/9 · 1.000 | 6/9 · 0.915 | 7/9 · 0.956 | 9/9 · 0.988 |
+| `sonnet55-effort-xhigh` | 9/9 · 1.000 | 9/9 · 1.000 | 5/9 · 0.916 | 6/9 · 0.900 | 9/9 · 0.987 |
 
 ## 7. Structural comparisons
 
@@ -582,6 +598,302 @@ Per category (primary metric `uncached_equivalent_all`):
 
 **Verdict.** `effort-high` vs `effort-low` over 45 paired tasks: tokens higher by 162,837 (95% CI [78,480, 254,122]); cost higher by 0.0880 (95% CI [0.0453, 0.1344]); turns higher by 1.6 (95% CI [0.6, 2.6]); accuracy 82.2% vs 77.8% (37/45 vs 35/45).
 
+### `sonnet55-effort-low` vs `effort-low`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| effort-low | 45 | **248,369** (155,721–315,825) | 93,983 | 0.158 | 3.0 | 26 in 26 run(s) | 15 | 0 | 0 | 94 | 0 | 77.8% (35/45) | 264,338 |
+| sonnet55-effort-low | 45 | **80,852** (74,483–116,832) | 80,852 | 0.072 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 165 | 0 | 86.7% (39/45) | 107,969 |
+
+Paired difference (`sonnet55-effort-low` − `effort-low`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -154,005.8 | [-191,925.3, -121,526.4] | -55.5% | sonnet55-effort-low lower |
+| uncached_equivalent | 45 | -11,412.5 | [-41,195.4, 20,218.5] | 59.8% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 45 | -0.0997 | [-0.1234, -0.0796] | -50.2% | sonnet55-effort-low lower |
+| num_turns | 45 | 1.5 | [0.5, 2.5] | 159.5% | sonnet55-effort-low higher |
+
+Iso-accuracy subset (33/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 33 | -161,346.2 | [-205,501.9, -123,049.8] | -55.6% | sonnet55-effort-low lower |
+| uncached_equivalent | 33 | 10,906.9 | [-20,007.7, 42,702.3] | 87.3% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 33 | -0.1064 | [-0.1342, -0.0822] | -50.2% | sonnet55-effort-low lower |
+| num_turns | 33 | 2.3 | [1.3, 3.3] | 202.3% | sonnet55-effort-low higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -171,355.8 | [-194,069.9, -145,793.0] | -53.1% | sonnet55-effort-low lower |
+| fix | 9 | -203,667.0 | [-346,618.0, -73,927.9] | -45.2% | sonnet55-effort-low lower |
+| impact | 9 | -114,562.7 | [-181,725.6, -60,368.2] | -59.6% | sonnet55-effort-low lower |
+| locate | 9 | -96,628.7 | [-137,858.4, -61,798.2] | -51.7% | sonnet55-effort-low lower |
+| reference | 9 | -183,815.0 | [-226,264.6, -143,011.7] | -67.9% | sonnet55-effort-low lower |
+
+**Verdict.** `sonnet55-effort-low` vs `effort-low` over 45 paired tasks: tokens lower by 154,006 (95% CI [-191,925, -121,526]); cost lower by 0.0997 (95% CI [-0.1234, -0.0796]); turns higher by 1.5 (95% CI [0.5, 2.5]); accuracy 86.7% vs 77.8% (39/45 vs 35/45).
+
+### `sonnet55-effort-medium` vs `effort-medium`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| effort-medium | 45 | **271,427** (187,325–398,152) | 124,539 | 0.181 | 4.0 | 26 in 26 run(s) | 38 | 0 | 0 | 97 | 0 | 80.0% (36/45) | 349,581 |
+| sonnet55-effort-medium | 45 | **97,000** (74,877–140,953) | 97,000 | 0.075 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 191 | 0 | 88.9% (40/45) | 121,496 |
+
+Paired difference (`sonnet55-effort-medium` − `effort-medium`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -203,555.6 | [-249,093.2, -161,514.6] | -59.0% | sonnet55-effort-medium lower |
+| uncached_equivalent | 45 | -30,432.0 | [-69,131.8, 7,804.2] | 52.0% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 45 | -0.1255 | [-0.1510, -0.1023] | -53.9% | sonnet55-effort-medium lower |
+| num_turns | 45 | 1.1 | [0.0, 2.2] | 126.8% | sonnet55-effort-medium higher |
+
+Iso-accuracy subset (35/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 35 | -227,572.7 | [-281,184.1, -177,307.5] | -59.4% | sonnet55-effort-medium lower |
+| uncached_equivalent | 35 | -29,123.9 | [-79,333.5, 20,398.8] | 73.2% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 35 | -0.1382 | [-0.1668, -0.1111] | -54.2% | sonnet55-effort-medium lower |
+| num_turns | 35 | 1.3 | [-0.1, 2.6] | 155.2% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -365,613.7 | [-460,683.6, -269,242.2] | -63.0% | sonnet55-effort-medium lower |
+| fix | 9 | -264,092.0 | [-358,846.3, -174,331.2] | -61.9% | sonnet55-effort-medium lower |
+| impact | 9 | -102,578.6 | [-143,766.1, -64,951.7] | -61.9% | sonnet55-effort-medium lower |
+| locate | 9 | -103,291.6 | [-146,345.4, -61,271.6] | -48.8% | sonnet55-effort-medium lower |
+| reference | 9 | -182,202.1 | [-261,775.6, -117,612.2] | -59.4% | sonnet55-effort-medium lower |
+
+**Verdict.** `sonnet55-effort-medium` vs `effort-medium` over 45 paired tasks: tokens lower by 203,556 (95% CI [-249,093, -161,515]); cost lower by 0.1255 (95% CI [-0.1510, -0.1023]); turns higher by 1.1 (95% CI [0.0, 2.2]); accuracy 88.9% vs 80.0% (40/45 vs 36/45).
+
+### `sonnet55-effort-high` vs `effort-high`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| effort-high | 45 | **273,470** (170,815–530,879) | 135,393 | 0.185 | 4.0 | 23 in 22 run(s) | 57 | 0 | 0 | 108 | 0 | 82.2% (37/45) | 463,430 |
+| sonnet55-effort-high | 45 | **124,327** (79,460–164,246) | 124,327 | 0.089 | 6.0 | 0 in 0 run(s) | 10 | 1 | 0 | 224 | 0 | 86.7% (39/45) | 150,851 |
+
+Paired difference (`sonnet55-effort-high` − `effort-high`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -276,758.2 | [-373,576.5, -193,823.4] | -54.8% | sonnet55-effort-high lower |
+| uncached_equivalent | 45 | -19,524.8 | [-53,981.9, 13,835.6] | 19.8% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 45 | -0.1537 | [-0.2003, -0.1111] | -48.8% | sonnet55-effort-high lower |
+| num_turns | 45 | 1.4 | [0.4, 2.6] | 87.8% | sonnet55-effort-high higher |
+
+Iso-accuracy subset (36/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 36 | -309,741.8 | [-423,464.7, -211,407.3] | -54.1% | sonnet55-effort-high lower |
+| uncached_equivalent | 36 | -13,001.4 | [-50,853.0, 27,962.1] | 28.4% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 36 | -0.1698 | [-0.2250, -0.1182] | -48.4% | sonnet55-effort-high lower |
+| num_turns | 36 | 1.8 | [0.5, 3.0] | 100.3% | sonnet55-effort-high higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -602,481.9 | [-875,843.0, -359,564.2] | -62.4% | sonnet55-effort-high lower |
+| fix | 9 | -328,660.7 | [-547,153.2, -148,525.2] | -57.1% | sonnet55-effort-high lower |
+| impact | 9 | -99,139.8 | [-136,051.8, -63,239.0] | -57.2% | sonnet55-effort-high lower |
+| locate | 9 | -123,139.8 | [-204,522.4, -58,103.4] | -44.3% | sonnet55-effort-high lower |
+| reference | 9 | -230,368.9 | [-356,991.7, -118,244.1] | -53.3% | sonnet55-effort-high lower |
+
+**Verdict.** `sonnet55-effort-high` vs `effort-high` over 45 paired tasks: tokens lower by 276,758 (95% CI [-373,577, -193,823]); cost lower by 0.1537 (95% CI [-0.2003, -0.1111]); turns higher by 1.4 (95% CI [0.4, 2.6]); accuracy 86.7% vs 82.2% (39/45 vs 37/45).
+
+### `sonnet55-effort-xhigh` vs `effort-xhigh`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| effort-xhigh | 45 | **421,143** (279,249–872,961) | 243,832 | 0.302 | 8.0 | 20 in 18 run(s) | 219 | 0 | 0 | 202 | 0 | 82.2% (37/45) | 649,577 |
+| sonnet55-effort-xhigh | 45 | **134,815** (99,587–174,203) | 134,815 | 0.116 | 7.0 | 0 in 0 run(s) | 97 | 1 | 0 | 263 | 0 | 84.4% (38/45) | 211,021 |
+
+Paired difference (`sonnet55-effort-xhigh` − `effort-xhigh`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | -411,913.9 | [-583,179.2, -276,610.6] | -57.0% | sonnet55-effort-xhigh lower |
+| uncached_equivalent | 45 | -173,521.2 | [-348,962.6, -47,889.2] | -1.8% | sonnet55-effort-xhigh lower |
+| total_cost_usd | 45 | -0.1946 | [-0.2631, -0.1380] | -45.3% | sonnet55-effort-xhigh lower |
+| num_turns | 45 | -1.2 | [-4.4, 1.8] | 53.3% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (36/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 36 | -439,382.8 | [-637,942.8, -278,795.5] | -55.0% | sonnet55-effort-xhigh lower |
+| uncached_equivalent | 36 | -173,508.1 | [-381,010.9, -28,337.0] | -2.0% | sonnet55-effort-xhigh lower |
+| total_cost_usd | 36 | -0.2015 | [-0.2892, -0.1317] | -42.8% | sonnet55-effort-xhigh lower |
+| num_turns | 36 | -1.0 | [-4.9, 2.7] | 40.3% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | -607,691.9 | [-826,455.1, -356,902.0] | -48.6% | sonnet55-effort-xhigh lower |
+| fix | 9 | -672,547.8 | [-1,377,758.5, -221,883.0] | -59.5% | sonnet55-effort-xhigh lower |
+| impact | 9 | -313,036.0 | [-482,337.6, -175,668.6] | -69.5% | sonnet55-effort-xhigh lower |
+| locate | 9 | -149,332.7 | [-224,934.2, -75,685.6] | -47.7% | sonnet55-effort-xhigh lower |
+| reference | 9 | -316,961.0 | [-515,500.0, -150,967.1] | -59.5% | sonnet55-effort-xhigh lower |
+
+**Verdict.** `sonnet55-effort-xhigh` vs `effort-xhigh` over 45 paired tasks: tokens lower by 411,914 (95% CI [-583,179, -276,611]); cost lower by 0.1946 (95% CI [-0.2631, -0.1380]); turns no detectable difference; accuracy 84.4% vs 82.2% (38/45 vs 37/45).
+
+### `opus-effort-low` vs `sonnet55-effort-low`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet55-effort-low | 45 | **80,852** (74,483–116,832) | 80,852 | 0.072 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 165 | 0 | 86.7% (39/45) | 107,969 |
+| opus-effort-low | 45 | **104,202** (78,168–132,332) | 104,202 | 0.138 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 189 | 0 | 84.4% (38/45) | 121,364 |
+
+Paired difference (`opus-effort-low` − `sonnet55-effort-low`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | 13,046.4 | [3,830.3, 22,297.9] | 16.9% | opus-effort-low higher |
+| uncached_equivalent | 45 | 13,046.4 | [4,669.8, 21,693.2] | 16.9% | opus-effort-low higher |
+| total_cost_usd | 45 | 0.0807 | [0.0706, 0.0921] | 102.5% | opus-effort-low higher |
+| num_turns | 45 | 0.3 | [-0.1, 0.7] | 10.5% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (38/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 38 | 12,059.6 | [1,983.3, 22,081.3] | 13.6% | opus-effort-low higher |
+| uncached_equivalent | 38 | 12,059.6 | [2,206.0, 22,009.1] | 13.6% | opus-effort-low higher |
+| total_cost_usd | 38 | 0.0835 | [0.0716, 0.0972] | 99.1% | opus-effort-low higher |
+| num_turns | 38 | 0.3 | [-0.2, 0.7] | 7.6% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | 23,565.4 | [4,466.2, 44,896.0] | 17.8% | opus-effort-low higher |
+| fix | 9 | 8,093.9 | [-23,033.6, 36,771.5] | 10.8% | **CI crosses 0 — no detectable difference** |
+| impact | 9 | 2,309.9 | [-11,632.3, 15,674.5] | 12.3% | **CI crosses 0 — no detectable difference** |
+| locate | 9 | 11,320.3 | [3,315.8, 23,650.4] | 16.2% | opus-effort-low higher |
+| reference | 9 | 19,942.4 | [8,419.8, 30,523.9] | 27.6% | opus-effort-low higher |
+
+**Verdict.** `opus-effort-low` vs `sonnet55-effort-low` over 45 paired tasks: tokens higher by 13,046 (95% CI [3,830, 22,298]); cost higher by 0.0807 (95% CI [0.0706, 0.0921]); turns no detectable difference; accuracy 84.4% vs 86.7% (38/45 vs 39/45).
+
+### `opus-effort-medium` vs `sonnet55-effort-medium`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet55-effort-medium | 45 | **97,000** (74,877–140,953) | 97,000 | 0.075 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 191 | 0 | 88.9% (40/45) | 121,496 |
+| opus-effort-medium | 45 | **119,567** (87,232–155,771) | 119,567 | 0.168 | 5.0 | 0 in 0 run(s) | 2 | 0 | 0 | 212 | 0 | 84.4% (38/45) | 147,596 |
+
+Paired difference (`opus-effort-medium` − `sonnet55-effort-medium`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | 21,269.3 | [7,441.7, 34,744.0] | 22.7% | opus-effort-medium higher |
+| uncached_equivalent | 45 | 21,269.3 | [8,620.8, 34,875.1] | 22.7% | opus-effort-medium higher |
+| total_cost_usd | 45 | 0.1222 | [0.1001, 0.1475] | 134.2% | opus-effort-medium higher |
+| num_turns | 45 | 0.4 | [-0.2, 1.0] | 10.7% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (37/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 37 | 22,592.5 | [6,983.7, 38,053.6] | 20.7% | opus-effort-medium higher |
+| uncached_equivalent | 37 | 22,592.5 | [7,394.0, 37,783.9] | 20.7% | opus-effort-medium higher |
+| total_cost_usd | 37 | 0.1299 | [0.1042, 0.1594] | 131.1% | opus-effort-medium higher |
+| num_turns | 37 | 0.4 | [-0.2, 1.0] | 9.0% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | 64,983.2 | [27,018.6, 107,426.1] | 34.8% | opus-effort-medium higher |
+| fix | 9 | -11,411.6 | [-42,244.1, 11,552.4] | -2.1% | **CI crosses 0 — no detectable difference** |
+| impact | 9 | 20,632.9 | [9,780.2, 33,218.7] | 39.0% | opus-effort-medium higher |
+| locate | 9 | 4,039.3 | [-8,052.6, 16,339.7] | 7.2% | **CI crosses 0 — no detectable difference** |
+| reference | 9 | 28,102.4 | [10,716.9, 47,282.5] | 34.3% | opus-effort-medium higher |
+
+**Verdict.** `opus-effort-medium` vs `sonnet55-effort-medium` over 45 paired tasks: tokens higher by 21,269 (95% CI [7,442, 34,744]); cost higher by 0.1222 (95% CI [0.1001, 0.1475]); turns no detectable difference; accuracy 84.4% vs 88.9% (38/45 vs 40/45).
+
+### `opus-effort-high` vs `sonnet55-effort-high`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet55-effort-high | 45 | **124,327** (79,460–164,246) | 124,327 | 0.089 | 6.0 | 0 in 0 run(s) | 10 | 1 | 0 | 224 | 0 | 86.7% (39/45) | 150,851 |
+| opus-effort-high | 45 | **131,978** (102,009–175,134) | 131,978 | 0.196 | 6.0 | 0 in 0 run(s) | 0 | 0 | 0 | 237 | 0 | 86.7% (39/45) | 172,766 |
+
+Paired difference (`opus-effort-high` − `sonnet55-effort-high`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | 20,010.0 | [-1,186.0, 43,548.6] | 19.4% | **CI crosses 0 — no detectable difference** |
+| uncached_equivalent | 45 | 20,010.0 | [-1,454.6, 43,369.2] | 19.4% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 45 | 0.1352 | [0.1113, 0.1636] | 121.6% | opus-effort-high higher |
+| num_turns | 45 | 0.0 | [-0.5, 0.5] | 4.4% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (38/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 38 | 21,930.4 | [-3,038.9, 48,816.4] | 20.1% | **CI crosses 0 — no detectable difference** |
+| uncached_equivalent | 38 | 21,930.4 | [-3,513.2, 49,754.3] | 20.1% | **CI crosses 0 — no detectable difference** |
+| total_cost_usd | 38 | 0.1418 | [0.1134, 0.1735] | 117.6% | opus-effort-high higher |
+| num_turns | 38 | 0.1 | [-0.5, 0.7] | 5.3% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | 51,344.7 | [-49,233.0, 152,521.8] | 28.6% | **CI crosses 0 — no detectable difference** |
+| fix | 9 | 16,490.3 | [478.4, 35,697.0] | 14.2% | opus-effort-high higher |
+| impact | 9 | 23,980.0 | [3,840.6, 46,359.8] | 40.5% | opus-effort-high higher |
+| locate | 9 | 2,906.3 | [-16,664.7, 24,033.7] | 5.2% | **CI crosses 0 — no detectable difference** |
+| reference | 9 | 5,328.8 | [-11,676.2, 24,000.6] | 8.7% | **CI crosses 0 — no detectable difference** |
+
+**Verdict.** `opus-effort-high` vs `sonnet55-effort-high` over 45 paired tasks: tokens no detectable difference; cost higher by 0.1352 (95% CI [0.1113, 0.1636]); turns no detectable difference; accuracy 86.7% vs 86.7% (39/45 vs 39/45).
+
+### `opus-effort-xhigh` vs `sonnet55-effort-xhigh`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet55-effort-xhigh | 45 | **134,815** (99,587–174,203) | 134,815 | 0.116 | 7.0 | 0 in 0 run(s) | 97 | 1 | 0 | 263 | 0 | 84.4% (38/45) | 211,021 |
+| opus-effort-xhigh | 45 | **144,863** (106,661–248,963) | 144,863 | 0.235 | 6.0 | 0 in 0 run(s) | 0 | 0 | 0 | 313 | 0 | 84.4% (38/45) | 274,361 |
+
+Paired difference (`opus-effort-xhigh` − `sonnet55-effort-xhigh`), all 45 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 45 | 55,284.2 | [27,307.6, 90,284.1] | 20.3% | opus-effort-xhigh higher |
+| uncached_equivalent | 45 | 55,284.2 | [29,051.8, 88,344.0] | 20.3% | opus-effort-xhigh higher |
+| total_cost_usd | 45 | 0.1706 | [0.1332, 0.2131] | 106.2% | opus-effort-xhigh higher |
+| num_turns | 45 | -1.1 | [-3.0, 0.2] | -3.7% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (38/45 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 38 | 63,339.4 | [32,339.0, 103,889.8] | 21.5% | opus-effort-xhigh higher |
+| uncached_equivalent | 38 | 63,339.4 | [31,191.0, 105,743.1] | 21.5% | opus-effort-xhigh higher |
+| total_cost_usd | 38 | 0.1822 | [0.1409, 0.2341] | 104.2% | opus-effort-xhigh higher |
+| num_turns | 38 | -1.2 | [-3.3, 0.4] | -3.4% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| explain | 9 | 205,388.4 | [113,881.1, 312,039.8] | 40.3% | opus-effort-xhigh higher |
+| fix | 9 | 29,142.4 | [-7,158.2, 72,766.4] | 19.3% | **CI crosses 0 — no detectable difference** |
+| impact | 9 | 14,855.4 | [1,546.7, 30,930.0] | 17.2% | opus-effort-xhigh higher |
+| locate | 9 | 6,901.6 | [1,320.2, 13,574.2] | 8.5% | opus-effort-xhigh higher |
+| reference | 9 | 20,133.3 | [3,380.8, 36,044.9] | 16.4% | opus-effort-xhigh higher |
+
+**Verdict.** `opus-effort-xhigh` vs `sonnet55-effort-xhigh` over 45 paired tasks: tokens higher by 55,284 (95% CI [27,308, 90,284]); cost higher by 0.1706 (95% CI [0.1332, 0.2131]); turns no detectable difference; accuracy 84.4% vs 84.4% (38/45 vs 38/45).
+
 ## 8. Features never exercised
 
 graphify exposes more than `query`. The table counts, per arm, how many times each subcommand was invoked across all runs (and, in parentheses, how many runs used it at least once). A zero column is the point: it means the benchmark never put that feature under measurement, so nothing here — positive or negative — can be read as evidence about it.
@@ -597,6 +909,10 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `opus-effort-low` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `opus-effort-medium` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `opus-effort-xhigh` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `sonnet55-effort-high` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `sonnet55-effort-low` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `sonnet55-effort-medium` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `sonnet55-effort-xhigh` | 45 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 
 | condition | runs reading `graph.json` directly | runs that never invoked the CLI (nudge ignored) | strict denials: total (median/run) |
 |---|---|---|---|
@@ -609,6 +925,10 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `opus-effort-low` | 0 | n/a (no graph) | 0 (0) |
 | `opus-effort-medium` | 0 | n/a (no graph) | 0 (0) |
 | `opus-effort-xhigh` | 0 | n/a (no graph) | 0 (0) |
+| `sonnet55-effort-high` | 0 | n/a (no graph) | 0 (0) |
+| `sonnet55-effort-low` | 0 | n/a (no graph) | 0 (0) |
+| `sonnet55-effort-medium` | 0 | n/a (no graph) | 0 (0) |
+| `sonnet55-effort-xhigh` | 0 | n/a (no graph) | 0 (0) |
 
 > **Cross-session memory was never measured.** `save-result`, `reflect` and `affected` are the mechanisms by which graphify is supposed to compound across sessions, and they were invoked **zero times in every arm**. Each benchmark run is a fresh corpus copy with a fresh session, so there is no second session for a saved result to pay off in — the design that would exercise them is a different experiment, not a variation of this one. The honest statement is that this benchmark measures single-session retrieval only.
 
@@ -629,6 +949,10 @@ Session timings, median (IQR) in ms:
 | `opus-effort-low` | 45 | 18,670 (14,521–27,411) | 13,345 (11,584–17,895) | 13,055 (10,998–17,389) | 2,365 (2,194–2,540) | 34 (29–42) |
 | `opus-effort-medium` | 45 | 20,933 (18,143–33,144) | 17,793 (13,582–22,849) | 16,823 (13,234–21,395) | 2,530 (2,304–2,662) | 32 (28–38) |
 | `opus-effort-xhigh` | 45 | 26,462 (20,185–43,718) | 24,795 (18,317–38,949) | 24,402 (18,012–38,590) | 2,694 (1,535–2,882) | 32 (28–36) |
+| `sonnet55-effort-high` | 45 | 40,129 (21,967–66,757) | 12,030 (9,438–16,152) | 11,704 (9,148–15,880) | 1,568 (1,469–1,814) | 27 (26–28) |
+| `sonnet55-effort-low` | 45 | 38,141 (26,688–48,558) | 8,491 (6,224–15,146) | 8,260 (5,995–14,833) | 1,479 (1,385–1,757) | 27 (26–28) |
+| `sonnet55-effort-medium` | 45 | 40,186 (29,415–55,629) | 9,148 (7,052–16,264) | 8,839 (6,750–15,931) | 1,584 (1,427–1,812) | 28 (26–29) |
+| `sonnet55-effort-xhigh` | 45 | 47,634 (37,429–71,854) | 16,890 (12,821–30,481) | 16,573 (11,815–30,138) | 1,644 (1,412–1,955) | 27 (26–29) |
 
 `claude.wall_ms` is the whole `claude -p` process as the harness timed it. Prefer it over `duration_ms` when an arm delegates: from Claude Code 2.1.28x the `Agent` tool runs in the background and `duration_ms` stops before the subagent's work is folded back in.
 
@@ -636,17 +960,21 @@ Session timings, median (IQR) in ms:
 
 Per-tool-call latency, median (IQR) in ms, pooled over calls:
 
-| condition | `Read` | `Bash` | `Agent` |
-|---|---|---|---|
-| `effort-high` | 8 (5–16) | 54 (39–176) | 14 (8–18) |
-| `effort-low` | 8 (7–11) | 57 (36–193) | 9 (8–11) |
-| `effort-low-nosub` | 7 (5–9) | 51 (35–181) | – |
-| `effort-medium` | 7 (6–12) | 55 (33–190) | 13 (8–16) |
-| `effort-xhigh` | 8 (5–13) | 48 (32–132) | 11 (8–15) |
-| `opus-effort-high` | – | 53 (41–77) | – |
-| `opus-effort-low` | – | 52 (38–100) | – |
-| `opus-effort-medium` | 123 (66–179) | 56 (42–88) | – |
-| `opus-effort-xhigh` | – | 49 (39–68) | – |
+| condition | `Read` | `Grep` | `Bash` | `Agent` |
+|---|---|---|---|---|
+| `effort-high` | 8 (5–16) | – | 54 (39–176) | 14 (8–18) |
+| `effort-low` | 8 (7–11) | – | 57 (36–193) | 9 (8–11) |
+| `effort-low-nosub` | 7 (5–9) | – | 51 (35–181) | – |
+| `effort-medium` | 7 (6–12) | – | 55 (33–190) | 13 (8–16) |
+| `effort-xhigh` | 8 (5–13) | – | 48 (32–132) | 11 (8–15) |
+| `opus-effort-high` | – | – | 53 (41–77) | – |
+| `opus-effort-low` | – | – | 52 (38–100) | – |
+| `opus-effort-medium` | 123 (66–179) | – | 56 (42–88) | – |
+| `opus-effort-xhigh` | – | – | 49 (39–68) | – |
+| `sonnet55-effort-high` | 6 (4–6) | 1 (1–1) | 42 (29–62) | – |
+| `sonnet55-effort-low` | 6 (5–6) | – | 44 (34–171) | – |
+| `sonnet55-effort-medium` | – | – | 42 (30–72) | – |
+| `sonnet55-effort-xhigh` | 4 (4–6) | 1 (1–1) | 41 (30–66) | – |
 
 Each cell is timed from the transcript entry carrying the `tool_use` block to the entry carrying its matching `tool_result`, both written locally by the same process. Calls whose result never arrived — a run that hit its turn cap mid-call — are absent rather than counted as zero. `n` per cell is the number of calls, not the number of runs, so an arm that called a tool once contributes one observation.
 
@@ -667,22 +995,30 @@ Thinking tokens are billed as output and are a **subset** of `output_tokens`, no
 | `opus-effort-low` | 45 | 3,320 | 63,780 | 5.2% |
 | `opus-effort-medium` | 45 | 9,381 | 92,876 | 10.1% |
 | `opus-effort-xhigh` | 45 | 51,424 | 177,148 | 29.0% |
+| `sonnet55-effort-high` | 45 | 8,167 | 85,439 | 9.6% |
+| `sonnet55-effort-low` | 45 | 2,091 | 53,695 | 3.9% |
+| `sonnet55-effort-medium` | 45 | 4,045 | 64,786 | 6.2% |
+| `sonnet55-effort-xhigh` | 45 | 51,470 | 164,796 | 31.2% |
 
 **Which model spent the tokens.** Summed from `modelUsage` over every run of the arm, on the same definition as `uncached_equivalent_all` (input + cache read + cache creation), so the row totals reconcile with the headline volume rather than describing some adjacent quantity. Note that a ~1k-token Haiku entry appears in **every** arm, including plain `baseline`: that is Claude Code's own background helper call, not delegated exploration. Only an arm whose Haiku row is orders of magnitude larger than that has actually moved work onto Haiku.
 
 That helper's size is a deterministic function of the task prompt, so every Sonnet arm running the same task set reports the **identical** Haiku total. Rows agreeing to the token are therefore the expected result here, not a copy-paste fault — and they are what makes the figure usable as a baseline to read a genuinely delegating arm against.
 
-| condition | `claude-opus-5-5` tokens | `claude-sonnet-5` tokens | `claude-opus-5-5` cost | `claude-sonnet-5` cost |
-|---|---|---|---|---|
-| `effort-high` | 0 | 18,827,147 | $0.00 | $12.14 |
-| `effort-low` | 0 | 11,499,491 | $0.00 | $8.18 |
-| `effort-low-nosub` | 0 | 8,751,362 | $0.00 | $5.67 |
-| `effort-medium` | 0 | 14,388,100 | $0.00 | $9.80 |
-| `effort-xhigh` | 0 | 27,255,569 | $0.00 | $16.60 |
-| `opus-effort-high` | 7,273,479 | 0 | $11.31 | $0.00 |
-| `opus-effort-low` | 5,156,317 | 0 | $7.33 | $0.00 |
-| `opus-effort-medium` | 6,185,216 | 0 | $9.65 | $0.00 |
-| `opus-effort-xhigh` | 11,207,236 | 0 | $15.52 | $0.00 |
+| condition | `claude-opus-5-5` tokens | `claude-sonnet-5` tokens | `claude-sonnet-5-5` tokens | `claude-opus-5-5` cost | `claude-sonnet-5` cost | `claude-sonnet-5-5` cost |
+|---|---|---|---|---|---|---|
+| `effort-high` | 0 | 18,827,147 | 0 | $0.00 | $12.14 | $0.00 |
+| `effort-low` | 0 | 11,499,491 | 0 | $0.00 | $8.18 | $0.00 |
+| `effort-low-nosub` | 0 | 8,751,362 | 0 | $0.00 | $5.67 | $0.00 |
+| `effort-medium` | 0 | 14,388,100 | 0 | $0.00 | $9.80 | $0.00 |
+| `effort-xhigh` | 0 | 27,255,569 | 0 | $0.00 | $16.60 | $0.00 |
+| `opus-effort-high` | 7,273,479 | 0 | 0 | $11.31 | $0.00 | $0.00 |
+| `opus-effort-low` | 5,156,317 | 0 | 0 | $7.33 | $0.00 | $0.00 |
+| `opus-effort-medium` | 6,185,216 | 0 | 0 | $9.65 | $0.00 | $0.00 |
+| `opus-effort-xhigh` | 11,207,236 | 0 | 0 | $15.52 | $0.00 | $0.00 |
+| `sonnet55-effort-high` | 0 | 0 | 6,373,028 | $0.00 | $0.00 | $5.23 |
+| `sonnet55-effort-low` | 0 | 0 | 4,569,229 | $0.00 | $0.00 | $3.70 |
+| `sonnet55-effort-medium` | 0 | 0 | 5,228,099 | $0.00 | $0.00 | $4.15 |
+| `sonnet55-effort-xhigh` | 0 | 0 | 8,719,445 | $0.00 | $0.00 | $7.85 |
 
 ## 11. Where the remaining tokens go
 
@@ -701,6 +1037,10 @@ Caveats that bound the reading: `first_turn_cache_creation` and `num_turns` are 
 | `opus-effort-low` | 45 | 104,202 | 5 | 8,533 | 42,570 | 61,939 | 40.8% |
 | `opus-effort-medium` | 45 | 119,567 | 5 | 8,532 | 42,675 | 75,896 | 37.9% |
 | `opus-effort-xhigh` | 45 | 144,863 | 6 | 8,535 | 51,132 | 93,701 | 33.9% |
+| `sonnet55-effort-high` | 45 | 124,327 | 6 | 7,596 | 45,402 | 78,877 | 37.6% |
+| `sonnet55-effort-low` | 45 | 80,852 | 4 | 7,597 | 30,424 | 50,444 | 38.3% |
+| `sonnet55-effort-medium` | 45 | 97,000 | 5 | 7,593 | 37,965 | 59,092 | 38.3% |
+| `sonnet55-effort-xhigh` | 45 | 134,815 | 7 | 7,597 | 45,642 | 88,266 | 36.3% |
 
 ## 12. Counter-productive cases and subagent use
 
@@ -713,6 +1053,10 @@ Caveats that bound the reading: `first_turn_cache_creation` and `num_turns` are 
 - `opus-effort-low`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 121,364 vs main-session-only 121,364.
 - `opus-effort-medium`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 147,596 vs main-session-only 147,596.
 - `opus-effort-xhigh`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 274,361 vs main-session-only 274,361.
+- `sonnet55-effort-high`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 150,851 vs main-session-only 150,851.
+- `sonnet55-effort-low`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 107,969 vs main-session-only 107,969.
+- `sonnet55-effort-medium`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 121,496 vs main-session-only 121,496.
+- `sonnet55-effort-xhigh`: **0** subagent(s) spawned across **0**/45 run(s). T2S all-model 211,021 vs main-session-only 211,021.
 - Runs that opened `graphify-out/graph.json` directly: **0**
 - graphify-condition runs that never invoked the `graphify` CLI (nudge ignored): **45** (`EXP1-issue-create-flow__opus-effort-medium__r1`, `EXP2-comment-mention-notify__opus-effort-medium__r1`, `EXP3-digest-pipeline__opus-effort-medium__r1`, `FIX1-issue-tenant-leak__opus-effort-medium__r1`, `FIX2-project-quota-off-by-one__opus-effort-medium__r1`, `FIX3-board-shows-archived__opus-effort-medium__r1`, `IMP1-planlimits-field__opus-effort-medium__r1`, `IMP2-rename-issue-created__opus-effort-medium__r1`, `IMP3-limited-resource-union__opus-effort-medium__r1`, `LOC1-shortcut-match__opus-effort-medium__r1`, `LOC2-webhook-plan-cap__opus-effort-medium__r1`, `LOC3-digest-window__opus-effort-medium__r1`, `REF1-assertcan-callers__opus-effort-medium__r1`, `REF2-would-exceed-limit-callers__opus-effort-medium__r1`, `REF3-issue-created-subscribers__opus-effort-medium__r1`, `XEXP1-webhook-delivery__opus-effort-medium__r1`, `XEXP2-invitation-lifecycle__opus-effort-medium__r1`, `XEXP3-plan-change__opus-effort-medium__r1`, `XEXP4-signin-to-actor__opus-effort-medium__r1`, `XEXP5-search-index__opus-effort-medium__r1`, `XEXP6-overdue-sweep__opus-effort-medium__r1`, `XFIX1-csv-quote-escape__opus-effort-medium__r1`, `XFIX2-mention-inside-code__opus-effort-medium__r1`, `XFIX3-last-owner-removable__opus-effort-medium__r1`, `XFIX4-advanced-search-inverted__opus-effort-medium__r1`, `XFIX5-self-notification__opus-effort-medium__r1`, `XFIX6-revoked-invite-accepted__opus-effort-medium__r1`, `XIMP1-role-union__opus-effort-medium__r1`, `XIMP2-rename-comment-created__opus-effort-medium__r1`, `XIMP3-issue-status-union__opus-effort-medium__r1`, `XIMP4-feature-flag-key-union__opus-effort-medium__r1`, `XIMP5-plan-id-union__opus-effort-medium__r1`, `XIMP6-limit-check-field__opus-effort-medium__r1`, `XLOC1-retry-throttle__opus-effort-medium__r1`, `XLOC2-invite-link-validity__opus-effort-medium__r1`, `XLOC3-issue-number-allocation__opus-effort-medium__r1`, `XLOC4-session-lifetime__opus-effort-medium__r1`, `XLOC5-delivery-retry-policy__opus-effort-medium__r1`, `XLOC6-menu-entry-visibility__opus-effort-medium__r1`, `XREF1-assertorgscope-callers__opus-effort-medium__r1`, `XREF2-emit-callers__opus-effort-medium__r1`, `XREF3-isenabled-callers__opus-effort-medium__r1`, `XREF4-comment-created-subscribers__opus-effort-medium__r1`, `XREF5-rate-limit-importers__opus-effort-medium__r1`, `XREF6-member-joined-repositories__opus-effort-medium__r1`)
 
@@ -731,6 +1075,10 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `IMP2-rename-issue-created__opus-effort-low__r1` | opus-effort-low | IMP2-rename-issue-created | false | completed |
 | `IMP2-rename-issue-created__opus-effort-medium__r1` | opus-effort-medium | IMP2-rename-issue-created | false | completed |
 | `IMP2-rename-issue-created__opus-effort-xhigh__r1` | opus-effort-xhigh | IMP2-rename-issue-created | false | completed |
+| `IMP2-rename-issue-created__sonnet55-effort-high__r1` | sonnet55-effort-high | IMP2-rename-issue-created | false | completed |
+| `IMP2-rename-issue-created__sonnet55-effort-low__r1` | sonnet55-effort-low | IMP2-rename-issue-created | false | completed |
+| `IMP2-rename-issue-created__sonnet55-effort-medium__r1` | sonnet55-effort-medium | IMP2-rename-issue-created | false | completed |
+| `IMP2-rename-issue-created__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | IMP2-rename-issue-created | false | completed |
 | `IMP3-limited-resource-union__effort-high__r1` | effort-high | IMP3-limited-resource-union | false | completed |
 | `LOC2-webhook-plan-cap__effort-high__r1` | effort-high | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__effort-low-nosub__r1` | effort-low-nosub | LOC2-webhook-plan-cap | false | completed |
@@ -741,12 +1089,18 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `LOC2-webhook-plan-cap__opus-effort-low__r1` | opus-effort-low | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__opus-effort-medium__r1` | opus-effort-medium | LOC2-webhook-plan-cap | false | completed |
 | `LOC2-webhook-plan-cap__opus-effort-xhigh__r1` | opus-effort-xhigh | LOC2-webhook-plan-cap | false | completed |
+| `LOC2-webhook-plan-cap__sonnet55-effort-low__r1` | sonnet55-effort-low | LOC2-webhook-plan-cap | false | completed |
+| `LOC2-webhook-plan-cap__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | LOC2-webhook-plan-cap | false | completed |
 | `LOC3-digest-window__effort-high__r1` | effort-high | LOC3-digest-window | false | completed |
 | `LOC3-digest-window__effort-medium__r1` | effort-medium | LOC3-digest-window | false | completed |
 | `LOC3-digest-window__effort-xhigh__r1` | effort-xhigh | LOC3-digest-window | false | completed |
 | `LOC3-digest-window__opus-effort-high__r1` | opus-effort-high | LOC3-digest-window | false | completed |
 | `LOC3-digest-window__opus-effort-low__r1` | opus-effort-low | LOC3-digest-window | false | completed |
 | `LOC3-digest-window__opus-effort-xhigh__r1` | opus-effort-xhigh | LOC3-digest-window | false | completed |
+| `LOC3-digest-window__sonnet55-effort-high__r1` | sonnet55-effort-high | LOC3-digest-window | false | completed |
+| `LOC3-digest-window__sonnet55-effort-low__r1` | sonnet55-effort-low | LOC3-digest-window | false | completed |
+| `LOC3-digest-window__sonnet55-effort-medium__r1` | sonnet55-effort-medium | LOC3-digest-window | false | completed |
+| `LOC3-digest-window__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | LOC3-digest-window | false | completed |
 | `REF2-would-exceed-limit-callers__effort-low__r1` | effort-low | REF2-would-exceed-limit-callers | false | completed |
 | `XFIX3-last-owner-removable__effort-low__r1` | effort-low | XFIX3-last-owner-removable | false | completed |
 | `XFIX5-self-notification__effort-low__r1` | effort-low | XFIX5-self-notification | false | completed |
@@ -760,6 +1114,8 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `XIMP1-role-union__effort-xhigh__r1` | effort-xhigh | XIMP1-role-union | false | completed |
 | `XIMP1-role-union__opus-effort-medium__r1` | opus-effort-medium | XIMP1-role-union | false | completed |
 | `XIMP1-role-union__opus-effort-xhigh__r1` | opus-effort-xhigh | XIMP1-role-union | false | completed |
+| `XIMP1-role-union__sonnet55-effort-high__r1` | sonnet55-effort-high | XIMP1-role-union | false | completed |
+| `XIMP1-role-union__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | XIMP1-role-union | false | completed |
 | `XIMP2-rename-comment-created__effort-high__r1` | effort-high | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__effort-low-nosub__r1` | effort-low-nosub | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__effort-low__r1` | effort-low | XIMP2-rename-comment-created | false | completed |
@@ -769,6 +1125,10 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `XIMP2-rename-comment-created__opus-effort-low__r1` | opus-effort-low | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__opus-effort-medium__r1` | opus-effort-medium | XIMP2-rename-comment-created | false | completed |
 | `XIMP2-rename-comment-created__opus-effort-xhigh__r1` | opus-effort-xhigh | XIMP2-rename-comment-created | false | completed |
+| `XIMP2-rename-comment-created__sonnet55-effort-high__r1` | sonnet55-effort-high | XIMP2-rename-comment-created | false | completed |
+| `XIMP2-rename-comment-created__sonnet55-effort-low__r1` | sonnet55-effort-low | XIMP2-rename-comment-created | false | completed |
+| `XIMP2-rename-comment-created__sonnet55-effort-medium__r1` | sonnet55-effort-medium | XIMP2-rename-comment-created | false | completed |
+| `XIMP2-rename-comment-created__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | XIMP2-rename-comment-created | false | completed |
 | `XIMP5-plan-id-union__effort-high__r1` | effort-high | XIMP5-plan-id-union | false | completed |
 | `XIMP5-plan-id-union__effort-low-nosub__r1` | effort-low-nosub | XIMP5-plan-id-union | false | completed |
 | `XIMP5-plan-id-union__effort-low__r1` | effort-low | XIMP5-plan-id-union | false | completed |
@@ -785,18 +1145,26 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **0*
 | `XIMP6-limit-check-field__opus-effort-low__r1` | opus-effort-low | XIMP6-limit-check-field | false | completed |
 | `XIMP6-limit-check-field__opus-effort-medium__r1` | opus-effort-medium | XIMP6-limit-check-field | false | completed |
 | `XIMP6-limit-check-field__opus-effort-xhigh__r1` | opus-effort-xhigh | XIMP6-limit-check-field | false | completed |
+| `XIMP6-limit-check-field__sonnet55-effort-high__r1` | sonnet55-effort-high | XIMP6-limit-check-field | false | completed |
+| `XIMP6-limit-check-field__sonnet55-effort-low__r1` | sonnet55-effort-low | XIMP6-limit-check-field | false | completed |
+| `XIMP6-limit-check-field__sonnet55-effort-medium__r1` | sonnet55-effort-medium | XIMP6-limit-check-field | false | completed |
+| `XIMP6-limit-check-field__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | XIMP6-limit-check-field | false | completed |
 | `XLOC4-session-lifetime__effort-low-nosub__r1` | effort-low-nosub | XLOC4-session-lifetime | false | completed |
 | `XLOC4-session-lifetime__opus-effort-high__r1` | opus-effort-high | XLOC4-session-lifetime | false | completed |
 | `XLOC4-session-lifetime__opus-effort-low__r1` | opus-effort-low | XLOC4-session-lifetime | false | completed |
 | `XLOC4-session-lifetime__opus-effort-medium__r1` | opus-effort-medium | XLOC4-session-lifetime | false | completed |
 | `XLOC4-session-lifetime__opus-effort-xhigh__r1` | opus-effort-xhigh | XLOC4-session-lifetime | false | completed |
+| `XLOC4-session-lifetime__sonnet55-effort-high__r1` | sonnet55-effort-high | XLOC4-session-lifetime | false | completed |
+| `XLOC4-session-lifetime__sonnet55-effort-low__r1` | sonnet55-effort-low | XLOC4-session-lifetime | false | completed |
+| `XLOC4-session-lifetime__sonnet55-effort-medium__r1` | sonnet55-effort-medium | XLOC4-session-lifetime | false | completed |
+| `XLOC4-session-lifetime__sonnet55-effort-xhigh__r1` | sonnet55-effort-xhigh | XLOC4-session-lifetime | false | completed |
 | `XREF4-comment-created-subscribers__effort-low__r1` | effort-low | XREF4-comment-created-subscribers | false | completed |
 
 ## 14. Deliberately-easy controls vs the rest
 
 Some tasks were written as **designed zero-advantage controls**: their answer is reproduced exactly by a single literal `grep`, so a structural index has nothing to add and the expected effect is zero or negative. They are marked `DELIBERATELY EASY` in the task notes and are separated out here so they neither flatter nor drag the headline number. Easy tasks: `IMP2-rename-issue-created`, `LOC1-shortcut-match`, `XIMP2-rename-comment-created`, `XLOC1-retry-throttle`, `XREF5-rate-limit-importers`.
 
-### easy (zero-advantage controls) — 45 runs over 5 tasks
+### easy (zero-advantage controls) — 65 runs over 5 tasks
 
 | condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -809,6 +1177,10 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 | opus-effort-low | 5 | **77,993** (77,459–78,168) | 77,993 | 0.106 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 14 | 0 | 60.0% (3/5) | 85,795 |
 | opus-effort-medium | 5 | **76,868** (61,445–80,266) | 76,868 | 0.121 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 14 | 0 | 60.0% (3/5) | 94,499 |
 | opus-effort-xhigh | 5 | **79,462** (64,692–102,789) | 79,462 | 0.150 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 16 | 0 | 60.0% (3/5) | 108,226 |
+| sonnet55-effort-high | 5 | **74,574** (74,424–96,729) | 74,574 | 0.057 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 17 | 0 | 60.0% (3/5) | 98,543 |
+| sonnet55-effort-low | 5 | **74,069** (36,510–74,506) | 74,069 | 0.052 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 11 | 0 | 60.0% (3/5) | 74,607 |
+| sonnet55-effort-medium | 5 | **73,543** (36,491–75,617) | 73,543 | 0.055 | 4.0 | 0 in 0 run(s) | 0 | 0 | 0 | 12 | 0 | 60.0% (3/5) | 82,032 |
+| sonnet55-effort-xhigh | 5 | **77,670** (76,430–79,355) | 77,670 | 0.069 | 4.0 | 0 in 0 run(s) | 2 | 0 | 0 | 15 | 0 | 60.0% (3/5) | 87,252 |
 
 | metric | tasks | mean diff | 95% CI | mean relative | verdict |
 |---|---|---|---|---|---|
@@ -817,7 +1189,7 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 | total_cost_usd | 0 | – | [–, –] | – | n too small |
 | num_turns | 0 | – | [–, –] | – | n too small |
 
-### rest — 360 runs over 40 tasks
+### rest — 520 runs over 40 tasks
 
 | condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -830,6 +1202,10 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 | opus-effort-low | 40 | **111,884** (79,484–138,039) | 111,884 | 0.140 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 175 | 0 | 87.5% (35/40) | 124,413 |
 | opus-effort-medium | 40 | **123,417** (102,736–164,967) | 123,417 | 0.171 | 6.0 | 0 in 0 run(s) | 2 | 0 | 0 | 198 | 0 | 87.5% (35/40) | 152,147 |
 | opus-effort-xhigh | 40 | **162,586** (112,648–263,626) | 162,586 | 0.242 | 6.0 | 0 in 0 run(s) | 0 | 0 | 0 | 297 | 0 | 87.5% (35/40) | 288,601 |
+| sonnet55-effort-high | 40 | **132,122** (95,894–167,997) | 132,122 | 0.091 | 6.0 | 0 in 0 run(s) | 10 | 1 | 0 | 207 | 0 | 90.0% (36/40) | 155,210 |
+| sonnet55-effort-low | 40 | **96,960** (74,980–120,951) | 96,960 | 0.072 | 5.0 | 0 in 0 run(s) | 2 | 0 | 0 | 154 | 0 | 90.0% (36/40) | 110,749 |
+| sonnet55-effort-medium | 40 | **100,518** (76,154–150,749) | 100,518 | 0.076 | 5.0 | 0 in 0 run(s) | 0 | 0 | 0 | 179 | 0 | 92.5% (37/40) | 124,695 |
+| sonnet55-effort-xhigh | 40 | **142,480** (108,789–197,308) | 142,480 | 0.117 | 7.5 | 0 in 0 run(s) | 95 | 1 | 0 | 248 | 0 | 87.5% (35/40) | 221,630 |
 
 | metric | tasks | mean diff | 95% CI | mean relative | verdict |
 |---|---|---|---|---|---|
@@ -840,7 +1216,7 @@ Some tasks were written as **designed zero-advantage controls**: their answer is
 
 ## 15. Limitations
 
-- N = 405 runs over 45 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
+- N = 585 runs over 45 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
 - Bootstrap resamples tasks, so the interval reflects task-to-task variation, not within-task run noise.
 - Where a CI crosses zero the honest reading is "no difference detected at this N", not "no difference exists".
 - The fixed ~21k-token system-prompt/tool-definition overhead is included in both arms and not subtracted (see §2).

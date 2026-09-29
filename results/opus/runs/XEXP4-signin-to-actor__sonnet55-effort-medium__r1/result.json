@@ -1,0 +1,97 @@
+{
+  "duration_api_ms": 30052,
+  "stop_reason": "end_turn",
+  "session_id": "76933659-88ea-46d9-b1ac-ec348dae00d3",
+  "total_cost_usd": 0.2160732,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 31840,
+    "cache_read_input_tokens": 237156,
+    "output_tokens": 4125,
+    "output_tokens_details": {
+      "thinking_tokens": 114
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 31840,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2589,
+        "cache_read_input_tokens": 41798,
+        "cache_creation_input_tokens": 501,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 501
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 16,
+      "outputTokens": 4125,
+      "cacheReadInputTokens": 237156,
+      "cacheCreationInputTokens": 31840,
+      "webSearchRequests": 0,
+      "costUSD": 0.2160732,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 114,
+      "canonicalModel": "claude-sonnet-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "is_error": false,
+  "num_turns": 8,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Sign-in runs in this order. I read the code but did not run it.\n\n## 1. Submitting the form\n- `LoginForm` (`src/app/(auth)/login/`) is a client component. It runs `loginSchema.safeParse` on the email, password and `rememberMe` fields to show field errors without a round trip.\n- It then calls the server action `loginAction` in `src/actions/auth/login.ts`. That action re-parses with `loginSchema`, because the client check is only a convenience.\n- `loginAction` does not use `withAction()`. There is no tenant or `Actor` yet, so it cannot.\n\n## 2. Checking the credentials\n- `loginAction` first calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")`. If the limit is hit it throws `RateLimitedError`.\n- It then calls `login()` in `src/server/services/auth-service.ts`. That function charges the same rate-limit bucket again.\n- `userRepo.findUserByEmail` looks up the user, and `userRepo.findPasswordHash` fetches the stored hash.\n- `verifyPassword` in `src/lib/hash.ts` checks the password. Stored hashes look like `scrypt:<salt>:<key>`. The password is NFKC-normalised, run through scrypt with the stored salt, and compared with `timingSafeEqual`.\n- An unknown email and a wrong password throw the same \"Those credentials did not match\" error.\n\n## 3. What is created, stored and sent to the browser\n- `login()` calls `createSessionToken(userId)` in `src/server/services/session-service.ts`.\n- That function makes a random 32-byte token with `randomToken` and sets the expiry to 30 days out.\n- `sessionRepo.createSession` inserts a row into the `sessions` table with a new id, the `userId`, `activeOrgId: null`, the `expiresAt` and the timestamps. The row holds only `hashToken(token)`, a SHA-256 of the token. A database dump therefore can't be replayed as a login.\n- Back in `loginAction`, `resolveSession(token)` immediately reads the session back into a `SessionPrincipal`. That is `{userId, email, activeOrgId, expiresAt}`.\n- `setSessionCookie` in `src/lib/session.ts` sends the raw token to the browser as the `taskflow_session` cookie. The cookie is `httpOnly`, `sameSite: lax` and `path: /`. It is `secure` in production, and its expiry is the session's `expiresAt`.\n- The action returns `{ok: true, data: principal}`. The form's `useEffect` then calls `router.push(next)`. The `next` value was sanitised on the login page by `safeDestination` so it can only be a same-site path.\n\nSo the server stores the token hash and the session row. The browser gets only the raw token in the cookie.\n\n## 4. How a later request re-establishes identity\n1. **`src/proxy.ts`** (the Next 16 replacement for middleware) runs first. It lets public paths through. For any other path it checks only that a `taskflow_session` cookie exists, and if not it redirects to `/login?next=…`. It cannot reach the database, so a present cookie proves nothing.\n2. **`getSessionPrincipal()`** in `src/lib/session.ts` does the real check. It reads the cookie with `getSessionToken`, and `resolveSession` hashes it. `sessionRepo.findSessionByTokenHash` then joins `sessions` to `users` and returns `null` if the row is missing or `expiresAt <= now`. `getSessionPrincipal` checks the expiry again.\n\n## 5. How the app decides the user is still signed in\n- There is no sliding renewal. A session is valid until its 30-day `expiresAt`, and the cookie expires at the same time.\n- Every request is re-validated against the database row.\n- `src/app/(dashboard)/layout.tsx` calls `getSessionPrincipal()` and does `redirect(\"/login\")` if it returns `null`. Its own comment says this is where the signed-in decision is really made.\n- Logout is `src/actions/auth/logout.ts`, which calls `clearSessionCookie`. `sessionRepo.revokeSession` deletes a row by session id, and `purgeExpiredSessions` sweeps expired rows.\n- `destroySession` in `session-service.ts` doesn't revoke the token's own row. It only purges already-expired rows, because `SessionPrincipal` carries no session id. I did not read `logout.ts`, so I can't say whether the logout action ends up going through that path.\n\n## 6. From bare identity to an `Actor` the pages can authorize against\n- A `SessionPrincipal` says who the user is but not what they may do. Authorization needs an `Actor` of the form `{userId, orgId, role}`.\n- `src/app/(dashboard)/[orgSlug]/layout.tsx` builds it in this order:\n  1. It awaits `params` to get `orgSlug`, then calls `getSessionPrincipal()`.\n  2. It calls `resolveOrgBySlug(orgSlug)`, which gives `notFound()` if the org doesn't exist.\n  3. It calls `resolveActorForOrg(principal, orgSlug)` in `session-service.ts`. That function does `findOrgBySlug` and `memberRepo.findMember(org.id, userId)`. It requires `status === \"active\"`, then builds the `Actor` with the member's role. It calls `assertOrgScope` and `touchLastSeen`. If the user isn't an active member it returns `null`, and the layout calls `notFound()`. That is the same 404 as a missing org, so it doesn't reveal which orgs exist.\n  4. The layout calls `assertOrgScope(actor, org.id)` again.\n  5. It calls `snapshotFlags(buildFlagContext(actor, org))` to get the feature-flag snapshot.\n  6. It loads the sidebar projects, the unread notifications and the `checkLimit` results for seats and projects.\n  7. It renders `OrgProvider` with the org, actor, flags and limits, wrapped around `DashboardShell`.\n- Server actions take a parallel path. `withAction()` calls `getActor(orgSlug)` in `src/lib/actor.ts`, or `requireActorFor(orgId)`. Both use the same principal and `resolveActorForOrg`. They throw `UnauthorizedError` or `NoMembershipError` on failure.\n\n## 7. The role-tailored sidebar\n- `DashboardShell` renders `src/components/domain/nav/app-sidebar.tsx`. The sidebar calls `visibleNav(SIDEBAR_NAV, actor, flags)` and `visibleNav(SETTINGS_NAV, actor, flags)` from `src/config/nav.ts`.\n- Each `NavItem` names an optional `action` and an optional `flag`. `visibleNav` drops an item if the flag is off in the snapshot. It also drops it if `can(actor, item.action, navResource(...))` in `src/lib/permissions.ts` returns false.\n- `can()` runs `explain()`, which applies four steps in order:\n  1. A cross-tenant check that compares `actor.orgId` with `resource.orgId`.\n  2. A platform-staff bypass.\n  3. A comparison of the actor's role rank against `ROLE_MATRIX[action]`. For example `org:manage_billing` needs owner and `member:invite` needs admin.\n  4. Ownership escalations, such as authors editing their own issues or comments.\n- Parents left with no visible children are dropped. A viewer therefore doesn't see Billing, Feature flags or Webhooks, while an owner does.",
+  "ttft_ms": 2028,
+  "type": "result",
+  "duration_ms": 30409,
+  "uuid": "ad663b8b-4351-416e-b510-56cd51f8fc2a",
+  "ttft_stream_ms": 677,
+  "time_to_request_ms": 25,
+  "first_content_frame_ms": 677,
+  "queued_turn_count": 0,
+  "result_index": 0
+}
