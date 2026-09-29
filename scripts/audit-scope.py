@@ -31,6 +31,12 @@ SCRATCH = re.compile(r"bench-scratch/([0-9a-f-]{36})")
 # Claude Code persists an oversized tool result under the run's own session
 # directory and tells the agent where; reading it back is reading its own output.
 OWN_SESSION_OUTPUT = re.compile(r"/\.claude/projects/[^/]*bench-scratch-([0-9a-f-]{36})/\1/tool-results/")
+# The same, reached through a wildcard: `~/.claude/projects/*/<own id prefix>*/tool-results/...`.
+OWN_SESSION_GLOB = re.compile(r"/\.claude/projects/\*/([0-9a-f]{8})[0-9a-f-]*\*?/tool-results/")
+# A bench-scratch path whose id differs from the run's own only after the first
+# 8 hex digits is the agent mistyping its own clone path (a mangled uuid), not
+# another run's clone: run ids are random, so an 8-digit prefix collision is ~2^-32.
+SCRATCH_ANY = re.compile(r"bench-scratch/([0-9a-f][0-9a-f-]*)")
 ABS = re.compile(r"(?<![\w.~-])(/(?:Users|home|private|var|tmp|Volumes|opt|etc)/[^\s'\"`;|&)]*)")
 ALLOWED_PREFIXES = (
     "/opt/homebrew/",  # toolchain binaries
@@ -75,7 +81,15 @@ def audit_run(transcript):
             if OWN_SESSION_OUTPUT.search(path):
                 notes.append("own-session-output")
                 continue
+            g = OWN_SESSION_GLOB.search(path)
+            if g and own_id and own_id.startswith(g.group(1)):
+                notes.append("own-session-output")
+                continue
             if own_id and own_id in path:
+                continue
+            typo = SCRATCH_ANY.search(path)
+            if typo and own_id and typo.group(1)[:8] == own_id[:8]:
+                notes.append("own-clone-mistyped")
                 continue
             if path.startswith(ALLOWED_PREFIXES):
                 continue
