@@ -21,5 +21,7 @@ case "${1:?set name}" in
   extreme) OUT=results/models/extreme; TASKS=tasks/tasks-extreme.json; REPS=2; TURNS=120; BUDGET=8; ARMS=$ALL ;;
   *) echo "unknown set: $1" >&2; exit 2 ;;
 esac
+# BENCH_ARMS overrides the arm list (e.g. to add a newly released model's arms only).
+ARMS="${BENCH_ARMS:-$ARMS}"
 exec env BENCH_RESULTS_DIR="$OUT" BENCH_MAX_TURNS=$TURNS BENCH_MAX_BUDGET_USD=$BUDGET pnpm bench:full -- \
   --tasks "$TASKS" --conditions "$ARMS" --reps $REPS --concurrency "${BENCH_CONCURRENCY:-6}" --corpus "$SNAP"
