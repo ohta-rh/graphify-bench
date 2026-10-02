@@ -1,0 +1,385 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/lib/errors.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/lib/errors.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/lib/errors.ts	2026-09-02 11:08:10
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/lib/errors.ts	2026-10-01 14:46:11
+@@ -12,6 +12,7 @@
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
++import { NotFoundError } from "@/server/services/_support";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
+@@ -32,6 +33,7 @@
+   return (
+     error instanceof PermissionDeniedError ||
+     error instanceof TenantScopeError ||
++    error instanceof NotFoundError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
+@@ -52,6 +54,9 @@
+ }
+ 
+ export function toAppError(error: unknown): AppErrorShape {
++  if (error instanceof NotFoundError) {
++    return { code: "not_found", message: error.message };
++  }
+   if (error instanceof ZodError) {
+     return {
+       code: "validation_failed",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/repositories/label-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/repositories/label-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/repositories/label-repository.ts	2026-10-01 14:46:11
+@@ -23,6 +23,18 @@
+   return rows.map(toLabel);
+ }
+ 
++export async function findLabelById(
++  orgId: OrgId,
++  labelId: LabelId,
++): Promise<IssueLabel | null> {
++  const row = getDb()
++    .select()
++    .from(labels)
++    .where(and(orgPredicate(labels.orgId, orgId), eq(labels.id, labelId)))
++    .get();
++  return row ? toLabel(row) : null;
++}
++
+ export async function insertLabel(
+   input: CreateLabelInput,
+ ): Promise<IssueLabel> {
+@@ -123,6 +135,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/repositories/reference-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/repositories/reference-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/repositories/reference-repository.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/repositories/reference-repository.ts	2026-10-01 14:46:11
+@@ -0,0 +1,24 @@
++import { eq } from "drizzle-orm";
++import { comments, getDb, issues, labels, projects } from "@/server/db";
++import type { OrgId } from "@/types/common";
++
++const referenceTables = { Issue: issues, Comment: comments, Label: labels, Project: projects };
++export type ReferenceEntity = keyof typeof referenceTables;
++
++/**
++ * Ownership-only lookup for a failed scoped reference lookup. This deliberately
++ * reads no resource data: services use it to distinguish a foreign reference
++ * from a missing one, without exposing another workspace's resource.
++ */
++export async function findReferenceOrgId(
++  entity: ReferenceEntity,
++  id: string,
++): Promise<OrgId | null> {
++  const table = referenceTables[entity];
++  const row = getDb()
++    .select({ orgId: table.orgId })
++    .from(table)
++    .where(eq(table.id, id))
++    .get();
++  return row ? row.orgId as OrgId : null;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/_references.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/_references.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/_references.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/_references.ts	2026-10-01 14:46:11
+@@ -0,0 +1,36 @@
++import { isLive } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
++import { findReferenceOrgId, type ReferenceEntity } from "@/server/repositories/reference-repository";
++import type { TenantScoped, UserId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import { NotFoundError } from "./_support";
++
++export async function requireScopedReference<T extends TenantScoped>(
++  actor: Actor,
++  row: T | null,
++  entity: ReferenceEntity,
++  id: string,
++): Promise<T> {
++  if (row === null) {
++    const orgId = await findReferenceOrgId(entity, id);
++    if (orgId !== null) assertOrgScope(actor, orgId);
++    throw new NotFoundError(entity, id);
++  }
++  assertOrgScope(actor, row.orgId);
++  return row;
++}
++
++/** User ids are global; only an active membership in this workspace counts. */
++export async function requireCurrentMember(
++  actor: Actor,
++  userId: UserId | null | undefined,
++): Promise<void> {
++  if (userId === null || userId === undefined) return;
++  const member = await memberRepo.findMember(actor.orgId, userId);
++  if (member === null) throw new NotFoundError("Member", userId);
++  assertOrgScope(actor, member.orgId);
++  if (!isLive(member) || member.status !== "active") {
++    throw new NotFoundError("Member", userId);
++  }
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/comment-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/comment-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/comment-service.ts	2026-10-01 14:44:16
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/comment-service.ts	2026-10-01 14:47:16
+@@ -7,8 +7,8 @@
+ import { resolveMentions } from "@/lib/mentions";
+ import { assertCan } from "@/lib/permissions";
+ import { consumeRateLimit } from "@/lib/rate-limit";
+-import { archivePatch, assertNotArchived } from "@/lib/soft-delete";
+-import { assertOrgScope } from "@/lib/tenant";
++import { archivePatch, assertNotArchived, isLive } from "@/lib/soft-delete";
++import { assertOrgScope, isInOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+@@ -17,7 +17,9 @@
+   commentResource,
+   issueResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
++import { requireScopedReference } from "./_references";
+ import type {
+   CreateCommentInput,
+   DeleteCommentInput,
+@@ -25,7 +27,7 @@
+ } from "@/schemas/comment";
+ import type { Comment, CommentThreadNode } from "@/types/comment";
+ import type { IssueId, OrgId, UserId } from "@/types/common";
+-import type { Actor } from "@/types/member";
++import type { Actor, MemberWithUser } from "@/types/member";
+ 
+ /** How long after posting an author may still edit their own comment. */
+ const EDIT_WINDOW_MS = 15 * 60 * 1000;
+@@ -48,14 +50,28 @@
+ ): Promise<Comment> {
+   assertOrgScope(actor, input.orgId);
+ 
+-  const issue = requireFound(
++  const issue = await requireScopedReference(
++    actor,
+     await issueRepo.findIssueById(input.orgId, input.issueId),
+     "Issue",
+     input.issueId,
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
++  if (!isLive(issue)) throw new NotFoundError("Issue", issue.id);
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId !== null) {
++    const parent = await requireScopedReference(
++      actor,
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (!isLive(parent) || parent.issueId !== input.issueId || parent.parentId !== null) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -64,7 +80,7 @@
+   }
+ 
+   const mentionedUserIds = await resolveMentionedUsers(
+-    input.orgId,
++    actor,
+     input.body,
+     input.mentionedUserIds,
+   );
+@@ -168,23 +184,30 @@
+ }
+ 
+ /**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
++ * Resolve both body handles and composer ids against current memberships.
++ * Scan every page so a valid mention never depends on list ordering or size.
+  */
+ async function resolveMentionedUsers(
+-  orgId: OrgId,
++  actor: Actor,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const members: MemberWithUser[] = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({
++      orgId: actor.orgId,
++      status: "active",
++      limit: MENTION_LOOKUP_LIMIT,
++      cursor,
++    });
++    members.push(...page.items.filter((member) =>
++      isInOrgScope(actor, member) && isLive(member) && member.status === "active",
++    ));
++    cursor = page.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
+-
+-  return [...new Set([...resolved, ...clientProvided])];
++  const currentUserIds = new Set(members.map((member) => member.userId));
++  const resolved = resolveMentions(body, members);
++  return [...new Set([...resolved, ...clientProvided.filter((id) => currentUserIds.has(id))])];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/issue-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/issue-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/issue-service.ts	2026-10-01 14:47:16
+@@ -6,7 +6,7 @@
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { assertNotArchived, isLive } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -20,7 +20,9 @@
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
++import { requireCurrentMember, requireScopedReference } from "./_references";
+ import type {
+   AssignIssueInput,
+   ChangeIssueStatusInput,
+@@ -29,7 +31,7 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, LabelId, OrgId, Page, ProjectId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -45,14 +47,30 @@
+ ): Promise<Issue> {
+   assertOrgScope(actor, input.orgId);
+ 
+-  const project = requireFound(
++  const project = await requireScopedReference(
++    actor,
+     await projectRepo.findProjectById(input.orgId, input.projectId),
+     "Project",
+     input.projectId,
+   );
++  if (!isLive(project)) throw new NotFoundError("Project", project.id);
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  await requireCurrentMember(actor, input.assigneeId);
++  await validateLabels(actor, input.labelIds);
++  if (input.parentId !== null) {
++    const parent = await requireScopedReference(
++      actor,
++      await issueRepo.findIssueById(input.orgId, input.parentId),
++      "Issue",
++      input.parentId,
++    );
++    if (!isLive(parent) || parent.projectId !== input.projectId) {
++      throw new NotFoundError("Issue", input.parentId);
++    }
++  }
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -66,7 +84,11 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const issue = await issueRepo.insertIssue(
++    { ...input, labelIds: [...new Set(input.labelIds)] },
++    actor.userId,
++    number,
++  );
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -94,7 +116,11 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+-  const after = await issueRepo.updateIssue(input);
++  if (input.labelIds !== undefined) await validateLabels(actor, input.labelIds);
++  const after = await issueRepo.updateIssue({
++    ...input,
++    ...(input.labelIds === undefined ? {} : { labelIds: [...new Set(input.labelIds)] }),
++  });
+ 
+   await emit("issue.updated", {
+     ...actorEnvelope(actor),
+@@ -161,6 +187,8 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await requireCurrentMember(actor, input.assigneeId);
++
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+@@ -280,4 +308,15 @@
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function validateLabels(actor: Actor, labelIds: readonly LabelId[]): Promise<void> {
++  for (const labelId of new Set(labelIds)) {
++    await requireScopedReference(
++      actor,
++      await labelRepo.findLabelById(actor.orgId, labelId),
++      "Label",
++      labelId,
++    );
++  }
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/project-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/project-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/56b1437a-f2fa-4804-b89b-edf665017d60/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/b651d2c0-2b92-40fa-ade8-04dd987a5823/src/server/services/project-service.ts	2026-10-01 14:47:16
+@@ -18,6 +18,7 @@
+   projectResource,
+   requireFound,
+ } from "./_support";
++import { requireCurrentMember } from "./_references";
+ import type {
+   ArchiveProjectInput,
+   CreateProjectInput,
+@@ -40,6 +41,8 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
+ 
++  await requireCurrentMember(actor, input.leadId);
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -85,6 +88,7 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  await requireCurrentMember(actor, input.leadId);
+   return projectRepo.updateProject(input);
+ }
+ 

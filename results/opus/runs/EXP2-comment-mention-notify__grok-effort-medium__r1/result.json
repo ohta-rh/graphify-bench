@@ -1,0 +1,37 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "duration_ms": 119128,
+  "duration_api_ms": 117993,
+  "num_turns": 13,
+  "result": "An `@handle` in an issue comment becomes a `comment_mention` notification only after the server turns that handle into a member `UserId`, stamps that id onto the `comment.created` event, and the notification fan-out accepts the recipient. The inbox row and the email channel are decided together in `notify`; the only mail that is later sent is the daily digest.\n\n**The handle becomes a user id twice, and the server union is what is stored.**\n\nIn the composer, `MentionTextarea` (`src/components/domain/comment/mention-textarea.tsx`) treats the local part of a member's email as the handle. `mentionHandle` in `src/components/domain/comment/mention-query.ts` lowercases `member.user.email.split(\"@\")[0]`. Autocomplete uses `findMentionQuery`, `matchMembers`, and `applyMention` so a picked teammate is inserted as `@handle`. On every change, the textarea calls `resolveMentions(body, members)` from `src/lib/mentions.ts` and `CommentComposer` keeps the resulting `UserId[]` as `mentionedUserIds`.\n\n`handleOf` in the same file is the same rule: the lowercased email local-part. `extractMentions` first strips fenced blocks and inline code spans, then matches `@` only at the start of the text or after whitespace or `([<`. Each handle is lowercased and de-duplicated in first-seen order. `resolveMentions` builds a map from those handles to `member.userId` and drops any handle that is not a live member. A typo does not fail the comment.\n\nSubmitting runs `CommentComposer.handleSubmit` → `createCommentAction` (`src/actions/comments/create-comment.ts`) → `createComment` (`src/server/services/comment-service.ts`). The action validates `createCommentSchema`, checks `can(..., \"comment:create\")`, and consumes the `comment:create` rate limit. The service repeats the org, permission, archive, and rate-limit checks, then calls `resolveMentionedUsers`.\n\nThat helper loads at most 100 live members with `memberRepo.listMembers` (`MENTION_LOOKUP_LIMIT`). Archived members are excluded by `liveMemberPredicate`. It runs `resolveMentions` on the body again and unions that with the client-supplied ids that appear in the same page. Unknown client ids are dropped. The body can therefore add people the composer missed, and a handle whose member is outside that page of 100 never resolves.\n\n**That id list is what travels forward.**\n\n`commentRepo.insertComment` stores the union on `Comment.mentionedUserIds`. `createComment` then calls `emit(\"comment.created\", ...)` from `src/lib/event-bus.ts` with `actorEnvelope(actor)` (`orgId`, `actorId`, `occurredAt`), plus `commentId`, `issueId`, and the same `mentionedUserIds`. The payload type is `TaskflowEventMap[\"comment.created\"]` in `src/types/event.ts`. The fan-out does not parse the markdown again.\n\n`emit` delivers to every subscriber registered for that type. The subscriber exists because `instrumentation.register` calls `registerEventHandlers` in `src/server/services/event-registry.ts`, and importing that module imports `notification-service`, whose `registerFanOut` calls `subscribe(\"comment.created\", ...)`.\n\n**The subscriber decides the row, the channels, or nothing.**\n\nThe `comment.created` handler in `src/server/services/notification-service.ts` does two separate fan-outs. It notifies the issue author and assignee with kind `comment_created`. If `payload.mentionedUserIds` is non-empty, it calls `notify(orgId, \"comment_mention\", mentionedUserIds, ...)` with the title \"You were mentioned\".\n\n`notify` de-duplicates recipients and skips anyone whose id equals `payload.actorId`, so mentioning yourself writes no row. For each remaining user it loads `preferenceRepo.getPreference(orgId, recipientId, \"comment_mention\")`. A missing row means the default channels `[\"in_app\", \"email\"]`. `resolveChannels` then builds the list:\n\n- `preference.inApp` adds `\"in_app\"`.\n- `\"email\"` is added when `preference.email` is true and either `digestOnly` is false or `isEnabled(\"digest_email\", flags)` is true. That flag is the `digest_email` plan flag in `src/config/feature-flags.ts` (`minPlan: \"growth\"`), evaluated with the org plan and `enabledFlagOverrides`.\n- If the list is empty, `notify` writes nothing. Both switches off, or `digestOnly` with email on while `digest_email` is disabled and in-app is off, produces no row.\n\nOtherwise `notificationRepo.insertNotifications` inserts one `notifications` row per recipient, with `kind: \"comment_mention\"`, `href: /issues/{issueId}`, and `channels` set to that list. The inbox at `src/app/(dashboard)/[orgSlug]/inbox/page.tsx` loads those rows through `listNotifications`. That query filters by org, recipient, and optional unread/kind. It does not filter on `channels`, so any inserted row shows up in the inbox, including a row whose only channel is `\"email\"`.\n\nSo for a resolved mention who is not the comment author:\n\n- No preference: one inbox row with both `in_app` and `email`.\n- In-app on, email off: one inbox row with only `in_app`.\n- Email on and not deferred: one inbox row that includes `email` (and `in_app` if that switch is on).\n- `digestOnly` with email on, and `digest_email` enabled: the row still includes `email`. The service treats that as mail for the digest run.\n- `digestOnly` with email on, and `digest_email` disabled: the email channel is omitted; the in-app row remains if `inApp` is on.\n- Every channel refused, the author mentioning themselves, or a handle that never resolved to a member in the lookup page: no row.\n\n**What actually sends mail.**\n\n`notify` does not call `sendEmail` or `renderTemplate(\"mention\")`. `MentionEmail` in `src/emails/mention-email.tsx` is only reached from `renderTemplate` in `src/emails/render.ts`, and nothing in the comment or notification path calls that. The email channel is a value stored on the row.\n\nThe mail that does leave is the digest. `startScheduler` enqueues `digest-email`. `runDigestEmailJob` (`src/server/jobs/digest-email-job.ts`) runs only during the org's `settings.digestHourUtc`, and only when `digest_email` is enabled. Recipients come from `listDigestRecipients` → `preferenceRepo.listDigestSubscribers`: any user with at least one preference row where `digestOnly` is true, not specifically `comment_mention`. `buildDigest` collects that user's unread notifications in the last day, of every kind, and `renderDigest` renders the `\"digest\"` template. `sendEmail` in `src/server/services/email-service.ts` writes the draft to the log. After a successful send, those notifications are marked read. A mention with the email channel and `digestOnly` false is recorded on the row and is not sent as its own message.",
+  "session_id": "f0892921-b07f-41d5-b290-0d28bedef4c9",
+  "total_cost_usd": 0.13357512,
+  "usage": {
+    "input_tokens": 56565,
+    "output_tokens": 8191,
+    "cache_read_input_tokens": 461184,
+    "cache_creation_input_tokens": 0,
+    "server_tool_use": {
+      "web_search_requests": 0
+    }
+  },
+  "modelUsage": {
+    "grok-4.7-build": {
+      "inputTokens": 56565,
+      "outputTokens": 8191,
+      "cacheReadInputTokens": 461184,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.13357512
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "grok",
+  "cost_basis": "grok_reported",
+  "requested_model": "grok-4.7"
+}

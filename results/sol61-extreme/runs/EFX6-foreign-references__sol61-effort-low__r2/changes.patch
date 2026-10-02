@@ -1,0 +1,218 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/lib/errors.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/lib/errors.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/lib/errors.ts	2026-09-02 11:08:10
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/lib/errors.ts	2026-10-01 14:39:05
+@@ -1,3 +1,4 @@
++import { NotFoundError } from "@/server/services/_support";
+ /**
+  * Maps thrown domain errors onto `AppErrorShape`.
+  *
+@@ -30,6 +31,7 @@
+ /** True for the error classes this module knows how to translate faithfully. */
+ export function isDomainError(error: unknown): boolean {
+   return (
++    error instanceof NotFoundError ||
+     error instanceof PermissionDeniedError ||
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+@@ -52,6 +54,10 @@
+ }
+ 
+ export function toAppError(error: unknown): AppErrorShape {
++  if (error instanceof NotFoundError) {
++    return { code: "not_found", message: error.message };
++  }
++
+   if (error instanceof ZodError) {
+     return {
+       code: "validation_failed",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/repositories/label-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/repositories/label-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/repositories/label-repository.ts	2026-10-01 14:39:05
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/repositories/reference-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/repositories/reference-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/repositories/reference-repository.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/repositories/reference-repository.ts	2026-10-01 14:39:05
+@@ -0,0 +1,14 @@
++import { eq } from "drizzle-orm";
++import { comments, getDb, issues, labels } from "@/server/db";
++import type { OrgId } from "@/types/common";
++
++/** Ownership-only lookup used to distinguish foreign references from missing ones. */
++export async function findReferenceOrg(
++  kind: "issue" | "comment" | "label",
++  id: string,
++): Promise<OrgId | null> {
++  const table = { issue: issues, comment: comments, label: labels }[kind];
++  const row = getDb().select({ orgId: table.orgId }).from(table)
++    .where(eq(table.id, id)).get();
++  return row ? row.orgId as OrgId : null;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/_references.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/_references.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/_references.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/_references.ts	2026-10-01 14:39:05
+@@ -0,0 +1,21 @@
++import { assertOrgScope } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
++import { findReferenceOrg } from "@/server/repositories/reference-repository";
++import type { Actor } from "@/types/member";
++import type { UserId } from "@/types/common";
++import { requireFound } from "./_support";
++
++export async function assertReferenceScope(
++  actor: Actor,
++  kind: "issue" | "comment" | "label",
++  id: string,
++): Promise<void> {
++  const orgId = requireFound(await findReferenceOrg(kind, id), kind, id);
++  assertOrgScope(actor, orgId);
++}
++
++export async function assertCurrentMember(actor: Actor, userId: UserId | null | undefined): Promise<void> {
++  if (userId == null) return;
++  const member = await memberRepo.findMember(actor.orgId, userId);
++  requireFound(member?.status === "active" && member.archivedAt === null ? member : null, "Member", userId);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/comment-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/comment-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/comment-service.ts	2026-10-01 14:37:40
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/comment-service.ts	2026-10-01 14:39:05
+@@ -1,3 +1,4 @@
++import { assertReferenceScope } from "./_references";
+ /**
+  * Comment creation, edit window enforcement, mention extraction and soft delete.
+  *
+@@ -56,6 +57,12 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId != null) {
++    await assertReferenceScope(actor, "comment", input.parentId);
++    const parent = await commentRepo.findCommentById(input.orgId, input.parentId);
++    requireFound(parent && parent.archivedAt === null && parent.issueId === input.issueId && parent.parentId === null ? parent : null, "Comment", input.parentId);
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -167,24 +174,22 @@
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+-/**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
+- */
++/** Resolve handles and composer ids against every current workspace member. */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
+-
+-  const resolved = resolveMentions(body, members.items);
+-
+-  return [...new Set([...resolved, ...clientProvided])];
++  const current = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({
++      orgId, status: "active", limit: MENTION_LOOKUP_LIMIT, cursor,
++    });
++    current.push(...page.items.filter(member => member.status === "active" && member.archivedAt === null));
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  const allowed = new Set(current.map(member => member.userId));
++  const resolved = resolveMentions(body, current);
++  return [...new Set([...resolved, ...clientProvided.filter(id => allowed.has(id))])];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/issue-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/issue-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/issue-service.ts	2026-10-01 14:39:05
+@@ -1,3 +1,4 @@
++import { assertCurrentMember, assertReferenceScope } from "./_references";
+ /**
+  * Issue business rules: authorization, per-project issue quota, numbering, status transitions and the events every other concern reacts to.
+  *
+@@ -65,6 +66,14 @@
+     );
+   }
+ 
++  await assertCurrentMember(actor, input.assigneeId);
++  await validateLabels(actor, input.labelIds);
++  if (input.parentId != null) {
++    await assertReferenceScope(actor, "issue", input.parentId);
++    const parent = await issueRepo.findIssueById(input.orgId, input.parentId);
++    requireFound(parent && parent.archivedAt === null && parent.projectId === input.projectId ? parent : null, "Issue", input.parentId);
++  }
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -94,6 +103,8 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await validateLabels(actor, input.labelIds);
++
+   const after = await issueRepo.updateIssue(input);
+ 
+   await emit("issue.updated", {
+@@ -161,6 +172,8 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await assertCurrentMember(actor, input.assigneeId);
++
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+@@ -280,4 +293,10 @@
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function validateLabels(actor: Actor, labelIds: readonly string[] | undefined): Promise<void> {
++  for (const id of new Set(labelIds ?? [])) {
++    await assertReferenceScope(actor, "label", id);
++  }
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/project-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/project-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/c4d040e8-44bf-4bbb-a0c1-a1aed9db216f/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/487c5cc9-9f55-433c-8ab2-d8023c8bc561/src/server/services/project-service.ts	2026-10-01 14:39:05
+@@ -1,3 +1,4 @@
++import { assertCurrentMember } from "./_references";
+ /**
+  * Project lifecycle including the project-count quota and the cascade that archives a project's issues.
+  *
+@@ -53,6 +54,8 @@
+     );
+   }
+ 
++  await assertCurrentMember(actor, input.leadId);
++
+   const slug = await suggestProjectSlug(input.orgId, input.name);
+ 
+   const project = await projectRepo.insertProject({
+@@ -84,6 +87,8 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++
++  await assertCurrentMember(actor, input.leadId);
+ 
+   return projectRepo.updateProject(input);
+ }

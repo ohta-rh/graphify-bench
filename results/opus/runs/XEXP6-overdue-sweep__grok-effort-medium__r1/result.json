@@ -1,0 +1,37 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "duration_ms": 119120,
+  "duration_api_ms": 118070,
+  "num_turns": 15,
+  "result": "An overdue issue is announced by a scheduled scan that only publishes a fact. The notification fan-out, loaded with the process, turns that fact into one alert for the current assignee, on the channels that person's `issue_overdue` preference allows. A process-lifetime set stops the same issue from being announced again on later passes.\n\n**What starts the check.** On Node.js startup, `register` in `src/instrumentation.ts` calls `registerEventHandlers` in `src/server/services/event-registry.ts` and then `startScheduler` in `src/server/jobs/scheduler.ts`. Importing the registry loads `src/server/services/notification-service.ts`, and `registerFanOut` attaches the `issue.overdue` subscriber before any job runs. `startScheduler` sets an unref'd interval of 60 seconds. Each `tick(now)` walks `CADENCE_MINUTES`. `overdue-issues` is due on the first tick and again only after 60 minutes (`isDue`). A due kind is enqueued with id `overdue-issues:<minute>` and `enqueue` in `src/server/jobs/queue.ts` ignores a duplicate id. `drain` then `runHandler`, which dynamically imports and calls `runOverdueIssueJob(now)`.\n\nThe same job can also be started by `POST` `src/app/api/cron/overdue/route.ts`. `assertCronSecret` requires the `x-taskflow-cron` header to match `TASKFLOW_CRON_SECRET` (a missing secret rejects the call). The route calls `runOverdueIssueJob(new Date())` and returns the `JobResult`. It does not send alerts itself.\n\n**Which issues count.** `runOverdueIssueJob` in `src/server/jobs/overdue-issue-job.ts` runs inside `runJob(\"overdue-issues\", …)` from `src/server/jobs/types.ts`. It first calls `shouldFilterArchived` from `src/lib/soft-delete.ts` with an empty scope. That returns true only when archived rows are excluded. If it were false, the sweep logs and returns without looking at issues. It then loads at most 50 organization ids from `listOrgIdsForRollup` in `src/server/repositories/usage-repository.ts`: rows in `organization_usage`, oldest `measuredAt` first. Organizations with no usage row are never scanned, and anything past the first 50 waits for a later pass.\n\nFor each organization, `listOverdueIssues` in `src/server/repositories/issue-repository.ts` keeps a row only when all of these hold: it belongs to that organization (`orgPredicate`), `archivedAt` is null (`livePredicate`), `dueAt` is not null, `dueAt` is strictly before the sweep timestamp, and `status` is `backlog`, `todo`, `in_progress`, or `in_review`. `done` and `canceled` (`CLOSED_ISSUE_STATUSES` in `src/types/issue.ts`) are left out. Results are ordered by `dueAt`. The UI helper `isOverdue` in `src/lib/date.ts` is the same past-due idea, but the scan does not call it. `OVERDUE_LOOKAHEAD_HOURS` in `src/config/constants.ts` is not consulted either.\n\n**What the job does and does not do.** For each selected issue the job skips a null `dueAt` and any id already in the in-memory `reported` set. Otherwise it `emit`s `issue.overdue` on `src/lib/event-bus.ts` with `orgId`, `actorId: null`, `occurredAt`, `issueId`, `projectId`, `dueAt`, and `assigneeId` (which may be null). `emit` waits for every subscriber and does not rethrow a handler failure. After `emit` returns, the id is added to `reported` and `processed` increments. If `emit` itself throws, the id is not recorded, `failed` increments, and a later pass can try again. The job never reads preferences, never chooses a recipient, and never sends mail. Its own comment states that it only announces the fact.\n\n**What stops a repeat.** `reported` lives for the life of the process. The next sweep still finds a still-open, still-overdue issue in the database, then `reported.has(issue.id)` drops it before another `emit`. `resetOverdueTracking` clears that set and is only for tests. The set is not stored, so a new process can announce the issue once more. The scheduler's 60-minute cadence is a separate limit. The set is what keeps a more frequent cron `POST` from announcing again. Because the id is recorded even when `assigneeId` is null, assigning someone later does not produce a second event.\n\n**How one person is told.** The subscriber in `registerFanOut` returns immediately when `assigneeId` is null. Otherwise it calls `notify(orgId, \"issue_overdue\", [assigneeId], …)` with the title \"An issue is overdue\", a body that includes the issue id and `dueAt`, href `/issues/<id>`, and `actorId: null`. `notify` dedupes the recipient list, skips a recipient who is the actor (this event has none, so the assignee is not dropped), and loads that user's preference for this organization and kind via `getPreference` in `src/server/repositories/notification-preference-repository.ts`. A missing row means the defaults `in_app` and `email`.\n\n`resolveChannels` builds the list from that preference. `inApp` adds `in_app`. `email` adds `email` when the preference wants email and either `digestOnly` is off, or `digestOnly` is on and `isEnabled(\"digest_email\", …)` is true (`src/lib/feature-flags.ts`; the flag needs the growth plan or an override). An empty channel list writes nothing. Otherwise `insertNotifications` in `src/server/repositories/notification-repository.ts` stores one row for that `recipientId`, including the channel list. Webhooks are not involved: `registerWebhookListeners` does not subscribe to `issue.overdue`, and `resolveChannels` never adds `webhook`.\n\nThe in-app alert is that row. The dashboard layout in `src/app/(dashboard)/[orgSlug]/layout.tsx` calls `listNotifications` for the signed-in user with `unreadOnly: true` and passes `notifications.total` to `NotificationBell`. The same user's rows are listed on the inbox page and in the `@panel/notifications` slot. Both paths check `notification:read` and query by `recipientId`, so only the assignee sees it.\n\nEmail is the other chosen channel, and it is not a second immediate send from this event. The `overdue` template in `src/emails/overdue-email.tsx` is not called by the job or the fan-out. When the assignee's preference is `digestOnly` and the organization has `digest_email`, the channel stays `email` and the unread row waits for the digest. `runDigestEmailJob` runs on its own 60-minute cadence, only during the organization's `digestHourUtc`, and only for users returned by `listDigestSubscribers`. `buildDigest` takes their unread notifications in the last day, `renderDigest` renders the digest template, and `sendEmail` in `src/server/services/email-service.ts` writes the draft to the log. Marking those notifications read is what keeps the same digest from being sent again.",
+  "session_id": "dcc5f3a7-7f35-4cf9-87af-b60deb24a8c5",
+  "total_cost_usd": 0.16560856,
+  "usage": {
+    "input_tokens": 75852,
+    "output_tokens": 8174,
+    "cache_read_input_tokens": 572672,
+    "cache_creation_input_tokens": 0,
+    "server_tool_use": {
+      "web_search_requests": 0
+    }
+  },
+  "modelUsage": {
+    "grok-4.7-build": {
+      "inputTokens": 75852,
+      "outputTokens": 8174,
+      "cacheReadInputTokens": 572672,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.16560856
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "grok",
+  "cost_basis": "grok_reported",
+  "requested_model": "grok-4.7"
+}

@@ -1,0 +1,37 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "duration_ms": 57121,
+  "duration_api_ms": 56370,
+  "num_turns": 7,
+  "result": "Creating an issue in the browser does not call the customer's URL during the request. The request publishes `issue.created` on an in-process bus. A listener writes one pending delivery row per matching endpoint. A later job signs that row and records it as delivered. Taskflow never opens an outbound HTTP connection.\n\n**What starts it.** The new-issue page at `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx` renders `IssueForm` (`src/components/domain/issue/issue-form.tsx`). Submit goes through `useFormAction` (`src/hooks/use-form-action.ts`) into the server action `createIssueAction` (`src/actions/issues/create-issue.ts`). That action checks `issue:create` and the plan's issue quota, then calls `createIssue` in `src/server/services/issue-service.ts`. After the issue row is inserted, `createIssue` calls `emit(\"issue.created\", …)` from `src/lib/event-bus.ts`. The payload is the `TaskflowEventMap[\"issue.created\"]` shape in `src/types/event.ts`: the actor envelope plus `issueId`, `projectId`, `title`, `assigneeId`, and `priority`. `emit` runs every subscriber with `Promise.allSettled`, so a webhook failure does not roll back the issue.\n\nThose subscribers exist only because `register()` in `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which calls `registerWebhookListeners()` in `src/server/services/webhook-service.ts`.\n\n**Which endpoints are chosen.** The `issue.created` handler in `registerWebhookListeners` calls `enqueueForOrg` with the event name and `JSON.stringify(payload)`. `enqueueForOrg` loads the org's rows with `webhookRepo.listEndpoints` (`src/server/repositories/webhook-repository.ts`). It skips an endpoint that is disabled, parses the endpoint's `eventTypes` JSON, and skips it unless that list contains `\"issue.created\"`. Each remaining endpoint gets one row from `webhookRepo.enqueueDelivery`, status `pending`, attempts `0`. The same function also serves `issue.status_changed`, `comment.created`, `billing.plan_changed`, and `webhook.delivery_requested`. `issue.updated` and `issue.assigned` are allowed on the create-webhook schema, but this listener set does not subscribe to them, so creating or assigning an issue does not enqueue those types.\n\n**What performs the send.** Two things can drain the table. `startScheduler()` (`src/server/jobs/scheduler.ts`), also started from `instrumentation.ts`, runs `tick` every 60 seconds. The `webhook-delivery` cadence is one minute, so `tick` enqueues that job kind and `drain` in `src/server/jobs/queue.ts` calls `runWebhookDeliveryJob`. Separately, `POST` in `src/app/api/cron/webhook-delivery/route.ts` checks `assertCronSecret` and calls `runWebhookDeliveryJob` directly.\n\n`runWebhookDeliveryJob` (`src/server/jobs/webhook-delivery-job.ts`) claims up to 25 pending rows via `claimPendingDeliveries`, which increments `attempts` and leaves the status `pending`. For each row it drops the delivery with `markDeliveryFailed` when the org's plan has no webhook quota or the `webhooks` flag is off (`orgAllowsWebhooks` via `getPlanLimits` and `isEnabled`), when `attempts` is greater than 6, or when the endpoint is missing or disabled. Otherwise it calls `signPayload(endpoint.secret, delivery.payload)`, logs the URL and a prefix of the signature, and calls `markDelivered`. The file states that this process is the delivery: there is no HTTP client, so the customer's endpoint is not requested. The test route `POST` in `src/app/api/webhooks/[endpointId]/test/route.ts` also returns the signature in JSON and does not POST to the URL.\n\n**When the first pass does not finish.** There is no delayed-retry column. `backoffMs` in the delivery job (1s, then 2s, doubling, capped at five minutes) is only written into the log line. A row stays `pending` if the worker stops after the claim and before `markDelivered` or `markDeliveryFailed`. The next drain claims it again and bumps `attempts`. Once that counter is above 6, the row is marked `failed` and is not claimed again. A separate retry sits on the queue itself: if `runWebhookDeliveryJob` throws, `drain` puts the `webhook-delivery` job back with its own backoff (1s doubling, cap 60s) and drops that job after 5 attempts (`MAX_ATTEMPTS` in `queue.ts`). `WEBHOOK_MAX_ATTEMPTS` in `src/config/constants.ts` is 5 and is not what this job reads.\n\n**How the receiver checks it is Taskflow.** `createWebhook` stores a secret from `randomToken(32)` on the endpoint; it is not rotated in place. `signPayload` is HMAC-SHA256 of that secret over the exact UTF-8 payload string, hex-encoded. The receiver recomputes that digest over the same bytes with the same secret. The delivery job and the test route both use that function, and neither puts the digest in an HTTP header.",
+  "session_id": "533fc5d4-79cf-40f9-b711-a6e74b7dcd99",
+  "total_cost_usd": 0.0663,
+  "usage": {
+    "input_tokens": 45408,
+    "output_tokens": 3828,
+    "cache_read_input_tokens": 162432,
+    "cache_creation_input_tokens": 0,
+    "server_tool_use": {
+      "web_search_requests": 0
+    }
+  },
+  "modelUsage": {
+    "grok-4.7-build": {
+      "inputTokens": 45408,
+      "outputTokens": 3828,
+      "cacheReadInputTokens": 162432,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0663
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "grok",
+  "cost_basis": "grok_reported",
+  "requested_model": "grok-4.7"
+}

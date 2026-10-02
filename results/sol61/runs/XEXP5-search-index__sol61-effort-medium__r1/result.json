@@ -1,0 +1,40 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "result": "The new title becomes searchable through an awaited event handler: the issue row is updated first, then its search document is refreshed before the normal write returns.\n\nAt server startup, `register()` in `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`. That idempotently installs `registerSearchListeners()` from `src/server/services/search-service.ts`, which subscribes to the relevant domain events.\n\nFor a title edit, `updateIssueAction()` in `src/actions/issues/update-issue.ts` runs through `withAction()` in `src/actions/_lib/with-action.ts`: it validates `updateIssueSchema`, resolves the authenticated `Actor`, and checks permission. It then calls `updateIssue()` in `src/server/services/issue-service.ts`. The service verifies organization scope, loads the existing issue, checks `issue:update` against that actual issue, and rejects archived issues. Next, `updateIssue()` in `src/server/repositories/issue-repository.ts` writes the supplied fields and `updatedAt`, scoped by organization and issue ID.\n\nAfter that write succeeds, the service awaits `emit(\"issue.updated\", …)`. Its search listener rereads the saved issue with `findIssueById()` and calls `indexIssue()`, rather than indexing the event’s `changedFields`. `indexIssue()` calls `upsertSearchDocument()` in `src/server/repositories/search-repository.ts`. It finds the document by `(orgId, subjectKind, subjectId)` and updates its content, project ID, and indexing timestamp, or inserts it if absent. Only after event delivery settles does the service return; the action then invalidates the issue-related caches.\n\n`emit()` in `src/lib/event-bus.ts` runs subscribers concurrently with `Promise.allSettled()` and waits for them all. Consequently, successful indexing normally finishes before the editor receives success. However, a failing subscriber is reported to error sinks and never rethrown: the ordinary write can succeed while its searchable copy remains stale. This is an in-process event mechanism, with separate database writes, rather than an atomic database synchronization guarantee.\n\nThe searchable copy is the SQLite `search_index` table, defined as `searchIndex` in `src/server/db/schema/webhooks.ts`, with type `SearchIndexRow`. Each document stores its own ID, organization ID, subject kind (`issue`, `comment`, or `project`), subject ID, nullable project ID, content, and `indexedAt`. In `search-service.ts`, `indexIssue()` stores title plus description separated by a newline; `indexProject()` stores name plus description and the project’s own ID; `indexComment()` stores the comment body with a null project ID. There are no separate indexed status, assignee, or label fields.\n\nThe same listeners index issue creation, comment creation, and project creation, and remove documents on issue archival, comment deletion, and project archival through `removeFromIndex()` and `deleteSearchDocument()`. The `search.reindex_requested` listener currently handles issues only. A separate `runSearchReindexJob()` in `src/server/jobs/search-reindex-job.ts` reuses the indexing functions for an organization’s live content, though its current implementation fetches only the first 100 projects, issues, and comments per issue.\n\nOn the query side, `SearchDialog()` in `src/components/domain/search/search-dialog.tsx` debounces input, calls `parseSearchQuery()` from `query-syntax.ts`, and passes a `SearchQueryInput` to its supplied `onSearch` callback. With advanced search enabled, the parser extracts `kind:`/`in:` and `project:` tokens into filters and sends the remaining text as `q`; unknown syntax tokens are discarded. Without advanced search, it sends the trimmed text unchanged. Empty text triggers no request, and responses from superseded searches are ignored.\n\nThe server provides two entry points. `searchAction()` in `src/actions/search/search.ts` uses `withAction()` to validate and authenticate, checks `org:read`, loads the organization, builds its feature context, and filters requested kinds to issues when `advanced_search` is disabled. `GET()` in `src/app/api/search/route.ts` requires `orgSlug` and `q`, resolves the actor through `getActor()`, checks `org:read` and `command_palette`, then validates a query requesting up to ten results. It selects all three kinds for advanced search and issues otherwise. `searchQuerySchema` in `src/schemas/search.ts` requires a 1–200-character query, valid branded IDs and kinds, and a page limit of 1–100, defaulting to 25.\n\nBoth entry points then call `search()` in `src/server/services/search-service.ts`. Its checks run in this order: `assertOrgScope()`, `assertCan(actor, \"issue:read\", …)`, `consumeRateLimit(orgId, \"search:query\")`, then organization lookup and `isEnabled(\"advanced_search\", …)`. Thus, a schema-valid query can still fail authentication, membership, scope, or authorization checks, or exhaust the organization-wide search bucket. `src/lib/rate-limit.ts` defines the base bucket as 120 tokens, refilling at 60 per minute, with scaling based on the recorded organization plan.\n\nA particularly surprising refusal happens next: **any colon anywhere in `q` is rejected when advanced search is disabled**, even literal title text such as `Release: September`. The check is simply `input.q.includes(\":\")`. `advanced_search` requires enterprise under `src/config/feature-flags.ts`, unless enabled by an organization override through `isEnabled()` in `src/lib/feature-flags.ts`. The rate-limit check precedes this colon check, so such a rejected query can still consume a token.\n\nOnce those gates pass, `searchDocuments()` in `src/server/repositories/search-repository.ts` applies the organization predicate, SQL `LIKE '%q%'`, optional subject-kind filtering, and optional project filtering. It counts all matches, then retrieves a page ordered by descending `indexedAt` and document ID. `keysetPredicate()`, `probeLimit()`, and `toPage()` in `src/server/repositories/_paging.ts` handle cursor pagination and the extra row used to detect another page; an undecodable cursor restarts at the first page. Matching uses the stored content directly, without rereading each source record. Raw API text such as `status:done` is not parsed into a status filter—even when advanced search permits it, it remains a `LIKE` query.\n\nFinally, `search()` converts documents into `SearchHit` values: subject kind and ID, the first content line as title, a snippet from `snippetAround()` with up to 60 characters on each side of the match, and a link from `hrefFor()`. The service returns `Page<SearchHit>` with items, total, and next cursor. The action returns only the items in an `ActionResult`; the API returns `{ items, total }`. Failures pass through `toActionResult()` or `errorResponse()`. Notably, the rate-limit and colon refusals throw plain `Error` objects, so `toAppError()` in `src/lib/errors.ts` currently classifies them as `internal_error`, producing HTTP 500 on the API route.",
+  "session_id": "01a0f04a-a969-7af1-aae2-4be21d630359",
+  "duration_ms": 125639,
+  "total_cost_usd": 0.1547336,
+  "usage": {
+    "input_tokens": 60691,
+    "output_tokens": 2187,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 114816,
+    "output_tokens_details": {
+      "thinking_tokens": 35
+    }
+  },
+  "modelUsage": {
+    "gpt-6.1-sol": {
+      "inputTokens": 60691,
+      "outputTokens": 2187,
+      "cacheReadInputTokens": 114816,
+      "cacheCreationInputTokens": 0,
+      "costUSD": 0.1547336
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "codex",
+  "cost_basis": "estimated_standard_list_price",
+  "native_usage": {
+    "input_tokens": 175507,
+    "cached_input_tokens": 114816,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2187,
+    "reasoning_output_tokens": 35
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "result": "The downgrade is checked before it is written, then recorded in the subscription and announced through an event. There is a significant inconsistency: this flow never updates `organizations.plan`, although much of the product still uses that value.\n\n1. **The billing page starts the request and authorization runs again on the server.** In `src/app/(dashboard)/[orgSlug]/settings/billing/page.tsx`, `Page()` loads the tenant context and calls `can(actor, \"org:manage_billing\", …)`. Its `selectPlan()` server function calls `changePlanAction()` with the organization ID, selected plan and `\"monthly\"` interval.\n\n   `changePlanAction()` in `src/actions/billing/change-plan.ts` runs through `withAction()` in `src/actions/_lib/with-action.ts`. The wrapper validates `changePlanSchema` from `src/schemas/billing.ts`, then resolves the authenticated actor through `requireActorFor()` in `src/lib/actor.ts`.\n\n   The action checks `can()` again; the service subsequently repeats authorization with `assertOrgScope()` and `assertCan()`. In `src/lib/permissions.ts`, `ROLE_MATRIX` requires **owner** for `org:manage_billing`. Platform staff also pass, but only after the cross-tenant check: the actor must belong to the organization being changed. Ordinary admins cannot change billing.\n\n2. **Existing consumption is compared with the target plan’s allowances.** The action’s `assertPlanFitsCurrentUsage()` obtains usage through `usage-service.getUsage()` and checks seats, projects and storage. It calls `wouldExceedLimit(targetPlan, resource, used, 0)` from `src/config/plan-limits.ts`: the comparison is **existing usage > target limit**, so equality is allowed. A failure throws `PlanLimitError` before any subscription write.\n\n   Next, `changePlan()` in `src/server/services/billing-service.ts` repeats the checks and additionally checks **webhook endpoint count**. Its `usageFor()` reads seats, projects and storage from `src/server/repositories/usage-repository.ts`, and webhooks through `webhookRepo.countEndpoints()`.\n\n   Despite the action’s “live usage” comment, `usage-repository.getUsage()` reads cached `organization_usage` counters; it does not recount source tables during this request. Neither layer checks existing issues against the smaller per-project issue allowance, nor API request consumption. These checks apply to every plan change, without first classifying it as an upgrade or downgrade.\n\n3. **The subscription is the authoritative stored plan for billing checks.** After validation, `changePlan()` calls `updateSubscriptionPlan()` in `src/server/repositories/subscription-repository.ts`. That updates the organization’s `subscriptions` row with the new `plan`, `interval`, `status: \"active\"` and `updatedAt`. Choosing a plan therefore ends a trial immediately. It does not adjust the purchased seat count or billing-period dates.\n\n   `billing-service.planFor()` reads `subscription.plan` first and falls back to `organizations.plan` only when no subscription exists. Consequently, `checkLimit()` and `assertWithinLimit()` use the subscription as their authority.\n\n   **This mutation does not synchronize `organizations.plan`.** That column is described as a display convenience, but several actual enforcement paths still read it.\n\n4. **The write is followed by an audit event, webhook enqueueing and cache invalidation.** `changePlan()` emits `billing.plan_changed`, containing the actor envelope and the old and new plans. Subscribers are registered by `registerEventHandlers()` in `src/server/services/event-registry.ts`, wired from `src/instrumentation.ts`.\n\n   `registerActivityListeners()` in `src/server/services/activity-service.ts` calls `record()` to create a subscription activity entry with a summary such as `Plan growth → starter`. `registerWebhookListeners()` in `src/server/services/webhook-service.ts` calls `enqueueForOrg()` to queue the event for enabled endpoints subscribed to it.\n\n   `emit()` in `src/lib/event-bus.ts` awaits subscribers concurrently and isolates their failures; a failed subscriber does not undo the subscription change. Afterwards, the action invalidates the organization cache tag, and `withAction()` invalidates the `\"billing\"` tag, both using the hours profile. The wrapper returns a stamped `ActionResult`, translating thrown errors through `toActionResult()`.\n\nAway from billing, the **new subscription value immediately affects quota measurements**. `Layout()` in `src/app/(dashboard)/[orgSlug]/layout.tsx` calls `checkLimit()` for seat and project checks and passes them into `OrgProvider`. The members settings page also calls `checkLimit()` for seats, and `GET` in `src/app/api/orgs/[orgId]/usage/route.ts` reports subscription-based checks. These consumers can now show the smaller allowance or less remaining capacity.\n\nHowever, the following behavior still depends on the **unchanged organization value**, so this downgrade flow alone does not make it follow the new subscription:\n\n- **Creation limits:** `createProject()` in `project-service.ts`, `createIssue()` in `issue-service.ts`, `inviteMembers()` in `invitation-service.ts`, `addAttachment()` in `attachment-service.ts`, and `createWebhook()` in `webhook-service.ts`, all under `src/server/services/`, check `org.plan`. Their corresponding action and form/page checks also commonly use the organization plan.\n- **Feature availability:** `buildFlagContext()` in `src/server/services/feature-flag-service.ts` reads `org.plan`. The dashboard uses it with `snapshotFlags()`, while `isEnabled()` in `src/lib/feature-flags.ts` evaluates the thresholds from `src/config/feature-flags.ts`: starter for Kanban and CSV export, growth for activity feed, digest email and webhooks, enterprise for public projects and advanced search. Allowed overrides can keep overridable flags enabled. Server consumers include `search()`, `exportActivity()`, notification `notify()`/`resolveChannels()`, and webhook creation.\n- **Webhook delivery and retention:** `orgAllowsWebhooks()` in `src/server/jobs/webhook-delivery-job.ts` checks the organization plan before delivery. `runCleanupArchivedJob()` in `src/server/jobs/cleanup-archived-job.ts` uses that plan’s `retentionDays` to remove old archived-issue search documents and purge old activity rows.\n- **Client limits:** `usePlanLimits()` in `src/hooks/use-plan-limits.ts` derives its `limits` from `org.plan`, while its supplied seat/project `checks` come from subscription-based `checkLimit()`. Those two outputs can therefore disagree after a downgrade.\n\nFinally, API-rate scaling is separate again: `src/lib/rate-limit.ts` uses an in-memory plan map populated by `setOrgPlan()`, defaulting to free. There are no application call sites updating that map, and the plan-change event does not update it. The downgrade therefore does not propagate into rate limiting either.",
+  "session_id": "01a0f036-ab97-7d22-a59d-4d3f4dc31d2c",
+  "duration_ms": 115974,
+  "total_cost_usd": 0.10219639999999999,
+  "usage": {
+    "input_tokens": 34652,
+    "output_tokens": 2031,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 125824,
+    "output_tokens_details": {
+      "thinking_tokens": 26
+    }
+  },
+  "modelUsage": {
+    "gpt-6.1-sol": {
+      "inputTokens": 34652,
+      "outputTokens": 2031,
+      "cacheReadInputTokens": 125824,
+      "cacheCreationInputTokens": 0,
+      "costUSD": 0.10219639999999999
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "codex",
+  "cost_basis": "estimated_standard_list_price",
+  "native_usage": {
+    "input_tokens": 160476,
+    "cached_input_tokens": 125824,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2031,
+    "reasoning_output_tokens": 26
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "run_id": "EIM1-ownership-handover__grok-effort-medium__r2",
+  "task_id": "EIM1-ownership-handover",
+  "category": "implement",
+  "condition": "grok-effort-medium",
+  "rep": 2,
+  "grader": "vitest",
+  "session_id": "ebf683af-e340-458d-8943-d4f49ef7dcc0",
+  "started_at": "2026-10-01T08:10:01.509Z",
+  "finished_at": "2026-10-01T08:23:58.683Z",
+  "corpus_dir": "/tmp/graphify-bench-corpus-v1",
+  "condition_spec": {
+    "name": "grok-effort-medium",
+    "overlays": [
+      "baseline"
+    ],
+    "corpus": "v1",
+    "model": "grok-4.7",
+    "effort": "medium",
+    "note": "As `grok-effort-low`, at `--effort medium`.",
+    "effective_model": "grok-4.7"
+  },
+  "overlay_dir": "/Users/tetsuyaohta/projects/other/graphify-bench/overlays/baseline",
+  "overlay_dirs": [
+    "/Users/tetsuyaohta/projects/other/graphify-bench/overlays/baseline"
+  ],
+  "overlay_files": [
+    "CLAUDE.md"
+  ],
+  "copy_strategy": "clonefile",
+  "copy_ms": 7673,
+  "mcp": null,
+  "patch": null,
+  "claude": {
+    "argv": [
+      "-p",
+      "Product change: workspace ownership can be handed over, with the new owner's consent.\n\nEvery workspace has exactly one recorded owner — the member Taskflow treats as *the* owner: the person who is alerted when someone new joins, and the one billing belongs to. Today that is fixed when the workspace is created. From now on the recorded owner can offer the workspace to another member, who takes it over by accepting.\n\nUser stories\n\n- As the workspace owner, I can offer my workspace to any other active member. The offered member gets a notification of a new kind, `ownership_handover`, inviting them to accept; nobody else is alerted. Only one offer can be open per workspace: while one is open, a further offer is refused until the open one is withdrawn, declined or lapsed. An offer lapses exactly seven days after it was made: an offer made at instant T can still be acted on before T + 7 days, and no longer from T + 7 days on.\n- As the offered member, I can accept — whatever my current role. When I accept, I become the recorded owner and hold the owner role, and the previous owner steps down to admin (if they still hold the owner role at that moment). If I already held the owner role, only the previous owner's role changes. The workspace has an owner at every instant during the handover; the existing rule that a workspace never loses its last owner must not get in the way. I can instead decline, after which nothing is pending and the owner may offer again.\n- As the owner who made an offer, I can withdraw it while it is open.\n- As any member of the workspace, I can see whether an offer is open and to whom.\n\nConsequences of acceptance (all of these must hold)\n\n- Every role change made by the handover is announced exactly as a manual role change is (the `member.role_changed` event, carrying the member, the role before and the role after), and the handover itself publishes a new domain event `organization.ownership_transferred` (`EventEnvelope & { fromUserId: UserId; toUserId: UserId }`, added to `TaskflowEventMap`), which the audit log records as an `organization.ownership_transferred` action on the organization (subject kind `organization`, subject id the workspace's, metadata `{ fromUserId, toUserId }`). Everything published during acceptance is on behalf of the accepting member.\n- Everything that follows \"the owner\" follows the new one: alerts about new members go to the new owner and no longer to the previous one; managing billing (for example changing the plan) is now the new owner's and is refused to the previous owner; and the previous owner, now an admin, can be removed from the workspace like any other admin.\n\nGuards and refusals\n\n- Only the recorded owner may offer or withdraw. Holding the owner role is not enough: a second member who has been given the owner role but is not the recorded owner is refused. Both refusals are a `PermissionDeniedError`.\n- An offer must go to an active member of the same workspace other than the owner. An unknown user, a user from another workspace or a removed member → `NotFoundError` (the one in `src/server/services/_support.ts`). The owner themselves → the refusal `\"self\"`.\n- Only the offered member can accept or decline. Anyone else acting on the offer gets the refusal `\"nothing_pending\"`, and so does everyone when no offer is open (accepting a second time, declining after a withdrawal, withdrawing when nothing is open). Accepting or declining an offer that has lapsed → `\"expired\"`; a lapsed offer no longer counts as open: it is not shown, it does not block a new offer, and acting on it changes nothing.\n- A new offer while one is open → `\"pending_exists\"`.\n- These refusals throw a new `OwnershipHandoverError`, exported from `src/lib/errors.ts`: it extends `Error`, has `readonly code = \"conflict\"` and `readonly reason: OwnershipHandoverRefusal`, where `export type OwnershipHandoverRefusal = \"self\" | \"pending_exists\" | \"nothing_pending\" | \"expired\"`. `toAppError` maps it to the `conflict` code and `isDomainError` recognises it.\n- An `orgId` outside the actor's workspace → `TenantScopeError`, on every operation. An offer in one workspace is invisible from another.\n- If either side leaves the workspace while the offer is open — the offered member is removed, or the offering owner is removed (possible when the workspace has another member with the owner role) — the offer is withdrawn automatically.\n\nOffers are persisted; a freshly migrated database (the way the test suite builds one) must have whatever you add.\n\nAPI — add these exports:\n\nIn `src/types/organization.ts`:\n\n```ts\nexport type OwnershipHandoverStatus = \"pending\" | \"accepted\" | \"declined\" | \"canceled\" | \"expired\";\n\nexport interface OwnershipHandover {\n  readonly id: string;\n  readonly orgId: OrgId;\n  readonly fromUserId: UserId;\n  readonly toUserId: UserId;\n  readonly status: OwnershipHandoverStatus;\n  readonly expiresAt: IsoTimestamp;\n  readonly createdAt: IsoTimestamp;\n  readonly resolvedAt: IsoTimestamp | null;\n}\n```\n\n`expiresAt` is exactly seven days after `createdAt`. An open offer has status `\"pending\"` and no `resolvedAt`; an offer that was accepted, declined or withdrawn carries that status and the instant it was resolved.\n\nIn `src/server/services/organization-service.ts`:\n\n- `export async function initiateOwnershipHandover(actor: Actor, orgId: OrgId, toUserId: UserId): Promise<OwnershipHandover>`\n- `export async function acceptOwnershipHandover(actor: Actor, orgId: OrgId): Promise<Organization>` — resolves to the workspace as it is after the acceptance.\n- `export async function declineOwnershipHandover(actor: Actor, orgId: OrgId): Promise<OwnershipHandover>`\n- `export async function cancelOwnershipHandover(actor: Actor, orgId: OrgId): Promise<OwnershipHandover>` — the withdrawal.\n- `export async function getPendingOwnershipHandover(actor: Actor, orgId: OrgId): Promise<OwnershipHandover | null>` — the open offer, or `null`.\n\nUpdate any visible test that encodes behaviour this change alters.\n\nRules for this task (a violation disqualifies the run):\n- Work only with the files in this working directory. Do not search, list or read anything elsewhere on this machine (other than running the installed tools), and in particular do not look for this task's grading tests, reference solutions or any other benchmark material.\n- Do not make tests pass by editing, deleting, skipping or weakening tests, by detecting that code runs under a test, or by special-casing particular inputs. Implement the behaviour described.\n- Temporary files you create yourself under /tmp are fine.\n\nThis is an `implement` task: edit the code and stop, as for a `fix` task. Do not write a summary and do not emit an ANSWER line.",
+      "--output-format",
+      "streaming-messages-json",
+      "--model",
+      "grok-4.7",
+      "--verbatim",
+      "--trust",
+      "--no-auto-update",
+      "--permission-mode",
+      "bypassPermissions",
+      "--session-id",
+      "ebf683af-e340-458d-8943-d4f49ef7dcc0",
+      "--leader-socket",
+      "/var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-grok-home/ebf683af-e340-458d-8943-d4f49ef7dcc0/leader.sock",
+      "--effort",
+      "medium",
+      "--max-turns",
+      "120"
+    ],
+    "exit_code": 0,
+    "signal": null,
+    "timed_out": false,
+    "wall_ms": 826122,
+    "parse_error": null,
+    "stderr_tail": null
+  },
+  "transcript": {
+    "captured": true,
+    "via": "stdout",
+    "dest": "/Users/tetsuyaohta/projects/other/graphify-bench/results/models/extreme/runs/EIM1-ownership-handover__grok-effort-medium__r2/transcript.jsonl",
+    "bytes": 1495959
+  },
+  "vitest": {
+    "ran": true,
+    "passed": true,
+    "exitCode": 0,
+    "spec": "tests/hidden/EIM1-ownership-handover.test.ts",
+    "outputTail": "RUN  v4.1.11 /private/tmp/bench-scratch/ebf683af-e340-458d-8943-d4f49ef7dcc0\n\n ✓ tests/hidden/EIM1-ownership-handover.test.ts (18 tests) 68ms\n\n Test Files  1 passed (1)\n      Tests  18 passed (18)\n   Start at  17:23:55\n   Duration  939ms (transform 156ms, setup 58ms, import 394ms, tests 68ms, environment 308ms)"
+  },
+  "hidden": [
+    "tests/hidden/EIM1-ownership-handover.test.ts"
+  ],
+  "env": {
+    "model": "grok-4.7",
+    "effort": "medium",
+    "maxBudgetUsd": 8,
+    "maxTurns": 120,
+    "scratch": "/tmp/bench-scratch",
+    "reps": 3,
+    "hookStrict": false
+  },
+  "versions": {
+    "claude": "2.1.286 (Claude Code)",
+    "graphify": "graphify 0.9.53",
+    "node": "v25.5.0",
+    "pnpm": "10.28.2",
+    "platform": "darwin 25.2.0 arm64"
+  },
+  "timings_ms": {
+    "total": 837174,
+    "copy": 7673,
+    "claude": 826123,
+    "vitest": 1375
+  },
+  "error": null,
+  "grok": {
+    "skills": [],
+    "leaked_skills": [],
+    "budget_cap": false
+  }
+}

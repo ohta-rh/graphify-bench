@@ -1,0 +1,248 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/repositories/invitation-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/repositories/invitation-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/repositories/invitation-repository.ts	2026-10-01 10:37:06
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/repositories/invitation-repository.ts	2026-10-01 10:38:49
+@@ -1,7 +1,7 @@
+ /**
+  * Pending invitations, keyed by token hash for the unauthenticated accept flow.
+  */
+-import { and, count, desc, eq, isNull } from "drizzle-orm";
++import { and, count, desc, eq, gt, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, invitations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -11,11 +11,8 @@
+ import type { InvitationId, IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Invitation } from "@/types/member";
+ 
+-/**
+- * Unit behind `expiresInDays`. Invite links are short-lived credentials, so
+- * the schema's whole-number validity is applied per hour rather than per day.
+- */
+-const EXPIRY_UNIT_MS = 60 * 60 * 1000;
++/** Milliseconds in a day of invitation validity. */
++const EXPIRY_UNIT_MS = 24 * 60 * 60 * 1000;
+ 
+ export async function insertInvitation(
+   orgId: OrgId,
+@@ -76,6 +73,7 @@
+         orgPredicate(invitations.orgId, orgId),
+         isNull(invitations.acceptedAt),
+         isNull(invitations.revokedAt),
++        gt(invitations.expiresAt, toIsoTimestamp(new Date())),
+       ),
+     )
+     .orderBy(desc(invitations.createdAt))
+@@ -126,11 +124,7 @@
+   return toInvitation(row);
+ }
+ 
+-/**
+- * Pending invites hold a seat, so the seat quota counts them. An unaccepted
+- * row keeps its seat whether or not it was withdrawn — a revoke-and-reinvite
+- * loop must not be a way of queueing more people than the plan allows.
+- */
++/** Only live pending invitations reserve seats. */
+ export async function countPendingInvitations(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+@@ -139,8 +133,20 @@
+       and(
+         orgPredicate(invitations.orgId, orgId),
+         isNull(invitations.acceptedAt),
++        isNull(invitations.revokedAt),
++        gt(invitations.expiresAt, toIsoTimestamp(new Date())),
+       ),
+     )
+     .get();
+   return row?.value ?? 0;
++}
++
++export async function findInvitationById(
++  orgId: OrgId,
++  invitationId: InvitationId,
++): Promise<Invitation | null> {
++  const row = getDb().select().from(invitations)
++    .where(and(orgPredicate(invitations.orgId, orgId), eq(invitations.id, invitationId)))
++    .get();
++  return row ? toInvitation(row) : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/repositories/member-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/repositories/member-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/repositories/member-repository.ts	2026-10-01 10:37:06
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/repositories/member-repository.ts	2026-10-01 10:38:49
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, isNull, like, or, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -130,9 +130,7 @@
+       orgId,
+       userId,
+       role,
+-      // A membership created on someone else's behalf starts in the
+-      // `invited` state; the first sign-in through the org promotes it.
+-      status: invitedBy === null ? "active" : "invited",
++      status: "active",
+       invitedBy,
+       joinedAt: stamp,
+       lastSeenAt: null,
+@@ -187,4 +185,27 @@
+     .set({ lastSeenAt: at })
+     .where(and(orgPredicate(members.orgId, orgId), eq(members.userId, userId)))
+     .run();
++}
++
++/** Restore an archived membership without changing its identity or audit history. */
++export async function restoreMember(
++  orgId: OrgId,
++  userId: UserId,
++  role: Role,
++  invitedBy: UserId,
++): Promise<Member | null> {
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb().update(members)
++    .set({ archivedAt: null, status: "active", role, invitedBy, joinedAt: stamp, updatedAt: stamp })
++    .where(and(orgPredicate(members.orgId, orgId), eq(members.userId, userId), sql`${members.archivedAt} is not null`))
++    .returning().get();
++  return row ? toMember(row) : null;
++}
++
++export async function findMemberByEmail(orgId: OrgId, email: string): Promise<Member | null> {
++  const row = getDb().select({ member: members }).from(members)
++    .innerJoin(users, eq(users.id, members.userId))
++    .where(and(orgPredicate(members.orgId, orgId), liveMemberPredicate(),
++      sql`lower(${users.email}) = ${email.toLowerCase()}`)).get();
++  return row ? toMember(row.member) : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/services/invitation-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/services/invitation-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/e825fdf4-c374-41a3-b89f-943b2cb386f4/src/server/services/invitation-service.ts	2026-10-01 10:37:06
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/776f4cd8-588e-412c-a682-a935de98e166/src/server/services/invitation-service.ts	2026-10-01 10:38:49
+@@ -11,6 +11,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as userRepo from "@/server/repositories/user-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { envelope, orgResource, requireFound } from "./_support";
+@@ -67,6 +68,22 @@
+     input.orgId,
+   );
+ 
++  if (org.archivedAt !== null) throw new Error("Organization has been deleted");
++
++  const emails = new Set<string>();
++  const pending = await invitationRepo.listPendingInvitations(input.orgId);
++  for (const invite of input.invites) {
++    const email = invite.email.toLowerCase();
++    if (emails.has(email)) throw new Error("Duplicate address in invitation batch");
++    emails.add(email);
++    if (pending.some((row) => row.email.toLowerCase() === email)) {
++      throw new Error("That address already has a pending invitation");
++    }
++    if (await memberRepo.findMemberByEmail(input.orgId, email)) {
++      throw new Error("That address already belongs to a member");
++    }
++  }
++
+   const seatsUsed =
+     (await memberRepo.countActiveMembers(input.orgId)) +
+     (await invitationRepo.countPendingInvitations(input.orgId));
+@@ -88,7 +105,7 @@
+       input.orgId,
+       {
+         orgId: input.orgId,
+-        email: invite.email,
++        email: invite.email.toLowerCase(),
+         role: invite.role,
+         expiresInDays: DEFAULT_EXPIRY_DAYS,
+       },
+@@ -102,7 +119,7 @@
+       orgId: input.orgId,
+       actorId: actor.userId,
+       occurredAt: invitation.createdAt,
+-      email: invite.email,
++      email: invite.email.toLowerCase(),
+       role: invite.role,
+     });
+   }
+@@ -110,10 +127,7 @@
+   return invitations;
+ }
+ 
+-/**
+- * Accepting runs unauthenticated: the token is the credential, so there is no
+- * `Actor` to scope against and every check has to come off the stored row.
+- */
++/** Accept a pending invitation for its authenticated recipient. */
+ export async function acceptInvitation(
+   userId: UserId,
+   input: AcceptInvitationTokenInput,
+@@ -134,10 +148,27 @@
+     throw new Error("That invitation has expired");
+   }
+ 
++  const user = requireFound(await userRepo.findUserById(userId), "User", userId);
++  if (user.email.toLowerCase() !== invitation.email.toLowerCase()) {
++    throw new Error("That invitation belongs to another email address");
++  }
++  const org = requireFound(await orgRepo.findOrgById(invitation.orgId), "Organization", invitation.orgId);
++  if (org.archivedAt !== null) throw new Error("Organization has been deleted");
++
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+-  if (existing) return existing;
++  const seatsUsed = (await memberRepo.countActiveMembers(invitation.orgId)) +
++    (await invitationRepo.countPendingInvitations(invitation.orgId));
++  if (seatsUsed > getPlanLimits(org.plan).seats) {
++    throw new Error("All seats are taken");
++  }
++  if (existing) {
++    await invitationRepo.markInvitationAccepted(invitation.orgId, invitation.id, toIsoTimestamp(new Date()));
++    return existing;
++  }
+ 
+-  const member = await memberRepo.insertMember(
++  const member = (await memberRepo.restoreMember(
++    invitation.orgId, userId, invitation.role, invitation.invitedBy,
++  )) ?? await memberRepo.insertMember(
+     invitation.orgId,
+     userId,
+     invitation.role,
+@@ -169,7 +200,7 @@
+ }
+ 
+ /**
+- * Re-issuing does not mint a new row: the original is revoked and replaced so
++ * Re-issuing revokes the original and creates a replacement so
+  * the audit trail keeps both, and the old link stops working immediately.
+  */
+ export async function resendInvitation(
+@@ -180,20 +211,19 @@
+   assertCan(actor, "member:invite", orgResource(actor.orgId));
+ 
+   const previous = requireFound(
+-    await invitationRepo
+-      .listPendingInvitations(actor.orgId)
+-      .then((rows) => rows.find((row) => row.id === invitationId) ?? null),
++    await invitationRepo.findInvitationById(actor.orgId, invitationId),
+     "Invitation",
+     invitationId,
+   );
+ 
++  if (previous.acceptedAt !== null || previous.revokedAt !== null) {
++    throw new Error("That invitation is no longer available to resend");
++  }
+   await invitationRepo.revokeInvitation(actor.orgId, invitationId);
+ 
+-  // A re-issued link starts at the lowest invitable role; whoever resends it
+-  // can promote the person once they have joined.
+   return inviteMember(actor, {
+     orgId: actor.orgId,
+     email: previous.email,
+-    role: "member",
++    role: previous.role,
+   });
+ }

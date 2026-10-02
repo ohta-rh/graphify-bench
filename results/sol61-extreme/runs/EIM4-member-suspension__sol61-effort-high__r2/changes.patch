@@ -1,0 +1,610 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/components/domain/activity/activity-labels.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/components/domain/activity/activity-labels.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/components/domain/activity/activity-labels.ts	2026-10-01 19:50:34
+@@ -27,6 +27,8 @@
+   "member.joined": "joined the organization",
+   "member.role_changed": "changed a role",
+   "member.removed": "removed a member",
++  "member.suspended": "suspended a member",
++  "member.reinstated": "reinstated a member",
+   "billing.plan_changed": "changed the plan",
+   "flag.toggled": "toggled a feature flag",
+ };
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/lib/mentions.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/lib/mentions.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/lib/mentions.ts	2026-09-02 11:08:10
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/lib/mentions.ts	2026-10-01 19:49:40
+@@ -48,6 +48,7 @@
+ ): readonly UserId[] {
+   const byHandle = new Map<string, UserId>();
+   for (const member of members) {
++    if (member.status === "suspended" || member.archivedAt !== null) continue;
+     byHandle.set(handleOf(member), member.userId);
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/schemas/activity.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/schemas/activity.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/schemas/activity.ts	2026-10-01 19:48:52
+@@ -26,6 +26,8 @@
+   "member.joined",
+   "member.role_changed",
+   "member.removed",
++  "member.suspended",
++  "member.reinstated",
+   "billing.plan_changed",
+   "flag.toggled",
+ ]);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/member-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/member-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/member-repository.ts	2026-10-01 19:48:51
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, ne, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -100,7 +100,7 @@
+   );
+ }
+ 
+-/** The seat count every plan check compares against. */
++/** The occupied seat count, including members temporarily suspended. */
+ export async function countActiveMembers(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+@@ -108,12 +108,51 @@
+     .where(
+       and(
+         orgPredicate(members.orgId, orgId),
+-        eq(members.status, "active"),
++        inArray(members.status, ["active", "suspended"]),
+         liveMemberPredicate(),
+       ),
+     )
+     .get();
+   return row?.value ?? 0;
++}
++
++/** Owners able to act, excluding the member whose access is being changed. */
++export async function countOtherActiveOwners(
++  orgId: OrgId,
++  memberId: MemberId,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(members)
++    .where(and(
++      orgPredicate(members.orgId, orgId),
++      ne(members.id, memberId),
++      eq(members.role, "owner"),
++      eq(members.status, "active"),
++      liveMemberPredicate(),
++    ))
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Changes access without archiving the membership or releasing its seat. */
++export async function updateMemberStatus(
++  orgId: OrgId,
++  memberId: MemberId,
++  status: "active" | "suspended",
++): Promise<Member> {
++  const row = getDb()
++    .update(members)
++    .set({ status, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(
++      orgPredicate(members.orgId, orgId),
++      eq(members.id, memberId),
++      liveMemberPredicate(),
++    ))
++    .returning()
++    .get();
++  if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
++  return toMember(row);
+ }
+ 
+ export async function insertMember(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/organization-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/organization-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/organization-repository.ts	2026-10-01 19:49:40
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNull, like, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -46,6 +46,7 @@
+     .where(
+       and(
+         eq(members.userId, userId),
++        ne(members.status, "suspended"),
+         isNull(members.archivedAt),
+         isNull(organizations.archivedAt),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/usage-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/usage-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/repositories/usage-repository.ts	2026-10-01 19:48:52
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, inArray, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -55,7 +55,7 @@
+     .where(
+       and(
+         eq(members.orgId, orgId),
+-        eq(members.status, "active"),
++        inArray(members.status, ["active", "suspended"]),
+         isNull(members.archivedAt),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/activity-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/activity-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/activity-service.ts	2026-10-01 19:49:40
+@@ -222,6 +222,24 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("member.suspended", (payload) =>
++      record(payload.orgId, "member.suspended", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: `Suspended member ${payload.userId}`,
++      }).then(() => undefined),
++    ),
++    subscribe("member.reinstated", (payload) =>
++      record(payload.orgId, "member.reinstated", {
++        actorId: payload.actorId,
++        subjectKind: "member",
++        subjectId: payload.memberId,
++        projectId: null,
++        summary: `Reinstated member ${payload.userId}`,
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/comment-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/comment-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/comment-service.ts	2026-10-01 19:49:40
+@@ -182,8 +182,9 @@
+     cursor: null,
+   });
+ 
+-  const resolved = resolveMentions(body, members.items);
+-  const known = new Set(members.items.map((member) => member.userId));
++  const eligible = members.items.filter((member) => member.status !== "suspended");
++  const resolved = resolveMentions(body, eligible);
++  const known = new Set(eligible.map((member) => member.userId));
+ 
+   return [
+     ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/digest-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/digest-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/digest-service.ts	2026-10-01 19:49:40
+@@ -8,6 +8,7 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import { renderEmail } from "./email-service";
+ import { buildFlagContext } from "./feature-flag-service";
+ import type { RenderedEmail } from "@/server/services/email-service";
+@@ -30,6 +31,8 @@
+   windowStart: IsoTimestamp,
+   windowEnd: IsoTimestamp,
+ ): Promise<DigestBundle | null> {
++  const member = await memberRepo.findMember(orgId, recipientId);
++  if (member?.status === "suspended") return null;
+   const org = await orgRepo.findOrgById(orgId);
+   if (!org) return null;
+ 
+@@ -65,7 +68,13 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  const recipients = await preferenceRepo.listDigestSubscribers(orgId);
++  const eligible: UserId[] = [];
++  for (const recipientId of recipients) {
++    const member = await memberRepo.findMember(orgId, recipientId);
++    if (member?.status !== "suspended") eligible.push(recipientId);
++  }
++  return eligible;
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/issue-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/issue-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/issue-service.ts	2026-10-01 19:50:34
+@@ -10,10 +10,12 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { MemberSuspendedError } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -29,10 +31,19 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
++async function assertAssigneeNotSuspended(
++  orgId: OrgId,
++  assigneeId: UserId | null,
++): Promise<void> {
++  if (assigneeId === null) return;
++  const member = await memberRepo.findMember(orgId, assigneeId);
++  if (member?.status === "suspended") throw new MemberSuspendedError();
++}
++
+ /**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+@@ -65,6 +76,7 @@
+     );
+   }
+ 
++  await assertAssigneeNotSuspended(input.orgId, input.assigneeId);
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -161,6 +173,7 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await assertAssigneeNotSuspended(input.orgId, input.assigneeId);
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/member-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/member-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/member-service.ts	2026-10-01 19:50:34
+@@ -17,9 +17,66 @@
+ import type { MemberId, OrgId, Page, UserId } from "@/types/common";
+ import type { Actor, Member, MemberWithUser, Role } from "@/types/member";
+ 
+-/** How many members are scanned when counting the remaining owners. */
+-const OWNER_SCAN_LIMIT = 100;
++/** Raised before assigning new work to a member whose access is suspended. */
++export class MemberSuspendedError extends Error {
++  readonly code = "conflict" as const;
+ 
++  constructor() {
++    super("Work cannot be assigned to a suspended member");
++    this.name = "MemberSuspendedError";
++  }
++}
++
++export async function suspendMember(
++  actor: Actor,
++  input: { orgId: OrgId; memberId: MemberId },
++): Promise<Member> {
++  return changeMemberStatus(actor, input, "suspended");
++}
++
++export async function reinstateMember(
++  actor: Actor,
++  input: { orgId: OrgId; memberId: MemberId },
++): Promise<Member> {
++  return changeMemberStatus(actor, input, "active");
++}
++
++async function changeMemberStatus(
++  actor: Actor,
++  input: { orgId: OrgId; memberId: MemberId },
++  status: "active" | "suspended",
++): Promise<Member> {
++  assertOrgScope(actor, input.orgId);
++  const stored = await memberRepo.findMemberById(input.orgId, input.memberId);
++  const member = requireFound(
++    stored?.archivedAt === null ? stored : null,
++    "Member",
++    input.memberId,
++  );
++  assertCan(actor, "member:remove", memberResource(member));
++  if (member.userId === actor.userId) {
++    throw new Error("You cannot suspend or reinstate yourself");
++  }
++  if (!hasRoleAtLeast(actor.role, member.role)) {
++    throw new Error("You cannot suspend or reinstate a member above your role");
++  }
++  if (member.status === status) return member;
++  if (status === "suspended") {
++    await assertLastOwnerRetained(input.orgId, input.memberId, "member");
++  }
++  const updated = await memberRepo.updateMemberStatus(
++    input.orgId,
++    input.memberId,
++    status,
++  );
++  await emit(status === "suspended" ? "member.suspended" : "member.reinstated", {
++    ...actorEnvelope(actor),
++    memberId: updated.id,
++    userId: updated.userId,
++  });
++  return updated;
++}
++
+ export async function listMembers(
+   actor: Actor,
+   input: ListMembersInput,
+@@ -132,17 +189,14 @@
+   if (nextRole === "owner") return;
+ 
+   const member = await memberRepo.findMemberById(orgId, memberId);
+-  if (!member || member.role !== "owner") return;
++  if (
++    !member ||
++    member.archivedAt !== null ||
++    member.role !== "owner" ||
++    member.status !== "active"
++  ) return;
+ 
+-  const page = await memberRepo.listMembers({
+-    orgId,
+-    role: "owner",
+-    limit: OWNER_SCAN_LIMIT,
+-    cursor: null,
+-  });
+-
+-  const remaining = page.items.filter((row) => row.id !== memberId);
+-  if (remaining.length === 0) {
++  if ((await memberRepo.countOtherActiveOwners(orgId, memberId)) === 0) {
+     throw new Error(
+       "An organization must keep at least one owner; transfer ownership first",
+     );
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/notification-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/notification-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/server/services/notification-service.ts	2026-10-01 19:49:40
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+@@ -64,6 +65,8 @@
+ 
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
++    const member = await memberRepo.findMember(orgId, recipientId);
++    if (member?.status === "suspended") continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/types/activity.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/types/activity.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/types/activity.ts	2026-09-02 10:42:36
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/types/activity.ts	2026-10-01 19:48:52
+@@ -27,6 +27,8 @@
+   | "member.joined"
+   | "member.role_changed"
+   | "member.removed"
++  | "member.suspended"
++  | "member.reinstated"
+   | "billing.plan_changed"
+   | "flag.toggled";
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/types/event.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/types/event.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/src/types/event.ts	2026-09-02 10:42:36
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/src/types/event.ts	2026-10-01 19:48:52
+@@ -81,6 +81,8 @@
+     to: Role;
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.suspended": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.reinstated": EventEnvelope & { memberId: MemberId; userId: UserId };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/tests/services/member-suspension.test.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/tests/services/member-suspension.test.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/26406ce1-93c3-4688-83d0-1fc3b3026579/tests/services/member-suspension.test.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/a31bb606-a6dc-478d-9130-027c39873034/tests/services/member-suspension.test.ts	2026-10-01 19:53:06
+@@ -0,0 +1,184 @@
++import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { emit, subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { TenantScopeError } from "@/lib/tenant";
++import { activityFilterSchema } from "@/schemas/activity";
++import * as activityRepo from "@/server/repositories/activity-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as notificationRepo from "@/server/repositories/notification-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as usageRepo from "@/server/repositories/usage-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { registerActivityListeners } from "@/server/services/activity-service";
++import { createComment } from "@/server/services/comment-service";
++import { buildDigest, listDigestRecipients } from "@/server/services/digest-service";
++import * as issueService from "@/server/services/issue-service";
++import * as memberService from "@/server/services/member-service";
++import { notify } from "@/server/services/notification-service";
++import { getOrganizationSummary } from "@/server/services/organization-service";
++import { resolveActorForOrg } from "@/server/services/session-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { MemberId } from "@/types/common";
++import type { Actor, Role } from "@/types/member";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++beforeAll(async () => { cleanup = await useTemporaryDatabase(); });
++afterAll(() => { cleanup(); });
++
++async function target(tenant: Tenant, role: Role) {
++  const member = await memberRepo.findMember(tenant.org.id, tenant.userIds[role]);
++  if (!member) throw new Error("Fixture member missing");
++  return { orgId: tenant.org.id, memberId: member.id };
++}
++
++describe("member suspension", () => {
++  it("retains membership, role and seat, blocks access, and audits only transitions", async () => {
++    const tenant = await createTenant("suspension-lifecycle");
++    const input = await target(tenant, "member");
++    const before = await memberRepo.findMemberById(input.orgId, input.memberId);
++    const suspended = vi.fn();
++    const reinstated = vi.fn();
++    const offs = [registerActivityListeners(), subscribe("member.suspended", suspended), subscribe("member.reinstated", reinstated)];
++    const principal = {
++      userId: tenant.userIds.member,
++      email: "member@suspension-lifecycle.test",
++      activeOrgId: tenant.org.id,
++      expiresAt: toIsoTimestamp(new Date(Date.now() + 86_400_000)),
++    };
++    try {
++      const after = await memberService.suspendMember(tenant.actors.admin, input);
++      expect(after).toMatchObject({ ...before, status: "suspended", updatedAt: expect.any(String) });
++      expect(await memberService.suspendMember(tenant.actors.admin, input)).toEqual(after);
++      expect(suspended).toHaveBeenCalledTimes(1);
++      expect(suspended.mock.calls[0][0]).toMatchObject({ ...input, actorId: tenant.userIds.admin, userId: tenant.userIds.member });
++      expect(await memberService.resolveActor(tenant.userIds.member, tenant.org.id)).toBeNull();
++      expect(await resolveActorForOrg(principal, tenant.org.slug)).toBeNull();
++      expect(await orgRepo.listOrgsForUser(tenant.userIds.member)).toEqual([]);
++      expect(await memberRepo.countActiveMembers(tenant.org.id)).toBe(4);
++      expect((await usageRepo.recomputeUsage(tenant.org.id)).seatsUsed).toBe(4);
++      expect((await getOrganizationSummary(tenant.actors.owner, tenant.org.id)).memberCount).toBe(4);
++      const listed = await memberService.listMembers(tenant.actors.owner, { orgId: tenant.org.id, limit: 100, cursor: null });
++      expect(listed.items.find((row) => row.id === input.memberId)?.status).toBe("suspended");
++
++      const active = await memberService.reinstateMember(tenant.actors.admin, input);
++      expect(active.status).toBe("active");
++      expect(await memberService.reinstateMember(tenant.actors.admin, input)).toEqual(active);
++      expect(reinstated).toHaveBeenCalledTimes(1);
++      expect(await memberService.resolveActor(tenant.userIds.member, tenant.org.id)).toEqual(tenant.actors.member);
++      expect(await resolveActorForOrg(principal, tenant.org.slug)).toEqual(tenant.actors.member);
++      expect((await orgRepo.listOrgsForUser(tenant.userIds.member)).map((org) => org.id)).toEqual([tenant.org.id]);
++      const filter = activityFilterSchema.parse({ orgId: tenant.org.id, action: ["member.suspended", "member.reinstated"] });
++      const audit = await activityRepo.listActivity(filter);
++      expect(audit.total).toBe(2);
++      for (const row of audit.items) expect(row).toMatchObject({ subjectKind: "member", subjectId: input.memberId, actorId: tenant.userIds.admin });
++
++      await memberService.suspendMember(tenant.actors.admin, input);
++      await memberService.removeMember(tenant.actors.admin, input);
++      expect(await memberRepo.countActiveMembers(tenant.org.id)).toBe(3);
++      expect((await usageRepo.recomputeUsage(tenant.org.id)).seatsUsed).toBe(3);
++      await expect(memberService.reinstateMember(tenant.actors.admin, input)).rejects.toBeInstanceOf(NotFoundError);
++    } finally { for (const off of offs) off(); }
++  });
++
++  it("refuses invalid scope, missing or removed members, self and higher roles without events", async () => {
++    const tenant = await createTenant("suspension-guards");
++    const other = await createTenant("suspension-other");
++    const member = await target(tenant, "member");
++    const owner = await target(tenant, "owner");
++    const viewer = await target(tenant, "viewer");
++    await memberService.removeMember(tenant.actors.owner, viewer);
++    const seen = vi.fn();
++    const offs = [subscribe("member.suspended", seen), subscribe("member.reinstated", seen)];
++    const before = await memberRepo.listMembers({ orgId: tenant.org.id, limit: 100, cursor: null });
++    try {
++      for (const change of [memberService.suspendMember, memberService.reinstateMember]) {
++        await expect(change(tenant.actors.admin, await target(other, "member"))).rejects.toBeInstanceOf(TenantScopeError);
++        await expect(change(tenant.actors.admin, { orgId: tenant.org.id, memberId: "missing" as MemberId })).rejects.toBeInstanceOf(NotFoundError);
++        await expect(change(tenant.actors.admin, { orgId: tenant.org.id, memberId: (await target(other, "member")).memberId })).rejects.toBeInstanceOf(NotFoundError);
++        await expect(change(tenant.actors.admin, viewer)).rejects.toBeInstanceOf(NotFoundError);
++        await expect(change(tenant.actors.viewer, member)).rejects.toBeInstanceOf(PermissionDeniedError);
++        await expect(change(tenant.actors.owner, owner)).rejects.toThrow(/yourself/);
++        await expect(change(tenant.actors.admin, owner)).rejects.toThrow(/above your role/);
++      }
++      expect(seen).not.toHaveBeenCalled();
++      expect(await memberRepo.listMembers({ orgId: tenant.org.id, limit: 100, cursor: null })).toEqual(before);
++    } finally { for (const off of offs) off(); }
++  });
++
++  it("counts only active owners when suspending, demoting and removing", async () => {
++    const tenant = await createTenant("suspension-owners");
++    const second = await target(tenant, "admin");
++    const first = await target(tenant, "owner");
++    await memberService.updateMemberRole(tenant.actors.owner, { ...second, role: "owner" });
++    const secondActor: Actor = { ...tenant.actors.admin, role: "owner" };
++    await memberService.suspendMember(tenant.actors.owner, second);
++    await expect(memberService.suspendMember(secondActor, first)).rejects.toThrow(/at least one owner/);
++    await expect(memberService.updateMemberRole(tenant.actors.owner, { ...first, role: "admin" })).rejects.toThrow(/at least one owner/);
++    await expect(memberService.removeMember(tenant.actors.owner, first)).rejects.toThrow(/at least one owner/);
++    await memberService.reinstateMember(tenant.actors.owner, second);
++    await memberService.suspendMember(secondActor, first);
++    expect((await memberService.updateMemberRole(secondActor, { ...first, role: "admin" })).role).toBe("admin");
++    expect((await memberService.removeMember(secondActor, first)).archivedAt).not.toBeNull();
++  });
++
++  it("rejects new assignments before writing or emitting and keeps existing assignments", async () => {
++    const tenant = await createTenant("suspension-work");
++    const input = await target(tenant, "member");
++    const existing = await issueService.createIssue(tenant.actors.admin, issueInput(tenant.org.id, tenant.project.id, { assigneeId: tenant.userIds.member }));
++    await memberService.suspendMember(tenant.actors.admin, input);
++    const seen = vi.fn();
++    const offs = [subscribe("issue.created", seen), subscribe("issue.assigned", seen)];
++    try {
++      await expect(issueService.createIssue(tenant.actors.admin, issueInput(tenant.org.id, tenant.project.id, { assigneeId: tenant.userIds.member }))).rejects.toMatchObject({ name: "MemberSuspendedError", code: "conflict" });
++      await expect(issueService.assignIssue(tenant.actors.admin, { orgId: tenant.org.id, issueId: existing.id, assigneeId: tenant.userIds.member })).rejects.toBeInstanceOf(memberService.MemberSuspendedError);
++      expect(await issueRepo.countIssues(tenant.org.id, tenant.project.id)).toBe(1);
++      expect(await issueRepo.nextIssueNumber(tenant.org.id, tenant.project.id)).toBe(2);
++      expect(await issueRepo.findIssueById(tenant.org.id, existing.id)).toEqual(existing);
++      expect(seen).not.toHaveBeenCalled();
++      expect((await issueService.assignIssue(tenant.actors.admin, { orgId: tenant.org.id, issueId: existing.id, assigneeId: null })).assigneeId).toBeNull();
++      expect((await issueService.assignIssue(tenant.actors.admin, { orgId: tenant.org.id, issueId: existing.id, assigneeId: tenant.userIds.viewer })).assigneeId).toBe(tenant.userIds.viewer);
++      await memberService.reinstateMember(tenant.actors.admin, input);
++      expect((await issueService.assignIssue(tenant.actors.admin, { orgId: tenant.org.id, issueId: existing.id, assigneeId: tenant.userIds.member })).assigneeId).toBe(tenant.userIds.member);
++    } finally { for (const off of offs) off(); }
++  });
++
++  it("drops mentions, blocks direct and fan-out notifications, and preserves unread digests", async () => {
++    const tenant = await createTenant("suspension-notifications");
++    const input = await target(tenant, "member");
++    const issue = await issueService.createIssue(tenant.actors.admin, issueInput(tenant.org.id, tenant.project.id, { assigneeId: tenant.userIds.member }));
++    const payload = { actorId: tenant.userIds.admin, title: "Update", body: "Update", href: "/issues" };
++    const [old] = await notify(tenant.org.id, "comment_created", [tenant.userIds.member], payload);
++    await preferenceRepo.upsertPreference({ orgId: tenant.org.id, userId: tenant.userIds.member, kind: "comment_created", inApp: true, email: true, digestOnly: true });
++    await memberService.suspendMember(tenant.actors.admin, input);
++    expect(await notify(tenant.org.id, "comment_created", [tenant.userIds.member], payload)).toEqual([]);
++    await emit("issue.overdue", { orgId: tenant.org.id, actorId: null, occurredAt: old.createdAt, issueId: issue.id, projectId: issue.projectId, assigneeId: tenant.userIds.member, dueAt: old.createdAt });
++    const seen = vi.fn();
++    const off = subscribe("comment.created", seen);
++    const commentInput = { orgId: tenant.org.id, issueId: issue.id, body: "Hello @member and @viewer", parentId: null, mentionedUserIds: [tenant.userIds.member, tenant.userIds.viewer] };
++    try {
++      const comment = await createComment(tenant.actors.admin, commentInput);
++      expect(comment.mentionedUserIds).toEqual([tenant.userIds.viewer]);
++      expect(seen.mock.calls[0][0].mentionedUserIds).toEqual([tenant.userIds.viewer]);
++      const notifications = await notificationRepo.listNotifications({ orgId: tenant.org.id, recipientId: tenant.userIds.member, unreadOnly: false, limit: 100, cursor: null });
++      expect(notifications.items).toEqual([old]);
++      const start = toIsoTimestamp(new Date(Date.now() - 86_400_000));
++      const end = toIsoTimestamp(new Date(Date.now() + 1_000));
++      expect(await listDigestRecipients(tenant.org.id)).toEqual([]);
++      expect(await buildDigest(tenant.org.id, tenant.userIds.member, start, end)).toBeNull();
++      await memberService.reinstateMember(tenant.actors.admin, input);
++      expect(await listDigestRecipients(tenant.org.id)).toEqual([tenant.userIds.member]);
++      expect((await buildDigest(tenant.org.id, tenant.userIds.member, start, end))?.entries.map((entry) => entry.notificationId)).toEqual([old.id]);
++      const resumed = await createComment(tenant.actors.admin, commentInput);
++      expect(resumed.mentionedUserIds).toEqual([tenant.userIds.member, tenant.userIds.viewer]);
++      expect(await notify(tenant.org.id, "comment_created", [tenant.userIds.member], payload)).toHaveLength(1);
++    } finally { off(); }
++  });
++});

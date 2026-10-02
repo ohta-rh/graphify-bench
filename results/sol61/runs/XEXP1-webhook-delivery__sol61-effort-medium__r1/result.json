@@ -1,0 +1,40 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "result": "The code queues webhook deliveries after issue creation, but **this repository never actually calls the customer’s endpoint**. Its delivery job computes a signature, logs the attempt, and marks the delivery successful. Here is the execution order and the retry behavior that exists.\n\nThe browser starts at `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx`, which passes `createIssueAction` into `IssueForm`. In `src/components/domain/issue/issue-form.tsx`, `IssueForm` validates through `createIssueSchema` and calls the `submit` function from `useFormAction` in `src/hooks/use-form-action.ts`. That invokes the server action with a `CreateIssueInput`.\n\n`createIssueAction` in `src/actions/issues/create-issue.ts` delegates to the function built by `withAction` in `src/actions/_lib/with-action.ts`. The wrapper validates the input again and resolves the authenticated `Actor`; for this input’s `orgId`, that uses `requireActorFor`. The action checks `issue:create`, calls `assertProjectHasRoom` to enforce the plan quota, and then calls `createIssue` in `src/server/services/issue-service.ts`.\n\n`createIssue` checks tenant scope, loads the parent project, verifies it is not archived, checks permission, and enforces the quota again. It calls `nextIssueNumber` and `insertIssue` in `src/server/repositories/issue-repository.ts`, then awaits `emit(\"issue.created\", payload)`. This is what puts webhook delivery in motion. The payload follows `TaskflowEventMap[\"issue.created\"]` in `src/types/event.ts`: issue ID, project ID, title, assignee, and priority, plus `orgId`, `actorId`, and `occurredAt` supplied by `actorEnvelope` in `src/server/services/_support.ts`.\n\nThe listeners are already attached before requests arrive. `register` in `src/instrumentation.ts` calls `registerEventHandlers` in `src/server/services/event-registry.ts`, which calls `registerWebhookListeners` in `src/server/services/webhook-service.ts`. Its `issue.created` subscriber serializes the event payload and calls the private `enqueueForOrg`. Issue creation goes directly through this subscriber; it does not first emit `webhook.delivery_requested`, which has a separate listener.\n\n`enqueueForOrg` calls `listEndpoints` in `src/server/repositories/webhook-repository.ts`. That query is restricted to the event’s organization. It skips disabled endpoints, parses each endpoint’s stored `eventTypes`, and keeps only endpoints subscribed to `\"issue.created\"`. For each match, `enqueueDelivery` inserts a `WebhookDeliveryRow` into `webhook_deliveries`, with the serialized payload, `status: \"pending\"`, and `attempts: 0`. The endpoint and delivery tables and their row types are defined in `src/server/db/schema/webhooks.ts`.\n\nThe event bus’s `emit` in `src/lib/event-bus.ts` awaits all subscribers using `Promise.allSettled`. Thus issue creation waits for enqueueing, but not background delivery. Subscriber errors are isolated and not rethrown, so an enqueue failure can leave the issue successfully created without a delivery row.\n\nBackground processing starts through `startScheduler` in `src/server/jobs/scheduler.ts`, also called by instrumentation. Every minute, `tick` enqueues a `\"webhook-delivery\"` job and calls `drain` in `src/server/jobs/queue.ts`. Its private `runHandler` dispatches to `runWebhookDeliveryJob` in `src/server/jobs/webhook-delivery-job.ts`. Alternatively, `POST` in `src/app/api/cron/webhook-delivery/route.ts` checks `assertCronSecret` and invokes the same job directly.\n\n`runWebhookDeliveryJob` claims up to 25 oldest pending deliveries through `claimPendingDeliveries`, which increments their attempt counters while leaving them pending. For each row, `orgAllowsWebhooks` checks the organization still exists, its plan allows webhooks, and the feature flag is enabled. The job also rejects deliveries whose attempt count exceeds six, or whose endpoint is missing or disabled. Those cases call `markDeliveryFailed`, storing a terminal `\"failed\"` status and an error. Otherwise, it calls `signPayload`, logs `\"webhook delivered\"`, and calls `markDelivered`. **There is no HTTP request, response-status check, or timeout handling.**\n\nRetries have two distinct layers. At the delivery-row level, a crash or exception before `markDelivered` leaves the row pending, so a later run can claim it again and increment its counter. Counts one through six are allowed; the seventh claim triggers the `attempts > MAX_ATTEMPTS` check and permanently fails the row. Although `backoffMs` in `webhook-delivery-job.ts` computes 1, 2, 4 seconds and so on, capped at five minutes, its result is only logged. It does not delay individual deliveries, and the table has no next-attempt timestamp.\n\nAt the scheduler-job level, `drain` catches a thrown job error and requeues the whole `QueuedJob` with an actual future `runAt`: exponential delays starting at one second, capped at one minute. It drops that queued job on its fifth failure. Execution still waits for a scheduler drain, and recurring scheduler ticks can create subsequent webhook-delivery jobs. The direct cron route returns errors rather than using this queue retry mechanism.\n\nFor authenticity, `signPayload(secret, payload)` in `src/server/services/webhook-service.ts` computes **HMAC-SHA256 over the exact UTF-8 payload string and returns hexadecimal output**. `createWebhook` generates the endpoint secret using `randomToken(32)` and `insertEndpoint` stores it with the endpoint. A receiver should recompute that HMAC using its shared secret and the untouched raw request body, then compare the full signature using a constant-time comparison. Parsing and reserializing JSON can change the bytes and invalidate verification.\n\nHowever, this implementation defines no outbound signature header because it sends no request. `POST` in `src/app/api/webhooks/[endpointId]/test/route.ts` returns a known payload and its full signature for verification testing; it also does not call the endpoint. The cryptographic signing helper exists, but actual network delivery and the signature’s transport to the receiver remain unimplemented.",
+  "session_id": "01a0f02d-1804-7a70-af78-b82df1d105b7",
+  "duration_ms": 77916,
+  "total_cost_usd": 0.095948,
+  "usage": {
+    "input_tokens": 33334,
+    "output_tokens": 1808,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 112000,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    }
+  },
+  "modelUsage": {
+    "gpt-6.1-sol": {
+      "inputTokens": 33334,
+      "outputTokens": 1808,
+      "cacheReadInputTokens": 112000,
+      "cacheCreationInputTokens": 0,
+      "costUSD": 0.095948
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "codex",
+  "cost_basis": "estimated_standard_list_price",
+  "native_usage": {
+    "input_tokens": 145334,
+    "cached_input_tokens": 112000,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 1808,
+    "reasoning_output_tokens": 0
+  }
+}

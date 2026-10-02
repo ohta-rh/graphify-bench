@@ -1,0 +1,37 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "duration_ms": 71348,
+  "duration_api_ms": 70545,
+  "num_turns": 8,
+  "result": "A title edit becomes searchable in the same request that saves it. The `search_index` table is a denormalised copy, and `search()` refuses some syntactically ordinary strings before it ever runs that copy.\n\n## How the copy stays in step\n\nProcess start calls `register()` in `src/instrumentation.ts` (Node runtime only). That calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which calls `registerSearchListeners()` in `src/server/services/search-service.ts` once. Those listeners sit on the in-process bus in `src/lib/event-bus.ts`.\n\nA title change goes through `updateIssue` in `src/server/services/issue-service.ts` (the server action is `src/actions/issues/update-issue.ts`):\n\n1. `assertOrgScope`, then `issueRepo.findIssueById`, then `assertCan(..., \"issue:update\", ...)` and `assertNotArchived`.\n2. `issueRepo.updateIssue` writes the issues row.\n3. `emit(\"issue.updated\", ...)` publishes an envelope with `orgId`, `issueId`, `projectId`, and `changedFields`. The new title is not on the event.\n4. `emit` awaits every subscriber with `Promise.allSettled`. A thrown indexer does not roll back the issue write; the error goes to the bus error sinks.\n\nThe `issue.updated` handler in `registerSearchListeners` ignores the payload body and calls `issueRepo.findIssueById` again. If that row exists, `indexIssue` runs. The same re-read-then-index pattern is used for `issue.created`. `issue.archived` calls `removeFromIndex` instead. `issue.status_changed` and `issue.assigned` are not subscribed, so a status or assignee change does not touch the index. Un-assigning does, because `assignIssue` emits `issue.updated` when `assigneeId` is null.\n\n`indexIssue` calls `upsertSearchDocument` in `src/server/repositories/search-repository.ts`. That looks up the row by `(orgId, subjectKind = \"issue\", subjectId)`, not by index id. A hit updates `content`, `projectId`, and `indexedAt`. A miss inserts a new ULID id plus those fields. The same upsert is used for comments (`comment.body` only, `projectId` null) and projects (`name` plus description, `projectId` set to the project id), driven by `comment.created` / `comment.deleted` and `project.created` / `project.archived`.\n\nA slower repair path exists beside this. `search.reindex_requested` is handled only when `subjectKind === \"issue\"`, and again re-reads the issue. `runSearchReindexJob` in `src/server/jobs/search-reindex-job.ts` walks one org’s projects, issues, and comments (page size 100, first page only) and calls `indexProject`, `indexIssue`, and `indexComment`. The scheduler in `src/server/jobs/scheduler.ts` enqueues `\"search-reindex\"` at most once every 1440 minutes. The title a colleague finds moments later comes from the awaited `issue.updated` handler, not from that job.\n\n## What the copy stores\n\nThe table is `searchIndex` (`search_index`) in `src/server/db/schema/webhooks.ts`, created in `src/server/db/migrate.ts`. Each row is:\n\n- `id` — ULID primary key\n- `orgId` — from `tenantColumns` in `src/server/db/schema/_shared.ts`\n- `subjectKind` — `\"issue\" | \"comment\" | \"project\"`\n- `subjectId` — the issue, comment, or project id\n- `projectId` — nullable\n- `content` — for an issue, `title` and `description ?? \"\"` joined with a newline\n- `indexedAt` — ISO-8601 text\n\nThere is an index on `(org_id, subject_kind)`. Status, assignee, labels, and priority are not stored. The first line of `content` is later treated as the hit title.\n\n## What a query goes through\n\nThree entry points call the same `search()` in `search-service.ts`: the search page `src/app/(dashboard)/[orgSlug]/search/page.tsx`, the server action `searchAction` in `src/actions/search/search.ts`, and `GET` in `src/app/api/search/route.ts`.\n\nOn the page, `loadTenantContext` loads the org and actor, `isEnabled(\"advanced_search\", ...)` decides kinds, and `searchQuerySchema` in `src/schemas/search.ts` requires `q` of 1–200 characters. Kinds are `[\"issue\", \"comment\", \"project\"]` when the flag is on and `[\"issue\"]` otherwise, with `limit` 30. An invalid parse never reaches `search()`; the page renders “That query is not valid”.\n\n`search()` then, in order:\n\n1. `assertOrgScope(actor, input.orgId)`.\n2. `assertCan(actor, \"issue:read\", orgResource(input.orgId))`.\n3. `consumeRateLimit(input.orgId, \"search:query\")`. That bucket, in `src/lib/rate-limit.ts`, holds 120 tokens and refills 60 per minute. If `allowed` is false it throws `Search rate limit reached; try again after ${resetAt}`.\n4. `orgRepo.findOrgById`, then `isEnabled(\"advanced_search\", ...)`. The flag is defined in `src/config/feature-flags.ts` as a plan strategy with `minPlan: \"enterprise\"`, overridable via `org.settings.enabledFlagOverrides`. `isEnabled` in `src/lib/feature-flags.ts` returns true for an override or when `planAtLeast` says the org plan is at least enterprise.\n5. If `input.q` contains `:` and the flag is off, it throws `Field-scoped search is not included in this plan` and never queries the table. That is the refusal of a perfectly ordinary-looking string. `status:done` is the intended field syntax, but the check is any colon, so a title search such as `fix: login` is refused on free and growth plans. The client parser `parseSearchQuery` in `src/components/domain/search/query-syntax.ts` does the opposite when `advanced` is false: it keeps the colon as literal text. The server does not use that parser. `searchAction` only narrows `kinds` to `\"issue\"` when the flag is off; it still forwards `q` unchanged into `search()`, so the colon check still fires. The palette route does the same, and also returns `forbidden` when `can(..., \"org:read\", ...)` fails or `command_palette` is off, and `validation_failed` when `orgSlug` or `q` is missing or the schema rejects the string.\n6. `searchRepo.searchDocuments` filters with `orgPredicate` on `orgId`, `LIKE %q%` on `content`, optional `subjectKind` and `projectId`, then keyset-pages by `indexedAt` descending and `id` descending.\n7. Each row becomes a `SearchHit`: `kind`, `subjectId`, title = first line of `content`, `snippetAround` (60 characters on each side of a case-insensitive match), and `hrefFor` (`/issues/${id}`, `/comments/${id}`, or `/projects/${id}`).",
+  "session_id": "2047c628-72ef-45c4-9a94-91a2a786bd4c",
+  "total_cost_usd": 0.07394048,
+  "usage": {
+    "input_tokens": 46751,
+    "output_tokens": 4523,
+    "cache_read_input_tokens": 193664,
+    "cache_creation_input_tokens": 0,
+    "server_tool_use": {
+      "web_search_requests": 0
+    }
+  },
+  "modelUsage": {
+    "grok-4.7-build": {
+      "inputTokens": 46751,
+      "outputTokens": 4523,
+      "cacheReadInputTokens": 193664,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.07394048
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "grok",
+  "cost_basis": "grok_reported",
+  "requested_model": "grok-4.7"
+}

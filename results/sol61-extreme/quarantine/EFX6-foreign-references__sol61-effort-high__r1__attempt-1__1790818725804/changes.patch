@@ -1,0 +1,313 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/lib/errors.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/lib/errors.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/lib/errors.ts	2026-09-02 11:08:10
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/lib/errors.ts	2026-10-01 10:38:42
+@@ -12,6 +12,7 @@
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
++import { NotFoundError } from "@/server/services/_support";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
+@@ -32,6 +33,7 @@
+   return (
+     error instanceof PermissionDeniedError ||
+     error instanceof TenantScopeError ||
++    error instanceof NotFoundError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
+@@ -52,6 +54,10 @@
+ }
+ 
+ export function toAppError(error: unknown): AppErrorShape {
++  if (error instanceof NotFoundError) {
++    return { code: "not_found", message: error.message };
++  }
++
+   if (error instanceof ZodError) {
+     return {
+       code: "validation_failed",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/repositories/label-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/repositories/label-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/repositories/label-repository.ts	2026-10-01 10:38:42
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/repositories/reference-repository.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/repositories/reference-repository.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/repositories/reference-repository.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/repositories/reference-repository.ts	2026-10-01 10:38:41
+@@ -0,0 +1,30 @@
++import { eq } from "drizzle-orm";
++import { comments, getDb, issues, labels, projects } from "@/server/db";
++import type { OrgId } from "@/types/common";
++
++const referenceTables = {
++  Comment: comments,
++  Issue: issues,
++  Label: labels,
++  Project: projects,
++};
++
++export type ReferenceKind = keyof typeof referenceTables;
++
++/**
++ * Ownership-only probe for mutation references. Unlike a resource read, this
++ * must distinguish a foreign id from a missing id. It returns no resource
++ * data; callers must check the owner before performing a scoped read.
++ */
++export async function findReferenceOrgId(
++  kind: ReferenceKind,
++  id: string,
++): Promise<OrgId | null> {
++  const table = referenceTables[kind];
++  const row = getDb()
++    .select({ orgId: table.orgId })
++    .from(table)
++    .where(eq(table.id, id))
++    .get();
++  return row ? (row.orgId as OrgId) : null;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/_references.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/_references.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/_references.ts	1970-01-01 09:00:00
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/_references.ts	2026-10-01 10:38:42
+@@ -0,0 +1,43 @@
++import { assertOrgScope } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
++import {
++  findReferenceOrgId,
++  type ReferenceKind,
++} from "@/server/repositories/reference-repository";
++import type { LabelId, UserId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import { NotFoundError, requireFound } from "./_support";
++
++export async function assertReferenceScope(
++  actor: Actor,
++  kind: ReferenceKind,
++  id: string,
++): Promise<void> {
++  const orgId = requireFound(await findReferenceOrgId(kind, id), kind, id);
++  assertOrgScope(actor, orgId);
++}
++
++export async function assertLabelsInScope(
++  actor: Actor,
++  labelIds: readonly LabelId[],
++): Promise<void> {
++  for (const id of new Set(labelIds)) {
++    await assertReferenceScope(actor, "Label", id);
++  }
++}
++
++export async function assertCurrentMember(
++  actor: Actor,
++  userId: UserId | null | undefined,
++): Promise<void> {
++  if (userId == null) return;
++  const member = requireFound(
++    await memberRepo.findMember(actor.orgId, userId),
++    "Member",
++    userId,
++  );
++  assertOrgScope(actor, member.orgId);
++  if (member.archivedAt !== null || member.status !== "active") {
++    throw new NotFoundError("Member", userId);
++  }
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/comment-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/comment-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/comment-service.ts	2026-10-01 10:36:14
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/comment-service.ts	2026-10-01 10:38:42
+@@ -16,8 +16,10 @@
+   actorEnvelope,
+   commentResource,
+   issueResource,
++  NotFoundError,
+   requireFound,
+ } from "./_support";
++import { assertReferenceScope } from "./_references";
+ import type {
+   CreateCommentInput,
+   DeleteCommentInput,
+@@ -56,6 +58,23 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId != null) {
++    await assertReferenceScope(actor, "Comment", input.parentId);
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    assertOrgScope(actor, parent.orgId);
++    if (
++      parent.archivedAt !== null ||
++      parent.issueId !== input.issueId ||
++      parent.parentId !== null
++    ) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -168,23 +187,43 @@
+ }
+ 
+ /**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
++ * Resolve body handles across every page of current members, then validate
++ * composer ids independently so stale suggestions can never notify outsiders.
+  */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const resolved = new Set<UserId>();
++  let cursor: string | null = null;
++  do {
++    const members = await memberRepo.listMembers({
++      orgId,
++      status: "active",
++      limit: MENTION_LOOKUP_LIMIT,
++      cursor,
++    });
++    const current = members.items.filter(
++      (member) =>
++        member.orgId === orgId &&
++        member.status === "active" &&
++        member.archivedAt === null,
++    );
++    for (const id of resolveMentions(body, current)) resolved.add(id);
++    cursor = members.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
+-
+-  return [...new Set([...resolved, ...clientProvided])];
++  for (const id of new Set(clientProvided)) {
++    const member = await memberRepo.findMember(orgId, id);
++    if (
++      member &&
++      member.orgId === orgId &&
++      member.status === "active" &&
++      member.archivedAt === null
++    ) {
++      resolved.add(id);
++    }
++  }
++  return [...resolved];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/issue-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/issue-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/issue-service.ts	2026-10-01 10:38:42
+@@ -19,8 +19,14 @@
+   issueResource,
+   orgResource,
+   projectResource,
++  NotFoundError,
+   requireFound,
+ } from "./_support";
++import {
++  assertCurrentMember,
++  assertLabelsInScope,
++  assertReferenceScope,
++} from "./_references";
+ import type {
+   AssignIssueInput,
+   ChangeIssueStatusInput,
+@@ -45,6 +51,7 @@
+ ): Promise<Issue> {
+   assertOrgScope(actor, input.orgId);
+ 
++  await assertReferenceScope(actor, "Project", input.projectId);
+   const project = requireFound(
+     await projectRepo.findProjectById(input.orgId, input.projectId),
+     "Project",
+@@ -53,6 +60,21 @@
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  await assertCurrentMember(actor, input.assigneeId);
++  await assertLabelsInScope(actor, input.labelIds);
++  if (input.parentId != null) {
++    await assertReferenceScope(actor, "Issue", input.parentId);
++    const parent = requireFound(
++      await issueRepo.findIssueById(input.orgId, input.parentId),
++      "Issue",
++      input.parentId,
++    );
++    assertOrgScope(actor, parent.orgId);
++    if (parent.archivedAt !== null || parent.projectId !== input.projectId) {
++      throw new NotFoundError("Issue", input.parentId);
++    }
++  }
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -94,6 +116,10 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  if (input.labelIds !== undefined) {
++    await assertLabelsInScope(actor, input.labelIds);
++  }
++
+   const after = await issueRepo.updateIssue(input);
+ 
+   await emit("issue.updated", {
+@@ -160,6 +186,8 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++
++  await assertCurrentMember(actor, input.assigneeId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/project-service.ts /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/project-service.ts
+--- /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/49106726-1623-4330-9089-5879778759ac/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/79b31913-4b8c-45c3-b0bb-44f1ba580cc1/src/server/services/project-service.ts	2026-10-01 10:38:42
+@@ -18,6 +18,7 @@
+   projectResource,
+   requireFound,
+ } from "./_support";
++import { assertCurrentMember } from "./_references";
+ import type {
+   ArchiveProjectInput,
+   CreateProjectInput,
+@@ -40,6 +41,8 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
+ 
++  await assertCurrentMember(actor, input.leadId);
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -84,6 +87,8 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++
++  await assertCurrentMember(actor, input.leadId);
+ 
+   return projectRepo.updateProject(input);
+ }
