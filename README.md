@@ -93,6 +93,32 @@ code-graph-rag (`cgr`), measured on the same tasks and graded the same way (diff
 
 **On symptom-only work Sonnet 5.5 closes the gap to Opus 5.5 that Sonnet 5 left open, at about half the cost.** On the extreme set (all 12 arms measured together on one CLI build) Sonnet 5.5 beats Sonnet 5 at matched effort by $1.27–$1.98 and 313–471 s per run and by +25 to +33 points of accuracy at medium, high and xhigh (paired CIs clear of zero); Sonnet 5 ran 60–90 turns and delegated to a subagent in ~80% of low/medium runs, Sonnet 5.5 ran 12–34 turns and never delegated. Against Opus 5.5 the accuracy difference is not established at any effort (90/96 vs 87/96), while Opus costs $0.26–$1.23 more and takes 14–105 s longer per run. On the spec-heavy ultra set Sonnet 5 and 5.5 cost the same and Sonnet 5.5 is slightly less accurate; on hard and code-45 Sonnet 5.5 is the cheapest arm. Sonnet 5.5 xhigh costs 1.3–2.6× its high setting with no accuracy gain. Interpretation (in the report): Sonnet 5.5 high and Opus 5.5 low are interchangeable defaults — equal accuracy on every set, Sonnet 5.5 high slightly cheaper, Opus 5.5 low about a quarter faster; Opus's earlier edge was discovery on symptom-only prompts, which is exactly where Sonnet 5.5 improved. Caveats: on code-45, hard and ultra the Sonnet 5.5 arms were added later on a newer CLI at concurrency 6 (the others ran at 3), so read their wall times with care; the hard/ultra/extreme tasks were authored by Opus and Fable subagents; costs are list-price equivalents. Single-page Japanese report with the summary and interpretation: [`docs/report-opus-ja.html`](docs/report-opus-ja.html); data: [`results/opus`](results/opus/REPORT.md), [`results/hard`](results/hard/REPORT.md), [`results/ultra`](results/ultra/REPORT.md), [`results/models/extreme`](results/models/extreme/REPORT.md). To benchmark another model, use the project skill [`.claude/skills/model-bench`](.claude/skills/model-bench/SKILL.md).
 
+<!-- SOL61-README-START -->
+**GPT-6.1 Sol, code-45 addition** (2026-09-30〜2026-10-01, Asia/Tokyo): all 45 original code tasks at reasoning low, medium and high, one repetition each, codex-cli 0.159.0, concurrency 3. 135 graded runs, $8.6251 at estimated standard list price. Same task prompts, baseline answer contract and graders as the existing comparison. The quota interrupted the run after 89 cells; the remaining 46 resumed the next day without replacing completed outcomes.
+
+| effort | correct | accuracy | median cost | cost/correct | median wall |
+|---|---:|---:|---:|---:|---:|
+| low | 38/45 | 84.4% | $0.0425 | $0.0669 | 24.2 s |
+| medium | 39/45 | 86.7% | $0.0417 | $0.0729 | 30.3 s |
+| high | 39/45 | 86.7% | $0.0554 | $0.0831 | 36.7 s |
+
+The effort comparison uses the same Codex runtime with interleaved execution. Claude rows are contextual comparisons: the agent CLI, tool set, system prompt, delegation and execution date differ. Codex runs have a 30-minute wall cap; the original Claude 60-turn/$4 caps are not enforced by this adapter. These results cover code-45 only. Paired task bootstrap CIs, categories and limits: [`results/sol61`](results/sol61/REPORT.md); machine-readable [`analysis.json`](results/sol61/analysis.json) and [`runs.csv`](results/sol61/runs.csv); Japanese HTML [`report-sol61-ja.html`](docs/report-sol61-ja.html), also appended to [`report-opus-ja.html`](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> scripts/run-sol61.sh` (completed cells are skipped).
+<!-- SOL61-README-END -->
+
+<!-- SOL61-EXTREME-README-START -->
+**GPT-6.1 Sol, extreme addition** (2026-10-01〜2026-10-02, Asia/Tokyo): the 12 original symptom-only tasks, 2 repetitions at low/medium/high, 72 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price total: $18.3684.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 18/24 (75.0%) | $0.1715 | $0.2139 | 132.7 s | 153.8 s |
+| medium | 19/24 (79.2%) | $0.2409 | $0.3030 | 273.3 s | 256.7 s |
+| high | 21/24 (87.5%) | $0.3851 | $0.4172 | 466.0 s | 424.2 s |
+
+Paired comparisons average repeats per task and bootstrap all 12 tasks. Claude reference totals use the same 72 low/medium/high cells (xhigh excluded). The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 120-turn/$8 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-extreme`](results/sol61-extreme/REPORT.md), [`analysis.json`](results/sol61-extreme/analysis.json), [`runs.csv`](results/sol61-extreme/runs.csv). Japanese HTML: [`report-sol61-extreme-ja.html`](docs/report-sol61-extreme-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> scripts/run-sol61.sh extreme`.
+<!-- SOL61-EXTREME-README-END -->
+
+**All five models by effort** (Grok 4.7, GPT-6.1 Sol, Opus 5.5, Sonnet 5.5, Sonnet 5 at low/medium/high, matched cells; xhigh excluded because Grok and Sol have none): [`docs/report-effort-summary-ja.html`](docs/report-effort-summary-ja.html), regenerated by `python3 scripts/report-effort-summary.py`. Over code-45 + extreme (207 cells, the two sets Sol ran) Sonnet 5.5 is most accurate (88.4%) and Sol cheapest per correct answer ($0.155 vs $0.256); over all four sets (375 cells, without Sol) Opus 5.5 leads at 92.3% and Sonnet 5.5 costs the least per correct answer. Grok 4.7 ties Opus on hard and ultra but falls to 76% on extreme with 5–7× the tool calls, and does not improve with effort. Costs come from different sources (Claude API report, Grok Build report, Sol list-price estimate) and the agent CLIs differ, so these are runtime-inclusive comparisons.
+
 Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
 
 Three findings behind the table:
