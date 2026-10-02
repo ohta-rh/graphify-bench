@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { captureTranscript, runClaudeP, type ClaudePInvocation } from "./lib/claude-p.js";
+import { isGrokModel, runGrokP } from "./lib/grok-exec.js";
 import {
   effectiveEffort,
   effectiveModel,
@@ -115,6 +116,8 @@ export interface RunMeta {
   versions: Record<string, string | null>;
   timings_ms: { total: number; copy: number; claude: number; vitest: number };
   error: string | null;
+  /** Present on grok arms. `budget_cap` is false: Grok has no dollar cap. */
+  grok?: { skills: string[]; leaked_skills: string[]; budget_cap: false };
 }
 
 function cmdVersion(cmd: string, args: string[]): string | null {
@@ -479,27 +482,46 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
     const provisioned = provisionMcp(spec, mcpDir, REPO_ROOT);
     if (provisioned) meta.mcp = provisioned.provision;
 
-    // 5. the measured call
+    // 5. the measured call. Grok is a different CLI; the result is normalized
+    // to the same JSON the collectors already read.
     const tClaude = Date.now();
-    invocation = await runClaudeP({
-      prompt: req.task.prompt,
-      cwd: workDir,
-      sessionId,
-      model: env.model,
-      effort: env.effort,
-      maxTurns: env.maxTurns,
-      maxBudgetUsd: env.maxBudgetUsd,
-      extraArgs: [...(spec.extraClaudeArgs ?? []), ...(provisioned?.extraArgs ?? [])],
-      // The palace path is exported to `claude` itself, not only to the server
-      // it spawns: the server inherits this environment, so setting it here
-      // closes the gap if a mempalace code path ever resolves the palace before
-      // its own `--palace` argument is parsed.
-      env: {
-        ...(env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : {}),
-        ...(provisioned?.env ?? {}),
-        ...(spec.env ?? {}),
-      },
-    });
+    const childEnv = {
+      ...(env.hookStrict ? { GRAPHIFY_HOOK_STRICT: "1" } : {}),
+      ...(provisioned?.env ?? {}),
+      ...(spec.env ?? {}),
+    };
+    if (isGrokModel(env.model)) {
+      const grok = await runGrokP({
+        prompt: req.task.prompt,
+        cwd: workDir,
+        sessionId,
+        model: env.model,
+        effort: env.effort,
+        maxTurns: env.maxTurns,
+        env: { ...process.env, ...childEnv },
+      });
+      invocation = grok;
+      meta.grok = { skills: grok.skills, leaked_skills: grok.leakedSkills, budget_cap: false };
+      if (grok.leakedSkills.length > 0) {
+        meta.error = `user skills leaked into the grok session: ${grok.leakedSkills.join(", ")}`;
+      }
+    } else {
+      invocation = await runClaudeP({
+        prompt: req.task.prompt,
+        cwd: workDir,
+        sessionId,
+        model: env.model,
+        effort: env.effort,
+        maxTurns: env.maxTurns,
+        maxBudgetUsd: env.maxBudgetUsd,
+        extraArgs: [...(spec.extraClaudeArgs ?? []), ...(provisioned?.extraArgs ?? [])],
+        // The palace path is exported to `claude` itself, not only to the server
+        // it spawns: the server inherits this environment, so setting it here
+        // closes the gap if a mempalace code path ever resolves the palace before
+        // its own `--palace` argument is parsed.
+        env: childEnv,
+      });
+    }
     meta.timings_ms.claude = Date.now() - tClaude;
     meta.claude = {
       argv: invocation.argv,
@@ -518,10 +540,16 @@ export async function executeRun(req: RunRequest): Promise<RunMeta> {
       fs.writeFileSync(path.join(outDir, "result.stdout.txt"), invocation.stdout);
       meta.error = meta.error ?? `claude -p produced no parseable JSON (${invocation.parseError ?? "empty"})`;
     }
-    meta.transcript = captureTranscript(workDir, sessionId, path.join(outDir, "transcript.jsonl")) as unknown as Record<
-      string,
-      unknown
-    >;
+    if (isGrokModel(env.model)) {
+      const dest = path.join(outDir, "transcript.jsonl");
+      fs.writeFileSync(dest, invocation.stdout);
+      meta.transcript = { captured: invocation.stdout.length > 0, via: "stdout", dest, bytes: Buffer.byteLength(invocation.stdout) };
+    } else {
+      meta.transcript = captureTranscript(workDir, sessionId, path.join(outDir, "transcript.jsonl")) as unknown as Record<
+        string,
+        unknown
+      >;
+    }
 
     // 7. did the MCP server actually connect? Read it back off the transcript
     // rather than trusting the spawn: `claude -p` exits 0 whether or not its

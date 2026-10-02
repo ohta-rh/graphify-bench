@@ -125,6 +125,13 @@ export const OPUS_MODEL = "claude-opus-5-5";
 export const SONNET55_MODEL = "claude-sonnet-5-5";
 
 /**
+ * Grok 4.7 as passed to `grok -p --model`. On grok 1.0.46 a probe's `modelUsage`
+ * key was `grok-4.7-build`; the report reads that key from the run, not this constant.
+ * No xhigh arm — that effort was left out of this comparison.
+ */
+export const GROK_MODEL = "grok-4.7";
+
+/**
  * The built-in tools the `lean-tools` family leaves in the request.
  *
  * `--tools` is an *allowlist that replaces the built-in set*, and it is the only
@@ -623,6 +630,32 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     model: SONNET55_MODEL,
     effort: "xhigh",
     note: "`effort-xhigh` on Sonnet 5.5 — only the model differs.",
+  },
+  {
+    name: "grok-effort-low",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: GROK_MODEL,
+    effort: "low",
+    note:
+      "`effort-low` on Grok 4.7. Same overlay and effort as `effort-low`. The process is `grok -p`, " +
+      "so the tool names differ and there is no dollar cap (Grok has no `--max-budget-usd`). The turn cap matches the set.",
+  },
+  {
+    name: "grok-effort-medium",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: GROK_MODEL,
+    effort: "medium",
+    note: "As `grok-effort-low`, at `--effort medium`.",
+  },
+  {
+    name: "grok-effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: GROK_MODEL,
+    effort: "high",
+    note: "As `grok-effort-low`, at `--effort high`. No xhigh arm.",
   },
 ] as const;
 

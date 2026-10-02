@@ -206,7 +206,7 @@ body = f"""
     <li><b>極難問では、Opus 5.5 と Sonnet 5.5 の正答率に、はっきりした差はない。</b>{tot['extreme']['Opus 5.5'][0]}/96 対 {tot['extreme']['Sonnet 5.5'][0]}/96。一方で Opus は、どの effort でも 1 本あたり {rng(X, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高く、{rng(X, 'opus-effort', 'sonnet55-effort', 'wall', sec)} 遅い（CI が 0 をまたがない）。wall をきれいに比べられるのは、全アームを同時に測ったこのセットだけ。</li>
     <li><b>難問でも Sonnet 5.5 が最安。</b>{tot['hard']['Sonnet 5.5'][0]}/128 正解で、1 本 {usd(D['hard']['arms']['sonnet55-effort-low']['cost_med'])}〜{usd(D['hard']['arms']['sonnet55-effort-xhigh']['cost_med'])}。Opus 5.5（{tot['hard']['Opus 5.5'][0]}/128）は、同じ effort 同士で {rng(H, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い。</li>
     <li><b>仕様を細かく書いた超難問では、Sonnet 5 と 5.5 のコストと時間に差がない</b>（どの effort でも CI が 0 をまたぐ）。正答率は 5.5 が {tot['ultra']['Sonnet 5.5'][0]}/96、5 が {tot['ultra']['Sonnet 5'][0]}/96 で、5.5 がわずかに低い（CI の上限がちょうど 0）。Opus は同じ effort 同士で {rng(U, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い。</li>
-    <li><b>45 問は、どのモデルも 78〜89% の天井に張り付く。</b>その中では Sonnet 5.5 の正解が最も多く（{tot['code45']['Sonnet 5.5'][0]}/180。Opus 5.5 は {tot['code45']['Opus 5.5'][0]}/180）、コストも最も低い（同じ effort 同士で Opus が {rng(C, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い）。</li>
+    <li><b>45 問では、今回測った Claude 3 モデルは 78〜89% の範囲に入る。</b>この Claude 比較の中では Sonnet 5.5 の正解が最も多く（{tot['code45']['Sonnet 5.5'][0]}/180。Opus 5.5 は {tot['code45']['Opus 5.5'][0]}/180）、コストも最も低い（同じ effort 同士で Opus が {rng(C, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い）。</li>
     <li><b>Sonnet 5.5 の xhigh は割に合わない。</b>high と比べてコストが {xh_ratio_lo:.1f}〜{xh_ratio_hi:.1f} 倍になるのに、正答率はどのセットでも上がらない（±1 本）。</li>
   </ul>
 
@@ -270,3 +270,13 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',drawAll);
 title_fix = head.replace("<title>Opus 5.5 対 Sonnet 5</title>", "<title>Opus・Sonnet モデル比較</title>")
 open(OUT, "w").write("\n".join(line.rstrip() for line in (title_fix + body).split("\n")))
 print("wrote", OUT)
+# Keep the independently measured Codex/code-45 addition when rebuilding this report.
+root = os.path.dirname(os.path.dirname(HERE))
+sol_results = os.path.join(root, "results", "sol61")
+if os.path.exists(os.path.join(sol_results, "analysis.json")):
+    import subprocess
+    subprocess.run([sys.executable, os.path.join(root, "scripts", "report-sol61.py"), sol_results, OUT], check=True)
+sol_extreme_results = os.path.join(root, "results", "sol61-extreme")
+if os.path.exists(os.path.join(sol_extreme_results, "analysis.json")):
+    import subprocess
+    subprocess.run([sys.executable, os.path.join(root, "scripts", "report-sol61-extreme.py"), sol_extreme_results, OUT], check=True)

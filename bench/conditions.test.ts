@@ -10,6 +10,7 @@ import {
   LEAN_TOOLS,
   LEAN_TOOLS_ARGS,
   OPUS_MODEL,
+  GROK_MODEL,
   SONNET55_MODEL,
   assertRegistryMatchesDisk,
   conditionNames,
@@ -583,6 +584,28 @@ describe("runtime lever arms", () => {
     expect(o.env).toBeUndefined();
     expect(o.mcp).toBeUndefined();
     expect(o.corpus).toBe(s.corpus);
+  });
+
+  it.each([
+    ["grok-effort-low", "effort-low"],
+    ["grok-effort-medium", "effort-medium"],
+    ["grok-effort-high", "effort-high"],
+  ])("%s is %s with only the model swapped", (grok, sonnet) => {
+    const o = getCondition(grok);
+    const s = getCondition(sonnet);
+    expect(o.model).toBe(GROK_MODEL);
+    expect(s.model).toBeUndefined();
+    expect(o.overlays).toEqual(s.overlays);
+    expect(o.effort).toBe(s.effort);
+    expect(o.extraClaudeArgs).toEqual(s.extraClaudeArgs);
+    expect(o.env).toBeUndefined();
+    expect(o.mcp).toBeUndefined();
+    expect(o.corpus).toBe(s.corpus);
+    expect(conditionNames().filter((name) => name.startsWith("grok-effort-"))).toEqual([
+      "grok-effort-low",
+      "grok-effort-medium",
+      "grok-effort-high",
+    ]);
   });
 
   // Phase 11: the combined arm. It must be the exact conjunction of the two
