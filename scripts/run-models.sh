@@ -1,6 +1,6 @@
 #!/bin/bash
 # Model comparison: Opus 5.5, Sonnet 5 and Sonnet 5.5 at effort low/medium/high/xhigh.
-#   scripts/run-models.sh code45|hard|ultra|extreme|apex
+#   scripts/run-models.sh code45|hard|ultra|extreme|apex|brownfield
 # extreme: all 12 arms into results/models/extreme (the earlier extreme run was
 # lost to quota stops). code45/hard/ultra: only the four Sonnet 5.5 arms, added to
 # the existing results dir with that set's original turn/budget caps, so they sit
@@ -21,6 +21,7 @@ case "${1:?set name}" in
   ultra)   OUT=results/ultra;          TASKS=tasks/tasks-ultra.json;   REPS=2; TURNS=120; BUDGET=8; ARMS=$SONNET55 ;;
   extreme) OUT=results/models/extreme; TASKS=tasks/tasks-extreme.json; REPS=2; TURNS=120; BUDGET=8; ARMS=$ALL ;;
   apex)    OUT=results/models/apex;    TASKS=tasks/tasks-apex.json;    REPS=2; TURNS=160; BUDGET=12; ARMS=$ALL,$HAIKU55 ;;
+  brownfield) OUT=results/models/brownfield; TASKS=tasks/tasks-brownfield.json; REPS=2; TURNS=160; BUDGET=12; ARMS=$ALL,$HAIKU55 ;;
   *) echo "unknown set: $1" >&2; exit 2 ;;
 esac
 # BENCH_ARMS overrides the arm list (e.g. to add a newly released model's arms only).
