@@ -1,0 +1,382 @@
+diff --git a/src/actions/projects/create-project.ts b/src/actions/projects/create-project.ts
+--- a/src/actions/projects/create-project.ts
++++ b/src/actions/projects/create-project.ts
+@@ -3,9 +3,9 @@
+ /**
+  * Creates a project after the plan's project quota is checked.
+  *
+- * Owner D. Archived projects still occupy the quota, so the count deliberately
+- * includes them — restoring a project must never be blocked by a limit the
+- * restore itself would breach.
++ * Owner D. Only live projects occupy the quota: archiving one frees its slot
++ * and restoring it takes the slot again (the restore is refused when the plan
++ * has no room), so the usage counter read here tracks live projects only.
+  *
+  * Must call (do not reimplement): createProjectSchema, can, getPlanLimits,
+  * getActor, toActionResult
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -9,6 +9,7 @@
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
++import { ProjectLifecycleError } from "@/lib/project-lifecycle";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof ProjectLifecycleError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -96,6 +98,14 @@
+     };
+   }
+ 
++  if (error instanceof ProjectLifecycleError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { projectId: error.projectId, reason: error.reason, status: error.status },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/lib/project-lifecycle.ts b/src/lib/project-lifecycle.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/project-lifecycle.ts
+@@ -0,0 +1,54 @@
++/**
++ * Project lifecycle rules: which projects take new work, when a project may
++ * be marked completed, and when a restore makes sense.
++ *
++ * A project is `active`, `paused` or `completed` while it is live, and may be
++ * archived on top of that. Only an active, live project accepts new issues;
++ * existing issues stay editable whatever the project's status. The decisions
++ * are pure so the service layer, the actions and the UI gates agree.
++ */
++import type { Project, ProjectStatus } from "@/types/project";
++
++export type ProjectLifecycleReason =
++  /** The project is paused or completed and takes no new issues. */
++  | "not_active"
++  /** The project still has open issues and cannot be marked completed. */
++  | "open_issues"
++  /** The project is live, so there is nothing to restore. */
++  | "not_archived";
++
++/** Thrown by the lifecycle guards; mapped to `conflict`, like double-archiving. */
++export class ProjectLifecycleError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly projectId: string,
++    readonly reason: ProjectLifecycleReason,
++    readonly status: ProjectStatus,
++  ) {
++    super(`Project ${projectId} (${status}): ${describe(reason)}`);
++    this.name = "ProjectLifecycleError";
++  }
++}
++
++function describe(reason: ProjectLifecycleReason): string {
++  switch (reason) {
++    case "not_active":
++      return "takes no new issues while paused or completed";
++    case "open_issues":
++      return "cannot be completed while it has open issues";
++    case "not_archived":
++      return "is not archived";
++  }
++}
++
++/** True when a new issue may be filed in the project. */
++export function acceptsNewIssues(project: Project): boolean {
++  return project.archivedAt === null && project.status === "active";
++}
++
++export function assertAcceptsNewIssues(project: Project): void {
++  if (!acceptsNewIssues(project) && project.archivedAt === null) {
++    throw new ProjectLifecycleError(project.id, "not_active", project.status);
++  }
++}
+diff --git a/src/lib/slug.ts b/src/lib/slug.ts
+--- a/src/lib/slug.ts
++++ b/src/lib/slug.ts
+@@ -100,3 +100,24 @@
+       : (words[0] ?? "task").slice(0, 3);
+   return letters.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4) || "TASK";
+ }
++
++export const PROJECT_KEY_MAX_LENGTH = 4;
++
++/**
++ * Derives a key that collides with nothing in `taken`, the way `uniqueSlug`
++ * does for addresses: the key itself, then `KEY2`, `KEY3`, …, trimmed so the
++ * result never exceeds `PROJECT_KEY_MAX_LENGTH`. Keys of archived projects
++ * are expected in `taken` — their issue numbers still carry them.
++ */
++export function uniqueProjectKey(key: string, taken: Iterable<string>): string {
++  const base = key.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, PROJECT_KEY_MAX_LENGTH) || "TASK";
++  const used = new Set(taken);
++  if (!used.has(base)) return base;
++
++  for (let suffix = 2; suffix < 1_000; suffix += 1) {
++    const digits = String(suffix);
++    const candidate = `${base.slice(0, PROJECT_KEY_MAX_LENGTH - digits.length)}${digits}`;
++    if (!used.has(candidate)) return candidate;
++  }
++  throw new InvalidSlugError(base, "exhausted unique key suffixes");
++}
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -23,7 +24,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -264,6 +265,32 @@
+   });
+ }
+ 
++/**
++ * Live issues of the project that are still open (neither done nor canceled).
++ * A count rather than a listing: the completion gate must see every issue,
++ * not the first page of them.
++ */
++export async function countOpenIssues(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(issues)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.projectId, projectId),
++          livePredicate(issues.archivedAt, {}),
++          notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
++        ),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
+ export async function countIssues(
+   orgId: OrgId,
+   projectId: ProjectId,
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -91,19 +91,25 @@
+ }
+ 
+ /**
+- * Counts the organization's projects; the `projects` quota reads this. An
+- * archived project keeps its slot until the retention sweep purges it — its
+- * rows, numbers and address are all still there.
++ * Counts live projects by default; the `projects` quota reads this. An
++ * archived project frees its slot the moment it is archived and takes one
++ * again when it is restored.
+  */
+ export async function countProjects(
+   orgId: OrgId,
+   scope: ArchiveScope = {},
+ ): Promise<number> {
+-  void scope;
+   const row = getDb()
+     .select({ value: count() })
+     .from(projects)
+-    .where(orgPredicate(projects.orgId, orgId))
++    .where(
++      and(
++        ...compact(
++          orgPredicate(projects.orgId, orgId),
++          livePredicate(projects.archivedAt, scope),
++        ),
++      ),
++    )
+     .get();
+   return row?.value ?? 0;
+ }
+@@ -152,8 +158,7 @@
+       ...(input.visibility === undefined
+         ? {}
+         : { visibility: input.visibility }),
+-      // `status` is a reflection of the project's issues, never a value a
+-      // form hands in; the column keeps what the lifecycle writes.
++      ...(input.status === undefined ? {} : { status: input.status }),
+       ...(input.leadId === undefined ? {} : { leadId: input.leadId }),
+       ...(input.color === undefined ? {} : { color: input.color }),
+       ...(input.targetDate === undefined
+@@ -204,25 +209,33 @@
+   return toProject(row);
+ }
+ 
+-/** Live slugs only — an archived project's address is free for reuse. */
++/**
++ * Includes archived slugs — a restored project must not collide, and the
++ * unique index holds archived rows too.
++ */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+ ): Promise<readonly string[]> {
+   const rows = getDb()
+     .select({ slug: projects.slug })
+     .from(projects)
+-    .where(
+-      and(
+-        ...compact(
+-          orgPredicate(projects.orgId, orgId),
+-          livePredicate(projects.archivedAt, {}),
+-        ),
+-      ),
+-    )
++    .where(orgPredicate(projects.orgId, orgId))
+     .all();
+   return rows.map((row) => row.slug);
+ }
+ 
++/** Every key in use, archived projects included: their issue numbers keep it. */
++export async function listTakenProjectKeys(
++  orgId: OrgId,
++): Promise<readonly string[]> {
++  const rows = getDb()
++    .select({ key: projects.key })
++    .from(projects)
++    .where(orgPredicate(projects.orgId, orgId))
++    .all();
++  return rows.map((row) => row.key);
++}
++
+ /** Open/closed/overdue counters plus the last write, for the project card. */
+ export async function getProjectStats(
+   orgId: OrgId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -6,6 +6,7 @@
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
++import { assertAcceptsNewIssues } from "@/lib/project-lifecycle";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+@@ -52,6 +53,9 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++  // A paused or completed project takes no new work; its existing issues
++  // stay editable, which is why only creation is gated.
++  assertAcceptsNewIssues(project);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -6,8 +6,9 @@
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { projectKeyFromName, uniqueSlug } from "@/lib/slug";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { ProjectLifecycleError } from "@/lib/project-lifecycle";
++import { projectKeyFromName, uniqueProjectKey, uniqueSlug } from "@/lib/slug";
++import { assertNotArchived, isArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -55,10 +56,15 @@
+ 
+   const slug = await suggestProjectSlug(input.orgId, input.name);
+ 
++  // Keys are unique per organization, archived projects included (their
++  // issue numbers still carry them), and made unique like the address is.
++  const takenKeys = await projectRepo.listTakenProjectKeys(input.orgId);
++  const key = uniqueProjectKey(input.key || projectKeyFromName(input.name), takenKeys);
++
+   const project = await projectRepo.insertProject({
+     ...input,
+     slug,
+-    key: input.key || projectKeyFromName(input.name),
++    key,
+   });
+ 
+   await emit("project.created", {
+@@ -85,6 +91,15 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  // A project is completed only once nothing in it is open — counted over
++  // every issue, never a page of them. Pausing needs no such check.
++  if (input.status === "completed" && project.status !== "completed") {
++    const open = await issueRepo.countOpenIssues(input.orgId, project.id);
++    if (open > 0) {
++      throw new ProjectLifecycleError(project.id, "open_issues", project.status);
++    }
++  }
++
+   return projectRepo.updateProject(input);
+ }
+ 
+@@ -139,6 +154,20 @@
+   );
+   assertCan(actor, "project:archive", projectResource(project));
+ 
++  // Only an archived project can come back, and it takes a plan slot again,
++  // so the same quota that guards creation guards the restore.
++  if (!isArchived(project)) {
++    throw new ProjectLifecycleError(project.id, "not_archived", project.status);
++  }
++
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  const used = await projectRepo.countProjects(orgId);
++  if (wouldExceedLimit(org.plan, "projects", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows ${used} projects; upgrade to restore another`,
++    );
++  }
++
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+ 
+   await emit("project.restored", {
+diff --git a/src/server/services/usage-service.ts b/src/server/services/usage-service.ts
+--- a/src/server/services/usage-service.ts
++++ b/src/server/services/usage-service.ts
+@@ -86,6 +86,11 @@
+         issuesUsed: -payload.issuesArchived,
+       });
+     }),
++    // A restore takes the slot back; its issues stay archived, so no issue
++    // delta is due here.
++    subscribe("project.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
++    }),
+     subscribe("member.joined", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
+     }),

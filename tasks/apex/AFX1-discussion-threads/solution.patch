@@ -1,0 +1,519 @@
+diff --git a/src/actions/comments/create-comment.ts b/src/actions/comments/create-comment.ts
+--- a/src/actions/comments/create-comment.ts
++++ b/src/actions/comments/create-comment.ts
+@@ -39,7 +39,8 @@
+       throw new ForbiddenActionError("comment:create");
+     }
+ 
+-    const verdict = await consumeRateLimit(input.orgId, COMMENT_BUCKET);
++    // Charged per member, as in the service: one person's burst is their own.
++    const verdict = await consumeRateLimit(input.orgId, COMMENT_BUCKET, 1, actor.userId);
+     if (!verdict.allowed) {
+       throw new RateLimitedError(COMMENT_BUCKET, verdict.resetAt);
+     }
+diff --git a/src/components/domain/comment/comment-thread.tsx b/src/components/domain/comment/comment-thread.tsx
+--- a/src/components/domain/comment/comment-thread.tsx
++++ b/src/components/domain/comment/comment-thread.tsx
+@@ -36,7 +36,10 @@
+     return null;
+   }
+ 
+-  const visible = orderThread(nodes).filter((node) => isLive(node.comment));
++  // A deleted opener stays as a placeholder while live replies hang under it.
++  const visible = orderThread(nodes).filter(
++    (node) => isLive(node.comment) || node.replies.some(isLive),
++  );
+ 
+   if (visible.length === 0) {
+     return <EmptyState title="No comments yet" description="Start the thread." />;
+diff --git a/src/lib/mentions.ts b/src/lib/mentions.ts
+--- a/src/lib/mentions.ts
++++ b/src/lib/mentions.ts
+@@ -46,21 +46,24 @@
+   body: string,
+   members: readonly MemberWithUser[],
+ ): readonly UserId[] {
+-  const byHandle = new Map<string, UserId>();
++  // A handle is not unique across email domains, so one handle may name
++  // several members; a mention reaches all of them, whatever their role.
++  const byHandle = new Map<string, UserId[]>();
+   for (const member of members) {
+-    // Read-only members cannot take part in a discussion, so pinging them
+-    // only produces an alert they can do nothing about.
+-    if (member.role === "viewer") continue;
+-    byHandle.set(handleOf(member), member.userId);
++    const handle = handleOf(member);
++    const bucket = byHandle.get(handle) ?? [];
++    bucket.push(member.userId);
++    byHandle.set(handle, bucket);
+   }
+ 
+   const resolved: UserId[] = [];
+   const seen = new Set<UserId>();
+   for (const handle of extractMentions(body)) {
+-    const userId = byHandle.get(handle);
+-    if (userId === undefined || seen.has(userId)) continue;
+-    seen.add(userId);
+-    resolved.push(userId);
++    for (const userId of byHandle.get(handle) ?? []) {
++      if (seen.has(userId)) continue;
++      seen.add(userId);
++      resolved.push(userId);
++    }
+   }
+ 
+   return resolved;
+diff --git a/src/lib/rate-limit.ts b/src/lib/rate-limit.ts
+--- a/src/lib/rate-limit.ts
++++ b/src/lib/rate-limit.ts
+@@ -77,9 +77,12 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  subject: string | null = null,
+ ): Promise<RateLimitVerdict> {
+   const config = configFor(orgId, bucketKey);
+-  const key = `${orgId}:${bucketKey}`;
++  // An optional subject (a member id, say) narrows the bucket below the org,
++  // so one person's burst is charged to them alone; the shape stays the same.
++  const key = subject === null ? `${orgId}:${bucketKey}` : `${orgId}:${bucketKey}:${subject}`;
+   const nowMs = Date.now();
+ 
+   const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
+diff --git a/src/server/repositories/comment-repository.ts b/src/server/repositories/comment-repository.ts
+--- a/src/server/repositories/comment-repository.ts
++++ b/src/server/repositories/comment-repository.ts
+@@ -73,8 +73,10 @@
+ 
+ /**
+  * The whole thread for one issue, in reading order: top-level comments oldest
+- * first, each followed by its replies. A deleted top-level comment takes its
+- * thread with it — nothing to anchor the replies to once the opener is gone.
++ * first, each followed by every reply that descends from it — directly or
++ * through other replies — in order of posting. Deleted comments are kept as
++ * placeholders so a reply chain never loses its anchor; their text is not
++ * returned, the UI renders them as "deleted".
+  */
+ export async function listThread(
+   orgId: OrgId,
+@@ -90,28 +92,56 @@
+         eq(comments.issueId, issueId),
+       ),
+     )
+-    .orderBy(asc(comments.createdAt))
++    .orderBy(asc(comments.createdAt), asc(comments.id))
+     .all();
+ 
+-  const decorated: CommentWithAuthor[] = rows.map((row) => ({
+-    ...toComment(row.comment),
+-    author: toUser(row.author),
+-  }));
++  const decorated: CommentWithAuthor[] = rows.map((row) => {
++    const comment = toComment(row.comment);
++    return {
++      ...comment,
++      body: comment.archivedAt === null ? comment.body : "",
++      author: toUser(row.author),
++    };
++  });
+ 
++  // Walk each reply up to its top-level ancestor. A reply whose chain does
++  // not end on this issue (a dangling parent) is treated as top-level rather
++  // than dropped, so the thread never silently loses a comment.
++  const byId = new Map(decorated.map((comment) => [comment.id, comment]));
++  const rootOf = new Map<string, string>();
++  const resolveRoot = (comment: CommentWithAuthor): string => {
++    const cached = rootOf.get(comment.id);
++    if (cached !== undefined) return cached;
++
++    const seen = new Set<string>([comment.id]);
++    let current = comment;
++    while (current.parentId !== null) {
++      const parent = byId.get(current.parentId);
++      if (parent === undefined || seen.has(parent.id)) break;
++      seen.add(parent.id);
++      current = parent;
++    }
++    rootOf.set(comment.id, current.id);
++    return current.id;
++  };
++
+   const repliesBy = new Map<string, CommentWithAuthor[]>();
++  const roots: CommentWithAuthor[] = [];
+   for (const comment of decorated) {
+-    if (comment.parentId === null) continue;
+-    const bucket = repliesBy.get(comment.parentId) ?? [];
++    const root = resolveRoot(comment);
++    if (root === comment.id) {
++      roots.push(comment);
++      continue;
++    }
++    const bucket = repliesBy.get(root) ?? [];
+     bucket.push(comment);
+-    repliesBy.set(comment.parentId, bucket);
++    repliesBy.set(root, bucket);
+   }
+ 
+-  return decorated
+-    .filter((comment) => comment.parentId === null && comment.archivedAt === null)
+-    .map((comment) => ({
+-      comment,
+-      replies: repliesBy.get(comment.id) ?? [],
+-    }));
++  return roots.map((comment) => ({
++    comment,
++    replies: repliesBy.get(comment.id) ?? [],
++  }));
+ }
+ 
+ export async function countComments(
+@@ -157,14 +187,23 @@
+   return toComment(row);
+ }
+ 
+-/** An edit stamps `edited_at`, which the UI shows next to the timestamp. */
++/**
++ * An edit stamps `edited_at`, which the UI shows next to the timestamp, and
++ * replaces the recorded mentions with the ones resolved from the new body.
++ */
+ export async function updateComment(
+   input: UpdateCommentInput,
++  mentionedUserIds: readonly UserId[],
+ ): Promise<Comment> {
+   const stamp = toIsoTimestamp(new Date());
+   const row = getDb()
+     .update(comments)
+-    .set({ body: input.body, editedAt: stamp, updatedAt: stamp })
++    .set({
++      body: input.body,
++      mentionedUserIds: JSON.stringify(mentionedUserIds),
++      editedAt: stamp,
++      updatedAt: stamp,
++    })
+     .where(
+       and(
+         orgPredicate(comments.orgId, input.orgId),
+diff --git a/src/server/repositories/member-repository.ts b/src/server/repositories/member-repository.ts
+--- a/src/server/repositories/member-repository.ts
++++ b/src/server/repositories/member-repository.ts
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, asc, count, desc, eq, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -100,6 +100,31 @@
+   );
+ }
+ 
++/**
++ * Every active member with their user record, oldest membership first and
++ * without a page cap. Mention resolution needs the whole organization: a
++ * paged read would quietly drop everyone beyond the first page.
++ */
++export async function listActiveMembers(
++  orgId: OrgId,
++): Promise<readonly MemberWithUser[]> {
++  const rows = getDb()
++    .select({ member: members, user: users })
++    .from(members)
++    .innerJoin(users, eq(users.id, members.userId))
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .orderBy(asc(members.createdAt), asc(members.id))
++    .all();
++
++  return rows.map((row) => ({ ...toMember(row.member), user: toUser(row.user) }));
++}
++
+ /** The seat count every plan check compares against. */
+ export async function countActiveMembers(orgId: OrgId): Promise<number> {
+   const row = getDb()
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -3,6 +3,7 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, archivePatch, consumeRateLimit
+  */
++import { COMMENT_EDIT_WINDOW_MINUTES } from "@/config/constants";
+ import { emit } from "@/lib/event-bus";
+ import { resolveMentions } from "@/lib/mentions";
+ import { assertCan } from "@/lib/permissions";
+@@ -13,6 +14,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import {
++  NotFoundError,
+   actorEnvelope,
+   commentResource,
+   issueResource,
+@@ -28,11 +30,8 @@
+ import type { Actor } from "@/types/member";
+ 
+ /** How long after posting an author may still edit their own comment. */
+-const EDIT_WINDOW_MS = 15 * 60 * 1000;
++const EDIT_WINDOW_MS = COMMENT_EDIT_WINDOW_MINUTES * 60 * 1000;
+ 
+-/** How many members are scanned when resolving `@handle` mentions. */
+-const MENTION_LOOKUP_LIMIT = 100;
+-
+ /** Token bucket protecting the comment thread from burst posting. */
+ const COMMENT_CREATE_BUCKET = "comment:create";
+ 
+@@ -41,6 +40,10 @@
+  * are resolved against the org's members here, so the stored row and the
+  * `comment.created` payload agree on who was mentioned — the notification
+  * fan-out reads that list rather than re-parsing the markdown.
++ *
++ * A reply must answer a live comment on the same issue: a parent on another
++ * issue (or in another organization) is simply not found, and a deleted one
++ * is a conflict, exactly like commenting on an archived issue.
+  */
+ export async function createComment(
+   actor: Actor,
+@@ -56,7 +59,26 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+-  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (parent.issueId !== issue.id) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++    assertNotArchived("Comment", parent.id, parent);
++  }
++
++  // The bucket is per member: one person's burst must not silence the rest
++  // of the workspace.
++  const verdict = await consumeRateLimit(
++    input.orgId,
++    COMMENT_CREATE_BUCKET,
++    1,
++    actor.userId,
++  );
+   if (!verdict.allowed) {
+     throw new Error(
+       `Comment rate limit reached; try again after ${verdict.resetAt}`,
+@@ -66,7 +88,7 @@
+   const mentionedUserIds = await resolveMentionedUsers(
+     input.orgId,
+     input.body,
+-    input.mentionedUserIds,
++    actor.userId,
+   );
+ 
+   const comment = await commentRepo.insertComment(
+@@ -88,6 +110,11 @@
+  * Edits are allowed inside a fifteen-minute window, or by anyone the role
+  * matrix already lets update a comment. `can()` decides the second half —
+  * this service only owns the time window.
++ *
++ * The mentions are re-read from the new text: the stored list becomes exactly
++ * what the text says, and only people who were not mentioned before are
++ * announced as newly mentioned. The difference is taken before the row is
++ * rewritten, because afterwards the previous list is gone.
+  */
+ export async function updateComment(
+   actor: Actor,
+@@ -107,7 +134,27 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const mentionedUserIds = await resolveMentionedUsers(
++    input.orgId,
++    input.body,
++    comment.authorId,
++  );
++  const previouslyMentioned = new Set(comment.mentionedUserIds);
++  const addedMentionedUserIds = mentionedUserIds.filter(
++    (userId) => !previouslyMentioned.has(userId),
++  );
++
++  const updated = await commentRepo.updateComment(input, mentionedUserIds);
++
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++    mentionedUserIds,
++    addedMentionedUserIds,
++  });
++
++  return updated;
+ }
+ 
+ /**
+@@ -162,32 +209,23 @@
+   return commentRepo.listThread(orgId, issueId);
+ }
+ 
++/** The window is counted from the original posting, never from an edit. */
+ function isPastEditWindow(comment: Comment): boolean {
+-  // The window follows the last save: a typo fix a minute before the cut-off
+-  // must not lock the author out of correcting the correction.
+-  const posted = new Date(comment.updatedAt).getTime();
++  const posted = new Date(comment.createdAt).getTime();
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+ /**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The server list wins on disagreement.
++ * The people a body mentions: every active member whose handle appears in the
++ * text, whatever their role and however many members the organization has.
++ * The author's own handle is ignored. Nothing a client sends alongside the
++ * text can add anyone — the text is the only source.
+  */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+-  clientProvided: readonly UserId[],
++  authorId: UserId,
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
+-
+-  const resolved = resolveMentions(body, members.items);
+-  const known = new Set(members.items.map((member) => member.userId));
+-
+-  return [
+-    ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+-  ];
++  const members = await memberRepo.listActiveMembers(orgId);
++  return resolveMentions(body, members).filter((userId) => userId !== authorId);
+ }
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -200,32 +201,52 @@
+     });
+   });
+ 
++  // One alert per person per comment: the issue's author and assignee and —
++  // for a reply — the author of the comment answered are told a comment was
++  // added, unless the comment mentions them, in which case the mention alert
++  // is the one they get. `notify()` already drops the comment's own author.
+   subscribe("comment.created", async (payload) => {
+-    const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+-    const watchers = issue
+-      ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+-      : [];
++    const [issue, comment] = await Promise.all([
++      issueRepo.findIssueById(payload.orgId, payload.issueId),
++      commentRepo.findCommentById(payload.orgId, payload.commentId),
++    ]);
+ 
+-    await notify(payload.orgId, "comment_created", watchers, {
++    const watchers = new Set<UserId>();
++    if (issue) {
++      watchers.add(issue.authorId);
++      if (issue.assigneeId !== null) watchers.add(issue.assigneeId);
++    }
++    if (comment && comment.parentId !== null) {
++      const parent = await commentRepo.findCommentById(payload.orgId, comment.parentId);
++      if (parent) watchers.add(parent.authorId);
++    }
++
++    const mentioned = new Set(payload.mentionedUserIds);
++    const plain = [...watchers].filter((userId) => !mentioned.has(userId));
++
++    await notify(payload.orgId, "comment_mention", payload.mentionedUserIds, {
++      title: "You were mentioned",
++      body: `You were mentioned on issue ${payload.issueId}`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    });
++
++    await notify(payload.orgId, "comment_created", plain, {
+       title: "New comment",
+       body: `A comment was added to issue ${payload.issueId}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
+     });
++  });
+ 
+-    if (payload.mentionedUserIds.length > 0) {
+-      await notify(
+-        payload.orgId,
+-        "comment_mention",
+-        payload.mentionedUserIds,
+-        {
+-          title: "You were mentioned",
+-          body: `You were mentioned on issue ${payload.issueId}`,
+-          href: `/issues/${payload.issueId}`,
+-          actorId: payload.actorId,
+-        },
+-      );
+-    }
++  // An edit only announces the people it newly mentions.
++  subscribe("comment.updated", async (payload) => {
++    await notify(payload.orgId, "comment_mention", payload.addedMentionedUserIds, {
++      title: "You were mentioned",
++      body: `You were mentioned on issue ${payload.issueId}`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    });
+   });
+ 
+   subscribe("member.joined", async (payload) => {
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -154,6 +154,13 @@
+       );
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
++    subscribe("comment.updated", async (payload) => {
++      const comment = await commentRepo.findCommentById(
++        payload.orgId,
++        payload.commentId,
++      );
++      if (comment) await indexComment(payload.orgId, comment);
++    }),
+     subscribe("comment.deleted", async (payload) => {
+       await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -72,6 +72,14 @@
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
+   };
++  "comment.updated": EventEnvelope & {
++    commentId: CommentId;
++    issueId: IssueId;
++    /** Everyone the edited text mentions. */
++    mentionedUserIds: readonly UserId[];
++    /** The subset not mentioned before this edit. */
++    addedMentionedUserIds: readonly UserId[];
++  };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };

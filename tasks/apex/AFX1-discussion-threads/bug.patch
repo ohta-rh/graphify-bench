@@ -1,0 +1,98 @@
+diff --git a/src/lib/mentions.ts b/src/lib/mentions.ts
+--- a/src/lib/mentions.ts
++++ b/src/lib/mentions.ts
+@@ -48,6 +48,9 @@
+ ): readonly UserId[] {
+   const byHandle = new Map<string, UserId>();
+   for (const member of members) {
++    // Read-only members cannot take part in a discussion, so pinging them
++    // only produces an alert they can do nothing about.
++    if (member.role === "viewer") continue;
+     byHandle.set(handleOf(member), member.userId);
+   }
+ 
+diff --git a/src/server/repositories/comment-repository.ts b/src/server/repositories/comment-repository.ts
+--- a/src/server/repositories/comment-repository.ts
++++ b/src/server/repositories/comment-repository.ts
+@@ -73,8 +73,8 @@
+ 
+ /**
+  * The whole thread for one issue, in reading order: top-level comments oldest
+- * first, each followed by its replies. Archived comments are kept so a reply
+- * chain never loses its anchor — the UI renders them as "deleted".
++ * first, each followed by its replies. A deleted top-level comment takes its
++ * thread with it — nothing to anchor the replies to once the opener is gone.
+  */
+ export async function listThread(
+   orgId: OrgId,
+@@ -107,7 +107,7 @@
+   }
+ 
+   return decorated
+-    .filter((comment) => comment.parentId === null)
++    .filter((comment) => comment.parentId === null && comment.archivedAt === null)
+     .map((comment) => ({
+       comment,
+       replies: repliesBy.get(comment.id) ?? [],
+diff --git a/src/server/services/comment-service.ts b/src/server/services/comment-service.ts
+--- a/src/server/services/comment-service.ts
++++ b/src/server/services/comment-service.ts
+@@ -163,7 +163,9 @@
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+-  const posted = new Date(comment.createdAt).getTime();
++  // The window follows the last save: a typo fix a minute before the cut-off
++  // must not lock the author out of correcting the correction.
++  const posted = new Date(comment.updatedAt).getTime();
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+diff --git a/tests/repositories/comment-repository.test.ts b/tests/repositories/comment-repository.test.ts
+--- a/tests/repositories/comment-repository.test.ts
++++ b/tests/repositories/comment-repository.test.ts
+@@ -141,44 +141,6 @@
+     expect(page.items.map((row) => row.id)).not.toContain(comment.id);
+   });
+ 
+-  it("keeps live replies when their parent is soft-deleted", async () => {
+-    const number = await issueRepo.nextIssueNumber(north.org.id, north.project.id);
+-    const issue = await issueRepo.insertIssue(
+-      issueInput(north.org.id, north.project.id, { title: "Deleted parent" }),
+-      north.userIds.owner,
+-      number,
+-    );
+-
+-    const top = await commentRepo.insertComment(
+-      {
+-        orgId: north.org.id,
+-        issueId: issue.id,
+-        body: "Parent to delete",
+-        parentId: null,
+-        mentionedUserIds: [],
+-      },
+-      north.userIds.owner,
+-    );
+-    const reply = await commentRepo.insertComment(
+-      {
+-        orgId: north.org.id,
+-        issueId: issue.id,
+-        body: "Still alive",
+-        parentId: top.id,
+-        mentionedUserIds: [],
+-      },
+-      north.userIds.member,
+-    );
+-    await commentRepo.archiveComment(north.org.id, top.id);
+-
+-    const thread = await commentRepo.listThread(north.org.id, issue.id);
+-    const node = thread.find((n) => n.comment.id === top.id);
+-
+-    expect(node).toBeDefined();
+-    expect(node?.comment.archivedAt).not.toBeNull();
+-    expect(node?.replies.map((r) => r.id)).toEqual([reply.id]);
+-  });
+-
+   it("scopes the thread to the organization, not just the issue", async () => {
+     await expect(
+       commentRepo.listThread(acme.org.id, northIssue.id),

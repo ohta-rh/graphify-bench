@@ -1,0 +1,1306 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -29,6 +29,9 @@
+   "member.removed": "removed a member",
+   "billing.plan_changed": "changed the plan",
+   "flag.toggled": "toggled a feature flag",
++  "milestone.created": "created a milestone",
++  "milestone.closed": "closed a milestone",
++  "milestone.reopened": "reopened a milestone",
+ };
+ 
+ export function activityLabel(action: ActivityAction): string {
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -50,6 +50,7 @@
+   project_archived: "Project archived",
+   plan_limit_reached: "Plan limit reached",
+   digest_ready: "Daily digest ready",
++  issue_milestone_changed: "My issue moved to another milestone",
+ };
+ 
+ export function NotificationPreferencesForm(
+diff --git a/src/config/constants.ts b/src/config/constants.ts
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Open milestones a project may hold at once; closed ones do not count. */
++export const MAX_OPEN_MILESTONES_PER_PROJECT: number = 10;
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -8,6 +8,7 @@
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
++import { MilestoneStateError } from "@/lib/milestones";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof MilestoneStateError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -96,6 +98,14 @@
+     };
+   }
+ 
++  if (error instanceof MilestoneStateError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { milestoneId: error.milestoneId ?? "", reason: error.reason },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/lib/milestones.ts b/src/lib/milestones.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/milestones.ts
+@@ -0,0 +1,72 @@
++/**
++ * Milestone state rules, shared by the milestone service, the issue service
++ * and the UI gates.
++ */
++import { MAX_OPEN_MILESTONES_PER_PROJECT } from "@/config/constants";
++import { parseIso } from "@/lib/date";
++import type { Milestone, MilestoneProgress } from "@/types/milestone";
++
++export type MilestoneStateReason =
++  /** The milestone is closed and the operation needs an open one. */
++  | "closed"
++  /** The milestone is already open. */
++  | "already_open"
++  /** The project already has the maximum number of open milestones. */
++  | "too_many_open"
++  /** Another milestone of the project already carries this name. */
++  | "name_taken";
++
++/** Thrown by the milestone guards; mapped to `conflict`, like double-archiving. */
++export class MilestoneStateError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly milestoneId: string | null,
++    readonly reason: MilestoneStateReason,
++  ) {
++    super(`Milestone ${milestoneId ?? "(new)"}: ${describe(reason)}`);
++    this.name = "MilestoneStateError";
++  }
++}
++
++function describe(reason: MilestoneStateReason): string {
++  switch (reason) {
++    case "closed":
++      return "is closed";
++    case "already_open":
++      return "is already open";
++    case "too_many_open":
++      return `the project already has ${MAX_OPEN_MILESTONES_PER_PROJECT} open milestones`;
++    case "name_taken":
++      return "the name is already used in this project";
++  }
++}
++
++export function isMilestoneOpen(milestone: Milestone): boolean {
++  return milestone.closedAt === null;
++}
++
++export function assertMilestoneOpen(milestone: Milestone): void {
++  if (!isMilestoneOpen(milestone)) {
++    throw new MilestoneStateError(milestone.id, "closed");
++  }
++}
++
++/** Names collide without regard to letter case. */
++export function normaliseMilestoneName(name: string): string {
++  return name.trim().toLowerCase();
++}
++
++/**
++ * Open, past its target date (strictly), and still holding open issues. A
++ * milestone with no target date is never overdue.
++ */
++export function isMilestoneOverdue(
++  milestone: Milestone,
++  progress: MilestoneProgress,
++  now: Date = new Date(),
++): boolean {
++  if (milestone.closedAt !== null || milestone.targetDate === null) return false;
++  if (progress.open === 0) return false;
++  return parseIso(milestone.targetDate).getTime() < now.getTime();
++}
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -28,6 +28,9 @@
+   "member.removed",
+   "billing.plan_changed",
+   "flag.toggled",
++  "milestone.created",
++  "milestone.closed",
++  "milestone.reopened",
+ ]);
+ 
+ export const activitySubjectKindSchema = z.enum([
+@@ -38,6 +41,7 @@
+   "member",
+   "subscription",
+   "feature_flag",
++  "milestone",
+ ]);
+ 
+ export const activityFilterSchema = z
+diff --git a/src/schemas/common.ts b/src/schemas/common.ts
+--- a/src/schemas/common.ts
++++ b/src/schemas/common.ts
+@@ -8,6 +8,7 @@
+   IssueId,
+   LabelId,
+   MemberId,
++  MilestoneId,
+   NotificationId,
+   OrgId,
+   ProjectId,
+@@ -47,6 +48,7 @@
+ export const attachmentIdSchema = brandedId<AttachmentId>("attachmentId");
+ export const subscriptionIdSchema = brandedId<SubscriptionId>("subscriptionId");
+ export const webhookIdSchema = brandedId<WebhookId>("webhookId");
++export const milestoneIdSchema = brandedId<MilestoneId>("milestoneId");
+ 
+ export const isoTimestampSchema = z
+   .iso
+diff --git a/src/schemas/index.ts b/src/schemas/index.ts
+--- a/src/schemas/index.ts
++++ b/src/schemas/index.ts
+@@ -22,5 +22,6 @@
+ export * from "./feature-flag";
+ export * from "./search";
+ export * from "./webhook";
++export * from "./milestone";
+ export * from "./export";
+ export * from "./pagination";
+diff --git a/src/schemas/issue.ts b/src/schemas/issue.ts
+--- a/src/schemas/issue.ts
++++ b/src/schemas/issue.ts
+@@ -5,6 +5,7 @@
+   isoTimestampSchema,
+   issueIdSchema,
+   labelIdSchema,
++  milestoneIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+   projectIdSchema,
+@@ -37,6 +38,7 @@
+   priority: issuePrioritySchema.default("none"),
+   assigneeId: userIdSchema.nullable().default(null),
+   parentId: issueIdSchema.nullable().default(null),
++  milestoneId: milestoneIdSchema.nullable().default(null),
+   estimate: z.number().int().min(0).max(100).nullable().default(null),
+   dueAt: isoTimestampSchema.nullable().default(null),
+   labelIds: z.array(labelIdSchema).max(20).default([]),
+diff --git a/src/schemas/milestone.ts b/src/schemas/milestone.ts
+new file mode 100644
+--- /dev/null
++++ b/src/schemas/milestone.ts
+@@ -0,0 +1,40 @@
++import { z } from "zod";
++import {
++  isoTimestampSchema,
++  issueIdSchema,
++  milestoneIdSchema,
++  orgIdSchema,
++  projectIdSchema,
++} from "./common";
++
++export const createMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  name: z.string().min(1).max(80),
++  targetDate: isoTimestampSchema.nullable().default(null),
++});
++
++export const updateMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  milestoneId: milestoneIdSchema,
++  name: z.string().min(1).max(80).optional(),
++  targetDate: isoTimestampSchema.nullable().optional(),
++});
++
++export const closeMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  milestoneId: milestoneIdSchema,
++  /** Where the milestone's open issues go; `null` takes them out of any milestone. */
++  moveOpenIssuesTo: milestoneIdSchema.nullable().default(null),
++});
++
++export const setIssueMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  milestoneId: milestoneIdSchema.nullable(),
++});
++
++export type CreateMilestoneInput = z.infer<typeof createMilestoneSchema>;
++export type UpdateMilestoneInput = z.infer<typeof updateMilestoneSchema>;
++export type CloseMilestoneInput = z.infer<typeof closeMilestoneSchema>;
++export type SetIssueMilestoneInput = z.infer<typeof setIssueMilestoneSchema>;
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -19,6 +19,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "issue_milestone_changed",
+ ]);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -145,6 +145,7 @@
+      author_id TEXT NOT NULL,
+      assignee_id TEXT,
+      parent_id TEXT,
++     milestone_id TEXT,
+      estimate INTEGER,
+      due_at TEXT,
+      started_at TEXT,
+@@ -158,6 +159,19 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE INDEX IF NOT EXISTS issues_org_milestone_idx ON issues (org_id, milestone_id)`,
++  `CREATE TABLE IF NOT EXISTS milestones (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     name TEXT NOT NULL,
++     target_date TEXT,
++     closed_at TEXT,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS milestones_org_project_idx ON milestones (org_id, project_id)`,
++  `CREATE INDEX IF NOT EXISTS milestones_org_closed_idx ON milestones (org_id, closed_at)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff --git a/src/server/db/schema/activity.ts b/src/server/db/schema/activity.ts
+--- a/src/server/db/schema/activity.ts
++++ b/src/server/db/schema/activity.ts
+@@ -17,6 +17,7 @@
+         "member",
+         "subscription",
+         "feature_flag",
++        "milestone",
+       ],
+     }).notNull(),
+     subjectId: text("subject_id").notNull(),
+diff --git a/src/server/db/schema/index.ts b/src/server/db/schema/index.ts
+--- a/src/server/db/schema/index.ts
++++ b/src/server/db/schema/index.ts
+@@ -14,3 +14,4 @@
+ export * from "./activity";
+ export * from "./billing";
+ export * from "./webhooks";
++export * from "./milestones";
+diff --git a/src/server/db/schema/issues.ts b/src/server/db/schema/issues.ts
+--- a/src/server/db/schema/issues.ts
++++ b/src/server/db/schema/issues.ts
+@@ -28,6 +28,7 @@
+     authorId: text("author_id").notNull(),
+     assigneeId: text("assignee_id"),
+     parentId: text("parent_id"),
++    milestoneId: text("milestone_id"),
+     estimate: integer("estimate"),
+     dueAt: text("due_at"),
+     startedAt: text("started_at"),
+@@ -41,6 +42,7 @@
+     index("issues_org_assignee_idx").on(table.orgId, table.assigneeId),
+     index("issues_org_archived_idx").on(table.orgId, table.archivedAt),
+     index("issues_org_due_idx").on(table.orgId, table.dueAt),
++    index("issues_org_milestone_idx").on(table.orgId, table.milestoneId),
+   ],
+ );
+ 
+diff --git a/src/server/db/schema/milestones.ts b/src/server/db/schema/milestones.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/db/schema/milestones.ts
+@@ -0,0 +1,22 @@
++import { index, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const milestones = sqliteTable(
++  "milestones",
++  {
++    id: idColumn(),
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    name: text("name").notNull(),
++    targetDate: text("target_date"),
++    closedAt: text("closed_at"),
++    ...timestampColumns,
++  },
++  (table) => [
++    index("milestones_org_project_idx").on(table.orgId, table.projectId),
++    index("milestones_org_closed_idx").on(table.orgId, table.closedAt),
++  ],
++);
++
++export type MilestoneRow = typeof milestones.$inferSelect;
++export type NewMilestoneRow = typeof milestones.$inferInsert;
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -13,6 +13,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "issue_milestone_changed",
+ ] as const;
+ 
+ export const notifications = sqliteTable(
+diff --git a/src/server/repositories/_mappers.ts b/src/server/repositories/_mappers.ts
+--- a/src/server/repositories/_mappers.ts
++++ b/src/server/repositories/_mappers.ts
+@@ -14,6 +14,7 @@
+   IssueRow,
+   LabelRow,
+   MemberRow,
++  MilestoneRow,
+   NotificationPreferenceRow,
+   NotificationRow,
+   OrganizationRow,
+@@ -37,6 +38,7 @@
+   IssueId,
+   LabelId,
+   MemberId,
++  MilestoneId,
+   NotificationId,
+   OrgId,
+   ProjectId,
+@@ -45,6 +47,7 @@
+ } from "@/types/common";
+ import type { Issue, IssueAttachment, IssueLabel } from "@/types/issue";
+ import type { Invitation, Member, User } from "@/types/member";
++import type { Milestone } from "@/types/milestone";
+ import type {
+   Notification,
+   NotificationChannel,
+@@ -207,6 +210,7 @@
+     authorId: brandId<UserId>(row.authorId),
+     assigneeId: row.assigneeId === null ? null : brandId<UserId>(row.assigneeId),
+     parentId: row.parentId === null ? null : brandId<IssueId>(row.parentId),
++    milestoneId: row.milestoneId === null ? null : brandId<MilestoneId>(row.milestoneId),
+     estimate: row.estimate,
+     dueAt: brandStampOrNull(row.dueAt),
+     startedAt: brandStampOrNull(row.startedAt),
+@@ -218,6 +222,19 @@
+   };
+ }
+ 
++export function toMilestone(row: MilestoneRow): Milestone {
++  return {
++    id: brandId<MilestoneId>(row.id),
++    orgId: brandId<OrgId>(row.orgId),
++    projectId: brandId<ProjectId>(row.projectId),
++    name: row.name,
++    targetDate: brandStampOrNull(row.targetDate),
++    closedAt: brandStampOrNull(row.closedAt),
++    createdAt: brandStamp(row.createdAt),
++    updatedAt: brandStamp(row.updatedAt),
++  };
++}
++
+ export function toLabel(row: LabelRow): IssueLabel {
+   return {
+     id: brandId<LabelId>(row.id),
+diff --git a/src/server/repositories/index.ts b/src/server/repositories/index.ts
+--- a/src/server/repositories/index.ts
++++ b/src/server/repositories/index.ts
+@@ -15,6 +15,7 @@
+ export * as issueRepository from "./issue-repository";
+ export * as labelRepository from "./label-repository";
+ export * as memberRepository from "./member-repository";
++export * as milestoneRepository from "./milestone-repository";
+ export * as notificationPreferenceRepository from "./notification-preference-repository";
+ export * as notificationRepository from "./notification-repository";
+ export * as organizationRepository from "./organization-repository";
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -23,7 +24,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -39,6 +40,7 @@
+   IsoTimestamp,
+   IssueId,
+   LabelId,
++  MilestoneId,
+   OrgId,
+   Page,
+   ProjectId,
+@@ -325,6 +327,7 @@
+       authorId,
+       assigneeId: input.assigneeId,
+       parentId: input.parentId,
++      milestoneId: input.milestoneId,
+       estimate: input.estimate,
+       dueAt: input.dueAt,
+       startedAt: null,
+@@ -480,6 +483,80 @@
+   return toIssue(row);
+ }
+ 
++export async function setIssueMilestone(
++  orgId: OrgId,
++  issueId: IssueId,
++  milestoneId: MilestoneId | null,
++): Promise<Issue> {
++  const row = getDb()
++    .update(issues)
++    .set({ milestoneId, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Issue ${issueId} not found`);
++  return toIssue(row);
++}
++
++/**
++ * Counts over the milestone's live issues — every one of them, never a page.
++ * Closed means done or canceled.
++ */
++export async function countMilestoneProgress(
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++): Promise<{ total: number; open: number; closed: number }> {
++  const db = getDb();
++  const scope = and(
++    ...compact(
++      orgPredicate(issues.orgId, orgId),
++      eq(issues.milestoneId, milestoneId),
++      livePredicate(issues.archivedAt, {}),
++    ),
++  );
++
++  const total = db.select({ value: count() }).from(issues).where(scope).get();
++  const closed = db
++    .select({ value: count() })
++    .from(issues)
++    .where(and(scope, inArray(issues.status, [...CLOSED_ISSUE_STATUSES])))
++    .get();
++
++  const totalCount = total?.value ?? 0;
++  const closedCount = closed?.value ?? 0;
++  return { total: totalCount, closed: closedCount, open: totalCount - closedCount };
++}
++
++/**
++ * Moves every open, live issue of `from` to `to` (or out of any milestone)
++ * in one statement, and returns the ids that moved. Closed and archived
++ * issues keep their milestone.
++ */
++export async function moveOpenIssuesBetweenMilestones(
++  orgId: OrgId,
++  from: MilestoneId,
++  to: MilestoneId | null,
++): Promise<readonly IssueId[]> {
++  const rows = getDb()
++    .update(issues)
++    .set({ milestoneId: to, updatedAt: toIsoTimestamp(new Date()) })
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.milestoneId, from),
++          livePredicate(issues.archivedAt, {}),
++          notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
++        ),
++      ),
++    )
++    .returning({ id: issues.id })
++    .all();
++
++  return rows.map((row) => row.id as IssueId);
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff --git a/src/server/repositories/milestone-repository.ts b/src/server/repositories/milestone-repository.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/repositories/milestone-repository.ts
+@@ -0,0 +1,122 @@
++/**
++ * Milestone rows: per-project groups of issues with an open/closed state.
++ */
++import { and, asc, count, eq, isNull } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, milestones } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import { toMilestone } from "./_mappers";
++import type { CreateMilestoneInput, UpdateMilestoneInput } from "@/schemas/milestone";
++import type { IsoTimestamp, MilestoneId, OrgId, ProjectId } from "@/types/common";
++import type { Milestone } from "@/types/milestone";
++
++export async function findMilestoneById(
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++): Promise<Milestone | null> {
++  const row = getDb()
++    .select()
++    .from(milestones)
++    .where(and(orgPredicate(milestones.orgId, orgId), eq(milestones.id, milestoneId)))
++    .get();
++  return row ? toMilestone(row) : null;
++}
++
++/** Every milestone of a project, oldest first; the service orders for display. */
++export async function listMilestones(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<readonly Milestone[]> {
++  const rows = getDb()
++    .select()
++    .from(milestones)
++    .where(
++      and(
++        orgPredicate(milestones.orgId, orgId),
++        eq(milestones.projectId, projectId),
++      ),
++    )
++    .orderBy(asc(milestones.createdAt), asc(milestones.id))
++    .all();
++  return rows.map(toMilestone);
++}
++
++export async function countOpenMilestones(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(milestones)
++    .where(
++      and(
++        orgPredicate(milestones.orgId, orgId),
++        eq(milestones.projectId, projectId),
++        isNull(milestones.closedAt),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
++export async function insertMilestone(
++  input: CreateMilestoneInput,
++): Promise<Milestone> {
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb()
++    .insert(milestones)
++    .values({
++      id: newId(),
++      orgId: input.orgId,
++      projectId: input.projectId,
++      name: input.name,
++      targetDate: input.targetDate,
++      closedAt: null,
++      createdAt: stamp,
++      updatedAt: stamp,
++    })
++    .returning()
++    .get();
++  return toMilestone(row);
++}
++
++export async function updateMilestone(
++  input: UpdateMilestoneInput,
++): Promise<Milestone> {
++  const row = getDb()
++    .update(milestones)
++    .set({
++      ...(input.name === undefined ? {} : { name: input.name }),
++      ...(input.targetDate === undefined ? {} : { targetDate: input.targetDate }),
++      updatedAt: toIsoTimestamp(new Date()),
++    })
++    .where(
++      and(
++        orgPredicate(milestones.orgId, input.orgId),
++        eq(milestones.id, input.milestoneId),
++      ),
++    )
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Milestone ${input.milestoneId} not found`);
++  return toMilestone(row);
++}
++
++/** `closedAt === null` reopens the milestone. */
++export async function setMilestoneClosedAt(
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++  closedAt: IsoTimestamp | null,
++): Promise<Milestone> {
++  const row = getDb()
++    .update(milestones)
++    .set({ closedAt, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(milestones.orgId, orgId), eq(milestones.id, milestoneId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Milestone ${milestoneId} not found`);
++  return toMilestone(row);
++}
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -222,6 +222,37 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("milestone.created", (payload) =>
++      record(payload.orgId, "milestone.created", {
++        actorId: payload.actorId,
++        subjectKind: "milestone",
++        subjectId: payload.milestoneId,
++        projectId: payload.projectId,
++        summary: `Created milestone ${payload.milestoneId}`,
++      }).then(() => undefined),
++    ),
++    subscribe("milestone.closed", (payload) =>
++      record(payload.orgId, "milestone.closed", {
++        actorId: payload.actorId,
++        subjectKind: "milestone",
++        subjectId: payload.milestoneId,
++        projectId: payload.projectId,
++        summary: `Closed milestone ${payload.milestoneId}, moved ${payload.movedIssueIds.length} issues`,
++        metadata: {
++          movedIssues: payload.movedIssueIds.length,
++          movedTo: payload.movedToMilestoneId,
++        },
++      }).then(() => undefined),
++    ),
++    subscribe("milestone.reopened", (payload) =>
++      record(payload.orgId, "milestone.reopened", {
++        actorId: payload.actorId,
++        subjectKind: "milestone",
++        subjectId: payload.milestoneId,
++        projectId: payload.projectId,
++        summary: `Reopened milestone ${payload.milestoneId}`,
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/index.ts b/src/server/services/index.ts
+--- a/src/server/services/index.ts
++++ b/src/server/services/index.ts
+@@ -17,6 +17,7 @@
+ export * as issueService from "./issue-service";
+ export * as labelService from "./label-service";
+ export * as memberService from "./member-service";
++export * as milestoneService from "./milestone-service";
+ export * as notificationService from "./notification-service";
+ export * as organizationService from "./organization-service";
+ export * as projectService from "./project-service";
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -5,6 +5,7 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
++import { assertMilestoneOpen } from "@/lib/milestones";
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -14,7 +15,9 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as milestoneRepo from "@/server/repositories/milestone-repository";
+ import {
++  NotFoundError,
+   actorEnvelope,
+   issueResource,
+   orgResource,
+@@ -29,7 +32,8 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { SetIssueMilestoneInput } from "@/schemas/milestone";
++import type { IssueId, MilestoneId, OrgId, Page, ProjectId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -65,6 +69,12 @@
+     );
+   }
+ 
++  // A milestone given at creation obeys the same rule as a later move: an
++  // open milestone of this very project.
++  if (input.milestoneId !== null) {
++    await requireOpenMilestoneOf(input.orgId, project.id, input.milestoneId);
++  }
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -188,6 +198,53 @@
+   return after;
+ }
+ 
++/**
++ * Puts an issue into one of its project's open milestones, or takes it out
++ * of any. The milestone must belong to the issue's project (anything else is
++ * not found here) and must be open.
++ */
++export async function setIssueMilestone(
++  actor: Actor,
++  input: SetIssueMilestoneInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++
++  if (input.milestoneId !== null) {
++    await requireOpenMilestoneOf(input.orgId, issue.projectId, input.milestoneId);
++  }
++
++  const after = await issueRepo.setIssueMilestone(input.orgId, issue.id, input.milestoneId);
++
++  await emit("issue.updated", {
++    ...actorEnvelope(actor),
++    issueId: after.id,
++    projectId: after.projectId,
++    changedFields: ["milestoneId"],
++  });
++
++  return after;
++}
++
++async function requireOpenMilestoneOf(
++  orgId: OrgId,
++  projectId: ProjectId,
++  milestoneId: MilestoneId,
++): Promise<void> {
++  const milestone = await milestoneRepo.findMilestoneById(orgId, milestoneId);
++  if (!milestone || milestone.projectId !== projectId) {
++    throw new NotFoundError("Milestone", milestoneId);
++  }
++  assertMilestoneOpen(milestone);
++}
++
+ export async function archiveIssue(
+   actor: Actor,
+   orgId: OrgId,
+diff --git a/src/server/services/milestone-service.ts b/src/server/services/milestone-service.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/services/milestone-service.ts
+@@ -0,0 +1,246 @@
++/**
++ * Milestones: per-project groups of issues with a target date, open until
++ * closed. Closing moves the open work out, so a closed milestone only holds
++ * what was finished (or archived) inside it.
++ *
++ * Must call (do not reimplement): assertCan, assertOrgScope, emit, assertNotArchived
++ */
++import { MAX_OPEN_MILESTONES_PER_PROJECT } from "@/config/constants";
++import { emit } from "@/lib/event-bus";
++import {
++  MilestoneStateError,
++  assertMilestoneOpen,
++  isMilestoneOpen,
++  isMilestoneOverdue,
++  normaliseMilestoneName,
++} from "@/lib/milestones";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as milestoneRepo from "@/server/repositories/milestone-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { toIsoTimestamp } from "@/types/common";
++import { NotFoundError, actorEnvelope, projectResource, requireFound } from "./_support";
++import type {
++  CloseMilestoneInput,
++  CreateMilestoneInput,
++  UpdateMilestoneInput,
++} from "@/schemas/milestone";
++import type { IssueId, MilestoneId, OrgId, ProjectId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { Milestone, MilestoneProgress, MilestoneWithProgress } from "@/types/milestone";
++import type { Project } from "@/types/project";
++
++export async function createMilestone(
++  actor: Actor,
++  input: CreateMilestoneInput,
++): Promise<Milestone> {
++  assertOrgScope(actor, input.orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:update", projectResource(project));
++  assertNotArchived("Project", project.id, project);
++
++  await assertNameFree(input.orgId, project.id, input.name, null);
++  await assertRoomForOpenMilestone(input.orgId, project.id);
++
++  const milestone = await milestoneRepo.insertMilestone(input);
++
++  await emit("milestone.created", {
++    ...actorEnvelope(actor),
++    milestoneId: milestone.id,
++    projectId: milestone.projectId,
++  });
++
++  return milestone;
++}
++
++export async function updateMilestone(
++  actor: Actor,
++  input: UpdateMilestoneInput,
++): Promise<Milestone> {
++  assertOrgScope(actor, input.orgId);
++
++  const { milestone, project } = await loadForWrite(actor, input.orgId, input.milestoneId);
++
++  if (input.name !== undefined) {
++    await assertNameFree(input.orgId, project.id, input.name, milestone.id);
++  }
++
++  return milestoneRepo.updateMilestone(input);
++}
++
++/**
++ * Closes the milestone and moves its open live issues to `moveOpenIssuesTo`
++ * (another open milestone of the same project) or out of any milestone.
++ * Closed and archived issues stay where they are. Published once, with the
++ * ids that moved, so the assignees can be told.
++ */
++export async function closeMilestone(
++  actor: Actor,
++  input: CloseMilestoneInput,
++): Promise<{ milestone: Milestone; movedIssueIds: readonly IssueId[] }> {
++  assertOrgScope(actor, input.orgId);
++
++  const { milestone, project } = await loadForWrite(actor, input.orgId, input.milestoneId);
++  assertMilestoneOpen(milestone);
++
++  if (input.moveOpenIssuesTo !== null) {
++    const target = await milestoneRepo.findMilestoneById(input.orgId, input.moveOpenIssuesTo);
++    if (!target || target.projectId !== project.id || target.id === milestone.id) {
++      throw new NotFoundError("Milestone", input.moveOpenIssuesTo);
++    }
++    assertMilestoneOpen(target);
++  }
++
++  const movedIssueIds = await issueRepo.moveOpenIssuesBetweenMilestones(
++    input.orgId,
++    milestone.id,
++    input.moveOpenIssuesTo,
++  );
++
++  const closed = await milestoneRepo.setMilestoneClosedAt(
++    input.orgId,
++    milestone.id,
++    toIsoTimestamp(new Date()),
++  );
++
++  await emit("milestone.closed", {
++    ...actorEnvelope(actor),
++    milestoneId: closed.id,
++    projectId: closed.projectId,
++    movedToMilestoneId: input.moveOpenIssuesTo,
++    movedIssueIds,
++  });
++
++  return { milestone: closed, movedIssueIds };
++}
++
++export async function reopenMilestone(
++  actor: Actor,
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++): Promise<Milestone> {
++  assertOrgScope(actor, orgId);
++
++  const { milestone, project } = await loadForWrite(actor, orgId, milestoneId);
++  if (isMilestoneOpen(milestone)) {
++    throw new MilestoneStateError(milestone.id, "already_open");
++  }
++  await assertRoomForOpenMilestone(orgId, project.id);
++
++  const reopened = await milestoneRepo.setMilestoneClosedAt(orgId, milestone.id, null);
++
++  await emit("milestone.reopened", {
++    ...actorEnvelope(actor),
++    milestoneId: reopened.id,
++    projectId: reopened.projectId,
++  });
++
++  return reopened;
++}
++
++/**
++ * Open milestones first, then closed ones; inside each group by target date
++ * (earliest first, no date last), then by creation.
++ */
++export async function listMilestones(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<readonly MilestoneWithProgress[]> {
++  assertOrgScope(actor, orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++
++  const rows = await milestoneRepo.listMilestones(orgId, projectId);
++  const decorated = await Promise.all(rows.map((milestone) => decorate(orgId, milestone)));
++
++  return [...decorated].sort((a, b) => {
++    const openA = a.milestone.closedAt === null ? 0 : 1;
++    const openB = b.milestone.closedAt === null ? 0 : 1;
++    if (openA !== openB) return openA - openB;
++    const dateA = a.milestone.targetDate ?? "~";
++    const dateB = b.milestone.targetDate ?? "~";
++    if (dateA !== dateB) return dateA < dateB ? -1 : 1;
++    return a.milestone.createdAt < b.milestone.createdAt ? -1 : 1;
++  });
++}
++
++export async function getMilestone(
++  actor: Actor,
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++): Promise<MilestoneWithProgress> {
++  assertOrgScope(actor, orgId);
++
++  const milestone = requireFound(
++    await milestoneRepo.findMilestoneById(orgId, milestoneId),
++    "Milestone",
++    milestoneId,
++  );
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, milestone.projectId),
++    "Project",
++    milestone.projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++
++  return decorate(orgId, milestone);
++}
++
++async function decorate(orgId: OrgId, milestone: Milestone): Promise<MilestoneWithProgress> {
++  const progress: MilestoneProgress = await issueRepo.countMilestoneProgress(orgId, milestone.id);
++  return { milestone, progress, overdue: isMilestoneOverdue(milestone, progress) };
++}
++
++async function loadForWrite(
++  actor: Actor,
++  orgId: OrgId,
++  milestoneId: MilestoneId,
++): Promise<{ milestone: Milestone; project: Project }> {
++  const milestone = requireFound(
++    await milestoneRepo.findMilestoneById(orgId, milestoneId),
++    "Milestone",
++    milestoneId,
++  );
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, milestone.projectId),
++    "Project",
++    milestone.projectId,
++  );
++  assertCan(actor, "project:update", projectResource(project));
++  assertNotArchived("Project", project.id, project);
++  return { milestone, project };
++}
++
++async function assertNameFree(
++  orgId: OrgId,
++  projectId: ProjectId,
++  name: string,
++  exceptId: MilestoneId | null,
++): Promise<void> {
++  const wanted = normaliseMilestoneName(name);
++  const siblings = await milestoneRepo.listMilestones(orgId, projectId);
++  const taken = siblings.some(
++    (row) => row.id !== exceptId && normaliseMilestoneName(row.name) === wanted,
++  );
++  if (taken) throw new MilestoneStateError(exceptId, "name_taken");
++}
++
++async function assertRoomForOpenMilestone(orgId: OrgId, projectId: ProjectId): Promise<void> {
++  const open = await milestoneRepo.countOpenMilestones(orgId, projectId);
++  if (open >= MAX_OPEN_MILESTONES_PER_PROJECT) {
++    throw new MilestoneStateError(null, "too_many_open");
++  }
++}
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -228,6 +228,25 @@
+     }
+   });
+ 
++  // Closing a milestone moves its open issues: each assignee hears about
++  // their issue once; whoever closed the milestone is not told about their
++  // own move.
++  subscribe("milestone.closed", async (payload) => {
++    for (const issueId of payload.movedIssueIds) {
++      const issue = await issueRepo.findIssueById(payload.orgId, issueId);
++      if (!issue || issue.assigneeId === null) continue;
++      await notify(payload.orgId, "issue_milestone_changed", [issue.assigneeId], {
++        title: "Your issue moved to another milestone",
++        body:
++          payload.movedToMilestoneId === null
++            ? `Issue ${issueId} is no longer in a milestone`
++            : `Issue ${issueId} now belongs to milestone ${payload.movedToMilestoneId}`,
++        href: `/issues/${issueId}`,
++        actorId: payload.actorId,
++      });
++    }
++  });
++
+   subscribe("member.joined", async (payload) => {
+     const org = requireFound(
+       await orgRepo.findOrgById(payload.orgId),
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -28,7 +28,10 @@
+   | "member.role_changed"
+   | "member.removed"
+   | "billing.plan_changed"
+-  | "flag.toggled";
++  | "flag.toggled"
++  | "milestone.created"
++  | "milestone.closed"
++  | "milestone.reopened";
+ 
+ export type ActivitySubjectKind =
+   | "organization"
+@@ -37,7 +40,8 @@
+   | "comment"
+   | "member"
+   | "subscription"
+-  | "feature_flag";
++  | "feature_flag"
++  | "milestone";
+ 
+ export interface ActivityEvent extends TenantScoped {
+   readonly id: ActivityId;
+diff --git a/src/types/common.ts b/src/types/common.ts
+--- a/src/types/common.ts
++++ b/src/types/common.ts
+@@ -25,6 +25,7 @@
+ export type SubscriptionId = Branded<string, "SubscriptionId">;
+ export type SessionId = Branded<string, "SessionId">;
+ export type WebhookId = Branded<string, "WebhookId">;
++export type MilestoneId = Branded<string, "MilestoneId">;
+ 
+ /** Union of every branded id used in the app, for generic id helpers. */
+ export type AnyId =
+@@ -41,7 +42,8 @@
+   | AttachmentId
+   | SubscriptionId
+   | SessionId
+-  | WebhookId;
++  | WebhookId
++  | MilestoneId;
+ 
+ /** ISO-8601 timestamp string as stored in SQLite text columns. */
+ export type IsoTimestamp = Branded<string, "IsoTimestamp">;
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -2,6 +2,7 @@
+   CommentId,
+   IssueId,
+   MemberId,
++  MilestoneId,
+   OrgId,
+   ProjectId,
+   UserId,
+@@ -88,6 +89,15 @@
+     used: number;
+   };
+   "flag.toggled": EventEnvelope & { flag: FeatureFlagKey; enabled: boolean };
++  "milestone.created": EventEnvelope & { milestoneId: MilestoneId; projectId: ProjectId };
++  "milestone.closed": EventEnvelope & {
++    milestoneId: MilestoneId;
++    projectId: ProjectId;
++    /** Where the open issues went; `null` when they were taken out of any milestone. */
++    movedToMilestoneId: MilestoneId | null;
++    movedIssueIds: readonly IssueId[];
++  };
++  "milestone.reopened": EventEnvelope & { milestoneId: MilestoneId; projectId: ProjectId };
+   "digest.due": EventEnvelope & { recipientId: UserId; windowStart: IsoTimestamp };
+   "search.reindex_requested": EventEnvelope & {
+     subjectKind: "issue" | "comment" | "project";
+diff --git a/src/types/issue.ts b/src/types/issue.ts
+--- a/src/types/issue.ts
++++ b/src/types/issue.ts
+@@ -3,6 +3,7 @@
+   IsoTimestamp,
+   IssueId,
+   LabelId,
++  MilestoneId,
+   ProjectId,
+   SoftDeletable,
+   TenantScoped,
+@@ -51,6 +52,8 @@
+   readonly authorId: UserId;
+   readonly assigneeId: UserId | null;
+   readonly parentId: IssueId | null;
++  /** The open milestone of its project the issue belongs to, if any. */
++  readonly milestoneId: MilestoneId | null;
+   readonly estimate: number | null;
+   readonly dueAt: IsoTimestamp | null;
+   readonly startedAt: IsoTimestamp | null;
+diff --git a/src/types/milestone.ts b/src/types/milestone.ts
+new file mode 100644
+--- /dev/null
++++ b/src/types/milestone.ts
+@@ -0,0 +1,34 @@
++import type {
++  IsoTimestamp,
++  MilestoneId,
++  ProjectId,
++  TenantScoped,
++  Timestamps,
++} from "./common";
++
++/**
++ * A milestone groups a project's issues toward a target. It is open from its
++ * creation until it is closed; closing moves whatever was still open out of
++ * it, so a closed milestone only ever holds finished (or archived) work.
++ */
++export interface Milestone extends Timestamps, TenantScoped {
++  readonly id: MilestoneId;
++  readonly projectId: ProjectId;
++  readonly name: string;
++  readonly targetDate: IsoTimestamp | null;
++  readonly closedAt: IsoTimestamp | null;
++}
++
++/** Counts over the milestone's live (non-archived) issues. */
++export interface MilestoneProgress {
++  readonly total: number;
++  readonly open: number;
++  readonly closed: number;
++}
++
++export interface MilestoneWithProgress {
++  readonly milestone: Milestone;
++  readonly progress: MilestoneProgress;
++  /** Open, past its target date, and still holding open issues. */
++  readonly overdue: boolean;
++}
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -17,7 +17,8 @@
+   | "member_joined"
+   | "project_archived"
+   | "plan_limit_reached"
+-  | "digest_ready";
++  | "digest_ready"
++  | "issue_milestone_changed";
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 
+diff --git a/tests/components/board-model.test.ts b/tests/components/board-model.test.ts
+--- a/tests/components/board-model.test.ts
++++ b/tests/components/board-model.test.ts
+@@ -32,6 +32,7 @@
+     authorId: AUTHOR_ID,
+     assigneeId: null,
+     parentId: null,
++    milestoneId: null,
+     estimate: null,
+     dueAt: null,
+     startedAt: null,
+diff --git a/tests/components/optimistic-issues.test.ts b/tests/components/optimistic-issues.test.ts
+--- a/tests/components/optimistic-issues.test.ts
++++ b/tests/components/optimistic-issues.test.ts
+@@ -23,6 +23,7 @@
+   authorId: "usr_1" as UserId,
+   assigneeId: null,
+   parentId: null,
++  milestoneId: null,
+   estimate: null,
+   dueAt: null,
+   startedAt: null,
+diff --git a/tests/helpers/factories.ts b/tests/helpers/factories.ts
+--- a/tests/helpers/factories.ts
++++ b/tests/helpers/factories.ts
+@@ -112,6 +112,7 @@
+     authorId: ALICE,
+     assigneeId: null,
+     parentId: null,
++    milestoneId: null,
+     estimate: null,
+     dueAt: null,
+     startedAt: null,
+diff --git a/tests/server/_support/fixtures.ts b/tests/server/_support/fixtures.ts
+--- a/tests/server/_support/fixtures.ts
++++ b/tests/server/_support/fixtures.ts
+@@ -128,6 +128,7 @@
+     priority: "none" as const,
+     assigneeId: (overrides.assigneeId ?? null) as UserId | null,
+     parentId: null,
++    milestoneId: null,
+     estimate: null,
+     dueAt: (overrides.dueAt ?? null) as never,
+     labelIds: [],

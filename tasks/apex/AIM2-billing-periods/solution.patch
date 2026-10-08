@@ -1,0 +1,752 @@
+diff --git a/src/app/api/cron/billing-renewal/route.ts b/src/app/api/cron/billing-renewal/route.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/api/cron/billing-renewal/route.ts
+@@ -0,0 +1,25 @@
++/**
++ * Cron-style trigger for subscription renewal and invoicing.
++ *
++ * Owner D. The job itself decides what is due — a subscription is renewed
++ * only while its period end has passed — so calling this every hour is
++ * correct and calling it twice in one hour is harmless.
++ *
++ * Must call (do not reimplement): runBillingRenewalJob
++ */
++
++import { assertCronSecret, errorResponse } from "@/app/api/_lib/responses";
++import { runBillingRenewalJob } from "@/server/jobs/billing-renewal-job";
++
++export const dynamic = "force-dynamic";
++
++export async function POST(request: Request): Promise<Response> {
++  try {
++    assertCronSecret(request);
++
++    const result = await runBillingRenewalJob(new Date());
++    return Response.json(result);
++  } catch (error) {
++    return errorResponse(error);
++  }
++}
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -28,6 +28,7 @@
+   "member.role_changed": "changed a role",
+   "member.removed": "removed a member",
+   "billing.plan_changed": "changed the plan",
++  "billing.invoice_issued": "issued an invoice",
+   "flag.toggled": "toggled a feature flag",
+ };
+ 
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -50,6 +50,7 @@
+   project_archived: "Project archived",
+   plan_limit_reached: "Plan limit reached",
+   digest_ready: "Daily digest ready",
++  invoice_issued: "Invoice issued",
+ };
+ 
+ export function NotificationPreferencesForm(
+diff --git a/src/lib/billing-periods.ts b/src/lib/billing-periods.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/billing-periods.ts
+@@ -0,0 +1,85 @@
++/**
++ * Billing-period arithmetic, pure so the renewal job, the plan change and the
++ * seat change all charge the same way.
++ *
++ * A period is `[start, end)`. A monthly period ends on the same day of the
++ * following month at the same time of day — or on that month's last day when
++ * it has no such day; an annual period ends on the same day and month of the
++ * following year (29 February becomes 28 February). Each new period starts
++ * where the previous one ended, so a clamped end date carries forward.
++ */
++import { parseIso } from "@/lib/date";
++import { getPlanLimits } from "@/config/plan-limits";
++import type { BillingInterval, PlanId } from "@/types/billing";
++import type { IsoTimestamp } from "@/types/common";
++import { toIsoTimestamp } from "@/types/common";
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++function daysInMonth(year: number, monthIndex: number): number {
++  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
++}
++
++/** The instant one interval after `start`, with the day clamped as described above. */
++export function nextPeriodEnd(start: IsoTimestamp, interval: BillingInterval): IsoTimestamp {
++  const from = parseIso(start);
++  const months = interval === "annual" ? 12 : 1;
++
++  const year = from.getUTCFullYear();
++  const month = from.getUTCMonth() + months;
++  const targetYear = year + Math.floor(month / 12);
++  const targetMonth = month % 12;
++  const day = Math.min(from.getUTCDate(), daysInMonth(targetYear, targetMonth));
++
++  return toIsoTimestamp(
++    new Date(
++      Date.UTC(
++        targetYear,
++        targetMonth,
++        day,
++        from.getUTCHours(),
++        from.getUTCMinutes(),
++        from.getUTCSeconds(),
++        from.getUTCMilliseconds(),
++      ),
++    ),
++  );
++}
++
++/** Months a period of this interval covers, for price arithmetic. */
++export function monthsPerPeriod(interval: BillingInterval): number {
++  return interval === "annual" ? 12 : 1;
++}
++
++/** The full charge for one period: per-seat monthly price × seats × months. */
++export function periodChargeCents(plan: PlanId, seats: number, interval: BillingInterval): number {
++  return getPlanLimits(plan).priceCentsPerSeatMonthly * seats * monthsPerPeriod(interval);
++}
++
++/** Whole days the period spans, at least one. */
++export function periodDays(start: IsoTimestamp, end: IsoTimestamp): number {
++  const span = parseIso(end).getTime() - parseIso(start).getTime();
++  return Math.max(1, Math.round(span / DAY_MS));
++}
++
++/** Days — whole or started — left until the end; none once the end is reached. */
++export function remainingDays(end: IsoTimestamp, now: Date): number {
++  const left = parseIso(end).getTime() - now.getTime();
++  return left <= 0 ? 0 : Math.ceil(left / DAY_MS);
++}
++
++/**
++ * A mid-period charge: the full-period amount of the change, scaled by the
++ * days left over the days in the period, rounded down to whole cents.
++ */
++export function proratedCents(
++  fullPeriodCents: number,
++  start: IsoTimestamp,
++  end: IsoTimestamp,
++  now: Date,
++): number {
++  if (fullPeriodCents <= 0) return 0;
++  const left = remainingDays(end, now);
++  if (left === 0) return 0;
++  return Math.floor((fullPeriodCents * left) / periodDays(start, end));
++}
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -27,6 +27,7 @@
+   "member.role_changed",
+   "member.removed",
+   "billing.plan_changed",
++  "billing.invoice_issued",
+   "flag.toggled",
+ ]);
+ 
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -19,6 +19,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "invoice_issued",
+ ]);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -13,6 +13,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "invoice_issued",
+ ] as const;
+ 
+ export const notifications = sqliteTable(
+diff --git a/src/server/jobs/billing-renewal-job.ts b/src/server/jobs/billing-renewal-job.ts
+new file mode 100644
+--- /dev/null
++++ b/src/server/jobs/billing-renewal-job.ts
+@@ -0,0 +1,90 @@
++/**
++ * Renews subscriptions whose period has ended and ends the ones whose
++ * cancellation date has arrived; every paid period renewed is invoiced.
++ *
++ * Must call (do not reimplement): emit, nextPeriodEnd, issueInvoice
++ */
++import { emit } from "@/lib/event-bus";
++import { createLogger } from "@/lib/logger";
++import { nextPeriodEnd } from "@/lib/billing-periods";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as subscriptionRepo from "@/server/repositories/subscription-repository";
++import { issueInvoice } from "@/server/services/billing-service";
++import { toIsoTimestamp } from "@/types/common";
++import { runJob } from "./types";
++import type { JobResult } from "@/server/jobs/types";
++import type { Subscription } from "@/types/billing";
++import type { IsoTimestamp, OrgId } from "@/types/common";
++
++const logger = createLogger("billing-renewal-job");
++
++/** Where a subscription lands once its cancellation date has arrived. */
++const FALLBACK_PLAN = "free" as const;
++
++/**
++ * One pass over every due subscription, deleted workspaces excluded. Idempotent
++ * for a given instant: a subscription is only due while its period end (or
++ * cancellation date) lies at or before `now`, and each renewal moves it past.
++ */
++export async function runBillingRenewalJob(now: Date): Promise<JobResult> {
++  return runJob("billing-renewal", async (result) => {
++    const stamp = toIsoTimestamp(now);
++    const due = await subscriptionRepo.listSubscriptionsDue(stamp);
++
++    for (const subscription of due) {
++      const orgId = subscription.orgId as OrgId;
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
++
++      try {
++        if (subscription.status === "canceled") {
++          await endSubscription(subscription, stamp);
++        } else if (subscription.status === "active") {
++          await renew(subscription, org.slug, stamp);
++        }
++        result.processed += 1;
++      } catch (error) {
++        result.failed += 1;
++        logger.error("renewal failed", {
++          orgId,
++          reason: error instanceof Error ? error.message : String(error),
++        });
++      }
++    }
++  });
++}
++
++/** Advances period by period until the end lies after `now`; paid periods are invoiced. */
++async function renew(subscription: Subscription, orgSlug: string, now: IsoTimestamp): Promise<void> {
++  let current = subscription;
++
++  while (current.currentPeriodEnd <= now) {
++    const start = current.currentPeriodEnd;
++    const end = nextPeriodEnd(start, current.interval);
++
++    current = await subscriptionRepo.advanceSubscriptionPeriod(current.orgId, start, end);
++
++    if (current.plan !== FALLBACK_PLAN) {
++      await issueInvoice(current.orgId, orgSlug, current.plan, current.seats, current.interval, start, end, null);
++    }
++  }
++}
++
++/** The cancellation date has arrived: back to the free plan from that instant. */
++async function endSubscription(subscription: Subscription, now: IsoTimestamp): Promise<void> {
++  const at = subscription.cancelAt ?? now;
++  await subscriptionRepo.endSubscription(
++    subscription.orgId,
++    FALLBACK_PLAN,
++    at,
++    nextPeriodEnd(at, "monthly"),
++  );
++
++  await emit("billing.plan_changed", {
++    orgId: subscription.orgId,
++    actorId: null,
++    occurredAt: at,
++    from: subscription.plan,
++    to: FALLBACK_PLAN,
++  });
++}
+diff --git a/src/server/jobs/index.ts b/src/server/jobs/index.ts
+--- a/src/server/jobs/index.ts
++++ b/src/server/jobs/index.ts
+@@ -24,6 +24,7 @@
+ export { emptyJobResult } from "./types";
+ export type { JobResult } from "./types";
+ 
++export { runBillingRenewalJob } from "./billing-renewal-job";
+ export { runCleanupArchivedJob } from "./cleanup-archived-job";
+ export { runDigestEmailJob, shouldRunForOrg } from "./digest-email-job";
+ export { runOverdueIssueJob } from "./overdue-issue-job";
+diff --git a/src/server/jobs/queue.ts b/src/server/jobs/queue.ts
+--- a/src/server/jobs/queue.ts
++++ b/src/server/jobs/queue.ts
+@@ -20,7 +20,8 @@
+   | "usage-rollup"
+   | "search-reindex"
+   | "cleanup-archived"
+-  | "trial-expiry";
++  | "trial-expiry"
++  | "billing-renewal";
+ 
+ /** Attempts after which a job is dropped rather than retried again. */
+ const MAX_ATTEMPTS = 5;
+@@ -159,5 +160,10 @@
+       await runTrialExpiryJob(now);
+       return;
+     }
++    case "billing-renewal": {
++      const { runBillingRenewalJob } = await import("./billing-renewal-job");
++      await runBillingRenewalJob(now);
++      return;
++    }
+   }
+ }
+diff --git a/src/server/jobs/scheduler.ts b/src/server/jobs/scheduler.ts
+--- a/src/server/jobs/scheduler.ts
++++ b/src/server/jobs/scheduler.ts
+@@ -18,6 +18,7 @@
+   "search-reindex": 1_440,
+   "cleanup-archived": 1_440,
+   "trial-expiry": 360,
++  "billing-renewal": 60,
+ };
+ 
+ const logger = createLogger("job-scheduler");
+diff --git a/src/server/repositories/invoice-repository.ts b/src/server/repositories/invoice-repository.ts
+--- a/src/server/repositories/invoice-repository.ts
++++ b/src/server/repositories/invoice-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * Invoice history for the billing page.
+  */
+-import { and, desc, eq } from "drizzle-orm";
++import { and, count, desc, eq } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, invoices } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -47,6 +47,16 @@
+   return toInvoice(row);
+ }
+ 
++/** How many invoices the workspace has, for the per-workspace numbering. */
++export async function countInvoices(orgId: OrgId): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(invoices)
++    .where(orgPredicate(invoices.orgId, orgId))
++    .get();
++  return row?.value ?? 0;
++}
++
+ export async function findInvoice(
+   orgId: OrgId,
+   invoiceId: string,
+diff --git a/src/server/repositories/subscription-repository.ts b/src/server/repositories/subscription-repository.ts
+--- a/src/server/repositories/subscription-repository.ts
++++ b/src/server/repositories/subscription-repository.ts
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -62,11 +62,20 @@
+   orgId: OrgId,
+   plan: PlanId,
+   interval: BillingInterval,
++  period: { start: IsoTimestamp; end: IsoTimestamp } | null = null,
+ ): Promise<Subscription> {
+   const stamp = toIsoTimestamp(new Date());
+   const row = getDb()
+     .update(subscriptions)
+-    .set({ plan, interval, status: "active", updatedAt: stamp })
++    .set({
++      plan,
++      interval,
++      status: "active",
++      ...(period === null
++        ? {}
++        : { currentPeriodStart: period.start, currentPeriodEnd: period.end }),
++      updatedAt: stamp,
++    })
+     .where(orgPredicate(subscriptions.orgId, orgId))
+     .returning()
+     .get();
+@@ -110,6 +119,79 @@
+   return toSubscription(row);
+ }
+ 
++/**
++ * Subscriptions the renewal job must look at: active ones whose period has
++ * ended, and canceled ones whose cancellation date has arrived. Cross-tenant
++ * by design; the job skips deleted workspaces itself.
++ */
++export async function listSubscriptionsDue(
++  now: IsoTimestamp,
++): Promise<readonly Subscription[]> {
++  const rows = getDb()
++    .select()
++    .from(subscriptions)
++    .where(
++      or(
++        and(eq(subscriptions.status, "active"), lte(subscriptions.currentPeriodEnd, now)),
++        and(
++          eq(subscriptions.status, "canceled"),
++          isNotNull(subscriptions.cancelAt),
++          lte(subscriptions.cancelAt, now),
++        ),
++      ),
++    )
++    .all();
++
++  return rows.map(toSubscription);
++}
++
++/** Moves the subscription to its next period. */
++export async function advanceSubscriptionPeriod(
++  orgId: OrgId,
++  periodStart: IsoTimestamp,
++  periodEnd: IsoTimestamp,
++): Promise<Subscription> {
++  const row = getDb()
++    .update(subscriptions)
++    .set({
++      currentPeriodStart: periodStart,
++      currentPeriodEnd: periodEnd,
++      updatedAt: toIsoTimestamp(new Date()),
++    })
++    .where(orgPredicate(subscriptions.orgId, orgId))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Subscription for org ${orgId} not found`);
++  return toSubscription(row);
++}
++
++/** A cancellation that has arrived: back on `plan`, active, fresh period. */
++export async function endSubscription(
++  orgId: OrgId,
++  plan: PlanId,
++  periodStart: IsoTimestamp,
++  periodEnd: IsoTimestamp,
++): Promise<Subscription> {
++  const row = getDb()
++    .update(subscriptions)
++    .set({
++      plan,
++      interval: "monthly",
++      status: "active",
++      cancelAt: null,
++      currentPeriodStart: periodStart,
++      currentPeriodEnd: periodEnd,
++      updatedAt: toIsoTimestamp(new Date()),
++    })
++    .where(orgPredicate(subscriptions.orgId, orgId))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Subscription for org ${orgId} not found`);
++  return toSubscription(row);
++}
++
+ /** Feeds the trial-expiry job; cross-tenant by design, it sweeps every org. */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -222,6 +222,21 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("billing.invoice_issued", (payload) =>
++      record(payload.orgId, "billing.invoice_issued", {
++        actorId: payload.actorId,
++        subjectKind: "subscription",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Issued invoice ${payload.invoiceNumber} for ${payload.amountCents} cents`,
++        metadata: {
++          invoiceId: payload.invoiceId,
++          amountCents: payload.amountCents,
++          periodStart: payload.periodStart,
++          periodEnd: payload.periodEnd,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/billing-service.ts b/src/server/services/billing-service.ts
+--- a/src/server/services/billing-service.ts
++++ b/src/server/services/billing-service.ts
+@@ -8,6 +8,12 @@
+   getPlanLimits,
+   wouldExceedLimit,
+ } from "@/config/plan-limits";
++import {
++  monthsPerPeriod,
++  nextPeriodEnd,
++  periodChargeCents,
++  proratedCents,
++} from "@/lib/billing-periods";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -24,6 +30,7 @@
+   UpdateSeatsInput,
+ } from "@/schemas/billing";
+ import type {
++  BillingInterval,
+   BillingSummary,
+   Invoice,
+   LimitCheck,
+@@ -31,7 +38,7 @@
+   PlanId,
+   Subscription,
+ } from "@/types/billing";
+-import type { OrgId } from "@/types/common";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Actor } from "@/types/member";
+ 
+ /** The dimensions the billing page shows a meter for. */
+@@ -141,10 +148,27 @@
+     }
+   }
+ 
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const before = await subscriptionRepo.findSubscription(input.orgId);
++  const now = new Date();
++
++  // Leaving the free plan starts a new period here and now, invoiced in full;
++  // moving between paid plans keeps the period and charges the difference for
++  // the days left; downgrades and trials charge nothing.
++  const leavingFree = before !== null && before.plan === "free" && input.plan !== "free";
++  const freshPeriod = leavingFree
++    ? { start: toIsoTimestamp(now), end: nextPeriodEnd(toIsoTimestamp(now), input.interval) }
++    : null;
++
+   const subscription = await subscriptionRepo.updateSubscriptionPlan(
+     input.orgId,
+     input.plan,
+     input.interval,
++    freshPeriod,
+   );
+ 
+   await emit("billing.plan_changed", {
+@@ -153,6 +177,33 @@
+     to: input.plan,
+   });
+ 
++  if (before !== null && input.plan !== "free") {
++    if (leavingFree) {
++      await issueInvoice(
++        input.orgId,
++        org.slug,
++        subscription.plan,
++        subscription.seats,
++        subscription.interval,
++        subscription.currentPeriodStart,
++        subscription.currentPeriodEnd,
++        actor.userId,
++      );
++    } else if (before.status === "active" && before.plan !== "free") {
++      const difference =
++        getPlanLimits(input.plan).priceCentsPerSeatMonthly -
++        getPlanLimits(before.plan).priceCentsPerSeatMonthly;
++      await chargeForRestOfPeriod(
++        input.orgId,
++        org.slug,
++        difference * before.seats * monthsPerPeriod(before.interval),
++        before,
++        now,
++        actor.userId,
++      );
++    }
++  }
++
+   return subscription;
+ }
+ 
+@@ -169,9 +220,108 @@
+     throw new Error(`Plan ${plan} tops out at ${getLimit(plan, "seats")} seats`);
+   }
+ 
+-  return subscriptionRepo.updateSeatCount(input.orgId, input.seats);
++  const before = await subscriptionRepo.findSubscription(input.orgId);
++  const updated = await subscriptionRepo.updateSeatCount(input.orgId, input.seats);
++
++  // Added seats on a paid, active subscription are charged for the rest of
++  // the period; removed seats are not credited.
++  if (before !== null && before.status === "active" && before.plan !== "free") {
++    const added = input.seats - before.seats;
++    if (added > 0) {
++      const org = requireFound(
++        await orgRepo.findOrgById(input.orgId),
++        "Organization",
++        input.orgId,
++      );
++      await chargeForRestOfPeriod(
++        input.orgId,
++        org.slug,
++        getPlanLimits(before.plan).priceCentsPerSeatMonthly * added * monthsPerPeriod(before.interval),
++        before,
++        new Date(),
++        actor.userId,
++      );
++    }
++  }
++
++  return updated;
+ }
+ 
++/**
++ * Issues a mid-period invoice for `fullPeriodCents` worth of change, scaled to
++ * the days left in the subscription's current period. Nothing is issued when
++ * nothing is owed.
++ */
++async function chargeForRestOfPeriod(
++  orgId: OrgId,
++  orgSlug: string,
++  fullPeriodCents: number,
++  subscription: Subscription,
++  now: Date,
++  actorId: UserId | null,
++): Promise<Invoice | null> {
++  const amount = proratedCents(
++    fullPeriodCents,
++    subscription.currentPeriodStart,
++    subscription.currentPeriodEnd,
++    now,
++  );
++  if (amount <= 0) return null;
++
++  return issueInvoice(
++    orgId,
++    orgSlug,
++    subscription.plan,
++    subscription.seats,
++    subscription.interval,
++    subscription.currentPeriodStart,
++    subscription.currentPeriodEnd,
++    actorId,
++    amount,
++  );
++}
++
++/**
++ * Writes one invoice for a period and announces it: the only place an invoice
++ * is created, whether by the renewal job or by a mid-period change. The
++ * amount defaults to the full period charge for the plan, seats and interval.
++ */
++export async function issueInvoice(
++  orgId: OrgId,
++  orgSlug: string,
++  plan: PlanId,
++  seats: number,
++  interval: BillingInterval,
++  periodStart: IsoTimestamp,
++  periodEnd: IsoTimestamp,
++  actorId: UserId | null,
++  amountCents: number = periodChargeCents(plan, seats, interval),
++): Promise<Invoice> {
++  const sequence = (await invoiceRepo.countInvoices(orgId)) + 1;
++  const invoice = await invoiceRepo.insertInvoice(orgId, {
++    orgId,
++    number: `INV-${orgSlug}-${String(sequence).padStart(4, "0")}`,
++    amountCents,
++    currency: "usd",
++    periodStart,
++    periodEnd,
++    paidAt: null,
++  });
++
++  await emit("billing.invoice_issued", {
++    orgId,
++    actorId,
++    occurredAt: toIsoTimestamp(new Date()),
++    invoiceId: invoice.id,
++    invoiceNumber: invoice.number,
++    amountCents: invoice.amountCents,
++    periodStart,
++    periodEnd,
++  });
++
++  return invoice;
++}
++
+ /** Cancels at period end by default; `cancelImmediately` ends it now. */
+ export async function cancelSubscription(
+   actor: Actor,
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -228,6 +228,18 @@
+     }
+   });
+ 
++  // Every invoice reaches the workspace owner, once.
++  subscribe("billing.invoice_issued", async (payload) => {
++    const org = await orgRepo.findOrgById(payload.orgId);
++    if (!org) return;
++    await notify(payload.orgId, "invoice_issued", [org.ownerId], {
++      title: "A new invoice is ready",
++      body: `Invoice ${payload.invoiceNumber} for ${payload.amountCents} cents`,
++      href: "/settings/billing/invoices",
++      actorId: null,
++    });
++  });
++
+   subscribe("member.joined", async (payload) => {
+     const org = requireFound(
+       await orgRepo.findOrgById(payload.orgId),
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -28,6 +28,7 @@
+   | "member.role_changed"
+   | "member.removed"
+   | "billing.plan_changed"
++  | "billing.invoice_issued"
+   | "flag.toggled";
+ 
+ export type ActivitySubjectKind =
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -82,6 +82,13 @@
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
++  "billing.invoice_issued": EventEnvelope & {
++    invoiceId: string;
++    invoiceNumber: string;
++    amountCents: number;
++    periodStart: IsoTimestamp;
++    periodEnd: IsoTimestamp;
++  };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+     limit: number;
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -17,7 +17,8 @@
+   | "member_joined"
+   | "project_archived"
+   | "plan_limit_reached"
+-  | "digest_ready";
++  | "digest_ready"
++  | "invoice_issued";
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 

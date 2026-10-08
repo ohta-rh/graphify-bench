@@ -1,0 +1,590 @@
+diff --git a/src/components/domain/notification/notification-preferences-form.tsx b/src/components/domain/notification/notification-preferences-form.tsx
+--- a/src/components/domain/notification/notification-preferences-form.tsx
++++ b/src/components/domain/notification/notification-preferences-form.tsx
+@@ -50,6 +50,7 @@
+   project_archived: "Project archived",
+   plan_limit_reached: "Plan limit reached",
+   digest_ready: "Daily digest ready",
++  sub_issues_completed: "All sub-issues of my issue are done",
+ };
+ 
+ export function NotificationPreferencesForm(
+diff --git a/src/config/constants.ts b/src/config/constants.ts
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Levels a sub-issue may sit below a root issue (a root is level 0). */
++export const MAX_SUB_ISSUE_DEPTH: number = 3;
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -8,6 +8,7 @@
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
++import { IssueHierarchyError } from "@/lib/issue-hierarchy";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof IssueHierarchyError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -96,6 +98,14 @@
+     };
+   }
+ 
++  if (error instanceof IssueHierarchyError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { issueId: error.issueId, reason: error.reason },
++    };
++  }
++
+   if (error instanceof InvalidSlugError) {
+     return {
+       code: "validation_failed",
+diff --git a/src/lib/issue-hierarchy.ts b/src/lib/issue-hierarchy.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/issue-hierarchy.ts
+@@ -0,0 +1,38 @@
++/**
++ * Sub-issue rules: an issue may sit under a parent of the same project, the
++ * tree never loops, and it never grows deeper than `MAX_SUB_ISSUE_DEPTH`
++ * levels below a root. Pure, so the issue service and any UI gate agree.
++ */
++import { MAX_SUB_ISSUE_DEPTH } from "@/config/constants";
++
++export type IssueHierarchyReason =
++  /** The parent is the issue itself or one of its descendants. */
++  | "cycle"
++  /** The resulting tree would be deeper than `MAX_SUB_ISSUE_DEPTH`. */
++  | "too_deep";
++
++/** Thrown by the hierarchy guards; mapped to `conflict`, like double-archiving. */
++export class IssueHierarchyError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly issueId: string,
++    readonly reason: IssueHierarchyReason,
++  ) {
++    super(
++      reason === "cycle"
++        ? `Issue ${issueId} cannot be its own ancestor`
++        : `Issue ${issueId} would sit deeper than ${MAX_SUB_ISSUE_DEPTH} levels`,
++    );
++    this.name = "IssueHierarchyError";
++  }
++}
++
++/**
++ * True when an issue whose subtree is `subtreeHeight` levels tall (0 for a
++ * leaf) may be placed under a parent that sits `parentDepth` levels below a
++ * root (0 for a root).
++ */
++export function fitsDepth(parentDepth: number, subtreeHeight: number): boolean {
++  return parentDepth + 1 + subtreeHeight <= MAX_SUB_ISSUE_DEPTH;
++}
+diff --git a/src/schemas/issue.ts b/src/schemas/issue.ts
+--- a/src/schemas/issue.ts
++++ b/src/schemas/issue.ts
+@@ -85,6 +85,12 @@
+   .extend(pageRequestSchema.shape)
+   .extend(archiveScopeSchema.shape);
+ 
++export const setIssueParentSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  parentId: issueIdSchema.nullable(),
++});
++
+ /** Board drag-and-drop payload: move one issue into a column at an index. */
+ export const moveIssueSchema = z.object({
+   orgId: orgIdSchema,
+@@ -108,3 +114,4 @@
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
++export type SetIssueParentInput = z.infer<typeof setIssueParentSchema>;
+diff --git a/src/schemas/notification.ts b/src/schemas/notification.ts
+--- a/src/schemas/notification.ts
++++ b/src/schemas/notification.ts
+@@ -19,6 +19,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "sub_issues_completed",
+ ]);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+diff --git a/src/server/db/schema/notifications.ts b/src/server/db/schema/notifications.ts
+--- a/src/server/db/schema/notifications.ts
++++ b/src/server/db/schema/notifications.ts
+@@ -13,6 +13,7 @@
+   "project_archived",
+   "plan_limit_reached",
+   "digest_ready",
++  "sub_issues_completed",
+ ] as const;
+ 
+ export const notifications = sqliteTable(
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -23,7 +23,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -472,14 +472,149 @@
+   const row = getDb()
+     .update(issues)
+     .set(restorePatch())
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Issue ${issueId} not found`);
++  return toIssue(row);
++}
++
++export async function setIssueParent(
++  orgId: OrgId,
++  issueId: IssueId,
++  parentId: IssueId | null,
++): Promise<Issue> {
++  const row = getDb()
++    .update(issues)
++    .set({ parentId, updatedAt: toIsoTimestamp(new Date()) })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+     .returning()
+     .get();
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+   return toIssue(row);
++}
++
++/** The direct live children of one issue, oldest first. */
++export async function listChildIssues(
++  orgId: OrgId,
++  parentId: IssueId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.parentId, parentId),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      ),
++    )
++    .orderBy(issues.createdAt, issues.number)
++    .all();
++
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map((row) => row.id as IssueId),
++  );
++  return rows.map((row) => toIssue(row, (labels[row.id] ?? []).map((l) => l.id)));
+ }
+ 
++/**
++ * Every live descendant of the given issues, level by level, with the depth
++ * (1 for a direct child) and status of each — read whole, never paged, so a
++ * parent with hundreds of children is counted in full.
++ */
++export async function listDescendants(
++  orgId: OrgId,
++  rootIds: readonly IssueId[],
++): Promise<readonly { id: IssueId; parentId: IssueId; depth: number; status: IssueStatus }[]> {
++  const out: { id: IssueId; parentId: IssueId; depth: number; status: IssueStatus }[] = [];
++  let frontier = [...rootIds];
++  let depth = 0;
++
++  while (frontier.length > 0) {
++    depth += 1;
++    const rows = getDb()
++      .select({ id: issues.id, parentId: issues.parentId, status: issues.status })
++      .from(issues)
++      .where(
++        and(
++          ...compact(
++            orgPredicate(issues.orgId, orgId),
++            inArray(issues.parentId, frontier),
++            livePredicate(issues.archivedAt, {}),
++          ),
++        ),
++      )
++      .all();
++
++    frontier = [];
++    for (const row of rows) {
++      const id = row.id as IssueId;
++      out.push({ id, parentId: row.parentId as IssueId, depth, status: row.status });
++      frontier.push(id);
++    }
++  }
++
++  return out;
++}
++
++/** Counts over every live descendant of one issue, at any depth. */
++export async function countDescendants(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<{ total: number; open: number; closed: number }> {
++  const rows = await listDescendants(orgId, [issueId]);
++  const closed = rows.filter((row) => CLOSED_ISSUE_STATUSES.includes(row.status)).length;
++  return { total: rows.length, closed, open: rows.length - closed };
++}
++
++/** How many levels lie between the issue and its root (0 for a root). */
++export async function depthOf(orgId: OrgId, issueId: IssueId): Promise<number> {
++  let depth = 0;
++  let current = issueId;
++  const seen = new Set<string>([issueId]);
++
++  for (;;) {
++    const row = getDb()
++      .select({ parentId: issues.parentId })
++      .from(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, current)))
++      .get();
++    if (!row || row.parentId === null || seen.has(row.parentId)) return depth;
++    seen.add(row.parentId);
++    current = row.parentId as IssueId;
++    depth += 1;
++  }
++}
++
++/** Archives the given live issues in one statement; returns the ids actually archived. */
++export async function archiveIssues(
++  orgId: OrgId,
++  issueIds: readonly IssueId[],
++): Promise<readonly IssueId[]> {
++  if (issueIds.length === 0) return [];
++  const rows = getDb()
++    .update(issues)
++    .set(archivePatch())
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          inArray(issues.id, [...issueIds]),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      ),
++    )
++    .returning({ id: issues.id })
++    .all();
++  return rows.map((row) => row.id as IssueId);
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -5,6 +5,7 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
++import { IssueHierarchyError, fitsDepth } from "@/lib/issue-hierarchy";
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -15,6 +16,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import {
++  NotFoundError,
+   actorEnvelope,
+   issueResource,
+   orgResource,
+@@ -27,10 +29,11 @@
+   CreateIssueInput,
+   IssueFilterInput,
+   MoveIssueInput,
++  SetIssueParentInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+-import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
++import type { Issue, IssueBoardColumn, IssueRollup, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+ /**
+@@ -65,6 +68,12 @@
+     );
+   }
+ 
++  // A parent given at creation obeys the same rules as a later move: a live
++  // issue of this project with room for one more level.
++  if (input.parentId !== null) {
++    await requireUsableParent(input.orgId, project.id, input.parentId, null, 0);
++  }
++
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+   const issue = await issueRepo.insertIssue(input, actor.userId, number);
+ 
+@@ -188,6 +197,116 @@
+   return after;
+ }
+ 
++/**
++ * Puts an issue under a parent of its own project, or makes it a root again.
++ * The subtree below the issue moves with it, so the depth check looks at the
++ * deepest descendant, not just the issue.
++ */
++export async function setIssueParent(
++  actor: Actor,
++  input: SetIssueParentInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++
++  if (input.parentId !== null) {
++    const subtree = await issueRepo.listDescendants(input.orgId, [issue.id]);
++    const height = subtree.reduce((max, row) => Math.max(max, row.depth), 0);
++    await requireUsableParent(input.orgId, issue.projectId, input.parentId, issue.id, height);
++  }
++
++  const after = await issueRepo.setIssueParent(input.orgId, issue.id, input.parentId);
++
++  await emit("issue.updated", {
++    ...actorEnvelope(actor),
++    issueId: after.id,
++    projectId: after.projectId,
++    changedFields: ["parentId"],
++  });
++
++  return after;
++}
++
++/** The direct live sub-issues of an issue, oldest first. */
++export async function listSubIssues(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++
++  return issueRepo.listChildIssues(orgId, issue.id);
++}
++
++/** Counts over every live issue below one issue, however deep and however many. */
++export async function getIssueRollup(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<IssueRollup> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++
++  return issueRepo.countDescendants(orgId, issue.id);
++}
++
++/**
++ * The parent must be a live issue of the same project, not the issue itself
++ * nor anything below it, and the tree must stay within the depth limit once
++ * a subtree `height` levels tall hangs under it.
++ */
++async function requireUsableParent(
++  orgId: OrgId,
++  projectId: ProjectId,
++  parentId: IssueId,
++  issueId: IssueId | null,
++  height: number,
++): Promise<void> {
++  const parent = await issueRepo.findIssueById(orgId, parentId);
++  if (!parent || parent.projectId !== projectId) {
++    throw new NotFoundError("Issue", parentId);
++  }
++  assertNotArchived("Issue", parent.id, parent);
++
++  if (issueId !== null) {
++    if (parent.id === issueId) throw new IssueHierarchyError(issueId, "cycle");
++    const below = await issueRepo.listDescendants(orgId, [issueId]);
++    if (below.some((row) => row.id === parent.id)) {
++      throw new IssueHierarchyError(issueId, "cycle");
++    }
++  }
++
++  const parentDepth = await issueRepo.depthOf(orgId, parent.id);
++  if (!fitsDepth(parentDepth, height)) {
++    throw new IssueHierarchyError(issueId ?? parentId, "too_deep");
++  }
++}
++
++/**
++ * Archiving an issue takes its live sub-issues with it, at every depth. Each
++ * issue archived is announced once, so everything that follows an archive —
++ * the counters, the search index, the alerts — follows for all of them.
++ */
+ export async function archiveIssue(
+   actor: Actor,
+   orgId: OrgId,
+@@ -203,13 +322,25 @@
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  const descendants = await issueRepo.listDescendants(orgId, [issue.id]);
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
++  const archivedDescendantIds = await issueRepo.archiveIssues(
++    orgId,
++    descendants.map((row) => row.id),
++  );
+ 
+   await emit("issue.archived", {
+     ...actorEnvelope(actor),
+     issueId: archived.id,
+     projectId: archived.projectId,
+   });
++  for (const descendantId of archivedDescendantIds) {
++    await emit("issue.archived", {
++      ...actorEnvelope(actor),
++      issueId: descendantId,
++      projectId: archived.projectId,
++    });
++  }
+ 
+   return archived;
+ }
+diff --git a/src/server/services/notification-service.ts b/src/server/services/notification-service.ts
+--- a/src/server/services/notification-service.ts
++++ b/src/server/services/notification-service.ts
+@@ -18,7 +18,8 @@
+   MarkNotificationReadInput,
+   UpdateNotificationPreferenceInput,
+ } from "@/schemas/notification";
+-import type { OrgId, Page, UserId } from "@/types/common";
++import type { IssueId, OrgId, Page, UserId } from "@/types/common";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import type { FlagContext } from "@/types/feature-flag";
+ import type { Actor } from "@/types/member";
+ import type {
+@@ -177,6 +178,35 @@
+  */
+ let registered = false;
+ 
++/**
++ * `changedId` just stopped being open. If it has a parent and the parent now
++ * has no open descendant left, the parent's assignee hears about it.
++ */
++async function announceSubIssuesCompleted(
++  orgId: OrgId,
++  changedId: IssueId,
++  actorId: UserId | null,
++): Promise<void> {
++  const changed = await issueRepo.findIssueById(orgId, changedId);
++  if (!changed || changed.parentId === null) return;
++
++  // An archived issue only counts as "just closed" if it was open before.
++  if (changed.archivedAt !== null && CLOSED_ISSUE_STATUSES.includes(changed.status)) return;
++
++  const parent = await issueRepo.findIssueById(orgId, changed.parentId);
++  if (!parent || parent.assigneeId === null || parent.archivedAt !== null) return;
++
++  const rollup = await issueRepo.countDescendants(orgId, parent.id);
++  if (rollup.open > 0) return;
++
++  await notify(orgId, "sub_issues_completed", [parent.assigneeId], {
++    title: "All sub-issues are done",
++    body: `Every sub-issue of issue ${parent.id} is now closed`,
++    href: `/issues/${parent.id}`,
++    actorId,
++  });
++}
++
+ function registerFanOut(): void {
+   if (registered) return;
+   registered = true;
+@@ -228,6 +258,19 @@
+     }
+   });
+ 
++  // When the last open sub-issue of an issue closes (or is archived while
++  // open), the issue's assignee is told once; their own change is not news.
++  subscribe("issue.status_changed", async (payload) => {
++    const wasOpen = !CLOSED_ISSUE_STATUSES.includes(payload.from);
++    const isClosed = CLOSED_ISSUE_STATUSES.includes(payload.to);
++    if (!wasOpen || !isClosed) return;
++    await announceSubIssuesCompleted(payload.orgId, payload.issueId, payload.actorId);
++  });
++
++  subscribe("issue.archived", async (payload) => {
++    await announceSubIssuesCompleted(payload.orgId, payload.issueId, payload.actorId);
++  });
++
+   subscribe("member.joined", async (payload) => {
+     const org = requireFound(
+       await orgRepo.findOrgById(payload.orgId),
+diff --git a/src/types/issue.ts b/src/types/issue.ts
+--- a/src/types/issue.ts
++++ b/src/types/issue.ts
+@@ -87,6 +87,13 @@
+   readonly includeArchived?: boolean;
+ }
+ 
++/** Counts over every live issue below one issue, at any depth. */
++export interface IssueRollup {
++  readonly total: number;
++  readonly open: number;
++  readonly closed: number;
++}
++
+ export interface IssueWithRelations {
+   readonly issue: Issue;
+   readonly labels: readonly IssueLabel[];
+diff --git a/src/types/notification.ts b/src/types/notification.ts
+--- a/src/types/notification.ts
++++ b/src/types/notification.ts
+@@ -17,7 +17,8 @@
+   | "member_joined"
+   | "project_archived"
+   | "plan_limit_reached"
+-  | "digest_ready";
++  | "digest_ready"
++  | "sub_issues_completed";
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 
