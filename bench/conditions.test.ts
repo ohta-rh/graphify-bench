@@ -12,6 +12,7 @@ import {
   OPUS_MODEL,
   GROK_MODEL,
   SONNET55_MODEL,
+  HAIKU55_MODEL,
   assertRegistryMatchesDisk,
   conditionNames,
   effectiveEffort,
@@ -573,10 +574,16 @@ describe("runtime lever arms", () => {
     ["sonnet55-effort-medium", "effort-medium"],
     ["sonnet55-effort-high", "effort-high"],
     ["sonnet55-effort-xhigh", "effort-xhigh"],
+    ["haiku55-effort-low", "effort-low"],
+    ["haiku55-effort-medium", "effort-medium"],
+    ["haiku55-effort-high", "effort-high"],
+    ["haiku55-effort-xhigh", "effort-xhigh"],
   ])("%s is %s with only the model swapped", (opus, sonnet) => {
     const o = getCondition(opus);
     const s = getCondition(sonnet);
-    expect(o.model).toBe(opus.startsWith("sonnet55") ? SONNET55_MODEL : OPUS_MODEL);
+    expect(o.model).toBe(
+      opus.startsWith("sonnet55") ? SONNET55_MODEL : opus.startsWith("haiku55") ? HAIKU55_MODEL : OPUS_MODEL,
+    );
     expect(s.model).toBeUndefined();
     expect(o.overlays).toEqual(s.overlays);
     expect(o.effort).toBe(s.effort);

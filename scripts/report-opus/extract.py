@@ -20,7 +20,7 @@ for d in glob.glob(f"{root}/runs/*"):
         wall=meta["claude"]["wall_ms"] / 1e3, ok=g, sub=(m.get("subagents_spawned") or 0) > 0,
         turns=m.get("num_turns") or 0, cat=meta["category"],
         think=(m.get("thinking_tokens") or 0)))
-ARMS = ["opus-effort-low", "opus-effort-medium", "opus-effort-high", "opus-effort-xhigh", "effort-low-nosub", "effort-low", "effort-medium", "effort-high", "effort-xhigh", "sonnet55-effort-low", "sonnet55-effort-medium", "sonnet55-effort-high", "sonnet55-effort-xhigh", "grok-effort-low", "grok-effort-medium", "grok-effort-high"]
+ARMS = ["opus-effort-low", "opus-effort-medium", "opus-effort-high", "opus-effort-xhigh", "effort-low-nosub", "effort-low", "effort-medium", "effort-high", "effort-xhigh", "sonnet55-effort-low", "sonnet55-effort-medium", "sonnet55-effort-high", "sonnet55-effort-xhigh", "grok-effort-low", "grok-effort-medium", "grok-effort-high", "haiku55-effort-low", "haiku55-effort-medium", "haiku55-effort-high", "haiku55-effort-xhigh"]
 out = {"arms": {}, "pairs": {}}
 for a in ARMS:
     runs = [r for t in R[a].values() for r in t]
@@ -48,10 +48,11 @@ def boot(x, y, k):
     if not d: return None
     rnd = random.Random(7); bs = sorted(st.mean(rnd.choices(d, k=len(d))) for _ in range(10000))
     return dict(n=len(d), mean=st.mean(d), lo=bs[249], hi=bs[9750])
+HAIKU55_PAIRS = [(f"haiku55-effort-{e}", f"{other}-{e}") for e in ("low", "medium", "high", "xhigh") for other in ("sonnet55-effort", "opus-effort")]
 GROK_PAIRS = [(f"grok-effort-{e}", f"{other}-{e}") for e in ("low", "medium", "high") for other in ("effort", "sonnet55-effort", "opus-effort")]
 for x, y in [("opus-effort-low", "effort-low"), ("opus-effort-medium", "effort-medium"),
              ("opus-effort-low", "effort-low-nosub"), ("opus-effort-medium", "effort-low-nosub"),
-             ("opus-effort-medium", "opus-effort-low"), ("effort-low-nosub", "effort-low"), ("opus-effort-high", "effort-high"), ("opus-effort-xhigh", "effort-xhigh"), ("opus-effort-low", "effort-high"), ("opus-effort-low", "effort-xhigh"), ("opus-effort-high", "opus-effort-low"), ("opus-effort-xhigh", "opus-effort-low"), ("effort-high", "effort-low"), ("effort-xhigh", "effort-low")] + [(f"sonnet55-effort-{e}", f"effort-{e}") for e in ("low","medium","high","xhigh")] + [(f"opus-effort-{e}", f"sonnet55-effort-{e}") for e in ("low","medium","high","xhigh")] + GROK_PAIRS:
+             ("opus-effort-medium", "opus-effort-low"), ("effort-low-nosub", "effort-low"), ("opus-effort-high", "effort-high"), ("opus-effort-xhigh", "effort-xhigh"), ("opus-effort-low", "effort-high"), ("opus-effort-low", "effort-xhigh"), ("opus-effort-high", "opus-effort-low"), ("opus-effort-xhigh", "opus-effort-low"), ("effort-high", "effort-low"), ("effort-xhigh", "effort-low")] + [(f"sonnet55-effort-{e}", f"effort-{e}") for e in ("low","medium","high","xhigh")] + [(f"opus-effort-{e}", f"sonnet55-effort-{e}") for e in ("low","medium","high","xhigh")] + GROK_PAIRS + HAIKU55_PAIRS:
     if set(R[x]) & set(R[y]):
         out["pairs"][f"{x}|{y}"] = {k: boot(x, y, k) for k in ("tok", "cost", "wall", "ok")}
 json.dump(out, sys.stdout, indent=1)

@@ -124,6 +124,9 @@ export const OPUS_MODEL = "claude-opus-5-5";
 /** Sonnet 5.5, measured beside Sonnet 5 at the same effort levels. */
 export const SONNET55_MODEL = "claude-sonnet-5-5";
 
+/** Haiku 5.5, measured beside Sonnet 5 / Sonnet 5.5 / Opus 5.5 at the same effort levels. */
+export const HAIKU55_MODEL = "claude-haiku-5-5";
+
 /**
  * Grok 4.7 as passed to `grok -p --model`. On grok 1.0.46 a probe's `modelUsage`
  * key was `grok-4.7-build`; the report reads that key from the run, not this constant.
@@ -630,6 +633,38 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     model: SONNET55_MODEL,
     effort: "xhigh",
     note: "`effort-xhigh` on Sonnet 5.5 — only the model differs.",
+  },
+  {
+    name: "haiku55-effort-low",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: HAIKU55_MODEL,
+    effort: "low",
+    note: "`effort-low` on Haiku 5.5 — only the model differs.",
+  },
+  {
+    name: "haiku55-effort-medium",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: HAIKU55_MODEL,
+    effort: "medium",
+    note: "`effort-medium` on Haiku 5.5 — only the model differs.",
+  },
+  {
+    name: "haiku55-effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: HAIKU55_MODEL,
+    effort: "high",
+    note: "`effort-high` on Haiku 5.5 — only the model differs.",
+  },
+  {
+    name: "haiku55-effort-xhigh",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: HAIKU55_MODEL,
+    effort: "xhigh",
+    note: "`effort-xhigh` on Haiku 5.5 — only the model differs.",
   },
   {
     name: "grok-effort-low",
