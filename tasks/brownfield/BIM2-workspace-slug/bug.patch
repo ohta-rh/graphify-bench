@@ -1,0 +1,141 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,17 @@
++# Documentation
++
++Taskflow keeps three kinds of document under `docs/`. They do not carry equal weight.
++
++| Folder | What it is | Weight |
++|---|---|---|
++| `docs/adr/` | Architecture Decision Records: numbered, dated, reviewed. | **Authoritative.** |
++| `docs/product/` | Product notes written before or alongside a feature: intent, examples, wording. | Context only. |
++| `docs/support/` | Runbooks and support macros: what people observed. | Describes behaviour, never specifies it. |
++
++## Precedence
++
++1. An ADR is the specification for every question it addresses. The highest-numbered ADR that addresses a question is the one that applies; a later ADR supersedes an earlier one only where it says so.
++2. Where a product note and an ADR disagree, the ADR wins. A product note that predates an ADR on the same subject is kept for history, not as a second opinion.
++3. Support notes record what was seen at the time. They are never evidence of intended behaviour.
++4. Code comments, `TODO`s and function names are not documentation. They are frequently stale.
++5. Where no document speaks, the current behaviour of the code is authoritative, and a new feature follows the conventions of its sibling features (same error classes, same guards, same events).
+diff --git a/docs/adr/0005-workspace-urls.md b/docs/adr/0005-workspace-urls.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adr/0005-workspace-urls.md
+@@ -0,0 +1,49 @@
++# ADR 0005 — Workspace URLs and renaming a slug
++
++- Status: accepted
++- Date: 2026-02-04
++- Supersedes: `docs/product/workspace-rename-notes.md` where the two disagree.
++
++## Context
++
++A workspace's slug is its URL (`/acme/...`), the key the session layer resolves an `Actor`
++from, and the thing people paste into chats and bookmarks. Today it is fixed at creation.
++Workspaces get renamed (rebrands, typos) and want their URL to follow. This record fixes what a
++slug change means for the old URL, for other workspaces, and for the people holding links.
++
++## Decision
++
++1. **A slug is chosen, not derived.** A rename takes the exact slug the admin typed. It must pass
++   the shared slug rules (shape, length, not reserved) and it must be available. A slug that is
++   not available is **refused**, never suffixed — suffixing is for slugs Taskflow derives, a
++   rename is a deliberate choice. Both refusals are the invalid-slug error every bad slug gets.
++
++2. **Availability.** A slug is unavailable while any other workspace — live or deleted — holds
++   it as its current slug, and while another workspace holds it **retired** (rule 3). A slug the
++   same workspace retired itself is available to it at any time.
++
++3. **The old slug is retired, not released.** For `ORG_SLUG_HOLD_DAYS` days after a rename the
++   old slug keeps resolving to the workspace everywhere a slug is resolved — the session layer
++   turning a URL into an `Actor`, and every lookup of a workspace by slug — and nobody else can
++   take it. When the hold ends, at exactly `ORG_SLUG_HOLD_DAYS` days after the rename, the slug
++   is released: it resolves to nothing and any workspace may take it, by rename or at creation
++   (creation keeps deriving: a slug that is taken or held is suffixed as today).
++
++4. **Chains.** Renaming again retires the slug being replaced; every earlier slug keeps its own
++   hold. Renaming back to a slug the workspace retired ends that slug's retirement and retires
++   the one being replaced.
++
++5. **Permission.** A rename is a workspace settings change: it needs the same permission as
++   updating the workspace's settings. A refusal changes nothing.
++
++6. **A rename to the current slug is a no-op**: nothing changes, nothing is published.
++
++7. **Announcing.** A rename publishes `organization.slug_changed` once and records the audit
++   action `organization.slug_changed` once, naming both slugs. The workspace's name, plan and
++   settings are untouched.
++
++## Consequences
++
++- Taskflow needs to remember retired slugs with the instant they were retired.
++- The session layer must resolve a slug through the same rule as every other lookup, rather than
++  reading the current slug column alone.
+diff --git a/docs/product/workspace-rename-notes.md b/docs/product/workspace-rename-notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/product/workspace-rename-notes.md
+@@ -0,0 +1,21 @@
++# Renaming a workspace URL — product notes
++
++_Written while scoping the "change workspace URL" setting (2025-12). Kept for history; see `docs/adr/0005-workspace-urls.md` for the current rules._
++
++## Why
++
++Companies rebrand, and the first owner often typed something hasty at sign-up. The URL should be
++changeable from the general settings page.
++
++## What we'd like
++
++- Only the workspace owner can change the URL.
++- The field behaves like the sign-up field: if the slug is taken we add a number, the way we do
++  at sign-up, so the save never fails on a collision.
++- The old URL stops working immediately. We show a warning before saving ("links to /acme will
++  break") and that is enough; keeping old URLs alive is a can of worms.
++- The audit log gets an entry.
++
++## Open questions
++
++- Should we send an email to all members? (Probably, later.)
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -86,9 +86,14 @@
+   return toOrganization(row);
+ }
+ 
++/**
++ * Settings and profile patch. `slug` is accepted for the "change workspace
++ * URL" form: the form validates the slug with `slugSchema` before it gets
++ * here, so the column is written as given.
++ */
+ export async function updateOrg(
+   orgId: OrgId,
+-  patch: UpdateOrganizationInput,
++  patch: UpdateOrganizationInput & { readonly slug?: string },
+ ): Promise<Organization> {
+   const current = await findOrgById(orgId);
+   if (!current) throw new Error(`Organization ${orgId} not found`);
+@@ -99,6 +104,7 @@
+     .update(organizations)
+     .set({
+       ...(patch.name === undefined ? {} : { name: patch.name }),
++      ...(patch.slug === undefined ? {} : { slug: patch.slug }),
+       ...(patch.logoUrl === undefined ? {} : { logoUrl: patch.logoUrl }),
+       defaultIssueStatus: settings.defaultIssueStatus,
+       allowPublicProjects: settings.allowPublicProjects,
+diff --git a/src/server/services/session-service.ts b/src/server/services/session-service.ts
+--- a/src/server/services/session-service.ts
++++ b/src/server/services/session-service.ts
+@@ -56,6 +56,8 @@
+   principal: SessionPrincipal,
+   orgSlug: string,
+ ): Promise<Actor | null> {
++  // Same lookup as `OrganizationService.resolveOrgBySlug`, taken from the
++  // repository directly to keep the session layer free of the service layer.
+   const org = await orgRepo.findOrgBySlug(orgSlug);
+   if (!org) return null;
+ 

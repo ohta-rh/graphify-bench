@@ -1,0 +1,147 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,17 @@
++# Documentation
++
++Taskflow keeps three kinds of document under `docs/`. They do not carry equal weight.
++
++| Folder | What it is | Weight |
++|---|---|---|
++| `docs/adr/` | Architecture Decision Records: numbered, dated, reviewed. | **Authoritative.** |
++| `docs/product/` | Product notes written before or alongside a feature: intent, examples, wording. | Context only. |
++| `docs/support/` | Runbooks and support macros: what people observed. | Describes behaviour, never specifies it. |
++
++## Precedence
++
++1. An ADR is the specification for every question it addresses. The highest-numbered ADR that addresses a question is the one that applies; a later ADR supersedes an earlier one only where it says so.
++2. Where a product note and an ADR disagree, the ADR wins. A product note that predates an ADR on the same subject is kept for history, not as a second opinion.
++3. Support notes record what was seen at the time. They are never evidence of intended behaviour.
++4. Code comments, `TODO`s and function names are not documentation. They are frequently stale.
++5. Where no document speaks, the current behaviour of the code is authoritative, and a new feature follows the conventions of its sibling features (same error classes, same guards, same events).
+diff --git a/docs/adr/0011-moving-issues-between-projects.md b/docs/adr/0011-moving-issues-between-projects.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adr/0011-moving-issues-between-projects.md
+@@ -0,0 +1,49 @@
++# ADR 0011 — Moving an issue to another project
++
++- Status: accepted
++- Date: 2026-03-18
++- Supersedes: `docs/product/issue-move-notes.md` where the two disagree.
++
++## Context
++
++An issue filed in the wrong project has to be re-created by hand today. The product wants a
++"move to project" action. Issue numbers are allocated per project and shown as `KEY-12`, the
++search index and the audit log both denormalise the project an issue belongs to, and the plan
++quota on issues is counted per project. This record fixes what a move means for each of them.
++
++## Decision
++
++1. **A move is one operation on one issue.** The issue leaves its project and joins the target
++   project of the same workspace. Its title, description, status, priority, assignee, estimate,
++   due date, labels, comments and attachments are untouched. Whatever the issue is linked to is
++   left as it is.
++
++2. **Numbers belong to projects.** The moved issue receives the **next number of the target
++   project**, allocated exactly as a newly created issue's would be. Its old number is **retired**:
++   a number that has ever been used in a project is never issued again in that project, whether
++   the issue that carried it was archived, moved away, or moved away and back. Issues created in
++   the source project afterwards continue after the highest number the project has ever issued.
++
++3. **Permission.** Moving requires being allowed to edit the issue (the same permission every
++   issue edit needs) **and** being allowed to create issues in the target project (the same
++   permission creating one there needs). Both are checked against the acting member; a refusal
++   changes nothing. The target project's per-project issue quota applies to a move exactly as it
++   applies to creating an issue there, and a refused move changes nothing either.
++
++4. **The audit log is append-only.** Entries written before the move keep the project they were
++   written under. The move itself is recorded once, under the **target** project, as the action
++   `issue.moved`, naming both projects and both numbers.
++
++5. **Everything that is indexed by project follows the issue.** After a move, searching inside
++   the target project finds the issue and searching inside the source project does not; the
++   boards and the issue lists of both projects reflect it immediately.
++
++6. **Announcing.** A move publishes exactly one domain event, `issue.moved`; it is not a
++   creation, an edit or an archive, and publishes none of those.
++
++## Consequences
++
++- `KEY-12` links to the old key stop resolving; that is the cost of per-project numbering and
++  is why the audit entry carries both numbers.
++- The number allocator has to remember the highest number ever issued per project rather than
++  derive it from the rows that happen to be in the project.
+diff --git a/docs/product/issue-move-notes.md b/docs/product/issue-move-notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/product/issue-move-notes.md
+@@ -0,0 +1,22 @@
++# Moving issues between projects — product notes
++
++_Written while scoping the "move to project" action (2026-01). Kept for history; see `docs/adr/0011-moving-issues-between-projects.md` for the current rules._
++
++## Why
++
++People file issues in the wrong project all the time, and re-creating one loses the comments.
++
++## What we'd like
++
++- A "Move to project…" entry on the issue page, offered to anyone who can see both projects.
++- The issue keeps its number, so links like `PLAT-12` keep working after the move; the page
++  shows both keys ("formerly PLAT-12") for a while.
++- The issue's history moves with it: the activity entries it accumulated are re-filed under
++  the new project, so the project's activity tab tells the whole story.
++- Comments, attachments and labels come along.
++
++## Open questions
++
++- What if the target project already has an issue with that number? (Probably bump it.)
++- Plan limits: does the target project's issue quota apply to a move? (Leaning no — it is not a
++  new issue.)
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -480,6 +480,27 @@
+   return toIssue(row);
+ }
+ 
++/**
++ * Re-points an issue at another project. Kept for the import tool's
++ * "merge projects" step, which renumbers in a second pass; the row keeps its
++ * number here so the pass can match it up again.
++ */
++export async function relocateIssue(
++  orgId: OrgId,
++  issueId: IssueId,
++  projectId: ProjectId,
++): Promise<Issue> {
++  const row = getDb()
++    .update(issues)
++    .set({ projectId, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Issue ${issueId} not found`);
++  return toIssue(row);
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -217,6 +217,9 @@
+ /**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+  * `updated_at` — so a move is a status change plus a touch.
++ *
++ * TODO(platform): "move" should eventually take a target project as well;
++ * `issueRepo.relocateIssue` is the primitive for that half.
+  */
+ export async function moveIssue(
+   actor: Actor,

@@ -1,0 +1,560 @@
+diff --git a/src/app/(dashboard)/[orgSlug]/issues/page.tsx b/src/app/(dashboard)/[orgSlug]/issues/page.tsx
+--- a/src/app/(dashboard)/[orgSlug]/issues/page.tsx
++++ b/src/app/(dashboard)/[orgSlug]/issues/page.tsx
+@@ -12,11 +12,13 @@
+ import type { Metadata } from "next";
+ import { IssueList } from "@/components/domain/issue/issue-list";
+ import { EmptyState } from "@/components/ui/empty-state";
++import { parseIssueFilterParams } from "@/hooks/issue-filter-params";
+ import { can } from "@/lib/permissions";
+ import { PENDING_ISSUE_ID, PENDING_PROJECT_ID } from "@/actions/_lib/permission-resources";
++import { issueFilterSchema } from "@/schemas/issue";
+ import { searchParamsPaginationSchema } from "@/schemas/pagination";
+ import { getIssue, listIssues } from "@/server/services/issue-service";
+-import { ISSUE_STATUSES, type IssueStatus, type IssueWithRelations } from "@/types/issue";
++import type { IssueWithRelations } from "@/types/issue";
+ import { loadTenantContext } from "../_lib/tenant-context";
+ 
+ type PageParams = { orgSlug: string };
+@@ -26,13 +28,6 @@
+ export const metadata: Metadata = {
+   title: "My issues",
+ };
+-
+-const OPEN_STATUSES: readonly IssueStatus[] = [
+-  "backlog",
+-  "todo",
+-  "in_progress",
+-  "in_review",
+-];
+ 
+ export default async function Page(props: {
+   params: Promise<PageParams>;
+@@ -57,15 +52,19 @@
+   }
+ 
+   const pagination = searchParamsPaginationSchema.parse(search);
+-  const status = parseStatuses(search.status);
+-
+-  const page = await listIssues(actor, {
++  // The shared codec reads the URL (ADR 0009); anything not narrowed on
++  // defaults to the signed-in user's open issues.
++  const parsed = parseIssueFilterParams(toSearchParams(search));
++  const filter = issueFilterSchema.parse({
++    ...parsed,
+     orgId: org.id,
+-    assigneeId: actor.userId,
+-    status: [...status],
++    assigneeId: parsed.assigneeId === undefined ? "me" : parsed.assigneeId,
++    status: parsed.status === undefined ? ["open"] : parsed.status,
+     limit: pagination.perPage,
+     cursor: pagination.cursor ?? null,
+   });
++
++  const page = await listIssues(actor, filter);
+ 
+   // `IssueList` wants the relations bundle; fetching them one by one is fine at
+   // page size, and keeps the list query itself cheap.
+@@ -94,13 +93,14 @@
+   );
+ }
+ 
+-/** `?status=todo&status=in_progress` narrows the list; anything else is open. */
+-function parseStatuses(
+-  raw: string | string[] | undefined,
+-): readonly IssueStatus[] {
+-  const values = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw];
+-  const known = values.filter((value): value is IssueStatus =>
+-    (ISSUE_STATUSES as readonly string[]).includes(value),
+-  );
+-  return known.length > 0 ? known : OPEN_STATUSES;
++/** Next hands `searchParams` over as a record; the codec reads a `get()`. */
++function toSearchParams(
++  raw: Readonly<Record<string, string | string[] | undefined>>,
++): URLSearchParams {
++  const params = new URLSearchParams();
++  for (const [key, value] of Object.entries(raw)) {
++    if (value === undefined) continue;
++    params.set(key, Array.isArray(value) ? value.join(",") : value);
++  }
++  return params;
+ }
+diff --git a/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/page.tsx b/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/page.tsx
+--- a/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/page.tsx
++++ b/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/page.tsx
+@@ -13,11 +13,12 @@
+ import { PENDING_ISSUE_ID } from "@/actions/_lib/permission-resources";
+ import { IssueList } from "@/components/domain/issue/issue-list";
+ import { EmptyState } from "@/components/ui/empty-state";
++import { parseIssueFilterParams } from "@/hooks/issue-filter-params";
+ import { can } from "@/lib/permissions";
+ import { issueFilterSchema } from "@/schemas/issue";
+ import { searchParamsPaginationSchema } from "@/schemas/pagination";
+ import { getIssue, listIssues } from "@/server/services/issue-service";
+-import { ISSUE_STATUSES, type IssueStatus, type IssueWithRelations } from "@/types/issue";
++import type { IssueWithRelations } from "@/types/issue";
+ import { loadProjectContext } from "../../../_lib/project-context";
+ 
+ type PageParams = { orgSlug: string; projectSlug: string };
+@@ -60,16 +61,14 @@
+   });
+ 
+   const pagination = searchParamsPaginationSchema.parse(search);
+-  const statuses = parseStatuses(search.status);
+ 
+-  // The filter goes through the shared schema so an unparseable URL is a
+-  // rejected filter rather than a malformed repository query.
++  // The shared codec reads the URL (ADR 0009) and the filter goes through the
++  // shared schema, so an unparseable URL is a rejected filter rather than a
++  // malformed repository query.
+   const filter = issueFilterSchema.parse({
++    ...parseIssueFilterParams(toSearchParams(search)),
+     orgId: org.id,
+     projectId: project.id,
+-    ...(statuses.length > 0 ? { status: statuses } : {}),
+-    ...(typeof search.q === "string" ? { query: search.q } : {}),
+-    includeArchived: search.archived === "1",
+     limit: pagination.perPage,
+     cursor: pagination.cursor ?? null,
+   });
+@@ -107,9 +106,14 @@
+   );
+ }
+ 
+-function parseStatuses(raw: string | string[] | undefined): IssueStatus[] {
+-  const values = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw];
+-  return values.filter((value): value is IssueStatus =>
+-    (ISSUE_STATUSES as readonly string[]).includes(value),
+-  );
++/** Next hands `searchParams` over as a record; the codec reads a `get()`. */
++function toSearchParams(
++  raw: Readonly<Record<string, string | string[] | undefined>>,
++): URLSearchParams {
++  const params = new URLSearchParams();
++  for (const [key, value] of Object.entries(raw)) {
++    if (value === undefined) continue;
++    params.set(key, Array.isArray(value) ? value.join(",") : value);
++  }
++  return params;
+ }
+diff --git a/src/hooks/issue-filter-params.ts b/src/hooks/issue-filter-params.ts
+--- a/src/hooks/issue-filter-params.ts
++++ b/src/hooks/issue-filter-params.ts
+@@ -1,22 +1,33 @@
+ /**
+  * The URL is the single source of truth for the issue list filter: a filtered
+- * view has to be shareable and survive a reload, and the server component that
+- * renders the page parses the very same query string. These two functions are
+- * that codec, kept pure so both sides can use them.
++ * view has to be shareable and survive a reload, and every page that renders a
++ * list parses the query string through this codec (ADR 0009). Kept pure so
++ * client and server use the same functions.
+  *
+- * `assignee=none` is the sanctioned spelling of "unassigned" — `undefined`
+- * means "don't filter on assignee at all", which is a different query.
++ * The vocabulary — status groups, `me`, `none`, the two `due_before` forms and
++ * the `archived` tokens — lives in `@/lib/issue-filters`; this file only maps
++ * it onto query parameters.
+  */
+-import type { LabelId, ProjectId, IsoTimestamp, UserId } from "@/types/common";
++import {
++  ARCHIVED_INCLUDE_TOKEN,
++  ARCHIVED_ONLY_TOKEN,
++  ME_TOKEN,
++  UNASSIGNED_TOKEN,
++  expandStatusFilter,
++  isStatusGroup,
++} from "@/lib/issue-filters";
++import type { LabelId, ProjectId, UserId } from "@/types/common";
+ import {
+   ISSUE_PRIORITIES,
+   ISSUE_STATUSES,
+   type IssueFilter,
+   type IssuePriority,
+   type IssueStatus,
++  type IssueStatusFilterValue,
++  type MeToken,
+ } from "@/types/issue";
+ 
+-export const UNASSIGNED_TOKEN = "none";
++export { ME_TOKEN, UNASSIGNED_TOKEN };
+ 
+ export interface ReadableParams {
+   get(name: string): string | null;
+@@ -30,10 +41,18 @@
+     .filter((part) => part.length > 0);
+ }
+ 
++function isStatusValue(value: string): value is IssueStatusFilterValue {
++  return ISSUE_STATUSES.includes(value as IssueStatus) || isStatusGroup(value);
++}
++
++/** `me` passes through for the service to resolve; anything else is an id. */
++function userToken(raw: string): UserId | MeToken {
++  return raw === ME_TOKEN ? ME_TOKEN : (raw as UserId);
++}
++
+ export function parseIssueFilterParams(params: ReadableParams): IssueFilter {
+-  const statuses = splitList(params.get("status")).filter(
+-    (value): value is IssueStatus =>
+-      ISSUE_STATUSES.includes(value as IssueStatus),
++  const statuses = expandStatusFilter(
++    splitList(params.get("status")).filter(isStatusValue),
+   );
+   const priorities = splitList(params.get("priority")).filter(
+     (value): value is IssuePriority =>
+@@ -45,6 +64,7 @@
+   const author = params.get("author");
+   const query = params.get("q");
+   const dueBefore = params.get("due_before");
++  const archived = params.get("archived");
+ 
+   const filter: IssueFilter = {
+     ...(project !== null ? { projectId: project as ProjectId } : {}),
+@@ -53,14 +73,15 @@
+     ...(assignee !== null
+       ? {
+           assigneeId:
+-            assignee === UNASSIGNED_TOKEN ? null : (assignee as UserId),
++            assignee === UNASSIGNED_TOKEN ? null : userToken(assignee),
+         }
+       : {}),
+-    ...(author !== null ? { authorId: author as UserId } : {}),
++    ...(author !== null ? { authorId: userToken(author) } : {}),
+     ...(labelIds.length > 0 ? { labelIds } : {}),
+     ...(query !== null && query.length > 0 ? { query } : {}),
+-    ...(dueBefore !== null ? { dueBefore: dueBefore as IsoTimestamp } : {}),
+-    ...(params.get("archived") === "1" ? { includeArchived: true } : {}),
++    ...(dueBefore !== null && dueBefore.length > 0 ? { dueBefore } : {}),
++    ...(archived === ARCHIVED_INCLUDE_TOKEN ? { includeArchived: true } : {}),
++    ...(archived === ARCHIVED_ONLY_TOKEN ? { archivedOnly: true } : {}),
+   };
+ 
+   return filter;
+@@ -90,7 +111,8 @@
+     params.q = filter.query;
+   }
+   if (filter.dueBefore !== undefined) params.due_before = filter.dueBefore;
+-  if (filter.includeArchived === true) params.archived = "1";
++  if (filter.archivedOnly === true) params.archived = ARCHIVED_ONLY_TOKEN;
++  else if (filter.includeArchived === true) params.archived = ARCHIVED_INCLUDE_TOKEN;
+   return params;
+ }
+ 
+diff --git a/src/lib/issue-filters.ts b/src/lib/issue-filters.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/issue-filters.ts
+@@ -0,0 +1,74 @@
++/**
++ * The issue list filter vocabulary (ADR 0009), shared by the URL codec, the
++ * filter schema, the service and the repository so the four never drift.
++ *
++ * Status groups, the `me` token for the acting user, the `none` token for
++ * "unassigned", the two forms of `due_before` and the `archived` tokens are
++ * all defined here and nowhere else.
++ */
++import type { IsoTimestamp } from "@/types/common";
++import { toIsoTimestamp } from "@/types/common";
++import {
++  ISSUE_STATUS_GROUPS,
++  type IssueStatus,
++  type IssueStatusFilterValue,
++  type IssueStatusGroup,
++} from "@/types/issue";
++
++/** `assignee=me` / `author=me`: the signed-in user, resolved by the service. */
++export const ME_TOKEN = "me";
++
++/** `assignee=none`: the sanctioned spelling of "unassigned". */
++export const UNASSIGNED_TOKEN = "none";
++
++/** `archived=1` mixes archived issues in; `archived=only` lists only them. */
++export const ARCHIVED_INCLUDE_TOKEN = "1";
++export const ARCHIVED_ONLY_TOKEN = "only";
++
++export function isStatusGroup(value: string): value is IssueStatusGroup {
++  return Object.prototype.hasOwnProperty.call(ISSUE_STATUS_GROUPS, value);
++}
++
++/**
++ * Expands `open` / `closed` into their member statuses, in first-appearance
++ * order and without duplicates. Plain statuses pass through unchanged.
++ */
++export function expandStatusFilter(
++  values: readonly IssueStatusFilterValue[],
++): readonly IssueStatus[] {
++  const seen = new Set<IssueStatus>();
++  const out: IssueStatus[] = [];
++  for (const value of values) {
++    const members = isStatusGroup(value) ? ISSUE_STATUS_GROUPS[value] : [value];
++    for (const status of members) {
++      if (seen.has(status)) continue;
++      seen.add(status);
++      out.push(status);
++    }
++  }
++  return out;
++}
++
++/** `YYYY-MM-DD`, the calendar-date form of `due_before`. */
++export const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
++
++export function isDateOnly(value: string): boolean {
++  return DATE_ONLY_PATTERN.test(value);
++}
++
++/**
++ * The comparison `due_before` turns into (ADR 0009 §5): a calendar date is
++ * the whole UTC day, inclusive; a full timestamp is strictly before.
++ */
++export function dueBeforeBound(value: string): {
++  readonly bound: IsoTimestamp;
++  readonly inclusive: boolean;
++} {
++  if (isDateOnly(value)) {
++    return {
++      bound: toIsoTimestamp(new Date(`${value}T23:59:59.999Z`)),
++      inclusive: true,
++    };
++  }
++  return { bound: toIsoTimestamp(new Date(value)), inclusive: false };
++}
+diff --git a/src/schemas/issue.ts b/src/schemas/issue.ts
+--- a/src/schemas/issue.ts
++++ b/src/schemas/issue.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { DATE_ONLY_PATTERN, ME_TOKEN } from "@/lib/issue-filters";
+ import type { IssuePriority, IssueStatus } from "@/types/issue";
+ import {
+   archiveScopeSchema,
+@@ -70,17 +71,33 @@
+   issueId: issueIdSchema,
+ });
+ 
++/** A status or one of the groups `open` / `closed` (ADR 0009 §3). */
++export const issueStatusFilterValueSchema = z.union([
++  issueStatusSchema,
++  z.enum(["open", "closed"]),
++]);
++
++/** A user id or `me`, the acting user (ADR 0009 §2). */
++export const userOrMeSchema = z.union([userIdSchema, z.literal(ME_TOKEN)]);
++
++/** `YYYY-MM-DD` (the whole UTC day, inclusive) or a timestamp (strictly before). */
++export const dueBeforeSchema = z.union([
++  z.string().regex(DATE_ONLY_PATTERN, "use YYYY-MM-DD or an ISO-8601 timestamp"),
++  isoTimestampSchema,
++]);
++
+ export const issueFilterSchema = z
+   .object({
+     orgId: orgIdSchema,
+     projectId: projectIdSchema.optional(),
+-    status: z.array(issueStatusSchema).optional(),
++    status: z.array(issueStatusFilterValueSchema).optional(),
+     priority: z.array(issuePrioritySchema).optional(),
+-    assigneeId: userIdSchema.nullable().optional(),
+-    authorId: userIdSchema.optional(),
++    assigneeId: userOrMeSchema.nullable().optional(),
++    authorId: userOrMeSchema.optional(),
+     labelIds: z.array(labelIdSchema).optional(),
+     query: z.string().max(200).optional(),
+-    dueBefore: isoTimestampSchema.optional(),
++    dueBefore: dueBeforeSchema.optional(),
++    archivedOnly: z.boolean().optional(),
+   })
+   .extend(pageRequestSchema.shape)
+   .extend(archiveScopeSchema.shape);
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -13,10 +13,12 @@
+   isNull,
+   like,
+   lt,
++  lte,
+   or,
+   sql,
+ } from "drizzle-orm";
+ import { newId } from "@/lib/id";
++import { dueBeforeBound, expandStatusFilter } from "@/lib/issue-filters";
+ import {
+   archivePatch,
+   restorePatch,
+@@ -89,38 +91,54 @@
+   return row ? toIssue(row) : null;
+ }
+ 
+-/** Builds the shared predicate list behind `listIssues` and its count. */
++/** `due_before` as a predicate: inclusive for a calendar date, strict otherwise. */
++function dueBeforePredicate(value: string): SQL {
++  const { bound, inclusive } = dueBeforeBound(value);
++  return inclusive ? lte(issues.dueAt, bound) : lt(issues.dueAt, bound);
++}
++
++/**
++ * Builds the shared predicate list behind `listIssues` and its count, from
++ * the one vocabulary of ADR 0009: status groups expand, `null` assignee means
++ * unassigned, labels are all-of, `archivedOnly` lists only archived rows.
++ */
+ function issueFilters(input: IssueFilterInput): readonly SQL[] {
+-  const scope: ArchiveScope = shouldFilterArchived(input)
+-    ? {}
+-    : { includeArchived: true };
++  const scope: ArchiveScope =
++    shouldFilterArchived(input) && input.archivedOnly !== true
++      ? {}
++      : { includeArchived: true };
++
++  const statuses =
++    input.status === undefined ? [] : expandStatusFilter(input.status);
++  const labelIds = [...new Set(input.labelIds ?? [])];
+ 
+   return compact(
+     orgPredicate(issues.orgId, input.orgId),
+     livePredicate(issues.archivedAt, scope),
++    input.archivedOnly === true ? isNotNull(issues.archivedAt) : undefined,
+     input.projectId === undefined
+       ? undefined
+       : eq(issues.projectId, input.projectId),
+-    input.status === undefined || input.status.length === 0
+-      ? undefined
+-      : inArray(issues.status, [...input.status]),
++    statuses.length === 0 ? undefined : inArray(issues.status, [...statuses]),
+     input.priority === undefined || input.priority.length === 0
+       ? undefined
+       : inArray(issues.priority, [...input.priority]),
+-    // `null` and `undefined` both arrive from the "Anyone" option of the
+-    // filter bar, so neither narrows the list.
+-    input.assigneeId ? eq(issues.assigneeId, input.assigneeId) : undefined,
++    input.assigneeId === undefined
++      ? undefined
++      : input.assigneeId === null
++        ? isNull(issues.assigneeId)
++        : eq(issues.assigneeId, input.assigneeId),
+     input.authorId === undefined
+       ? undefined
+       : eq(issues.authorId, input.authorId),
+-    input.dueBefore === undefined ? undefined : lt(issues.dueAt, input.dueBefore),
++    input.dueBefore === undefined ? undefined : dueBeforePredicate(input.dueBefore),
+     input.query === undefined
+       ? undefined
+       : or(
+           like(issues.title, `%${input.query}%`),
+           like(issues.description, `%${input.query}%`),
+         ),
+-    input.labelIds === undefined || input.labelIds.length === 0
++    labelIds.length === 0
+       ? undefined
+       : inArray(
+           issues.id,
+@@ -130,9 +148,11 @@
+             .where(
+               and(
+                 orgPredicate(issueLabels.orgId, input.orgId),
+-                inArray(issueLabels.labelId, [...input.labelIds]),
++                inArray(issueLabels.labelId, labelIds),
+               ),
+-            ),
++            )
++            .groupBy(issueLabels.issueId)
++            .having(sql`count(distinct ${issueLabels.labelId}) = ${labelIds.length}`),
+         ),
+   );
+ }
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -5,6 +5,7 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
++import { ME_TOKEN } from "@/lib/issue-filters";
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -262,7 +263,20 @@
+   // A cross-project list is an org-wide read; per-project visibility is
+   // enforced when the caller opens an individual issue.
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+-  return issueRepo.listIssues(input);
++  return issueRepo.listIssues(resolveMeTokens(actor, input));
++}
++
++/**
++ * `assignee=me` / `author=me` name the acting user (ADR 0009 §2). The token
++ * travels through the codec and the schema unchanged and is resolved here,
++ * so every entry point gets the same answer.
++ */
++function resolveMeTokens(actor: Actor, input: IssueFilterInput): IssueFilterInput {
++  return {
++    ...input,
++    ...(input.assigneeId === ME_TOKEN ? { assigneeId: actor.userId } : {}),
++    ...(input.authorId === ME_TOKEN ? { authorId: actor.userId } : {}),
++  };
+ }
+ 
+ export async function getBoard(
+diff --git a/src/types/issue.ts b/src/types/issue.ts
+--- a/src/types/issue.ts
++++ b/src/types/issue.ts
+@@ -29,6 +29,25 @@
+ 
+ /** Statuses that count as closed for stats, digests and overdue checks. */
+ export const CLOSED_ISSUE_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++
++/** Every status that is not closed. */
++export const OPEN_ISSUE_STATUSES: readonly IssueStatus[] = ISSUE_STATUSES.filter(
++  (status) => !CLOSED_ISSUE_STATUSES.includes(status),
++);
++
++/** The status groups a filter may name instead of listing statuses (ADR 0009). */
++export type IssueStatusGroup = "open" | "closed";
++
++export const ISSUE_STATUS_GROUPS: Readonly<Record<IssueStatusGroup, readonly IssueStatus[]>> = {
++  open: OPEN_ISSUE_STATUSES,
++  closed: CLOSED_ISSUE_STATUSES,
++};
++
++/** A value accepted in a status filter: a status or a group name. */
++export type IssueStatusFilterValue = IssueStatus | IssueStatusGroup;
++
++/** `me` in an assignee/author filter: the acting user, resolved by the service. */
++export type MeToken = "me";
+ 
+ export type IssuePriority = "none" | "low" | "medium" | "high" | "urgent";
+ 
+@@ -74,17 +93,26 @@
+   readonly uploadedBy: UserId;
+ }
+ 
+-/** Filter accepted by the issue repository, service layer and list UI alike. */
++/**
++ * Filter accepted by the issue repository, service layer and list UI alike
++ * (ADR 0009): one vocabulary for the URL codec, the schema and the repository.
++ */
+ export interface IssueFilter {
+   readonly projectId?: ProjectId;
+-  readonly status?: readonly IssueStatus[];
++  /** Statuses and/or the groups `open` / `closed`. */
++  readonly status?: readonly IssueStatusFilterValue[];
+   readonly priority?: readonly IssuePriority[];
+-  readonly assigneeId?: UserId | null;
+-  readonly authorId?: UserId;
++  /** A user, `null` for unassigned, or `me` for the acting user. */
++  readonly assigneeId?: UserId | MeToken | null;
++  readonly authorId?: UserId | MeToken;
++  /** All-of: an issue matches only when it carries every listed label. */
+   readonly labelIds?: readonly LabelId[];
+   readonly query?: string;
+-  readonly dueBefore?: IsoTimestamp;
++  /** `YYYY-MM-DD` (that whole UTC day or earlier) or a timestamp (strictly before). */
++  readonly dueBefore?: IsoTimestamp | string;
+   readonly includeArchived?: boolean;
++  /** Archived issues only. */
++  readonly archivedOnly?: boolean;
+ }
+ 
+ export interface IssueWithRelations {

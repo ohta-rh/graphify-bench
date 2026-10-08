@@ -1,0 +1,385 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -14,6 +14,7 @@
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+   "project.restored": "restored a project",
++  "project.cloned": "cloned a project",
+   "issue.created": "created an issue",
+   "issue.updated": "updated an issue",
+   "issue.status_changed": "changed status",
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -13,6 +13,7 @@
+   "project.updated",
+   "project.archived",
+   "project.restored",
++  "project.cloned",
+   "issue.created",
+   "issue.updated",
+   "issue.status_changed",
+diff --git a/src/schemas/project.ts b/src/schemas/project.ts
+--- a/src/schemas/project.ts
++++ b/src/schemas/project.ts
+@@ -43,6 +43,16 @@
+   archiveIssues: z.boolean().default(true),
+ });
+ 
++/** Clone a project, optionally with its live issues (ADR 0012). */
++export const cloneProjectSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  name: z.string().min(2).max(80),
++  slug: slugSchema,
++  key: projectKeySchema,
++  includeIssues: z.boolean().default(true),
++});
++
+ export const listProjectsSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -56,3 +66,4 @@
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
++export type CloneProjectInput = z.infer<typeof cloneProjectSchema>;
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -481,58 +481,36 @@
+ }
+ 
+ /**
+- * Copies a project's issues into another project, row for row, for the ops
+- * console's "duplicate project" action: status, assignee and number come
+- * along so the duplicate's board matches the original. Labels are copied too.
++ * Every live issue of one project, in number order, labels included. Not a
++ * page: the callers that need this (cloning) must see the whole project.
+  */
+-export async function copyIssuesToProject(
+-  orgId: OrgId,
+-  fromProjectId: ProjectId,
+-  toProjectId: ProjectId,
+-): Promise<number> {
+-  const db = getDb();
+-  const page = await listIssues({
++export async function listLiveIssuesForProject(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        ...compact(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.projectId, projectId),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      ),
++    )
++    .orderBy(issues.number)
++    .all();
++
++  const labels = await listLabelsForIssues(
+     orgId,
+-    projectId: fromProjectId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  const stamp = toIsoTimestamp(new Date());
+-  for (const issue of page.items) {
+-    const id = newId();
+-    db.insert(issues)
+-      .values({
+-        id,
+-        orgId,
+-        projectId: toProjectId,
+-        number: issue.number,
+-        title: issue.title,
+-        description: issue.description,
+-        status: issue.status,
+-        priority: issue.priority,
+-        authorId: issue.authorId,
+-        assigneeId: issue.assigneeId,
+-        parentId: null,
+-        estimate: issue.estimate,
+-        dueAt: issue.dueAt,
+-        startedAt: issue.startedAt,
+-        completedAt: issue.completedAt,
+-        createdAt: stamp,
+-        updatedAt: stamp,
+-      })
+-      .run();
+-
+-    if (issue.labelIds.length > 0) {
+-      db.insert(issueLabels)
+-        .values(
+-          issue.labelIds.map((labelId) => ({ orgId, issueId: id, labelId })),
+-        )
+-        .run();
+-    }
+-  }
+-
+-  return page.items.length;
++    rows.map((row) => row.id as IssueId),
++  );
++
++  return rows.map((row) =>
++    toIssue(row, (labels[row.id] ?? []).map((label) => label.id)),
++  );
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -205,43 +205,6 @@
+   return toProject(row);
+ }
+ 
+-/**
+- * Row-level duplicate used by the ops console's "duplicate project" action.
+- * Copies the project exactly as it is — status, dates, archive state — under
+- * the new name, slug and key; the console renumbers nothing.
+- */
+-export async function duplicateProject(
+-  orgId: OrgId,
+-  projectId: ProjectId,
+-  name: string,
+-  slug: string,
+-  key: string,
+-): Promise<Project> {
+-  const source = getDb()
+-    .select()
+-    .from(projects)
+-    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId)))
+-    .get();
+-  if (!source) throw new Error(`Project ${projectId} not found`);
+-
+-  const stamp = toIsoTimestamp(new Date());
+-  const row = getDb()
+-    .insert(projects)
+-    .values({
+-      ...source,
+-      id: newId(),
+-      name,
+-      slug,
+-      key,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
+-
+-  return toProject(row);
+-}
+-
+ /** Includes archived slugs — a restored project must not collide. */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -166,6 +166,19 @@
+         summary: `Archived project with ${payload.issuesArchived} issues`,
+       }).then(() => undefined),
+     ),
++    subscribe("project.cloned", (payload) =>
++      record(payload.orgId, "project.cloned", {
++        actorId: payload.actorId,
++        subjectKind: "project",
++        subjectId: payload.projectId,
++        projectId: payload.projectId,
++        summary: `Cloned a project with ${payload.issuesCopied} issues`,
++        metadata: {
++          sourceProjectId: payload.sourceProjectId,
++          issuesCopied: payload.issuesCopied,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("issue.created", (payload) =>
+       record(payload.orgId, "issue.created", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -12,29 +12,32 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import { ISSUE_STATUSES } from "@/types/issue";
+ import {
+   actorEnvelope,
+   orgResource,
+   projectResource,
+   requireFound,
+ } from "./_support";
++import { indexIssue, indexProject } from "./search-service";
++import { recomputeUsage } from "./usage-service";
+ import type {
+   ArchiveProjectInput,
++  CloneProjectInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
++import type { Issue, IssueStatus } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ import type { Project, ProjectWithStats } from "@/types/project";
+ 
+ /**
+  * Creates a project once the plan still has room for one. The key is derived
+  * from the name when the caller left it blank, so the issue numbering scheme
+- * (`TF-12`) is never invented at the call site.
+- *
+- * The ops console duplicates a project with `projectRepo.duplicateProject`
+- * plus `issueRepo.copyIssuesToProject`; those bypass the gates below.
++ * (`TF-12`) is never invented at the call site. Cloning a project goes
++ * through `cloneProject`, which applies the same gates to the whole batch.
+  */
+ export async function createProject(
+   actor: Actor,
+@@ -74,6 +77,111 @@
+   return project;
+ }
+ 
++/**
++ * Clones a project (ADR 0012): a new project with the chosen name, slug and
++ * key, the source's description, visibility, colour and lead, and — when asked
++ * — a fresh-start copy of every live issue, numbered from 1 in source order.
++ * Gated like a creation, as a batch: nothing is written unless the project
++ * quota and the per-project issue quota admit the whole clone. One
++ * `project.cloned` is published; the clone is indexed and metered directly.
++ */
++export async function cloneProject(
++  actor: Actor,
++  input: CloneProjectInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const source = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:read", projectResource(source));
++  assertCan(actor, "project:create", orgResource(input.orgId));
++  assertNotArchived("Project", source.id, source);
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++
++  const usedProjects = await projectRepo.countProjects(input.orgId);
++  if (wouldExceedLimit(org.plan, "projects", usedProjects)) {
++    throw new Error(
++      `Plan ${org.plan} allows ${usedProjects} projects; upgrade to add another`,
++    );
++  }
++
++  const originals: readonly Issue[] = input.includeIssues
++    ? await issueRepo.listLiveIssuesForProject(input.orgId, source.id)
++    : [];
++  if (
++    originals.length > 0 &&
++    wouldExceedLimit(org.plan, "issuesPerProject", 0, originals.length)
++  ) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in project ${input.key}`,
++    );
++  }
++
++  const slug = await suggestProjectSlug(input.orgId, input.slug);
++  const project = await projectRepo.insertProject({
++    orgId: input.orgId,
++    name: input.name,
++    slug,
++    key: input.key,
++    description: source.description,
++    visibility: source.visibility,
++    leadId: source.leadId,
++    color: source.color,
++    targetDate: null,
++  });
++
++  const status = defaultIssueStatusOf(org.settings.defaultIssueStatus);
++  const copies: Issue[] = [];
++  for (const original of originals) {
++    const copy = await issueRepo.insertIssue(
++      {
++        orgId: input.orgId,
++        projectId: project.id,
++        title: original.title,
++        description: original.description,
++        status,
++        priority: original.priority,
++        assigneeId: null,
++        parentId: null,
++        estimate: original.estimate,
++        dueAt: original.dueAt,
++        labelIds: [...original.labelIds],
++      },
++      actor.userId,
++      copies.length + 1,
++    );
++    copies.push(copy);
++  }
++
++  // No per-issue announcements for a batch (ADR 0012 §6): index and meter
++  // the clone directly instead of through the event listeners.
++  await indexProject(input.orgId, project);
++  for (const copy of copies) await indexIssue(input.orgId, copy);
++  await recomputeUsage(input.orgId);
++
++  await emit("project.cloned", {
++    ...actorEnvelope(actor),
++    projectId: project.id,
++    sourceProjectId: source.id,
++    issuesCopied: copies.length,
++  });
++
++  return project;
++}
++
++/** The workspace setting is stored as text; fall back to the schema default. */
++function defaultIssueStatusOf(value: string): IssueStatus {
++  return ISSUE_STATUSES.includes(value as IssueStatus) ? (value as IssueStatus) : "backlog";
++}
++
+ export async function updateProject(
+   actor: Actor,
+   input: UpdateProjectInput,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -14,6 +14,7 @@
+   | "project.updated"
+   | "project.archived"
+   | "project.restored"
++  | "project.cloned"
+   | "issue.created"
+   | "issue.updated"
+   | "issue.status_changed"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -36,6 +36,11 @@
+     issuesArchived: number;
+   };
+   "project.restored": EventEnvelope & { projectId: ProjectId };
++  "project.cloned": EventEnvelope & {
++    projectId: ProjectId;
++    sourceProjectId: ProjectId;
++    issuesCopied: number;
++  };
+   "issue.created": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;

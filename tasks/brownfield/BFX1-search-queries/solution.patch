@@ -1,0 +1,496 @@
+diff --git a/src/actions/search/search.ts b/src/actions/search/search.ts
+--- a/src/actions/search/search.ts
++++ b/src/actions/search/search.ts
+@@ -4,9 +4,9 @@
+  * Search Server Action used by the command palette and the search page.
+  *
+  * Owner D. Searching across comments as well as issues is an `advanced_search`
+- * capability. The service narrows the requested kinds when the flag is off, so
+- * this action passes the request straight through and the palette degrades
+- * instead of erroring.
++ * capability. The service is the gate (ADR 0007): it parses the query and
++ * narrows the requested kinds when the flag is off, so this action passes the
++ * request straight through and the palette degrades instead of erroring.
+  *
+  * Must call (do not reimplement): searchQuerySchema, can, getActor,
+  * toActionResult
+diff --git a/src/app/api/search/route.ts b/src/app/api/search/route.ts
+--- a/src/app/api/search/route.ts
++++ b/src/app/api/search/route.ts
+@@ -3,8 +3,9 @@
+  *
+  * Owner D. The palette hits this route rather than the Server Action because it
+  * fires on every keystroke and wants a plain cancellable fetch. Like
+- * `searchAction` it asks for every kind and leaves the plan gating to the
+- * service, so neither entry point can be the lenient one.
++ * `searchAction` it asks for every kind and leaves the query language and the
++ * plan gating to the service (ADR 0007), so neither entry point can be the
++ * lenient one.
+  *
+  * Must call (do not reimplement): can, isEnabled
+  */
+diff --git a/src/components/domain/search/query-syntax.ts b/src/components/domain/search/query-syntax.ts
+--- a/src/components/domain/search/query-syntax.ts
++++ b/src/components/domain/search/query-syntax.ts
+@@ -1,91 +1,13 @@
+ /**
+- * The `advanced_search` query language.
++ * The `advanced_search` query language, as the dialog sees it.
+  *
+- * A plain query is just terms. With the flag on, `kind:` and `project:`
+- * prefixes narrow the search before it reaches the index, which is why the
+- * parser lives on the client too: the dialog has to show the user what it
+- * understood before it spends a round trip.
++ * The parser itself lives in `@/lib/search-query` and is shared with the
++ * search service (ADR 0007): the dialog shows what it understood before it
++ * spends a round trip, and the server searches exactly that.
+  */
+-import type { ProjectId } from "@/types/common";
+-
+-export type SearchSubjectKind = "issue" | "comment" | "project";
+-
+-const KINDS: readonly SearchSubjectKind[] = ["issue", "comment", "project"];
+-
+-export interface ParsedSearchQuery {
+-  /** The free-text remainder, with every recognised token removed. */
+-  readonly text: string;
+-  readonly kinds: readonly SearchSubjectKind[];
+-  readonly projectId: ProjectId | null;
+-  /** Tokens that looked like syntax but named nothing we know. */
+-  readonly unknownTokens: readonly string[];
+-}
+-
+-export const DEFAULT_SEARCH_KINDS: readonly SearchSubjectKind[] = ["issue"];
+-
+-/**
+- * @param raw      what the user typed
+- * @param advanced whether the `advanced_search` flag is on for this org; when
+- *                 false the whole string is treated as free text so a colon in
+- *                 a title still finds the title.
+- */
+-export function parseSearchQuery(
+-  raw: string,
+-  advanced: boolean,
+-): ParsedSearchQuery {
+-  if (!advanced) {
+-    return {
+-      text: raw.trim(),
+-      kinds: DEFAULT_SEARCH_KINDS,
+-      projectId: null,
+-      unknownTokens: [],
+-    };
+-  }
+-
+-  const terms: string[] = [];
+-  const kinds: SearchSubjectKind[] = [];
+-  const unknown: string[] = [];
+-  let projectId: ProjectId | null = null;
+-
+-  for (const token of raw.split(/\s+/).filter((part) => part.length > 0)) {
+-    const separator = token.indexOf(":");
+-    if (separator <= 0) {
+-      terms.push(token);
+-      continue;
+-    }
+-
+-    const field = token.slice(0, separator).toLowerCase();
+-    const value = token.slice(separator + 1);
+-    if (value.length === 0) {
+-      unknown.push(token);
+-      continue;
+-    }
+-
+-    if (field === "kind" || field === "in") {
+-      const kind = value.toLowerCase().replace(/s$/, "") as SearchSubjectKind;
+-      if (KINDS.includes(kind)) kinds.push(kind);
+-      else unknown.push(token);
+-    } else if (field === "project") {
+-      projectId = value as ProjectId;
+-    } else {
+-      unknown.push(token);
+-    }
+-  }
+-
+-  return {
+-    text: terms.join(" "),
+-    kinds: kinds.length > 0 ? kinds : DEFAULT_SEARCH_KINDS,
+-    projectId,
+-    unknownTokens: unknown,
+-  };
+-}
+-
+-/** A one-line explanation of what the parser understood, for the dialog. */
+-export function describeQuery(parsed: ParsedSearchQuery): string {
+-  const parts = [`searching ${parsed.kinds.join(", ")}`];
+-  if (parsed.projectId !== null) parts.push(`in project ${parsed.projectId}`);
+-  if (parsed.unknownTokens.length > 0) {
+-    parts.push(`ignoring ${parsed.unknownTokens.join(", ")}`);
+-  }
+-  return parts.join(" · ");
+-}
++export {
++  DEFAULT_SEARCH_KINDS,
++  describeQuery,
++  parseSearchQuery,
++} from "@/lib/search-query";
++export type { ParsedSearchQuery, SearchSubjectKind } from "@/lib/search-query";
+diff --git a/src/lib/search-query.ts b/src/lib/search-query.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/search-query.ts
+@@ -0,0 +1,112 @@
++/**
++ * The search query language, shared verbatim by the dialog and the service.
++ *
++ * ADR 0007: the dialog's hint line and the server's execution must come from
++ * one parser, matching is a literal substring, and field tokens exist only
++ * for workspaces that have `advanced_search`.
++ */
++import type { ProjectId } from "@/types/common";
++
++export type SearchSubjectKind = "issue" | "comment" | "project";
++
++export const SEARCH_SUBJECT_KINDS: readonly SearchSubjectKind[] = [
++  "issue",
++  "comment",
++  "project",
++];
++
++export const DEFAULT_SEARCH_KINDS: readonly SearchSubjectKind[] = ["issue"];
++
++export interface ParsedSearchQuery {
++  /** The free-text remainder, with every recognised token removed. */
++  readonly text: string;
++  /** Kinds to search: the `kind:` tokens, or the default when there are none. */
++  readonly kinds: readonly SearchSubjectKind[];
++  /** The `kind:` / `in:` tokens exactly as given — empty when the query named none. */
++  readonly kindTokens: readonly SearchSubjectKind[];
++  readonly projectId: ProjectId | null;
++  /** Tokens that looked like syntax but named nothing we know. */
++  readonly unknownTokens: readonly string[];
++}
++
++/**
++ * @param raw      what the user typed
++ * @param advanced whether the `advanced_search` flag is on for this org; when
++ *                 false the whole string is free text, so a colon in a title
++ *                 still finds the title and nothing is ever refused.
++ */
++export function parseSearchQuery(
++  raw: string,
++  advanced: boolean,
++): ParsedSearchQuery {
++  if (!advanced) {
++    return {
++      text: raw.trim(),
++      kinds: DEFAULT_SEARCH_KINDS,
++      kindTokens: [],
++      projectId: null,
++      unknownTokens: [],
++    };
++  }
++
++  const terms: string[] = [];
++  const kinds: SearchSubjectKind[] = [];
++  const unknown: string[] = [];
++  let projectId: ProjectId | null = null;
++
++  for (const token of raw.split(/\s+/).filter((part) => part.length > 0)) {
++    const separator = token.indexOf(":");
++    if (separator <= 0) {
++      terms.push(token);
++      continue;
++    }
++
++    const field = token.slice(0, separator).toLowerCase();
++    const value = token.slice(separator + 1);
++    if (value.length === 0) {
++      unknown.push(token);
++      continue;
++    }
++
++    if (field === "kind" || field === "in") {
++      const kind = value.toLowerCase().replace(/s$/, "") as SearchSubjectKind;
++      if (SEARCH_SUBJECT_KINDS.includes(kind)) kinds.push(kind);
++      else unknown.push(token);
++    } else if (field === "project") {
++      projectId = value as ProjectId;
++    } else {
++      unknown.push(token);
++    }
++  }
++
++  return {
++    text: terms.join(" "),
++    kinds: kinds.length > 0 ? kinds : DEFAULT_SEARCH_KINDS,
++    kindTokens: kinds,
++    projectId,
++    unknownTokens: unknown,
++  };
++}
++
++/** A one-line explanation of what the parser understood, for the dialog. */
++export function describeQuery(parsed: ParsedSearchQuery): string {
++  const parts = [`searching ${parsed.kinds.join(", ")}`];
++  if (parsed.projectId !== null) parts.push(`in project ${parsed.projectId}`);
++  if (parsed.unknownTokens.length > 0) {
++    parts.push(`ignoring ${parsed.unknownTokens.join(", ")}`);
++  }
++  return parts.join(" · ");
++}
++
++/** The escape character the repository declares on its `LIKE … ESCAPE` clause. */
++export const LIKE_ESCAPE_CHAR = "\\";
++
++/**
++ * Turns free text into a `LIKE` pattern that matches it as a literal
++ * substring: `%`, `_` and the escape character itself are escaped, so a query
++ * such as `100%` finds `100%` and nothing else.
++ */
++export function likeContainsPattern(text: string): string {
++  const escaped = text.replace(/[\\%_]/g, (char) => `${LIKE_ESCAPE_CHAR}${char}`);
++  return `%${escaped}%`;
++}
+diff --git a/src/schemas/search.ts b/src/schemas/search.ts
+--- a/src/schemas/search.ts
++++ b/src/schemas/search.ts
+@@ -1,7 +1,12 @@
+ import { z } from "zod";
++import { SEARCH_SUBJECT_KINDS } from "@/lib/search-query";
++import type { SearchSubjectKind } from "@/lib/search-query";
+ import { orgIdSchema, pageRequestSchema, projectIdSchema } from "./common";
+ 
+-export const searchSubjectKindSchema = z.enum(["issue", "comment", "project"]);
++/** The kinds the index knows, declared once in `@/lib/search-query`. */
++export const searchSubjectKindSchema = z.enum(
++  SEARCH_SUBJECT_KINDS as [SearchSubjectKind, ...SearchSubjectKind[]],
++);
+ 
+ export const searchQuerySchema = z
+   .object({
+diff --git a/src/server/repositories/index.ts b/src/server/repositories/index.ts
+--- a/src/server/repositories/index.ts
++++ b/src/server/repositories/index.ts
+@@ -33,4 +33,4 @@
+   livePredicate,
+   orgPredicate,
+ } from "./base-repository";
+-export type { SearchSubjectKind } from "./search-repository";
++export type { SearchSubjectKind } from "@/lib/search-query";
+diff --git a/src/server/repositories/search-repository.ts b/src/server/repositories/search-repository.ts
+--- a/src/server/repositories/search-repository.ts
++++ b/src/server/repositories/search-repository.ts
+@@ -1,13 +1,15 @@
+ /**
+  * Denormalised search index kept in step by `SearchService`.
+  */
+-import { and, count, desc, eq, inArray, like } from "drizzle-orm";
++import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
++import { LIKE_ESCAPE_CHAR, likeContainsPattern } from "@/lib/search-query";
+ import { getDb, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import type { SearchQueryInput } from "@/schemas/search";
++import type { SearchSubjectKind } from "@/lib/search-query";
+ import type { SearchIndexRow } from "@/server/db/schema/webhooks";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
+ 
+@@ -78,7 +80,9 @@
+ /**
+  * Substring match over the denormalised content column. Deliberately simple —
+  * the index is a convenience layer, not a search engine, and the tenant filter
+- * is what actually matters here.
++ * is what actually matters here. The text is matched literally: `%`, `_` and
++ * the escape character are escaped (ADR 0007 §1), so they never act as
++ * wildcards.
+  */
+ export async function searchDocuments(
+   input: SearchQueryInput,
+@@ -88,7 +92,7 @@
+ 
+   const filters = compact(
+     orgPredicate(searchIndex.orgId, input.orgId),
+-    like(searchIndex.content, `%${input.q}%`),
++    sql`${searchIndex.content} LIKE ${likeContainsPattern(input.q)} ESCAPE ${LIKE_ESCAPE_CHAR}`,
+     input.kinds.length === 0
+       ? undefined
+       : inArray(searchIndex.subjectKind, [...input.kinds]),
+@@ -130,4 +134,4 @@
+   return row?.value ?? 0;
+ }
+ 
+-export type SearchSubjectKind = 'issue' | 'comment' | 'project';
++export type { SearchSubjectKind } from "@/lib/search-query";
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { consumeRateLimit } from "@/lib/rate-limit";
++import { parseSearchQuery } from "@/lib/search-query";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+@@ -14,10 +15,10 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+ import { orgResource } from "./_support";
++import type { SearchSubjectKind } from "@/lib/search-query";
+ import type { SearchQueryInput } from "@/schemas/search";
+-import type { SearchSubjectKind } from "@/server/repositories/search-repository";
+ import type { Comment } from "@/types/comment";
+-import type { OrgId, Page } from "@/types/common";
++import type { CommentId, IssueId, OrgId, Page, ProjectId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
+ import type { Issue } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -38,10 +39,14 @@
+ const SEARCH_QUERY_BUCKET = "search:query";
+ 
+ /**
+- * Runs a query against the denormalised index. Field-scoped syntax
+- * (`status:done`) is an `advanced_search` feature, so a query containing a
+- * colon is rejected for plans that do not include it rather than silently
+- * being treated as literal text.
++ * Runs a query against the denormalised index (ADR 0007).
++ *
++ * The query is parsed by the same parser the dialog uses. Field tokens
++ * (`kind:` / `in:`, `project:`) exist only for workspaces with
++ * `advanced_search`; without the flag the whole string is free text and only
++ * issues are searched, whatever kinds the caller asked for. Free text is
++ * matched literally — the repository escapes it — so a colon or a `%` in a
++ * title is found as typed and nothing is ever refused for its syntax.
+  */
+ export async function search(
+   actor: Actor,
+@@ -66,34 +71,34 @@
+     overrides: org?.settings.enabledFlagOverrides,
+   });
+ 
+-  if (input.q.includes(":") && !advanced) {
+-    throw new Error("Field-scoped search is not included in this plan");
+-  }
+-
+-  const text = normaliseQuery(input.q);
+-  const page = await searchRepo.searchDocuments({ ...input, q: text });
++  const parsed = parseSearchQuery(input.q, advanced);
++
++  const kinds: readonly SearchSubjectKind[] = !advanced
++    ? ["issue"]
++    : parsed.kindTokens.length > 0
++      ? parsed.kindTokens
++      : input.kinds;
++
++  const projectId = parsed.projectId ?? input.projectId;
++
++  const page = await searchRepo.searchDocuments({
++    ...input,
++    q: parsed.text,
++    kinds: [...new Set(kinds)],
++    ...(projectId === undefined ? {} : { projectId }),
++  });
+ 
+   return {
+     items: page.items.map((row) => ({
+       kind: row.subjectKind,
+       id: row.subjectId,
+       title: row.content.split("\n")[0] ?? row.subjectId,
+-      snippet: snippetAround(row.content, text),
++      snippet: snippetAround(row.content, parsed.text),
+       href: hrefFor(row.subjectKind, row.subjectId),
+     })),
+     nextCursor: page.nextCursor,
+     total: page.total,
+   };
+-}
+-
+-/**
+- * Strips the field tokens the dialog has already applied (`kind:`, `in:`,
+- * `project:`), so the index only ever sees the free text. The dialog's parser
+- * in `components/domain/search/query-syntax.ts` is the reference for what a
+- * token looks like.
+- */
+-function normaliseQuery(raw: string): string {
+-  return raw.trim().replace(/\s+/g, " ");
+ }
+ 
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
+@@ -106,16 +111,23 @@
+   );
+ }
+ 
++/**
++ * A comment is indexed under its issue's project (ADR 0007 §6), so
++ * project-scoped searches find it. Resolved here, on every path that writes a
++ * comment document — the write-time listeners, the rebuild job and reindex
++ * requests all come through this function.
++ */
+ export async function indexComment(
+   orgId: OrgId,
+   comment: Comment,
+ ): Promise<void> {
++  const issue = await issueRepo.findIssueById(orgId, comment.issueId);
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    issue?.projectId ?? null,
+   );
+ }
+ 
+@@ -179,18 +191,44 @@
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+-      if (payload.subjectKind !== "issue") return;
+-      const issue = await issueRepo.findIssueById(
+-        payload.orgId,
+-        payload.subjectId as Issue["id"],
+-      );
+-      if (issue) await indexIssue(payload.orgId, issue);
++      await reindexSubject(payload.orgId, payload.subjectKind, payload.subjectId);
+     }),
+   ];
+ 
+   return () => {
+     for (const off of offs) off();
+   };
++}
++
++/**
++ * Re-indexes one subject of any kind (ADR 0007 §7). A subject that no longer
++ * exists, or is archived, is dropped from the index rather than re-written.
++ */
++async function reindexSubject(
++  orgId: OrgId,
++  subjectKind: SearchSubjectKind,
++  subjectId: string,
++): Promise<void> {
++  switch (subjectKind) {
++    case "issue": {
++      const issue = await issueRepo.findIssueById(orgId, subjectId as IssueId);
++      if (issue && issue.archivedAt === null) await indexIssue(orgId, issue);
++      else await removeFromIndex(orgId, "issue", subjectId);
++      return;
++    }
++    case "comment": {
++      const comment = await commentRepo.findCommentById(orgId, subjectId as CommentId);
++      if (comment && comment.archivedAt === null) await indexComment(orgId, comment);
++      else await removeFromIndex(orgId, "comment", subjectId);
++      return;
++    }
++    case "project": {
++      const project = await projectRepo.findProjectById(orgId, subjectId as ProjectId);
++      if (project && project.archivedAt === null) await indexProject(orgId, project);
++      else await removeFromIndex(orgId, "project", subjectId);
++      return;
++    }
++  }
+ }
+ 
+ function hrefFor(kind: SearchSubjectKind, subjectId: string): string {

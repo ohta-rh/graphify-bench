@@ -1,0 +1,276 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,17 @@
++# Documentation
++
++Taskflow keeps three kinds of document under `docs/`. They do not carry equal weight.
++
++| Folder | What it is | Weight |
++|---|---|---|
++| `docs/adr/` | Architecture Decision Records: numbered, dated, reviewed. | **Authoritative.** |
++| `docs/product/` | Product notes written before or alongside a feature: intent, examples, wording. | Context only. |
++| `docs/support/` | Runbooks and support macros: what people observed. | Describes behaviour, never specifies it. |
++
++## Precedence
++
++1. An ADR is the specification for every question it addresses. The highest-numbered ADR that addresses a question is the one that applies; a later ADR supersedes an earlier one only where it says so.
++2. Where a product note and an ADR disagree, the ADR wins. A product note that predates an ADR on the same subject is kept for history, not as a second opinion.
++3. Support notes record what was seen at the time. They are never evidence of intended behaviour.
++4. Code comments, `TODO`s and function names are not documentation. They are frequently stale.
++5. Where no document speaks, the current behaviour of the code is authoritative, and a new feature follows the conventions of its sibling features (same error classes, same guards, same events).
+diff --git a/docs/adr/0007-search-query-language.md b/docs/adr/0007-search-query-language.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adr/0007-search-query-language.md
+@@ -0,0 +1,55 @@
++# ADR 0007 — The search query language
++
++- Status: accepted
++- Date: 2026-02-18
++- Supersedes: the "Search" section of `docs/product/search-notes.md` where the two disagree.
++
++## Context
++
++Workspace search is a substring index (`search_index`) maintained on every write and queried by
++the command palette, the search page and the search API. The dialog grew a small query language
++(`kind:` / `in:` and `project:` prefixes) that the client parses to show a hint line. The server
++and the client have drifted on what a query means; this record fixes the meaning.
++
++## Decision
++
++1. **Matching is literal.** A query's free text is matched as a case-insensitive substring of the
++   indexed text. Every character the user typed is looked for as typed: `%`, `_`, `\` and `:`
++   are ordinary characters, never wildcards and never operators.
++
++2. **Field tokens exist only for workspaces that have `advanced_search`.** A token is a word of the
++   form `field:value` (no spaces around the colon, non-empty value):
++   - `kind:<issue|comment|project>` — also spelled `in:`; a trailing `s` is tolerated
++     (`in:comments`). Several `kind:` tokens accumulate. When at least one `kind:` token is
++     present it decides which kinds are searched, whatever the caller's `kinds` said.
++   - `project:<project id>` — restricts every kind to that project. It overrides the caller's
++     `projectId`.
++   - Any other `field:value` token, and a token whose value is empty (`kind:`), names nothing
++     Taskflow knows: it is dropped from the text and ignored.
++   What remains after the tokens are removed is the free text of rule 1.
++
++3. **Without `advanced_search` the whole query is free text.** A colon is just a character
++   (rule 1). A query is never refused for its syntax, on any plan.
++
++4. **Without `advanced_search` only issues are searched.** Whatever kinds the caller asks for,
++   the result and its `total` cover issues only. With the flag, the caller's kinds (or the
++   `kind:` tokens, rule 2) are honoured. `advanced_search` is evaluated like every other flag:
++   plan, then the workspace's overrides.
++
++5. **One parser.** The dialog's hint line and the server's query execution use the same parser,
++   so what the dialog says it understood is what the server searches.
++
++6. **Comments belong to their issue's project in the index.** A comment's search document carries
++   the project id of the issue it was posted on, so `project:` scoping (and the `projectId`
++   filter) finds comments as well as issues. This holds however the document gets written:
++   on creation, on edit, on a rebuild of the workspace index, and on a reindex request.
++
++7. **Reindex requests cover every kind.** A `search.reindex_requested` event for an issue, a
++   comment or a project re-indexes that subject (a subject that no longer exists or is
++   archived is left out of the index).
++
++## Consequences
++
++- The service is the gate. Entry points above it (the Server Action, the API route) pass the
++  query and the requested kinds through; they do not narrow or refuse anything themselves.
++- Searching `Release 2: hotfix` on a Starter workspace finds the issue with that title.
+diff --git a/docs/product/search-notes.md b/docs/product/search-notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/product/search-notes.md
+@@ -0,0 +1,32 @@
++# Search — product notes
++
++_Written for the search dialog launch (2025-11). Kept for history; see `docs/adr/0007-search-query-language.md` for the current rules._
++
++## What search does
++
++Search is a substring match over issue titles and descriptions, comment bodies and project
++names. Results are newest-indexed first. It is deliberately not a search engine.
++
++## Advanced search (Enterprise)
++
++Advanced search adds the query prefixes `kind:` (alias `in:`) and `project:`. The dialog shows a
++hint line ("searching comments · in project …") so people see what we understood before they
++hit enter.
++
++A colon anywhere in the query means the person is using field syntax. On plans without Advanced
++search we show "Field-scoped search is not included in this plan" rather than silently searching
++the literal text — it is the nudge to upgrade, and it stops people wondering why `kind:comment`
++found nothing.
++
++Unknown prefixes (`label:`, `status:` and so on) are shown in the hint line as ignored.
++
++## Scoping
++
++`project:` applies to issues. Comments are not tied to a project in the index, so a
++project-scoped search returns issues only; the comment results come back when the project
++scope is removed.
++
++## Kinds
++
++The palette asks for issues only unless Advanced search is on, in which case it asks for
++issues, comments and projects. The search page always asks for what the person ticked.
+diff --git a/src/actions/search/search.ts b/src/actions/search/search.ts
+--- a/src/actions/search/search.ts
++++ b/src/actions/search/search.ts
+@@ -4,20 +4,18 @@
+  * Search Server Action used by the command palette and the search page.
+  *
+  * Owner D. Searching across comments as well as issues is an `advanced_search`
+- * capability; when the flag is off the requested kinds are narrowed rather than
+- * rejected, so the palette degrades instead of erroring.
++ * capability. The service narrows the requested kinds when the flag is off, so
++ * this action passes the request straight through and the palette degrades
++ * instead of erroring.
+  *
+- * Must call (do not reimplement): searchQuerySchema, can, isEnabled, getActor,
++ * Must call (do not reimplement): searchQuerySchema, can, getActor,
+  * toActionResult
+  */
+ 
+ import { ForbiddenActionError } from "@/actions/_lib/action-errors";
+ import { withAction } from "@/actions/_lib/with-action";
+-import { isEnabled } from "@/lib/feature-flags";
+ import { can } from "@/lib/permissions";
+ import { searchQuerySchema, type SearchQueryInput } from "@/schemas/search";
+-import { buildFlagContext } from "@/server/services/feature-flag-service";
+-import { getOrganizationSummary } from "@/server/services/organization-service";
+ import { search, type SearchHit } from "@/server/services/search-service";
+ import type { ActionResult } from "@/types/api";
+ 
+@@ -30,14 +28,7 @@
+       throw new ForbiddenActionError("org:read");
+     }
+ 
+-    const { organization } = await getOrganizationSummary(actor, input.orgId);
+-    const context = buildFlagContext(actor, organization);
+-
+-    const kinds = isEnabled("advanced_search", context)
+-      ? input.kinds
+-      : input.kinds.filter((kind) => kind === "issue");
+-
+-    const page = await search(actor, { ...input, kinds });
++    const page = await search(actor, input);
+     return [...page.items];
+   },
+   { requireOrg: true },
+diff --git a/src/app/api/search/route.ts b/src/app/api/search/route.ts
+--- a/src/app/api/search/route.ts
++++ b/src/app/api/search/route.ts
+@@ -2,9 +2,9 @@
+  * JSON search endpoint used by the command palette.
+  *
+  * Owner D. The palette hits this route rather than the Server Action because it
+- * fires on every keystroke and wants a plain cancellable fetch; the gating is
+- * identical to `searchAction`, deliberately duplicated so neither entry point
+- * can be the lenient one.
++ * fires on every keystroke and wants a plain cancellable fetch. Like
++ * `searchAction` it asks for every kind and leaves the plan gating to the
++ * service, so neither entry point can be the lenient one.
+  *
+  * Must call (do not reimplement): can, isEnabled
+  */
+@@ -48,9 +48,7 @@
+     const parsed = searchQuerySchema.safeParse({
+       orgId: actor.orgId,
+       q,
+-      kinds: isEnabled("advanced_search", context)
+-        ? ["issue", "comment", "project"]
+-        : ["issue"],
++      kinds: ["issue", "comment", "project"],
+       limit: PALETTE_LIMIT,
+     });
+     if (!parsed.success) {
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -70,19 +70,30 @@
+     throw new Error("Field-scoped search is not included in this plan");
+   }
+ 
+-  const page = await searchRepo.searchDocuments(input);
++  const text = normaliseQuery(input.q);
++  const page = await searchRepo.searchDocuments({ ...input, q: text });
+ 
+   return {
+     items: page.items.map((row) => ({
+       kind: row.subjectKind,
+       id: row.subjectId,
+       title: row.content.split("\n")[0] ?? row.subjectId,
+-      snippet: snippetAround(row.content, input.q),
++      snippet: snippetAround(row.content, text),
+       href: hrefFor(row.subjectKind, row.subjectId),
+     })),
+     nextCursor: page.nextCursor,
+     total: page.total,
+   };
++}
++
++/**
++ * Strips the field tokens the dialog has already applied (`kind:`, `in:`,
++ * `project:`), so the index only ever sees the free text. The dialog's parser
++ * in `components/domain/search/query-syntax.ts` is the reference for what a
++ * token looks like.
++ */
++function normaliseQuery(raw: string): string {
++  return raw.trim().replace(/\s+/g, " ");
+ }
+ 
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
+diff --git a/tests/services/search-service.test.ts b/tests/services/search-service.test.ts
+--- a/tests/services/search-service.test.ts
++++ b/tests/services/search-service.test.ts
+@@ -24,7 +24,7 @@
+ beforeAll(async () => {
+   cleanup = await useTemporaryDatabase();
+   detach = searchService.registerSearchListeners();
+-  tenant = await createTenant("searchsvc", "growth");
++  tenant = await createTenant("searchsvc", "enterprise");
+ });
+ 
+ afterAll(() => {
+@@ -151,31 +151,22 @@
+   });
+ 
+   it("falls back to plain matching when advanced_search is off", async () => {
+-    // The tenant is on "growth", which does not include advanced_search.
++    // A "growth" workspace does not include advanced_search.
++    const plain = await createTenant("searchsvcplain", "growth");
+     await issueService.createIssue(
+-      tenant.actors.member,
+-      issueInput(tenant.org.id, tenant.project.id, { title: "PlainMatchWorks" }),
++      plain.actors.member,
++      issueInput(plain.org.id, plain.project.id, { title: "PlainMatchWorks" }),
+     );
+ 
+     await expect(
+-      searchService.search(tenant.actors.member, {
+-        orgId: tenant.org.id,
++      searchService.search(plain.actors.member, {
++        orgId: plain.org.id,
+         q: "PlainMatchWorks",
+         kinds: ["issue"],
+         limit: 25,
+         cursor: null,
+       }),
+     ).resolves.toMatchObject({ total: 1 });
+-
+-    await expect(
+-      searchService.search(tenant.actors.member, {
+-        orgId: tenant.org.id,
+-        q: "status:PlainMatchWorks",
+-        kinds: ["issue"],
+-        limit: 25,
+-        cursor: null,
+-      }),
+-    ).rejects.toThrow(/not included in this plan/);
+   });
+ 
+   it("rate-limits search queries per organization", async () => {

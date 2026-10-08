@@ -1,0 +1,553 @@
+diff --git a/src/actions/_lib/action-errors.ts b/src/actions/_lib/action-errors.ts
+--- a/src/actions/_lib/action-errors.ts
++++ b/src/actions/_lib/action-errors.ts
+@@ -9,7 +9,6 @@
+  */
+ 
+ import type { LimitedResource } from "@/types/billing";
+-import type { IsoTimestamp } from "@/types/common";
+ import type { PermissionAction } from "@/types/permission";
+ 
+ /** No session at all, or a session whose active organization is gone. */
+@@ -50,18 +49,12 @@
+   }
+ }
+ 
+-/** The token bucket in `@/lib/rate-limit` refused the request. */
+-export class RateLimitedError extends Error {
+-  readonly code = "rate_limited" as const;
+-
+-  constructor(
+-    readonly bucketKey: string,
+-    readonly resetAt: IsoTimestamp,
+-  ) {
+-    super(`Rate limit exceeded for ${bucketKey}; retry after ${resetAt}`);
+-    this.name = "RateLimitedError";
+-  }
+-}
++/**
++ * The token bucket in `@/lib/rate-limit` refused the request. The class lives
++ * with the limiter (ADR 0003) so services and actions throw the same error
++ * and `toAppError()` maps it once; this name is kept for existing imports.
++ */
++export { RateLimitExceededError as RateLimitedError } from "@/lib/rate-limit";
+ 
+ /** A feature flag that gates the whole action is off for this organization. */
+ export class FeatureUnavailableError extends Error {
+diff --git a/src/actions/_lib/permission-resources.ts b/src/actions/_lib/permission-resources.ts
+--- a/src/actions/_lib/permission-resources.ts
++++ b/src/actions/_lib/permission-resources.ts
+@@ -12,7 +12,6 @@
+   CommentId,
+   IssueId,
+   MemberId,
+-  OrgId,
+   ProjectId,
+ } from "@/types/common";
+ 
+@@ -22,7 +21,7 @@
+ export const PENDING_MEMBER_ID = "" as MemberId;
+ 
+ /**
+- * Bucket owner for rate limits consumed before any tenant is known — the login
+- * and password-reset flows, which are reachable without a session.
++ * Bucket owner for rate limits consumed before any tenant is known. Declared
++ * with the limiter so the services and the inbound routes share one owner.
+  */
+-export const ANONYMOUS_ORG_ID = "" as OrgId;
++export { ANONYMOUS_BUCKET_OWNER as ANONYMOUS_ORG_ID } from "@/lib/rate-limit";
+diff --git a/src/actions/auth/login.ts b/src/actions/auth/login.ts
+--- a/src/actions/auth/login.ts
++++ b/src/actions/auth/login.ts
+@@ -4,17 +4,14 @@
+  * Signs a user in and sets the session cookie.
+  *
+  * Owner D. Runs before any tenant is known, so it cannot go through
+- * `withAction()` — there is no `Actor` to resolve yet. The rate limit is
+- * charged against the anonymous bucket to blunt credential stuffing.
++ * `withAction()` — there is no `Actor` to resolve yet. The service charges
++ * the anonymous rate-limit bucket once per attempt (ADR 0003); a refusal
++ * surfaces here as a `rate_limited` result through `toActionResult`.
+  *
+- * Must call (do not reimplement): loginSchema, setSessionCookie,
+- * consumeRateLimit
++ * Must call (do not reimplement): loginSchema, setSessionCookie
+  */
+ 
+-import { ANONYMOUS_ORG_ID } from "@/actions/_lib/permission-resources";
+-import { RateLimitedError } from "@/actions/_lib/action-errors";
+ import { toActionResult } from "@/lib/errors";
+-import { consumeRateLimit } from "@/lib/rate-limit";
+ import { setSessionCookie } from "@/lib/session";
+ import { loginSchema } from "@/schemas/auth";
+ import { login } from "@/server/services/auth-service";
+@@ -23,8 +20,6 @@
+ import type { ActionResult } from "@/types/api";
+ import type { SessionPrincipal } from "@/types/member";
+ 
+-const LOGIN_BUCKET = "auth:login";
+-
+ export async function loginAction(raw: unknown): Promise<ActionResult<SessionPrincipal>> {
+   const parsed = loginSchema.safeParse(raw);
+   if (!parsed.success) {
+@@ -32,11 +27,6 @@
+   }
+ 
+   try {
+-    const verdict = await consumeRateLimit(ANONYMOUS_ORG_ID, LOGIN_BUCKET);
+-    if (!verdict.allowed) {
+-      throw new RateLimitedError(LOGIN_BUCKET, verdict.resetAt);
+-    }
+-
+     const { token } = await login(parsed.data);
+     const principal = await resolveSession(token);
+     if (principal === null) {
+diff --git a/src/actions/auth/reset-password.ts b/src/actions/auth/reset-password.ts
+--- a/src/actions/auth/reset-password.ts
++++ b/src/actions/auth/reset-password.ts
+@@ -4,17 +4,15 @@
+  * Requests and confirms a password reset.
+  *
+  * Owner D. The request half deliberately reports success even for an unknown
+- * address so the form cannot be used to enumerate accounts; the rate limit is
+- * what stops it being abused as a mail cannon.
++ * address so the form cannot be used to enumerate accounts; the rate limit,
++ * charged once per attempt by the service (ADR 0003), is what stops it being
++ * abused as a mail cannon.
+  *
+  * Must call (do not reimplement): passwordResetRequestSchema,
+- * passwordResetConfirmSchema, consumeRateLimit
++ * passwordResetConfirmSchema
+  */
+ 
+-import { RateLimitedError } from "@/actions/_lib/action-errors";
+-import { ANONYMOUS_ORG_ID } from "@/actions/_lib/permission-resources";
+ import { toActionResult } from "@/lib/errors";
+-import { consumeRateLimit } from "@/lib/rate-limit";
+ import {
+   passwordResetConfirmSchema,
+   passwordResetRequestSchema,
+@@ -25,8 +23,6 @@
+ } from "@/server/services/auth-service";
+ import type { ActionResult } from "@/types/api";
+ 
+-const RESET_BUCKET = "auth:password-reset";
+-
+ export async function requestPasswordResetAction(
+   raw: unknown,
+ ): Promise<ActionResult<null>> {
+@@ -36,11 +32,6 @@
+   }
+ 
+   try {
+-    const verdict = await consumeRateLimit(ANONYMOUS_ORG_ID, RESET_BUCKET);
+-    if (!verdict.allowed) {
+-      throw new RateLimitedError(RESET_BUCKET, verdict.resetAt);
+-    }
+-
+     await requestPasswordReset(parsed.data);
+     return { ok: true, data: null, submittedAt: new Date().toISOString() };
+   } catch (error) {
+@@ -57,11 +48,6 @@
+   }
+ 
+   try {
+-    const verdict = await consumeRateLimit(ANONYMOUS_ORG_ID, RESET_BUCKET);
+-    if (!verdict.allowed) {
+-      throw new RateLimitedError(RESET_BUCKET, verdict.resetAt);
+-    }
+-
+     await confirmPasswordReset(parsed.data);
+     return { ok: true, data: null, submittedAt: new Date().toISOString() };
+   } catch (error) {
+diff --git a/src/config/constants.ts b/src/config/constants.ts
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Longest workspace (organization) name the schema accepts; sign-up derives names within it. */
++export const WORKSPACE_NAME_MAX_LENGTH: number = 64;
+diff --git a/src/lib/account.ts b/src/lib/account.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/account.ts
+@@ -0,0 +1,63 @@
++/**
++ * Account-creation rules shared by sign-up and the user repository (ADR 0003).
++ *
++ * Email addresses are case-insensitive; the first workspace's name and URL
++ * slug are derived from the display name, and the derivation never fails.
++ */
++import { WORKSPACE_NAME_MAX_LENGTH } from "@/config/constants";
++import { SLUG_MIN_LENGTH, slugify, uniqueSlug } from "@/lib/slug";
++
++/** The slug used when nothing usable can be derived from a display name. */
++export const WORKSPACE_SLUG_FALLBACK = "workspace";
++
++/** The suffix every first workspace's name ends in. */
++export const WORKSPACE_NAME_SUFFIX = "'s workspace";
++
++/** Addresses are stored and compared lowercased, whatever was typed. */
++export function normaliseEmail(email: string): string {
++  return email.trim().toLowerCase();
++}
++
++/** Thrown by sign-up when the address already has an account. */
++export class EmailAlreadyRegisteredError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly email: string) {
++    super("An account with that email already exists.");
++    this.name = "EmailAlreadyRegisteredError";
++  }
++}
++
++/**
++ * `<name>'s workspace`, shortened from the display-name side until the whole
++ * name fits the limit the workspace schema enforces, so the result always
++ * ends in the suffix.
++ */
++export function workspaceNameFor(displayName: string): string {
++  const trimmed = displayName.trim();
++  const room = Math.max(1, WORKSPACE_NAME_MAX_LENGTH - WORKSPACE_NAME_SUFFIX.length);
++  const head = trimmed.length > room ? trimmed.slice(0, room).trimEnd() : trimmed;
++  return `${head}${WORKSPACE_NAME_SUFFIX}`;
++}
++
++/**
++ * Derives the first workspace's slug from the display name: slugified, then
++ * made unique and non-reserved the way every derived slug is. A result
++ * shorter than the minimum length, or empty, falls back to `workspace`.
++ * Never throws, so a name can never refuse a sign-up.
++ */
++export function deriveWorkspaceSlug(
++  displayName: string,
++  taken: Iterable<string>,
++): string {
++  return uniqueSlug(workspaceSlugBase(displayName), taken);
++}
++
++/**
++ * The slug a display name derives before uniqueness is applied — what a
++ * repository should list taken slugs for.
++ */
++export function workspaceSlugBase(displayName: string): string {
++  const base = slugify(displayName);
++  return base.length >= SLUG_MIN_LENGTH ? base : WORKSPACE_SLUG_FALLBACK;
++}
+diff --git a/src/lib/errors.ts b/src/lib/errors.ts
+--- a/src/lib/errors.ts
++++ b/src/lib/errors.ts
+@@ -3,12 +3,15 @@
+  *
+  * The service layer throws (`PermissionDeniedError`, `TenantScopeError`,
+  * `FeatureDisabledError`, `AlreadyArchivedError`, `InvalidSlugError`,
+- * `ZodError`); Server Actions and Route Handlers never propagate those to the
+- * client. Everything funnels through `toAppError()` so one thrown class maps
+- * to exactly one `ErrorCode` and one HTTP status, app-wide.
++ * `RateLimitExceededError`, `EmailAlreadyRegisteredError`, `ZodError`); Server
++ * Actions and Route Handlers never propagate those to the client. Everything
++ * funnels through `toAppError()` so one thrown class maps to exactly one
++ * `ErrorCode` and one HTTP status, app-wide.
+  */
++import { EmailAlreadyRegisteredError } from "@/lib/account";
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
++import { RateLimitExceededError } from "@/lib/rate-limit";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+@@ -35,6 +38,8 @@
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
++    error instanceof RateLimitExceededError ||
++    error instanceof EmailAlreadyRegisteredError ||
+     error instanceof ZodError
+   );
+ }
+@@ -105,6 +110,22 @@
+     };
+   }
+ 
++  if (error instanceof RateLimitExceededError) {
++    return {
++      code: "rate_limited",
++      message: error.message,
++      meta: { bucketKey: error.bucketKey, resetAt: error.resetAt },
++    };
++  }
++
++  if (error instanceof EmailAlreadyRegisteredError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      fieldErrors: { email: [error.message] },
++    };
++  }
++
+   return {
+     code: "internal_error",
+     message:
+diff --git a/src/lib/rate-limit.ts b/src/lib/rate-limit.ts
+--- a/src/lib/rate-limit.ts
++++ b/src/lib/rate-limit.ts
+@@ -25,9 +25,34 @@
+   "comment:create": { capacity: 60, refillPerMinute: 20 },
+   "issue:create": { capacity: 60, refillPerMinute: 20 },
+   "search:query": { capacity: 120, refillPerMinute: 60 },
++  "auth:login": { capacity: 30, refillPerMinute: 10 },
++  "auth:register": { capacity: 10, refillPerMinute: 2 },
+   "auth:password-reset": { capacity: 5, refillPerMinute: 1 },
+   "webhook:deliver": { capacity: 100, refillPerMinute: 50 },
+ };
++
++/**
++ * The owner every unauthenticated attempt is charged to: sign-up, sign-in,
++ * password resets and inbound callbacks run before any tenant is known and
++ * share one anonymous owner, so there is exactly one bucket per key.
++ */
++export const ANONYMOUS_BUCKET_OWNER = "" as OrgId;
++
++/**
++ * Thrown when a bucket refuses a request. Carries the `rate_limited` code so
++ * `toAppError()` maps it to HTTP 429 like every other domain error (ADR 0003).
++ */
++export class RateLimitExceededError extends Error {
++  readonly code = "rate_limited" as const;
++
++  constructor(
++    readonly bucketKey: string,
++    readonly resetAt: IsoTimestamp,
++  ) {
++    super(`Too many attempts; try again after ${resetAt}.`);
++    this.name = "RateLimitExceededError";
++  }
++}
+ 
+ /** Applied to any key not in the table above. */
+ const DEFAULT_BUCKET: RateLimitConfig = { capacity: 30, refillPerMinute: 10 };
+diff --git a/src/schemas/organization.ts b/src/schemas/organization.ts
+--- a/src/schemas/organization.ts
++++ b/src/schemas/organization.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { WORKSPACE_NAME_MAX_LENGTH } from "@/config/constants";
+ import { orgIdSchema } from "./common";
+ import { slugSchema } from "./slug";
+ import { planIdSchema } from "./billing";
+@@ -14,14 +15,14 @@
+ });
+ 
+ export const createOrganizationSchema = z.object({
+-  name: z.string().min(2).max(64),
++  name: z.string().min(2).max(WORKSPACE_NAME_MAX_LENGTH),
+   slug: slugSchema,
+   plan: planIdSchema.default("free"),
+ });
+ 
+ export const updateOrganizationSchema = z.object({
+   orgId: orgIdSchema,
+-  name: z.string().min(2).max(64).optional(),
++  name: z.string().min(2).max(WORKSPACE_NAME_MAX_LENGTH).optional(),
+   logoUrl: z.url().nullable().optional(),
+   settings: organizationSettingsSchema.partial().optional(),
+ });
+diff --git a/src/server/repositories/user-repository.ts b/src/server/repositories/user-repository.ts
+--- a/src/server/repositories/user-repository.ts
++++ b/src/server/repositories/user-repository.ts
+@@ -2,6 +2,7 @@
+  * Global user rows. The only repository that is NOT tenant scoped — users exist across organizations.
+  */
+ import { eq, inArray } from "drizzle-orm";
++import { normaliseEmail } from "@/lib/account";
+ import { newId } from "@/lib/id";
+ import { getDb, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -16,15 +17,12 @@
+   return row ? toUser(row) : null;
+ }
+ 
+-/**
+- * Addresses are matched as stored. The auth schemas lowercase what the forms
+- * submit, so a lookup already arrives in the stored spelling.
+- */
++/** Addresses are case-insensitive (ADR 0003): stored and matched lowercased. */
+ export async function findUserByEmail(email: string): Promise<User | null> {
+   const rows = getDb()
+     .select()
+     .from(users)
+-    .where(eq(users.email, email))
++    .where(eq(users.email, normaliseEmail(email)))
+     .all();
+   const row = rows.at(0);
+   return row ? toUser(row) : null;
+@@ -40,8 +38,7 @@
+     .insert(users)
+     .values({
+       id: newId(),
+-      // Stored as typed: the welcome email is addressed with this value.
+-      email: input.email,
++      email: normaliseEmail(input.email),
+       name: input.name,
+       passwordHash: input.passwordHash,
+       avatarUrl: null,
+diff --git a/src/server/services/auth-service.ts b/src/server/services/auth-service.ts
+--- a/src/server/services/auth-service.ts
++++ b/src/server/services/auth-service.ts
+@@ -9,13 +9,24 @@
+  * `OrganizationService.createOrganization`, which owns that membership row.
+  */
+ import {
++  EmailAlreadyRegisteredError,
++  deriveWorkspaceSlug,
++  normaliseEmail,
++  workspaceNameFor,
++  workspaceSlugBase,
++} from "@/lib/account";
++import {
+   hashPassword,
+   hashToken,
+   randomToken,
+   verifyPassword,
+ } from "@/lib/hash";
+-import { consumeRateLimit } from "@/lib/rate-limit";
+-import { slugify } from "@/lib/slug";
++import {
++  ANONYMOUS_BUCKET_OWNER,
++  RateLimitExceededError,
++  consumeRateLimit,
++} from "@/lib/rate-limit";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as resetTokenRepo from "@/server/repositories/_password-reset-repository";
+ import * as sessionRepo from "@/server/repositories/session-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+@@ -29,48 +40,59 @@
+   PasswordResetRequestInput,
+   RegisterInput,
+ } from "@/schemas/auth";
+-import type { OrgId, SessionId } from "@/types/common";
++import type { SessionId } from "@/types/common";
+ import type { User } from "@/types/member";
+ import type { Organization } from "@/types/organization";
+ 
+-/** Buckets guarding the unauthenticated endpoints. */
++/** Buckets guarding the unauthenticated endpoints (ADR 0003 §5). */
++const REGISTER_BUCKET = "auth:register";
+ const LOGIN_BUCKET = "auth:login";
+ const RESET_BUCKET = "auth:password-reset";
+-
+-/**
+- * Rate limiting before a session exists has no tenant to charge against, so
+- * every unauthenticated attempt is billed to this sentinel bucket.
+- */
+-const ANONYMOUS_ORG = "00000000000000000000000000" as OrgId;
+ 
+ /** How long a password-reset link stays usable. */
+ const RESET_TTL_MS = 60 * 60 * 1000;
+ 
+ /**
++ * Charges one attempt to the anonymous owner and refuses with the domain
++ * error every unauthenticated endpoint reports when throttled.
++ */
++async function chargeAnonymous(bucketKey: string): Promise<void> {
++  const verdict = await consumeRateLimit(ANONYMOUS_BUCKET_OWNER, bucketKey);
++  if (!verdict.allowed) {
++    throw new RateLimitExceededError(bucketKey, verdict.resetAt);
++  }
++}
++
++/**
+  * Registration creates the user and their first workspace in one step — a
+  * Taskflow account with no organization cannot do anything, so there is no
+- * intermediate state where one exists without the other.
++ * intermediate state where one exists without the other (ADR 0003).
++ *
++ * The throttle is charged before anything is written; a duplicate address
++ * is a conflict; the workspace name and slug are derived so that no display
++ * name can refuse a sign-up.
+  */
+ export async function register(
+   input: RegisterInput,
+ ): Promise<{ user: User; org: Organization }> {
+-  const existing = await userRepo.findUserByEmail(input.email);
++  await chargeAnonymous(REGISTER_BUCKET);
++
++  const email = normaliseEmail(input.email);
++  const existing = await userRepo.findUserByEmail(email);
+   if (existing) {
+-    throw new Error("An account with that email already exists");
++    throw new EmailAlreadyRegisteredError(email);
+   }
+ 
+   const user = await userRepo.insertUser({
+-    email: input.email,
++    email,
+     name: input.name,
+     passwordHash: await hashPassword(input.password),
+   });
+ 
+-  // A reserved or awkward name is handled downstream: `createOrganization`
+-  // runs the slug through `uniqueSlug()`, which skips reserved words and
+-  // suffixes collisions.
++  const taken = await orgRepo.listTakenOrgSlugs(workspaceSlugBase(input.name));
+   const org = await createOrganization(user.id, {
+-    name: `${input.name}'s workspace`,
+-    slug: slugify(input.name) || "workspace",
++    name: workspaceNameFor(input.name),
++    slug: deriveWorkspaceSlug(input.name, taken),
+     plan: "free",
+   });
+ 
+@@ -91,12 +113,9 @@
+ export async function login(
+   input: LoginInput,
+ ): Promise<{ user: User; token: string }> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, LOGIN_BUCKET);
+-  if (!verdict.allowed) {
+-    throw new Error("Too many sign-in attempts; try again shortly");
+-  }
++  await chargeAnonymous(LOGIN_BUCKET);
+ 
+-  const user = await userRepo.findUserByEmail(input.email);
++  const user = await userRepo.findUserByEmail(normaliseEmail(input.email));
+   if (!user) throw new Error("Those credentials did not match");
+ 
+   const storedHash = await userRepo.findPasswordHash(user.id);
+@@ -115,16 +134,17 @@
+ 
+ /**
+  * Always resolves, whether or not the address is known — telling an anonymous
+- * caller which emails have accounts is an enumeration oracle. Only the token's
+- * hash is stored; the raw value exists solely inside the email that carries it.
++ * caller which emails have accounts is an enumeration oracle, and a throttled
++ * request stays silent for the same reason. Only the token's hash is stored;
++ * the raw value exists solely inside the email that carries it.
+  */
+ export async function requestPasswordReset(
+   input: PasswordResetRequestInput,
+ ): Promise<void> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, RESET_BUCKET);
++  const verdict = await consumeRateLimit(ANONYMOUS_BUCKET_OWNER, RESET_BUCKET);
+   if (!verdict.allowed) return;
+ 
+-  const user = await userRepo.findUserByEmail(input.email);
++  const user = await userRepo.findUserByEmail(normaliseEmail(input.email));
+   if (!user) return;
+ 
+   const token = randomToken(32);
+@@ -151,10 +171,7 @@
+ export async function confirmPasswordReset(
+   input: PasswordResetConfirmInput,
+ ): Promise<User> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, RESET_BUCKET);
+-  if (!verdict.allowed) {
+-    throw new Error("Too many reset attempts; try again shortly");
+-  }
++  await chargeAnonymous(RESET_BUCKET);
+ 
+   const stored = await resetTokenRepo.findLiveResetToken(
+     hashToken(input.token),

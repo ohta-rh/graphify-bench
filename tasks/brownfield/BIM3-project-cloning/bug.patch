@@ -1,0 +1,237 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,17 @@
++# Documentation
++
++Taskflow keeps three kinds of document under `docs/`. They do not carry equal weight.
++
++| Folder | What it is | Weight |
++|---|---|---|
++| `docs/adr/` | Architecture Decision Records: numbered, dated, reviewed. | **Authoritative.** |
++| `docs/product/` | Product notes written before or alongside a feature: intent, examples, wording. | Context only. |
++| `docs/support/` | Runbooks and support macros: what people observed. | Describes behaviour, never specifies it. |
++
++## Precedence
++
++1. An ADR is the specification for every question it addresses. The highest-numbered ADR that addresses a question is the one that applies; a later ADR supersedes an earlier one only where it says so.
++2. Where a product note and an ADR disagree, the ADR wins. A product note that predates an ADR on the same subject is kept for history, not as a second opinion.
++3. Support notes record what was seen at the time. They are never evidence of intended behaviour.
++4. Code comments, `TODO`s and function names are not documentation. They are frequently stale.
++5. Where no document speaks, the current behaviour of the code is authoritative, and a new feature follows the conventions of its sibling features (same error classes, same guards, same events).
+diff --git a/docs/adr/0012-cloning-a-project.md b/docs/adr/0012-cloning-a-project.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adr/0012-cloning-a-project.md
+@@ -0,0 +1,56 @@
++# ADR 0012 — Cloning a project
++
++- Status: accepted
++- Date: 2026-03-25
++- Supersedes: `docs/product/project-clone-notes.md` where the two disagree.
++
++## Context
++
++Teams run the same shape of project repeatedly (a release train, an onboarding checklist) and
++want to start the next one from the last. The product wants a "clone project" action that
++creates a new project from an existing one, optionally with its issues. Issues are numbered per
++project, counted per project against the plan, indexed for search and metered for usage, so a
++clone is a batch of creations and has to behave like one. This record fixes what is copied,
++what is reset, and how the batch is gated.
++
++## Decision
++
++1. **The clone is a new project of the same workspace**, with the name, slug and key the caller
++   chose. Its description, visibility, colour and lead are copied from the source. It starts
++   `active`, with no start or target date, and it is not archived. The slug is treated exactly
++   like a created project's slug (made unique by suffix when taken). The key is the caller's
++   responsibility.
++
++2. **Gates, like a creation.** Cloning needs the permission to read the source project and the
++   permission to create a project, both checked against the acting member. The source must be a
++   live project of the workspace. The plan's project quota applies as it does to creating a
++   project.
++
++3. **A clone is a fresh start.** When issues are included, every **live** (not archived) issue of
++   the source is copied; archived issues are not. Each copy keeps the source issue's title,
++   description, priority, estimate, due date and labels. Everything that records progress is
++   reset: the copy starts in the workspace's default issue status, unassigned, with no start or
++   completion time, authored by the person cloning. Comments and attachments are not copied,
++   and whatever an issue is linked to is not copied either.
++
++4. **Numbering.** The copies are numbered from 1 in the order of the source issues' numbers, so
++   the clone reads in the same order as the source; issues created in the clone afterwards
++   continue after them.
++
++5. **All or nothing.** The clone is checked before anything is written: the plan's per-project
++   issue quota applies to the whole batch of copies (as many issues as would be copied, counted
++   the way a single creation counts them). If the batch does not fit, the clone is refused and
++   nothing is created — no project, no issues.
++
++6. **Announcing.** A clone publishes exactly one domain event, `project.cloned`, and records one
++   audit entry under the new project. It does not publish `project.created` or one
++   `issue.created` per copy. The things those announcements would have driven still happen:
++   the clone and its issues are searchable at once, and the workspace's project and issue
++   meters reflect the clone at once.
++
++## Consequences
++
++- Copying must walk every live issue of the source, however many there are; a page is not a
++  project.
++- Whatever the copier borrows, a copy never keeps the source row's status, assignee or number
++  (rules 3 and 4).
+diff --git a/docs/product/project-clone-notes.md b/docs/product/project-clone-notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/product/project-clone-notes.md
+@@ -0,0 +1,24 @@
++# Cloning a project — product notes
++
++_Written while scoping the "duplicate project" action (2026-01). Kept for history; see `docs/adr/0012-cloning-a-project.md` for the current rules._
++
++## Why
++
++Release trains and onboarding checklists are the same project over and over. People want
++"duplicate" on the project page.
++
++## What we'd like
++
++- A "Duplicate project…" entry asking for a name; the slug and key are derived from it.
++- Everything comes along: the issues with their status and assignee, so the board of the copy
++  looks exactly like the board of the original; archived issues too, so the history is complete.
++- Issue numbers are kept, so cross-references in descriptions ("see PLAT-12") still make sense
++  in the copy.
++- Comments are not copied (they are conversations, not work).
++- The copy is announced like any new project, and each copied issue like any new issue, so the
++  people assigned to them hear about it.
++
++## Open questions
++
++- Plan limits: a copy of a big project could blow the per-project issue limit. Leaning towards
++  copying as many as fit and telling the user.
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -480,6 +480,61 @@
+   return toIssue(row);
+ }
+ 
++/**
++ * Copies a project's issues into another project, row for row, for the ops
++ * console's "duplicate project" action: status, assignee and number come
++ * along so the duplicate's board matches the original. Labels are copied too.
++ */
++export async function copyIssuesToProject(
++  orgId: OrgId,
++  fromProjectId: ProjectId,
++  toProjectId: ProjectId,
++): Promise<number> {
++  const db = getDb();
++  const page = await listIssues({
++    orgId,
++    projectId: fromProjectId,
++    limit: 100,
++    cursor: null,
++  });
++
++  const stamp = toIsoTimestamp(new Date());
++  for (const issue of page.items) {
++    const id = newId();
++    db.insert(issues)
++      .values({
++        id,
++        orgId,
++        projectId: toProjectId,
++        number: issue.number,
++        title: issue.title,
++        description: issue.description,
++        status: issue.status,
++        priority: issue.priority,
++        authorId: issue.authorId,
++        assigneeId: issue.assigneeId,
++        parentId: null,
++        estimate: issue.estimate,
++        dueAt: issue.dueAt,
++        startedAt: issue.startedAt,
++        completedAt: issue.completedAt,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .run();
++
++    if (issue.labelIds.length > 0) {
++      db.insert(issueLabels)
++        .values(
++          issue.labelIds.map((labelId) => ({ orgId, issueId: id, labelId })),
++        )
++        .run();
++    }
++  }
++
++  return page.items.length;
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff --git a/src/server/repositories/project-repository.ts b/src/server/repositories/project-repository.ts
+--- a/src/server/repositories/project-repository.ts
++++ b/src/server/repositories/project-repository.ts
+@@ -205,6 +205,43 @@
+   return toProject(row);
+ }
+ 
++/**
++ * Row-level duplicate used by the ops console's "duplicate project" action.
++ * Copies the project exactly as it is — status, dates, archive state — under
++ * the new name, slug and key; the console renumbers nothing.
++ */
++export async function duplicateProject(
++  orgId: OrgId,
++  projectId: ProjectId,
++  name: string,
++  slug: string,
++  key: string,
++): Promise<Project> {
++  const source = getDb()
++    .select()
++    .from(projects)
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId)))
++    .get();
++  if (!source) throw new Error(`Project ${projectId} not found`);
++
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb()
++    .insert(projects)
++    .values({
++      ...source,
++      id: newId(),
++      name,
++      slug,
++      key,
++      createdAt: stamp,
++      updatedAt: stamp,
++    })
++    .returning()
++    .get();
++
++  return toProject(row);
++}
++
+ /** Includes archived slugs — a restored project must not collide. */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+diff --git a/src/server/services/project-service.ts b/src/server/services/project-service.ts
+--- a/src/server/services/project-service.ts
++++ b/src/server/services/project-service.ts
+@@ -32,6 +32,9 @@
+  * Creates a project once the plan still has room for one. The key is derived
+  * from the name when the caller left it blank, so the issue numbering scheme
+  * (`TF-12`) is never invented at the call site.
++ *
++ * The ops console duplicates a project with `projectRepo.duplicateProject`
++ * plus `issueRepo.copyIssuesToProject`; those bypass the gates below.
+  */
+ export async function createProject(
+   actor: Actor,

@@ -1,0 +1,156 @@
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,17 @@
++# Documentation
++
++Taskflow keeps three kinds of document under `docs/`. They do not carry equal weight.
++
++| Folder | What it is | Weight |
++|---|---|---|
++| `docs/adr/` | Architecture Decision Records: numbered, dated, reviewed. | **Authoritative.** |
++| `docs/product/` | Product notes written before or alongside a feature: intent, examples, wording. | Context only. |
++| `docs/support/` | Runbooks and support macros: what people observed. | Describes behaviour, never specifies it. |
++
++## Precedence
++
++1. An ADR is the specification for every question it addresses. The highest-numbered ADR that addresses a question is the one that applies; a later ADR supersedes an earlier one only where it says so.
++2. Where a product note and an ADR disagree, the ADR wins. A product note that predates an ADR on the same subject is kept for history, not as a second opinion.
++3. Support notes record what was seen at the time. They are never evidence of intended behaviour.
++4. Code comments, `TODO`s and function names are not documentation. They are frequently stale.
++5. Where no document speaks, the current behaviour of the code is authoritative, and a new feature follows the conventions of its sibling features (same error classes, same guards, same events).
+diff --git a/docs/adr/0003-account-creation.md b/docs/adr/0003-account-creation.md
+new file mode 100644
+--- /dev/null
++++ b/docs/adr/0003-account-creation.md
+@@ -0,0 +1,54 @@
++# ADR 0003 — Account creation
++
++- Status: accepted
++- Date: 2026-01-20
++- Supersedes: `docs/product/sign-up-notes.md` where the two disagree.
++
++## Context
++
++Sign-up creates a user and their first workspace in one step, because a Taskflow account with
++no workspace cannot do anything. The step has to succeed for every name people actually have,
++has to be safe to expose unauthenticated, and has to leave the account in the state the rest of
++the product assumes. This record fixes those rules.
++
++## Decision
++
++1. **One step.** Sign-up creates the user, their first workspace and the owner membership, in
++   that order, and publishes `member.joined` for the owner exactly once. The workspace is named
++   `<display name>'s workspace`; when that is longer than the limit the workspace schema enforces
++   on a name, the display name is shortened until the whole name fits, so the result still ends in
++   `'s workspace`.
++
++2. **The first workspace's URL slug is derived, and derivation never refuses a sign-up.** The
++   display name is slugified by the shared slug rules; the result is made unique the way every
++   other derived slug is (a numeric suffix when taken); a reserved slug is never used, a slug
++   shorter than the minimum length is never used, and when nothing usable is left the slug is
++   `workspace` (suffixed when taken). A person whose name is `Admin`, `Al`, `J` or `山田` signs up
++   like anyone else.
++
++3. **Email addresses are case-insensitive.** An address is stored lowercased and compared
++   lowercased wherever it is looked up, so `Alice@Example.com` and `alice@example.com` are one
++   account, whichever way it was typed at sign-up or sign-in.
++
++4. **An address that already has an account is refused**, as a `conflict`, and nothing is
++   created. Sign-up is not an enumeration oracle worth protecting: the register form already
++   requires the address to be confirmed by the welcome email, and a silent success would leave
++   the person without a workspace and without an explanation.
++
++5. **Sign-up is throttled like every other unauthenticated endpoint**, on the anonymous bucket
++   `auth:register`, charged once per attempt, before anything is written. A throttled sign-up,
++   sign-in or password-reset confirmation is refused with the `rate_limited` error code (HTTP 429),
++   translated by the error mapper like every other domain error — never reported as an internal
++   error. A throttled password-reset *request* stays silent, as today, because that endpoint must
++   not reveal anything.
++
++6. **The first workspace starts on the Free plan with an active subscription.** Trials are
++   started by choosing a paid plan on the billing page, never at sign-up.
++
++7. **One welcome email**, to the stored address, naming the workspace.
++
++## Consequences
++
++- `uniqueSlug()` already skips reserved slugs and suffixes collisions; the derivation adds the
++  minimum-length and fallback rules on top of it.
++- The error mapper (`toAppError`) learns the rate-limit and the duplicate-address errors.
+diff --git a/docs/product/sign-up-notes.md b/docs/product/sign-up-notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/product/sign-up-notes.md
+@@ -0,0 +1,27 @@
++# Sign-up — product notes
++
++_Written for the self-serve launch (2025-10). Kept for history; see `docs/adr/0003-account-creation.md` for the current rules._
++
++## The form
++
++Name, email, password (twice), terms. We ask for at least two characters in the name so the
++workspace URL is valid — the URL is the name slugified, and if that one is taken we add a number.
++
++## What happens
++
++1. The account is created.
++2. A workspace called "<name>'s workspace" is created with the person as owner.
++3. Every new workspace starts a **14-day Growth trial**, so people see the full product before
++   they decide. When the trial ends the workspace drops to Free.
++4. We send the welcome email.
++
++## Addresses that already exist
++
++We never tell an anonymous visitor whether an address has an account. If the address is taken,
++the form shows the same success screen and we email the existing owner a "you already have an
++account" note instead of creating anything.
++
++## Abuse
++
++Sign-up is not rate-limited for the launch; the invite flow is, and that is where the spam
++pressure was. Sign-in is throttled per address.
+diff --git a/src/server/repositories/user-repository.ts b/src/server/repositories/user-repository.ts
+--- a/src/server/repositories/user-repository.ts
++++ b/src/server/repositories/user-repository.ts
+@@ -16,11 +16,15 @@
+   return row ? toUser(row) : null;
+ }
+ 
++/**
++ * Addresses are matched as stored. The auth schemas lowercase what the forms
++ * submit, so a lookup already arrives in the stored spelling.
++ */
+ export async function findUserByEmail(email: string): Promise<User | null> {
+   const rows = getDb()
+     .select()
+     .from(users)
+-    .where(eq(users.email, email.toLowerCase()))
++    .where(eq(users.email, email))
+     .all();
+   const row = rows.at(0);
+   return row ? toUser(row) : null;
+@@ -36,7 +40,8 @@
+     .insert(users)
+     .values({
+       id: newId(),
+-      email: input.email.toLowerCase(),
++      // Stored as typed: the welcome email is addressed with this value.
++      email: input.email,
+       name: input.name,
+       passwordHash: input.passwordHash,
+       avatarUrl: null,
+diff --git a/src/server/services/auth-service.ts b/src/server/services/auth-service.ts
+--- a/src/server/services/auth-service.ts
++++ b/src/server/services/auth-service.ts
+@@ -65,6 +65,9 @@
+     passwordHash: await hashPassword(input.password),
+   });
+ 
++  // A reserved or awkward name is handled downstream: `createOrganization`
++  // runs the slug through `uniqueSlug()`, which skips reserved words and
++  // suffixes collisions.
+   const org = await createOrganization(user.id, {
+     name: `${input.name}'s workspace`,
+     slug: slugify(input.name) || "workspace",

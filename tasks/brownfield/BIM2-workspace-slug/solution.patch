@@ -1,0 +1,444 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -10,6 +10,7 @@
+ 
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
++  "organization.slug_changed": "changed the workspace URL",
+   "project.created": "created a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+diff --git a/src/config/constants.ts b/src/config/constants.ts
+--- a/src/config/constants.ts
++++ b/src/config/constants.ts
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Days a renamed workspace's old slug keeps resolving and stays unavailable (ADR 0005). */
++export const ORG_SLUG_HOLD_DAYS: number = 30;
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -9,6 +9,7 @@
+ 
+ export const activityActionSchema = z.enum([
+   "organization.updated",
++  "organization.slug_changed",
+   "project.created",
+   "project.updated",
+   "project.archived",
+diff --git a/src/schemas/organization.ts b/src/schemas/organization.ts
+--- a/src/schemas/organization.ts
++++ b/src/schemas/organization.ts
+@@ -26,6 +26,12 @@
+   settings: organizationSettingsSchema.partial().optional(),
+ });
+ 
++/** Change a workspace's URL slug (ADR 0005). */
++export const renameOrganizationSlugSchema = z.object({
++  orgId: orgIdSchema,
++  slug: slugSchema,
++});
++
+ export const transferOwnershipSchema = z.object({
+   orgId: orgIdSchema,
+   newOwnerUserId: z.string().min(1),
+@@ -43,3 +49,4 @@
+ export type UpdateOrganizationInput = z.infer<typeof updateOrganizationSchema>;
+ export type DeleteOrganizationInput = z.infer<typeof deleteOrganizationSchema>;
+ export type TransferOwnershipInput = z.infer<typeof transferOwnershipSchema>;
++export type RenameOrganizationSlugInput = z.infer<typeof renameOrganizationSlugSchema>;
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -67,6 +67,14 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS organizations_slug_idx ON organizations (slug)`,
+   `CREATE INDEX IF NOT EXISTS organizations_owner_idx ON organizations (owner_id)`,
++  `CREATE TABLE IF NOT EXISTS organization_slug_history (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     slug TEXT NOT NULL,
++     retired_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS organization_slug_history_slug_idx ON organization_slug_history (slug)`,
++  `CREATE INDEX IF NOT EXISTS organization_slug_history_org_idx ON organization_slug_history (org_id)`,
+   `CREATE TABLE IF NOT EXISTS organization_usage (
+      org_id TEXT PRIMARY KEY NOT NULL,
+      seats_used INTEGER NOT NULL DEFAULT 0,
+diff --git a/src/server/db/schema/organizations.ts b/src/server/db/schema/organizations.ts
+--- a/src/server/db/schema/organizations.ts
++++ b/src/server/db/schema/organizations.ts
+@@ -33,6 +33,25 @@
+   ],
+ );
+ 
++/**
++ * Slugs a workspace has retired by renaming (ADR 0005). A row keeps the old
++ * slug resolving, and unavailable to others, for `ORG_SLUG_HOLD_DAYS` after
++ * `retired_at`.
++ */
++export const organizationSlugHistory = sqliteTable(
++  "organization_slug_history",
++  {
++    id: idColumn(),
++    orgId: text("org_id").notNull(),
++    slug: text("slug").notNull(),
++    retiredAt: text("retired_at").notNull(),
++  },
++  (table) => [
++    index("organization_slug_history_slug_idx").on(table.slug),
++    index("organization_slug_history_org_idx").on(table.orgId),
++  ],
++);
++
+ export const organizationUsage = sqliteTable("organization_usage", {
+   orgId: text("org_id").primaryKey(),
+   seatsUsed: integer("seats_used").notNull().default(0),
+@@ -45,3 +64,4 @@
+ export type OrganizationRow = typeof organizations.$inferSelect;
+ export type NewOrganizationRow = typeof organizations.$inferInsert;
+ export type OrganizationUsageRow = typeof organizationUsage.$inferSelect;
++export type OrganizationSlugHistoryRow = typeof organizationSlugHistory.$inferSelect;
+diff --git a/src/server/repositories/organization-repository.ts b/src/server/repositories/organization-repository.ts
+--- a/src/server/repositories/organization-repository.ts
++++ b/src/server/repositories/organization-repository.ts
+@@ -3,20 +3,34 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNull, like, ne } from "drizzle-orm";
++import { ORG_SLUG_HOLD_DAYS } from "@/config/constants";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizationSlugHistory, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
+-import type { OrgId, UserId } from "@/types/common";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
+ 
++const MS_PER_DAY = 24 * 60 * 60 * 1000;
++
++/** The instant a slug retired at `retiredAt` is released again (ADR 0005 §3). */
++export function slugHoldEndsAt(retiredAt: IsoTimestamp): IsoTimestamp {
++  return toIsoTimestamp(
++    new Date(new Date(retiredAt).getTime() + ORG_SLUG_HOLD_DAYS * MS_PER_DAY),
++  );
++}
++
++function stillHeld(retiredAt: IsoTimestamp, now: IsoTimestamp): boolean {
++  return slugHoldEndsAt(retiredAt) > now;
++}
++
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+@@ -33,6 +47,93 @@
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+   return row ? toOrganization(row) : null;
++}
++
++/**
++ * The one rule for turning a slug into a workspace (ADR 0005 §3): the current
++ * slug of a live workspace, or a slug a live workspace retired less than
++ * `ORG_SLUG_HOLD_DAYS` ago. Every lookup by slug — the session layer included
++ * — goes through here.
++ */
++export async function resolveOrgSlug(
++  slug: string,
++  now: IsoTimestamp = toIsoTimestamp(new Date()),
++): Promise<Organization | null> {
++  const current = await findOrgBySlug(slug);
++  if (current) return current;
++
++  const retired = getDb()
++    .select({ org: organizations, retiredAt: organizationSlugHistory.retiredAt })
++    .from(organizationSlugHistory)
++    .innerJoin(organizations, eq(organizations.id, organizationSlugHistory.orgId))
++    .where(
++      and(eq(organizationSlugHistory.slug, slug), isNull(organizations.archivedAt)),
++    )
++    .all();
++
++  const held = retired.find((row) => stillHeld(row.retiredAt as IsoTimestamp, now));
++  return held ? toOrganization(held.org) : null;
++}
++
++/**
++ * Whether `orgId` may take `slug` (ADR 0005 §2): no other workspace, live or
++ * deleted, holds it now, and no other workspace retired it within the hold.
++ * A workspace's own retired slugs are available to it.
++ */
++export async function isSlugAvailableFor(
++  orgId: OrgId,
++  slug: string,
++  now: IsoTimestamp = toIsoTimestamp(new Date()),
++): Promise<boolean> {
++  const db = getDb();
++
++  const current = db
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(and(eq(organizations.slug, slug), ne(organizations.id, orgId)))
++    .get();
++  if (current) return false;
++
++  const retired = db
++    .select({ orgId: organizationSlugHistory.orgId, retiredAt: organizationSlugHistory.retiredAt })
++    .from(organizationSlugHistory)
++    .where(and(eq(organizationSlugHistory.slug, slug), ne(organizationSlugHistory.orgId, orgId)))
++    .all();
++
++  return !retired.some((row) => stillHeld(row.retiredAt as IsoTimestamp, now));
++}
++
++/**
++ * Moves a workspace to `slug`: the old slug is retired at `now`, and a
++ * retirement of the new slug by the same workspace ends (ADR 0005 §4).
++ */
++export async function renameOrgSlug(
++  orgId: OrgId,
++  slug: string,
++  now: IsoTimestamp = toIsoTimestamp(new Date()),
++): Promise<Organization> {
++  const db = getDb();
++  const current = await findOrgById(orgId);
++  if (!current) throw new Error(`Organization ${orgId} not found`);
++
++  db.delete(organizationSlugHistory)
++    .where(
++      and(eq(organizationSlugHistory.orgId, orgId), eq(organizationSlugHistory.slug, slug)),
++    )
++    .run();
++
++  db.insert(organizationSlugHistory)
++    .values({ id: newId(), orgId, slug: current.slug, retiredAt: now })
++    .run();
++
++  const row = db
++    .update(organizations)
++    .set({ slug, updatedAt: now })
++    .where(eq(organizations.id, orgId))
++    .returning()
++    .get();
++
++  return toOrganization(row);
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -86,14 +187,10 @@
+   return toOrganization(row);
+ }
+ 
+-/**
+- * Settings and profile patch. `slug` is accepted for the "change workspace
+- * URL" form: the form validates the slug with `slugSchema` before it gets
+- * here, so the column is written as given.
+- */
++/** Settings and profile patch. The slug is changed through `renameOrgSlug` only. */
+ export async function updateOrg(
+   orgId: OrgId,
+-  patch: UpdateOrganizationInput & { readonly slug?: string },
++  patch: UpdateOrganizationInput,
+ ): Promise<Organization> {
+   const current = await findOrgById(orgId);
+   if (!current) throw new Error(`Organization ${orgId} not found`);
+@@ -104,7 +201,6 @@
+     .update(organizations)
+     .set({
+       ...(patch.name === undefined ? {} : { name: patch.name }),
+-      ...(patch.slug === undefined ? {} : { slug: patch.slug }),
+       ...(patch.logoUrl === undefined ? {} : { logoUrl: patch.logoUrl }),
+       defaultIssueStatus: settings.defaultIssueStatus,
+       allowPublicProjects: settings.allowPublicProjects,
+@@ -132,14 +228,32 @@
+   return toOrganization(row);
+ }
+ 
+-/** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
++/**
++ * Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. Slugs
++ * still held by a renamed workspace count as taken (ADR 0005 §3), so a
++ * derived slug is suffixed past them like past any other taken slug.
++ */
+ export async function listTakenOrgSlugs(
+   prefix: string,
++  now: IsoTimestamp = toIsoTimestamp(new Date()),
+ ): Promise<readonly string[]> {
+-  const rows = getDb()
++  const db = getDb();
++  const current = db
+     .select({ slug: organizations.slug })
+     .from(organizations)
+     .where(like(organizations.slug, `${prefix}%`))
+     .all();
+-  return rows.map((row) => row.slug);
+-}
++
++  const retired = db
++    .select({ slug: organizationSlugHistory.slug, retiredAt: organizationSlugHistory.retiredAt })
++    .from(organizationSlugHistory)
++    .where(like(organizationSlugHistory.slug, `${prefix}%`))
++    .all();
++
++  return [
++    ...current.map((row) => row.slug),
++    ...retired
++      .filter((row) => stillHeld(row.retiredAt as IsoTimestamp, now))
++      .map((row) => row.slug),
++  ];
++}
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -222,6 +222,16 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("organization.slug_changed", (payload) =>
++      record(payload.orgId, "organization.slug_changed", {
++        actorId: payload.actorId,
++        subjectKind: "organization",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Changed the workspace URL from /${payload.from} to /${payload.to}`,
++        metadata: { from: payload.from, to: payload.to },
++      }).then(() => undefined),
++    ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/organization-service.ts b/src/server/services/organization-service.ts
+--- a/src/server/services/organization-service.ts
++++ b/src/server/services/organization-service.ts
+@@ -5,7 +5,7 @@
+  */
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertValidSlug, uniqueSlug } from "@/lib/slug";
++import { InvalidSlugError, assertValidSlug, uniqueSlug } from "@/lib/slug";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -13,10 +13,12 @@
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { record } from "./activity-service";
+-import { envelope, orgResource, requireFound } from "./_support";
++import { actorEnvelope, envelope, orgResource, requireFound } from "./_support";
++import { toIsoTimestamp } from "@/types/common";
+ import type {
+   CreateOrganizationInput,
+   DeleteOrganizationInput,
++  RenameOrganizationSlugInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
+ import type { OrgId, UserId } from "@/types/common";
+@@ -77,6 +79,45 @@
+ }
+ 
+ /**
++ * Changes the workspace's URL slug (ADR 0005). The slug is chosen, so it is
++ * validated and must be available — refused, never suffixed. The old slug is
++ * retired for `ORG_SLUG_HOLD_DAYS`: it keeps resolving to this workspace and
++ * nobody else can take it. One event and one audit entry; nothing else on the
++ * workspace changes.
++ */
++export async function renameOrganizationSlug(
++  actor: Actor,
++  input: RenameOrganizationSlugInput,
++): Promise<Organization> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "org:update", orgResource(input.orgId));
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++
++  assertValidSlug(input.slug);
++  if (org.slug === input.slug) return org;
++
++  const now = toIsoTimestamp(new Date());
++  if (!(await orgRepo.isSlugAvailableFor(org.id, input.slug, now))) {
++    throw new InvalidSlugError(input.slug, "is not available");
++  }
++
++  const renamed = await orgRepo.renameOrgSlug(org.id, input.slug, now);
++
++  await emit("organization.slug_changed", {
++    ...actorEnvelope(actor),
++    from: org.slug,
++    to: renamed.slug,
++  });
++
++  return renamed;
++}
++
++/**
+  * Deletion is a soft delete guarded by a typed confirmation, the same shape
+  * GitHub uses: the caller has to retype the slug.
+  */
+@@ -129,8 +170,9 @@
+   return orgRepo.listOrgsForUser(userId);
+ }
+ 
++/** A current slug, or one retired less than `ORG_SLUG_HOLD_DAYS` ago (ADR 0005). */
+ export async function resolveOrgBySlug(
+   slug: string,
+ ): Promise<Organization | null> {
+-  return orgRepo.findOrgBySlug(slug);
++  return orgRepo.resolveOrgSlug(slug);
+ }
+diff --git a/src/server/services/session-service.ts b/src/server/services/session-service.ts
+--- a/src/server/services/session-service.ts
++++ b/src/server/services/session-service.ts
+@@ -56,9 +56,10 @@
+   principal: SessionPrincipal,
+   orgSlug: string,
+ ): Promise<Actor | null> {
+-  // Same lookup as `OrganizationService.resolveOrgBySlug`, taken from the
+-  // repository directly to keep the session layer free of the service layer.
+-  const org = await orgRepo.findOrgBySlug(orgSlug);
++  // The one slug rule (ADR 0005): a current slug or one still held after a
++  // rename. Taken from the repository to keep the session layer free of the
++  // service layer, but it is the same rule `resolveOrgBySlug` applies.
++  const org = await orgRepo.resolveOrgSlug(orgSlug);
+   if (!org) return null;
+ 
+   const member = await memberRepo.findMember(org.id, principal.userId);
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -10,6 +10,7 @@
+  *  bus keys so `ActivityService` can map one to the other mechanically. */
+ export type ActivityAction =
+   | "organization.updated"
++  | "organization.slug_changed"
+   | "project.created"
+   | "project.updated"
+   | "project.archived"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -81,6 +81,7 @@
+     to: Role;
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "organization.slug_changed": EventEnvelope & { from: string; to: string };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;

@@ -664,18 +664,18 @@ describe("tasks-hard.json", () => {
 });
 
 // ---------------------------------------------------------------------------
-// tasks-ultra.json / tasks-extreme.json — the sets built to find Opus 5.5's ceiling
+// tasks-ultra / extreme / apex / brownfield.json — the hidden-test sets built to find Opus 5.5's ceiling
 // ---------------------------------------------------------------------------
 
-for (const set of ["ultra", "extreme"] as const) {
+for (const [set, count] of [["ultra", 12], ["extreme", 12], ["apex", 6], ["brownfield", 6]] as const) {
   describe(`tasks-${set}.json`, () => {
     const tasks = loadTasks(`tasks-${set}.json`);
     const rules = fs.readFileSync(path.join(TASKS_DIR, "ultra", "RULES.txt"), "utf8").trim();
 
-    it("has 12 hidden-test tasks, 6 fix and 6 implement", () => {
-      expect(tasks).toHaveLength(12);
-      expect(tasks.filter((t) => t.category === "fix")).toHaveLength(6);
-      expect(tasks.filter((t) => t.category === "implement")).toHaveLength(6);
+    it(`has ${count} hidden-test tasks, half fix and half implement`, () => {
+      expect(tasks).toHaveLength(count);
+      expect(tasks.filter((t) => t.category === "fix")).toHaveLength(count / 2);
+      expect(tasks.filter((t) => t.category === "implement")).toHaveLength(count / 2);
       for (const t of tasks) {
         expect(t.grader, t.id).toBe("vitest");
         expect(t.hidden, t.id).toEqual([{ from: `${set}/${t.id}/hidden.test.ts`, to: `tests/hidden/${t.id}.test.ts` }]);

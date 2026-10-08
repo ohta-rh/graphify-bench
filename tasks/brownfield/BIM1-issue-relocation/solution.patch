@@ -1,0 +1,362 @@
+diff --git a/src/components/domain/activity/activity-labels.ts b/src/components/domain/activity/activity-labels.ts
+--- a/src/components/domain/activity/activity-labels.ts
++++ b/src/components/domain/activity/activity-labels.ts
+@@ -20,6 +20,7 @@
+   "issue.assigned": "assigned an issue",
+   "issue.archived": "archived an issue",
+   "issue.restored": "restored an issue",
++  "issue.moved": "moved an issue to another project",
+   "comment.created": "commented",
+   "comment.updated": "edited a comment",
+   "comment.deleted": "deleted a comment",
+diff --git a/src/schemas/activity.ts b/src/schemas/activity.ts
+--- a/src/schemas/activity.ts
++++ b/src/schemas/activity.ts
+@@ -19,6 +19,7 @@
+   "issue.assigned",
+   "issue.archived",
+   "issue.restored",
++  "issue.moved",
+   "comment.created",
+   "comment.updated",
+   "comment.deleted",
+diff --git a/src/schemas/issue.ts b/src/schemas/issue.ts
+--- a/src/schemas/issue.ts
++++ b/src/schemas/issue.ts
+@@ -85,6 +85,13 @@
+   .extend(pageRequestSchema.shape)
+   .extend(archiveScopeSchema.shape);
+ 
++/** Move one issue into another project of the same workspace (ADR 0011). */
++export const moveIssueToProjectSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  toProjectId: projectIdSchema,
++});
++
+ /** Board drag-and-drop payload: move one issue into a column at an index. */
+ export const moveIssueSchema = z.object({
+   orgId: orgIdSchema,
+@@ -108,3 +115,4 @@
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
++export type MoveIssueToProjectInput = z.infer<typeof moveIssueToProjectSchema>;
+diff --git a/src/server/db/migrate.ts b/src/server/db/migrate.ts
+--- a/src/server/db/migrate.ts
++++ b/src/server/db/migrate.ts
+@@ -158,6 +158,12 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS issue_number_sequences (
++     project_id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     last_number INTEGER NOT NULL DEFAULT 0
++   )`,
++  `CREATE INDEX IF NOT EXISTS issue_number_sequences_org_idx ON issue_number_sequences (org_id)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff --git a/src/server/db/schema/issues.ts b/src/server/db/schema/issues.ts
+--- a/src/server/db/schema/issues.ts
++++ b/src/server/db/schema/issues.ts
+@@ -70,6 +70,21 @@
+   ],
+ );
+ 
++/**
++ * The highest issue number ever issued per project (ADR 0011). A number is
++ * retired when its issue is archived or moved away, so the next number cannot
++ * be derived from the rows currently in the project.
++ */
++export const issueNumberSequences = sqliteTable(
++  "issue_number_sequences",
++  {
++    projectId: text("project_id").primaryKey(),
++    ...tenantColumns,
++    lastNumber: integer("last_number").notNull().default(0),
++  },
++  (table) => [index("issue_number_sequences_org_idx").on(table.orgId)],
++);
++
+ export const attachments = sqliteTable(
+   "attachments",
+   {
+@@ -88,4 +103,5 @@
+ export type IssueRow = typeof issues.$inferSelect;
+ export type NewIssueRow = typeof issues.$inferInsert;
+ export type LabelRow = typeof labels.$inferSelect;
++export type IssueNumberSequenceRow = typeof issueNumberSequences.$inferSelect;
+ export type AttachmentRow = typeof attachments.$inferSelect;
+diff --git a/src/server/repositories/issue-repository.ts b/src/server/repositories/issue-repository.ts
+--- a/src/server/repositories/issue-repository.ts
++++ b/src/server/repositories/issue-repository.ts
+@@ -22,7 +22,14 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issueNumberSequences,
++  issues,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -286,21 +293,48 @@
+ }
+ 
+ /**
+- * Next per-project issue number. Archived issues keep their number, so the
+- * max is taken over every row rather than the live ones.
++ * Next per-project issue number (ADR 0011). A number, once issued in a
++ * project, is never issued again: the project's sequence remembers the
++ * highest number ever handed out, and is seeded from the rows the first time
++ * a project that predates the sequence table allocates. Archived issues and
++ * issues moved away keep their old number retired.
+  */
+ export async function nextIssueNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+ ): Promise<number> {
+-  const row = getDb()
++  const db = getDb();
++
++  const sequence = db
++    .select({ lastNumber: issueNumberSequences.lastNumber })
++    .from(issueNumberSequences)
++    .where(
++      and(
++        orgPredicate(issueNumberSequences.orgId, orgId),
++        eq(issueNumberSequences.projectId, projectId),
++      ),
++    )
++    .get();
++
++  const highestRow = db
+     .select({ value: sql<number | null>`max(${issues.number})` })
+     .from(issues)
+     .where(
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++
++  const next = Math.max(sequence?.lastNumber ?? 0, highestRow?.value ?? 0) + 1;
++
++  db.insert(issueNumberSequences)
++    .values({ projectId, orgId, lastNumber: next })
++    .onConflictDoUpdate({
++      target: issueNumberSequences.projectId,
++      set: { lastNumber: next },
++    })
++    .run();
++
++  return next;
+ }
+ 
+ export async function insertIssue(
+@@ -481,24 +515,27 @@
+ }
+ 
+ /**
+- * Re-points an issue at another project. Kept for the import tool's
+- * "merge projects" step, which renumbers in a second pass; the row keeps its
+- * number here so the pass can match it up again.
++ * Moves one issue into another project under a number the caller allocated
++ * with `nextIssueNumber(targetProject)` (ADR 0011). Everything else on the row
++ * — and the labels, comments and attachments that hang off it — stays.
+  */
+-export async function relocateIssue(
++export async function moveIssueToProject(
+   orgId: OrgId,
+   issueId: IssueId,
+   projectId: ProjectId,
++  issueNumber: number,
+ ): Promise<Issue> {
+   const row = getDb()
+     .update(issues)
+-    .set({ projectId, updatedAt: toIsoTimestamp(new Date()) })
++    .set({ projectId, number: issueNumber, updatedAt: toIsoTimestamp(new Date()) })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+     .returning()
+     .get();
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+-  return toIssue(row);
++
++  const labels = await listLabelsForIssues(orgId, [issueId]);
++  return toIssue(row, (labels[issueId] ?? []).map((label) => label.id));
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff --git a/src/server/services/activity-service.ts b/src/server/services/activity-service.ts
+--- a/src/server/services/activity-service.ts
++++ b/src/server/services/activity-service.ts
+@@ -186,6 +186,21 @@
+         metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.moved", (payload) =>
++      record(payload.orgId, "issue.moved", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.toProjectId,
++        summary: `Moved issue #${payload.fromNumber} to another project as #${payload.toNumber}`,
++        metadata: {
++          fromProjectId: payload.fromProjectId,
++          toProjectId: payload.toProjectId,
++          fromNumber: payload.fromNumber,
++          toNumber: payload.toNumber,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+         actorId: payload.actorId,
+diff --git a/src/server/services/issue-service.ts b/src/server/services/issue-service.ts
+--- a/src/server/services/issue-service.ts
++++ b/src/server/services/issue-service.ts
+@@ -27,6 +27,7 @@
+   CreateIssueInput,
+   IssueFilterInput,
+   MoveIssueInput,
++  MoveIssueToProjectInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+@@ -216,10 +217,8 @@
+ 
+ /**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+- * `updated_at` — so a move is a status change plus a touch.
+- *
+- * TODO(platform): "move" should eventually take a target project as well;
+- * `issueRepo.relocateIssue` is the primitive for that half.
++ * `updated_at` — so a move is a status change plus a touch. Moving an issue
++ * to another project is `moveIssueToProject`.
+  */
+ export async function moveIssue(
+   actor: Actor,
+@@ -230,6 +229,71 @@
+     issueId: input.issueId,
+     status: input.toStatus,
+   });
++}
++
++/**
++ * Moves an issue into another project of the same workspace (ADR 0011).
++ *
++ * Guards, in the spirit of an edit plus a creation: tenant scope, a live
++ * issue the actor may edit, a live target project the actor may create issues
++ * in, and the target's per-project quota. The issue takes the target's next
++ * number; its old number is retired. A move within the same project changes
++ * nothing and publishes nothing. One `issue.moved` is published; nothing else.
++ */
++export async function moveIssueToProject(
++  actor: Actor,
++  input: MoveIssueToProjectInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++
++  const target = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.toProjectId),
++    "Project",
++    input.toProjectId,
++  );
++  assertCan(actor, "issue:create", projectResource(target));
++  assertNotArchived("Project", target.id, target);
++
++  if (issue.projectId === target.id) return issue;
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const used = await issueRepo.countIssues(input.orgId, target.id);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in project ${target.key}`,
++    );
++  }
++
++  const number = await issueRepo.nextIssueNumber(input.orgId, target.id);
++  const moved = await issueRepo.moveIssueToProject(
++    input.orgId,
++    issue.id,
++    target.id,
++    number,
++  );
++
++  await emit("issue.moved", {
++    ...actorEnvelope(actor),
++    issueId: moved.id,
++    fromProjectId: issue.projectId,
++    toProjectId: moved.projectId,
++    fromNumber: issue.number,
++    toNumber: moved.number,
++  });
++
++  return moved;
+ }
+ 
+ export async function getIssue(
+diff --git a/src/server/services/search-service.ts b/src/server/services/search-service.ts
+--- a/src/server/services/search-service.ts
++++ b/src/server/services/search-service.ts
+@@ -147,6 +147,12 @@
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
++    subscribe("issue.moved", async (payload) => {
++      // The index denormalises the project (ADR 0011 §5): re-read the row so
++      // the document carries the target project.
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+         payload.orgId,
+diff --git a/src/types/activity.ts b/src/types/activity.ts
+--- a/src/types/activity.ts
++++ b/src/types/activity.ts
+@@ -20,6 +20,7 @@
+   | "issue.assigned"
+   | "issue.archived"
+   | "issue.restored"
++  | "issue.moved"
+   | "comment.created"
+   | "comment.updated"
+   | "comment.deleted"
+diff --git a/src/types/event.ts b/src/types/event.ts
+--- a/src/types/event.ts
++++ b/src/types/event.ts
+@@ -61,6 +61,13 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.moved": EventEnvelope & {
++    issueId: IssueId;
++    fromProjectId: ProjectId;
++    toProjectId: ProjectId;
++    fromNumber: number;
++    toNumber: number;
++  };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
