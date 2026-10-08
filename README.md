@@ -121,6 +121,29 @@ The effort comparison uses the same Codex runtime with interleaved execution. Cl
 Paired comparisons average repeats per task and bootstrap all 12 tasks. Claude reference totals use the same 72 low/medium/high cells (xhigh excluded). The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 120-turn/$8 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-extreme`](results/sol61-extreme/REPORT.md), [`analysis.json`](results/sol61-extreme/analysis.json), [`runs.csv`](results/sol61-extreme/runs.csv). Japanese HTML: [`report-sol61-extreme-ja.html`](docs/report-sol61-extreme-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> scripts/run-sol61.sh extreme`.
 <!-- SOL61-EXTREME-README-END -->
 
+<!-- LUNA-README-START -->
+**GPT-6 Luna, all four sets:** 500 solver and graded runs at low/medium/high/xhigh. Independent Codex runtime; Claude turn/budget caps cannot be enforced identically. Concurrent Haiku host load and runtime/date differences apply. Base Standard solver cost subtotal $6.9047, not an invoice. [Data and paired task CIs](results/luna/REPORT.md), [JSON](results/luna/analysis.json), [CSV](results/luna/runs.csv), [Japanese HTML](docs/report-luna-ja.html).
+
+| セット | effort | 採点済み/予定 | 正解 | 時間中央値 | 推定費用中央値 |
+|---|---|---|---|---|---|
+| 通常45問 | low | 45/45 | 35 | 23.1 s | $0.0027 |
+| 通常45問 | medium | 45/45 | 32 | 25.8 s | $0.0022 |
+| 通常45問 | high | 45/45 | 37 | 36.5 s | $0.0027 |
+| 通常45問 | xhigh | 45/45 | 38 | 29.0 s | $0.0035 |
+| 難問 | low | 32/32 | 27 | 47.0 s | $0.0043 |
+| 難問 | medium | 32/32 | 26 | 35.2 s | $0.0042 |
+| 難問 | high | 32/32 | 31 | 50.8 s | $0.0050 |
+| 難問 | xhigh | 32/32 | 29 | 59.3 s | $0.0067 |
+| 超難問 | low | 24/24 | 15 | 76.7 s | $0.0169 |
+| 超難問 | medium | 24/24 | 20 | 54.2 s | $0.0109 |
+| 超難問 | high | 24/24 | 22 | 96.1 s | $0.0165 |
+| 超難問 | xhigh | 24/24 | 22 | 172.1 s | $0.0252 |
+| 極難問 | low | 24/24 | 9 | 92.8 s | $0.0230 |
+| 極難問 | medium | 24/24 | 9 | 86.4 s | $0.0144 |
+| 極難問 | high | 24/24 | 14 | 123.0 s | $0.0248 |
+| 極難問 | xhigh | 24/24 | 16 | 302.0 s | $0.0457 |
+<!-- LUNA-README-END -->
+
 Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
 
 Three findings behind the table:
