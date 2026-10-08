@@ -1,4 +1,4 @@
-"""Build docs/report-opus-ja.html: Opus 5.5 / Sonnet 5 / Sonnet 5.5 across four task sets.
+"""Build docs/report-opus-ja.html: Opus 5.5 / Sonnet 5 / Sonnet 5.5 / Haiku 5.5 across four task sets.
 
 Usage: python3 scripts/report-opus/build_html.py <out.html> <dir with f-code45.json f-hard.json f-ultra.json f-extreme.json>
 Each f-<set>.json is extract.py output for that set's results dir.
@@ -19,7 +19,8 @@ D = {k: json.load(open(os.path.join(DATA, f"f-{k}.json"))) for k, _, _ in SETS}
 head = open(os.path.join(HERE, "head.html")).read()
 
 EFFORTS = ["low", "medium", "high", "xhigh"]
-FAM = [("opus-effort", "Opus 5.5", "m-opus"), ("effort", "Sonnet 5", "m-s5"), ("sonnet55-effort", "Sonnet 5.5", "m-s55")]
+FAM = [("opus-effort", "Opus 5.5", "m-opus"), ("effort", "Sonnet 5", "m-s5"), ("sonnet55-effort", "Sonnet 5.5", "m-s55"),
+       ("haiku55-effort", "Haiku 5.5", "m-h55")]
 
 
 def arm(prefix, e):
@@ -100,7 +101,7 @@ def arm_table(k):
 
 def pair_table(k):
     rows = []
-    for x, y, label in [("sonnet55-effort", "effort", "Sonnet 5.5 − Sonnet 5"), ("opus-effort", "sonnet55-effort", "Opus 5.5 − Sonnet 5.5")]:
+    for x, y, label in [("sonnet55-effort", "effort", "Sonnet 5.5 − Sonnet 5"), ("opus-effort", "sonnet55-effort", "Opus 5.5 − Sonnet 5.5"), ("haiku55-effort", "sonnet55-effort", "Haiku 5.5 − Sonnet 5.5")]:
         for e in EFFORTS:
             p = D[k]["pairs"].get(f"{arm(x, e)}|{arm(y, e)}")
             if not p:
@@ -153,7 +154,7 @@ def famrow(k, lbl):
 summary_table = (
     '<div class="tbl"><table class="rep"><thead><tr><th>セット（4 effort の合計）</th>'
     '<th class="n"><i class="dot m-opus"></i>Opus 5.5</th><th class="n"><i class="dot m-s5"></i>Sonnet 5</th>'
-    '<th class="n"><i class="dot m-s55"></i>Sonnet 5.5</th></tr></thead><tbody>'
+    '<th class="n"><i class="dot m-s55"></i>Sonnet 5.5</th><th class="n"><i class="dot m-h55"></i>Haiku 5.5</th></tr></thead><tbody>'
     + "".join(famrow(k, lbl) for k, lbl, _ in SETS)
     + "</tbody></table></div>"
 )
@@ -173,18 +174,22 @@ def set_section(k, lbl, path):
   <p class="cap">cost・wall・turns は 1 本あたりの中央値。$/正解 = arm の総費用 ÷ 正解数。委譲 = subagent を起動した run の数。</p>
   {pair_table(k)}
   <p class="cap">緑 = 左が有利で 95% CI が 0 をまたがない、赤 = 左が不利で CI が 0 をまたがない、灰色 = 差があるとは言えない。データ: <code>{path}</code></p>
-  <div class="chart" id="sc-{k}"><div class="chart-head"><strong>{lbl}: $/正解 と正答率</strong><span class="legend"><span><i class="dot m-opus"></i>Opus 5.5</span><span><i class="dot m-s5"></i>Sonnet 5</span><span><i class="dot m-s55"></i>Sonnet 5.5</span></span></div><svg role="img" aria-label="{lbl} の arm ごとの 正解 1 件あたりコストと正答率"></svg></div>
+  <div class="chart" id="sc-{k}"><div class="chart-head"><strong>{lbl}: $/正解 と正答率</strong><span class="legend"><span><i class="dot m-opus"></i>Opus 5.5</span><span><i class="dot m-s5"></i>Sonnet 5</span><span><i class="dot m-s55"></i>Sonnet 5.5</span><span><i class="dot m-h55"></i>Haiku 5.5</span></span></div><svg role="img" aria-label="{lbl} の arm ごとの 正解 1 件あたりコストと正答率"></svg></div>
 """
 
 
 x_ok = {e: X[f"sonnet55-effort-{e}|effort-{e}"]["ok"] for e in EFFORTS}
+h_ok = {e: X[f"haiku55-effort-{e}|sonnet55-effort-{e}"]["ok"] for e in EFFORTS}
+h_ratio = {k: tot[k]["Haiku 5.5"][2] / tot[k]["Sonnet 5.5"][2] for k in D}
+h_turns = [D[k]["arms"][f"haiku55-effort-{e}"]["turns_med"] for k in ("ultra", "extreme") for e in EFFORTS]
+s55_turns = [D[k]["arms"][f"sonnet55-effort-{e}"]["turns_med"] for k in ("ultra", "extreme") for e in EFFORTS]
 body = f"""
 <style>
-  :root{{--m-opus:#3E4B9A;--m-s5:#8A9190;--m-s55:#0B8C7F}}
-  @media (prefers-color-scheme: dark){{:root:not([data-theme="light"]){{--m-opus:#9AA6E8;--m-s5:#7C8683;--m-s55:#3DB3A5}}}}
-  :root[data-theme="dark"]{{--m-opus:#9AA6E8;--m-s5:#7C8683;--m-s55:#3DB3A5}}
+  :root{{--m-opus:#3E4B9A;--m-s5:#8A9190;--m-s55:#0B8C7F;--m-h55:#B0701A}}
+  @media (prefers-color-scheme: dark){{:root:not([data-theme="light"]){{--m-opus:#9AA6E8;--m-s5:#7C8683;--m-s55:#3DB3A5;--m-h55:#E0A55A}}}}
+  :root[data-theme="dark"]{{--m-opus:#9AA6E8;--m-s5:#7C8683;--m-s55:#3DB3A5;--m-h55:#E0A55A}}
   .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:0}}
-  .m-opus{{background:var(--m-opus)}} .m-s5{{background:var(--m-s5)}} .m-s55{{background:var(--m-s55)}}
+  .m-opus{{background:var(--m-opus)}} .m-s5{{background:var(--m-s5)}} .m-s55{{background:var(--m-s55)}} .m-h55{{background:var(--m-h55)}}
   tr.aside td{{color:var(--ink-2)}}
   .opinion{{margin:24px 0;padding:18px 22px;border-left:3px solid var(--m-s55);background:var(--panel)}}
   .opinion p{{margin:8px 0}}
@@ -192,9 +197,9 @@ body = f"""
 </style>
 <body>
 <div class="wrap">
-  <p class="eyebrow">graphify-bench · モデル比較 · 2026-09-25〜29</p>
+  <p class="eyebrow">graphify-bench · モデル比較 · 2026-09-25〜10-08</p>
   <h1>Sonnet 5.5 は、症状だけの難しい修正で Opus 5.5 とほぼ同じ正答率を、約半分のコストで出した。</h1>
-  <p class="lede col">Opus 5.5・Sonnet 5・Sonnet 5.5 を、それぞれ <code>--effort</code> low・medium・high・xhigh の 4 段階で、難しさと問題の書き方が違う 4 つの問題セットに解かせた。どれも素の Claude Code（<code>claude -p</code>）で、変えたのはモデルと effort だけ。{all_runs:,} run、定価換算で ${all_cost:,.0f}。</p>
+  <p class="lede col">Opus 5.5・Sonnet 5・Sonnet 5.5、それに 10-08 に追加した Haiku 5.5 を、それぞれ <code>--effort</code> low・medium・high・xhigh の 4 段階で、難しさと問題の書き方が違う 4 つの問題セットに解かせた。どれも素の Claude Code（<code>claude -p</code>）で、変えたのはモデルと effort だけ。{all_runs:,} run、定価換算で ${all_cost:,.0f}。</p>
 
   <h2 class="col">サマリと見解</h2>
   {summary_table}
@@ -207,6 +212,7 @@ body = f"""
     <li><b>難問でも Sonnet 5.5 が最安。</b>{tot['hard']['Sonnet 5.5'][0]}/128 正解で、1 本 {usd(D['hard']['arms']['sonnet55-effort-low']['cost_med'])}〜{usd(D['hard']['arms']['sonnet55-effort-xhigh']['cost_med'])}。Opus 5.5（{tot['hard']['Opus 5.5'][0]}/128）は、同じ effort 同士で {rng(H, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い。</li>
     <li><b>仕様を細かく書いた超難問では、Sonnet 5 と 5.5 のコストと時間に差がない</b>（どの effort でも CI が 0 をまたぐ）。正答率は 5.5 が {tot['ultra']['Sonnet 5.5'][0]}/96、5 が {tot['ultra']['Sonnet 5'][0]}/96 で、5.5 がわずかに低い（CI の上限がちょうど 0）。Opus は同じ effort 同士で {rng(U, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い。</li>
     <li><b>45 問では、今回測った Claude 3 モデルは 78〜89% の範囲に入る。</b>この Claude 比較の中では Sonnet 5.5 の正解が最も多く（{tot['code45']['Sonnet 5.5'][0]}/180。Opus 5.5 は {tot['code45']['Opus 5.5'][0]}/180）、コストも最も低い（同じ effort 同士で Opus が {rng(C, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い）。</li>
+    <li><b>Haiku 5.5 は、仕様が書いてある問題では Sonnet 5.5 と並び、症状だけの問題で一段落ちる。</b>4 effort の合計で、難問 {tot['hard']['Haiku 5.5'][0]}/128（Sonnet 5.5 は {tot['hard']['Sonnet 5.5'][0]}/128）、超難問 {tot['ultra']['Haiku 5.5'][0]}/96（同 {tot['ultra']['Sonnet 5.5'][0]}/96）、45 問 {tot['code45']['Haiku 5.5'][0]}/180（同 {tot['code45']['Sonnet 5.5'][0]}/180）、極難問 {tot['extreme']['Haiku 5.5'][0]}/96（同 {tot['extreme']['Sonnet 5.5'][0]}/96）。極難問の low では Sonnet 5.5 より {pt(h_ok['low']['mean'])}（CI が 0 をまたがない）。$/正解はどのセットでも最安で、Sonnet 5.5 の {min(h_ratio.values()):.2f}〜{max(h_ratio.values()):.2f} 倍。代わりにターン数が多く（超難問・極難問の中央値 {min(h_turns):g}〜{max(h_turns):g}、Sonnet 5.5 は {min(s55_turns):g}〜{max(s55_turns):g}）、極難問では 1 本あたり {rng(X, 'haiku55-effort', 'sonnet55-effort', 'wall', sec)} 遅い（CI が 0 をまたがない）。一度も委譲していない。</li>
     <li><b>Sonnet 5.5 の xhigh は割に合わない。</b>high と比べてコストが {xh_ratio_lo:.1f}〜{xh_ratio_hi:.1f} 倍になるのに、正答率はどのセットでも上がらない（±1 本）。</li>
   </ul>
 
@@ -215,6 +221,7 @@ body = f"""
     <p><b>既定の候補は 2 つで、どちらでもいい。Sonnet 5.5 の high と、Opus 5.5 の low。</b>4 つのセットを通して、この 2 つの正答率はほぼ同じ。極難問はどちらも 23/24、難問はどちらも 32/32、超難問は 22/24 対 21/24、45 問は 39/45 対 38/45。コストも、Sonnet 5.5 high の方が少し安いか同じくらい。違うのは速さで、全アームを同時に測った極難問では Opus 5.5 low の方が 1 本あたり約 4 分の 1 速かった（{sec(D['extreme']['arms']['opus-effort-low']['wall_med'])} 対 {sec(D['extreme']['arms']['sonnet55-effort-high']['wall_med'])}）。待ち時間を減らしたいなら Opus low、1 本あたりのコストを削りたいなら Sonnet 5.5 high、という選び方になるわ。</p>
     <p><b>定型の作業なら、Sonnet 5.5 の low で十分。</b>45 問で {D['code45']['arms']['sonnet55-effort-low']['acc']}/45、難問で {D['hard']['arms']['sonnet55-effort-low']['acc']}/32 を、1 本 {usd(D['code45']['arms']['sonnet55-effort-low']['cost_med'])}・{usd(D['hard']['arms']['sonnet55-effort-low']['cost_med'])} で出している。</p>
     <p><b>Opus 5.5 の high・xhigh を選ぶのは、一度で正しいことが何より大事なときだけ。</b>合計の正答率では、隠しテストの 3 セットで Opus が Sonnet 5.5 を {min(pp):.1f}〜{max(pp):.1f}pt 上回る。ただ、同じ問題同士の CI ではほとんどが 0 をまたいでいて、1 本あたりのコストは同じ effort の Sonnet 5.5 の {oc_lo:.1f}〜{oc_hi:.1f} 倍よ。</p>
+    <p><b>Haiku 5.5 は、仕様が明確な作業と探索の下働き向き。</b>難問と超難問では Sonnet 5.5 と同じだけ解いて、コストは 1/2〜1/4 以下。45 問の内訳でも、呼び出し元の列挙と説明は満点で、落としたのは影響範囲の洗い出しと場所探し。一方、症状から直す場所を探す極難問では Sonnet 5.5 より {tot['extreme']['Sonnet 5.5'][0] - tot['extreme']['Haiku 5.5'][0]} 本少なく、時間も 2 倍前後かかる。high は medium より伸びず、xhigh で 2〜3 本増えるが、1 本あたりのコストは high の 1.7〜2.3 倍。待ち時間込みで考えると、普段のコーディングを Haiku 5.5 に置き換える理由はない。上の「探索で差がつく」という仮説とも合う結果よ。</p>
     <p><b>Sonnet 5 を選ぶ理由は、もうない。</b>仕様が細かい問題では Sonnet 5.5 と同等で、症状だけの問題では正答率・コスト・時間のすべてで大きく劣る。</p>
     <p><b>何が変わったのか（仮説）。</b>前回まで、Opus の強みは「症状から原因の場所を、少ない手数で探し当てる力」だと読んでいた。その証拠が、症状だけの問題で Sonnet 5 に大差をつけていたことよ。Sonnet 5.5 は、まさにその部分が伸びた。症状だけの極難問ではターン数が 1/3〜1/5 になって委譲もなくなり、正答率が上がった。一方、探索の要らない超難問ではほとんど変わっていない。これは測定からの推論で、モデルの中身を確かめたわけじゃないわ。</p>
   </div>
@@ -227,6 +234,7 @@ body = f"""
   <h2 class="col">限界</h2>
   <ul class="col">
     <li><b>比較の条件はセットで違う。</b>極難問は 12 アームすべてを同じ CLI（2.1.284）で、同じ時期に交互に走らせた。45 問・難問・超難問は、Opus 5.5 と Sonnet 5 が CLI 2.1.282・並列度 3（2026-09-25〜28）で、Sonnet 5.5 だけを CLI 2.1.284・並列度 6（2026-09-29）で追加した。この 3 セットでは、とくに Sonnet 5.5 の wall に並列度の違いが混ざる。コストと正答率は並列度の影響を受けない。</li>
+    <li><b>Haiku 5.5 は後から追加した。</b>2026-10-08 に CLI 2.1.293・並列度 6 で 4 セットとも測った。極難問でも、他の 12 アームとは日付と CLI が違うので、wall の比較には注意がいる。コストと正答率は並列度の影響を受けない。</li>
     <li><b>問題の作成者。</b>難問と超難問は Opus の subagent、極難問は Fable 5.1 の subagent が作り、全問を独立に再検証した。それでも、作成者の考え方に合う問題に偏っている可能性は否定できない。</li>
     <li><b>本数。</b>各 arm は 24〜45 本。正答率の数 pt の差は、多くの場合 CI の範囲内。</li>
     <li><b>費用は定価換算。</b><code>total_cost_usd</code> の値で、サブスクリプションで動かした分の実際の請求額とは一致しない。</li>
@@ -267,7 +275,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',drawAll);
 </body>
 </html>
 """
-title_fix = head.replace("<title>Opus 5.5 対 Sonnet 5</title>", "<title>Opus・Sonnet モデル比較</title>")
+title_fix = head.replace("<title>Opus 5.5 対 Sonnet 5</title>", "<title>Claude モデル比較</title>")
 open(OUT, "w").write("\n".join(line.rstrip() for line in (title_fix + body).split("\n")))
 print("wrote", OUT)
 # Keep the independently measured Codex/code-45 addition when rebuilding this report.
