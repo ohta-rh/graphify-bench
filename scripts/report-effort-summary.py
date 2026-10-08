@@ -26,6 +26,10 @@ REF = "sonnet55-effort"
 MODELS = [("Haiku 5.5", "haiku55-effort"), ("Sonnet 5.5", "sonnet55-effort"), ("Opus 5.5", "opus-effort"),
           ("Sonnet 5", "effort"), ("Grok 4.7", "grok-effort"), ("GPT-6.1 Sol", "sol61-effort"),
           ("GPT-6 Luna", "luna-effort")]
+# One colour token per model; Claude colours match docs/report-opus-ja.html.
+MODEL_CLASS = {"Haiku 5.5": "m-h55", "Sonnet 5.5": "m-s55", "Opus 5.5": "m-opus", "Sonnet 5": "m-s5",
+               "Grok 4.7": "m-grok", "GPT-6.1 Sol": "m-sol", "GPT-6 Luna": "m-luna"}
+TASK_JA = json.loads((ROOT / "scripts" / "task-names-ja.json").read_text())
 SETS = [("45問", "code-45", ["results/opus", "results/sol61", "results/luna/code45"]),
         ("難問", "hard", ["results/hard", "results/luna/hard"]),
         ("超難問", "ultra", ["results/ultra", "results/luna/ultra"]),
@@ -98,6 +102,22 @@ def esc(s):
     return html.escape(str(s))
 
 
+def mlabel(m):
+    return f'<span class="model"><i class="dot {MODEL_CLASS[m]}"></i>{m}</span>'
+
+
+def tlabel(t):
+    return f'<span class="tname">{esc(TASK_JA.get(t, t))}</span><span class="tid">{esc(t)}</span>'
+
+
+def heat(c, n):
+    """Pass-rate cell: background strength follows the rate (green high, red low)."""
+    r = c / n
+    tone = "good" if r >= 0.5 else "bad"
+    strength = round(abs(r - 0.5) * 2 * 42) + 6
+    return f'<td class="n heat" style="--tone:var(--{tone});--s:{strength}%">{c}/{n}</td>'
+
+
 def usd(v, digits=3):
     return "-" if v is None else f"${v:.{digits}f}"
 
@@ -128,6 +148,26 @@ def done_note(s):
     return "" if s is None or s["n"] == s["total"] else f'<span class="part">{s["n"]}/{s["total"]}</span>'
 
 
+# ---------- key points ----------
+def keypoints_section():
+    """Per set: most accurate, cheapest per correct answer and fastest model (complete runs only)."""
+    cards = []
+    for name, key, _ in SETS:
+        full = [(m, s) for m, p in MODELS if (s := stats(key, p, EFFORTS)) and s["n"] == s["total"]]
+        top = max(s["acc"] for _, s in full)
+        best = [m for m, s in full if s["acc"] == top]
+        cheap_m, cheap = min(full, key=lambda z: z[1]["per_correct"])
+        fast_m, fast = min(full, key=lambda z: z[1]["wall"])
+        cards.append(
+            f'<div class="card"><p class="card-set">{name}<span>{len(cells(key, EFFORTS))} セル</span></p>'
+            f'<dl><dt>正答率トップ</dt><dd><span class="names">{"".join(mlabel(m) for m in best)}</span><b>{top:.0%}</b></dd>'
+            f'<dt>$/正解 最安</dt><dd>{mlabel(cheap_m)}<b>{usd(cheap["per_correct"])}</b></dd>'
+            f'<dt>最速（中央値）</dt><dd>{mlabel(fast_m)}<b>{fast["wall"]:.0f}s</b></dd></dl></div>')
+    legend = "".join(f'<span>{mlabel(m)}</span>' for m, _ in MODELS)
+    return (f'<div class="legend">{legend}</div><div class="cards">{"".join(cards)}</div>'
+            '<p class="muted">low〜high 合計。そのセットの全セルを終えたモデルだけで判定している（途中のセットは除外）。</p>')
+
+
 # ---------- 0. status ----------
 def status_section():
     body = []
@@ -139,7 +179,7 @@ def status_section():
             has_x = any(c == f"{p}-xhigh" for (c, _, _) in DATA[key])
             expected = base if has_x else len(cells(key, EFFORTS))
             tds.append(f'<td class="n">{"-" if n == 0 else f"{n}/{expected}"}</td>')
-        body.append(f"<tr><td>{m}</td>{''.join(tds)}</tr>")
+        body.append(f"<tr><td>{mlabel(m)}</td>{''.join(tds)}</tr>")
     q = "".join(f'<td class="n">{QUARANTINE[key]}</td>' for _, key, _ in SETS)
     body.append(f'<tr class="na"><td>quarantine（全モデル、再実行済み）</td>{q}</tr>')
     return ('<h2 id="status">進み具合</h2><p class="muted">採点済みセル数 / 予定セル数。'
@@ -168,7 +208,7 @@ def overview_section():
                     continue
                 v = get(s)
                 tds += cell(v, best[key], (fmt(v) if v is not None else "-") + done_note(s), s["n"] != s["total"])
-            body.append(f"<tr><td>{m}</td>{tds}</tr>")
+            body.append(f"<tr><td>{mlabel(m)}</td>{tds}</tr>")
         parts.append(table(["モデル"] + [n for n, _, _ in SETS], body, title))
     return "\n".join(parts)
 
@@ -206,10 +246,10 @@ def paired_section():
             sig = "sig-neg" if hi < 0 else "sig-pos" if lo > 0 else ""
             cr = sum(x["cost"] for x in ma) / sum(x["cost"] for x in mb)
             wr = st.median(x["wall"] for x in ma) / st.median(x["wall"] for x in mb)
-            body.append(f'<tr><td>{name}</td><td>{m}</td><td class="n">{len(ma)}</td>'
+            body.append(f'<tr><td>{name}</td><td>{mlabel(m)}</td><td class="n">{len(ma)}</td>'
                         f'<td class="n {sig}">{mean * 100:+.1f}pt</td><td class="n">[{lo * 100:+.1f}, {hi * 100:+.1f}]</td>'
                         f'<td class="n">{cr:.2f}×</td><td class="n">{wr:.2f}×</td></tr>')
-    parts.append(table(["セット", "モデル", "セル", "正答率の差", "95% CI", "コスト比", "時間比"], body))
+    parts.append(table(["セット", "モデル", "セル", "正答率の差", "95% CI", "コスト比", "時間比"], body, None, "pair"))
     return "\n".join(parts)
 
 
@@ -234,7 +274,7 @@ def category_section():
             c = sum(x["ok"] for x in rows)
             sc = st.mean(x["score"] or 0 for x in rows)
             tds += cell(c, best[cat], f'{c}/{len(rows)} <span class="part">{sc:.2f}</span>')
-        body.append(f"<tr><td>{m}</td>{tds}</tr>")
+        body.append(f"<tr><td>{mlabel(m)}</td>{tds}</tr>")
     parts.append(table(["モデル"] + [f"{c}<br><span class=th-sub>{j}</span>" for c, j in CATEGORIES], body,
                        "正解数（low〜high 合計）と平均スコア"))
     # per effort
@@ -250,7 +290,7 @@ def category_section():
                 cr = [x for x in rows if x["category"] == cat]
                 tds += f'<td class="n">{sum(x["ok"] for x in cr)}/{len(cr)}</td>' if cr else '<td class="n na">-</td>'
             tot = sum(x["ok"] for x in rows)
-            body.append(f'<tr><td>{m}</td>{tds}<td class="n">{tot}/{len(rows)}</td></tr>')
+            body.append(f'<tr><td>{mlabel(m)}</td>{tds}<td class="n">{tot}/{len(rows)}</td></tr>')
         parts.append(table(["モデル"] + [c for c, _ in CATEGORIES] + ["計"], body, f"effort: {e}", "compact"))
     # tasks most often failed
     fails = collections.Counter()
@@ -259,8 +299,8 @@ def category_section():
         if any(c == f"{p}-{e}" for _, p in MODELS for e in EFFORTS):
             tries[t] += 1
             fails[t] += not x["ok"]
-    body = [f'<tr><td>{esc(t)}</td><td class="n">{fails[t]}/{tries[t]}</td></tr>' for t, _ in fails.most_common(10)]
-    parts.append(table(["タスク", "全モデルの失敗数"], body, "落とされやすいタスク（全モデル・low〜high）", "compact"))
+    body = [f'<tr><td>{tlabel(t)}</td>{heat(tries[t] - fails[t], tries[t])}</tr>' for t, _ in fails.most_common(10)]
+    parts.append(table(["タスク", "正解 / 全モデルの本数"], body, "落とされやすいタスク（全モデル・low〜high）", "compact"))
     return "\n".join(parts)
 
 
@@ -281,7 +321,7 @@ def scaling_section():
                 seen = True
                 tds += f'<td class="n">{s["correct"]}/{s["n"]}<br><span class="part">{usd(s["cost_med"])}</span></td>'
             if seen:
-                body.append(f"<tr><td>{m}</td>{tds}</tr>")
+                body.append(f"<tr><td>{mlabel(m)}</td>{tds}</tr>")
         parts.append(table(["モデル"] + ALL_EFFORTS, body, name, "compact"))
     return "\n".join(parts)
 
@@ -289,7 +329,7 @@ def scaling_section():
 # ---------- 5. per-task matrices ----------
 def task_section():
     parts = ['<h2 id="tasks">タスク別の正誤（難問・超難問・極難問）</h2>',
-             '<p class="muted">low〜high × 2 回 = 6 本中の正解数。0〜2 は赤、6 は強調。</p>']
+             '<p class="muted">low〜high × 2 回 = 6 本中の正解数。緑が濃いほど多く解け、赤が濃いほど落としている。途中のモデルは終わった本数が分母。</p>']
     for name, key, _ in SETS[1:]:
         tasks = sorted({t for (_, t, _) in cells(key, EFFORTS)})
         body = []
@@ -300,11 +340,9 @@ def task_section():
                 if not rows:
                     tds += '<td class="n na">-</td>'
                     continue
-                c = sum(x["ok"] for x in rows)
-                cls = "hit" if c == len(rows) else "low" if c <= len(rows) / 3 else ""
-                tds += f'<td class="n {cls}">{c}/{len(rows)}</td>'
-            body.append(f"<tr><td>{esc(t)}</td>{tds}</tr>")
-        parts.append(table(["タスク"] + [m for m, _ in MODELS], body, name, "compact"))
+                tds += heat(sum(x["ok"] for x in rows), len(rows))
+            body.append(f"<tr><td>{tlabel(t)}</td>{tds}</tr>")
+        parts.append(table(["タスク"] + [mlabel(m) for m, _ in MODELS], body, name, "compact heatmap"))
     return "\n".join(parts)
 
 
@@ -320,7 +358,7 @@ def reliability_section():
             rows = rows_for(key, p, cells(key, ALL_EFFORTS))
             n = sum(1 for x in rows if x["terminal"] in ("max_turns", "error_max_turns", "wall_timeout"))
             tds += f'<td class="n">{"-" if not rows else f"{n}/{len(rows)}"}</td>'
-        body.append(f"<tr><td>{m}</td>{tds}</tr>")
+        body.append(f"<tr><td>{mlabel(m)}</td>{tds}</tr>")
     parts.append(table(["モデル"] + [n for n, _, _ in SETS], body, None, "compact"))
     return "\n".join(parts)
 
@@ -341,7 +379,7 @@ def effort_tables():
             bw = bold_best([s["wall"] for _, s in ss], "min")
             body = []
             for m, s in ss:
-                body.append(f'<tr><td>{m}{done_note(s)}</td><td class="n">{s["correct"]}/{s["n"]}</td>'
+                body.append(f'<tr><td>{mlabel(m)}{done_note(s)}</td><td class="n">{s["correct"]}/{s["n"]}</td>'
                             + cell(s["acc"], ba, f'{s["acc"]:.0%}<span class="bar" style="--w:{s["acc"] * 100:.0f}%"></span>')
                             + f'<td class="n">{usd(s["cost"], 2)}</td>' + cell(s["per_correct"], bc, usd(s["per_correct"]))
                             + cell(s["wall"], bw, f'{s["wall"]:.0f}s')
@@ -354,7 +392,7 @@ def effort_tables():
 
 
 today = datetime.date.today().isoformat()
-body = "\n".join([status_section(), overview_section(), paired_section(), category_section(),
+body = "\n".join([keypoints_section(), status_section(), overview_section(), paired_section(), category_section(),
                   scaling_section(), task_section(), reliability_section(), effort_tables()])
 page = f"""<!doctype html>
 <html lang="ja">
@@ -364,9 +402,9 @@ page = f"""<!doctype html>
 <title>モデル比較の詳細</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@700&family=Noto+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-  :root{{--ground:#F5F6F3;--panel:#FCFCFB;--ink:#1C2024;--ink-2:#5F6B67;--rule:#D8DDD9;--rule-2:#EEF0EC;--accent:#3E4B9A;--bar:#B9C4C0;--good:#0B7A6F;--bad:#B24A2A;--hit:#E3EFEC;--low:#F6E4DD}}
-  @media (prefers-color-scheme: dark){{:root:not([data-theme="light"]){{--ground:#15181A;--panel:#1C2023;--ink:#E6E9E6;--ink-2:#9AA39F;--rule:#2C3235;--rule-2:#232829;--accent:#9AA6E8;--bar:#3A4448;--good:#3DB3A5;--bad:#E0785A;--hit:#1F2F2C;--low:#3A2621}}}}
-  :root[data-theme="dark"]{{--ground:#15181A;--panel:#1C2023;--ink:#E6E9E6;--ink-2:#9AA39F;--rule:#2C3235;--rule-2:#232829;--accent:#9AA6E8;--bar:#3A4448;--good:#3DB3A5;--bad:#E0785A;--hit:#1F2F2C;--low:#3A2621}}
+  :root{{--ground:#F5F6F3;--panel:#FCFCFB;--ink:#1C2024;--ink-2:#5F6B67;--rule:#D8DDD9;--rule-2:#EEF0EC;--accent:#3E4B9A;--bar:#B9C4C0;--good:#0B7A6F;--bad:#B24A2A;--hit:#E3EFEC;--low:#F6E4DD;--m-h55:#B0701A;--m-s55:#0B8C7F;--m-opus:#3E4B9A;--m-s5:#8A9190;--m-grok:#5B5F66;--m-sol:#9A4D8C;--m-luna:#4C8BC2}}
+  @media (prefers-color-scheme: dark){{:root:not([data-theme="light"]){{--ground:#15181A;--panel:#1C2023;--ink:#E6E9E6;--ink-2:#9AA39F;--rule:#2C3235;--rule-2:#232829;--accent:#9AA6E8;--bar:#3A4448;--good:#3DB3A5;--bad:#E0785A;--hit:#1F2F2C;--low:#3A2621;--m-h55:#E0A55A;--m-s55:#3DB3A5;--m-opus:#9AA6E8;--m-s5:#7C8683;--m-grok:#AEB3BA;--m-sol:#D08BC4;--m-luna:#82B6E4}}}}
+  :root[data-theme="dark"]{{--ground:#15181A;--panel:#1C2023;--ink:#E6E9E6;--ink-2:#9AA39F;--rule:#2C3235;--rule-2:#232829;--accent:#9AA6E8;--bar:#3A4448;--good:#3DB3A5;--bad:#E0785A;--hit:#1F2F2C;--low:#3A2621;--m-h55:#E0A55A;--m-s55:#3DB3A5;--m-opus:#9AA6E8;--m-s5:#7C8683;--m-grok:#AEB3BA;--m-sol:#D08BC4;--m-luna:#82B6E4}}
   *{{box-sizing:border-box}}
   body{{margin:0;background:var(--ground);color:var(--ink);font-family:"Noto Sans JP",system-ui,sans-serif;font-size:15px;line-height:1.8}}
   .wrap{{max-width:1040px;margin:0 auto;padding:48px 16px 96px}}
@@ -390,13 +428,33 @@ page = f"""<!doctype html>
   .part{{display:block;font-size:11px;color:var(--ink-2);font-family:"IBM Plex Mono",monospace}}
   td.hit{{background:var(--hit)}} td.low{{background:var(--low)}}
   td.sig-neg{{color:var(--bad);font-weight:500}} td.sig-pos{{color:var(--good);font-weight:500}}
+  .model{{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}}
+  .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}}
+  .m-h55{{background:var(--m-h55)}} .m-s55{{background:var(--m-s55)}} .m-opus{{background:var(--m-opus)}} .m-s5{{background:var(--m-s5)}}
+  .m-grok{{background:var(--m-grok)}} .m-sol{{background:var(--m-sol)}} .m-luna{{background:var(--m-luna)}}
+  .tname{{display:block;font-weight:500;white-space:normal;min-width:11em}}
+  .tid{{display:block;font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-2);letter-spacing:.01em}}
+  td.heat{{background:color-mix(in srgb,var(--tone) var(--s),var(--panel))}}
+  .heatmap td.n{{text-align:center}} .heatmap th:not(:first-child){{text-align:center}}
+  tbody td:first-child,thead th:first-child{{position:sticky;left:0;background:var(--panel);z-index:1}}
+  .heatmap tbody td:first-child{{min-width:14em}}
+  .legend{{display:flex;flex-wrap:wrap;gap:6px 18px;margin:28px 0 14px;font-size:13.5px}}
+  .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:8px 0}}
+  .card{{background:var(--panel);border:1px solid var(--rule);border-radius:8px;padding:14px 16px}}
+  .card-set{{font-family:"Shippori Mincho",serif;font-weight:700;font-size:18px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:baseline}}
+  .card-set span{{font-family:"Noto Sans JP",sans-serif;font-weight:400;font-size:12px;color:var(--ink-2)}}
+  .card dl{{margin:0;display:grid;gap:2px}} .card dt{{font-size:11.5px;color:var(--ink-2);margin-top:6px}}
+  .card dd{{margin:0;display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:14px}}
+  .card dd .names{{display:flex;flex-wrap:wrap;gap:2px 12px}}
+  .pair th:nth-child(2){{text-align:left}}
+  .card dd b{{font-family:"IBM Plex Mono",monospace;font-weight:500;color:var(--accent)}}
   .bar{{display:inline-block;vertical-align:middle;margin-left:8px;width:56px;height:6px;background:linear-gradient(90deg,var(--bar) var(--w),transparent var(--w));border:1px solid var(--rule)}}
 </style>
 </head>
 <body><div class="wrap">
-<h1>モデル比較の詳細：Claude・Grok・GPT</h1>
+<h1 id="top">モデル比較の詳細：Claude・Grok・GPT</h1>
 <p class="muted">{today} 集計。45問・難問・超難問・極難問の4セット。Haiku 5.5 / Sonnet 5.5 / Opus 5.5 / Sonnet 5（Claude Code）、Grok 4.7（Grok CLI）、GPT-6.1 Sol / GPT-6 Luna（Codex）。</p>
-<nav><a href="#status">進み具合</a><a href="#overview">総合</a><a href="#paired">ペア比較</a><a href="#category">カテゴリ別</a><a href="#scaling">effort</a><a href="#tasks">タスク別</a><a href="#reliability">打ち切り</a><a href="#low">low</a><a href="#medium">medium</a><a href="#high">high</a><a href="#xhigh">xhigh</a></nav>
+<nav><a href="#top">要点</a><a href="#status">進み具合</a><a href="#overview">総合</a><a href="#paired">ペア比較</a><a href="#category">カテゴリ別</a><a href="#scaling">effort</a><a href="#tasks">タスク別</a><a href="#reliability">打ち切り</a><a href="#low">low</a><a href="#medium">medium</a><a href="#high">high</a><a href="#xhigh">xhigh</a></nav>
 <ul class="muted">
 <li>どの表も、同じタスク・同じ effort・同じ回のセルで比べている（ペア比較）。合計は low〜high のみ（Grok と Sol に xhigh が無いため）。</li>
 <li>途中のモデルは、終わったセル数を小さく添えている（例 36/45）。その数字は揃ったセルだけの値なので、他モデルと完全には比べられない。</li>

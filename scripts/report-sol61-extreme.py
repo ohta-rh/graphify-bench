@@ -198,9 +198,15 @@ def md_table(headers, rows):
     return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---'] + ['---:'] * (len(headers)-1)) + '|\n' + '\n'.join('| ' + ' | '.join(row) + ' |' for row in rows)
 
 
+TASK_JA = json.loads((ROOT / 'scripts' / 'task-names-ja.json').read_text())
+
+
 def html_table(headers, rows):
     def cell(value, tag, index):
         content = html.escape(value)
+        if tag == 'td' and index == 0 and value in TASK_JA:
+            content = (html.escape(TASK_JA[value]) + '<span class="q" style="display:block;font-family:\'IBM Plex Mono\',monospace;font-size:11px">'
+                       + html.escape(value) + '</span>')
         if tag == 'td' and ' [' in value:
             first, rest = value.split(' ['); content = html.escape(first) + '<span class="q">[' + html.escape(rest) + '</span>'
         return f'<{tag}' + (' class="n"' if index else '') + '>' + content + f'</{tag}>'
