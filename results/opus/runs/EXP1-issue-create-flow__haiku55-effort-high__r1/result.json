@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 88635,
+  "stop_reason": "end_turn",
+  "session_id": "9923abb7-5ae3-41b5-b60a-dea2257ff63c",
+  "total_cost_usd": 0.029197469999999996,
+  "usage": {
+    "input_tokens": 22,
+    "cache_creation_input_tokens": 76529,
+    "cache_read_input_tokens": 573347,
+    "output_tokens": 16312,
+    "output_tokens_details": {
+      "thinking_tokens": 7633
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 76529,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 7357,
+        "cache_read_input_tokens": 86102,
+        "cache_creation_input_tokens": 1133,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1133
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 22,
+      "outputTokens": 16312,
+      "cacheReadInputTokens": 573347,
+      "cacheCreationInputTokens": 76529,
+      "webSearchRequests": 0,
+      "costUSD": 0.029197469999999996,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 7633,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 27,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "I traced this by reading the code; I did not run the tests or the app. The short version: the browser form calls a Server Action, which runs through a shared wrapper that validates input and resolves the actor. The action then runs a quota check, the service re-checks permissions and quota, and the row is inserted. After the insert, the service publishes `issue.created` on an in-process bus, and several subscribers react to it inside the same request.\n\n**1. Browser: the form**\n\nThe page is `src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx`. It is a server component that passes `createIssueAction` to the client `IssueForm` (`src/components/domain/issue/issue-form.tsx`) as `onSubmit`. `IssueForm` uses react-hook-form with `zodResolver(createIssueSchema)`, so the browser validates against the same schema the server re-parses. On submit it calls `submit` from `useFormAction` (`src/hooks/use-form-action.ts`). That hook awaits the action, sets `error` on a failed `ActionResult`, and resets the form on success. The code I read does not navigate after success.\n\nBefore the form is even rendered, the page itself gates access. It calls `loadProjectContext` (`src/app/(dashboard)/[orgSlug]/_lib/project-context.ts`), which calls `loadTenantContext` (`tenant-context.ts`). That resolves the org by slug, calls `getActor(orgSlug)`, asserts org scope, and loads flags. Then `getProject` applies project visibility, and any failure becomes a 404. The page runs `can(actor, \"issue:create\", …)` and calls `notFound()` if denied. It then reads the quota with `listIssues(..., includeArchived: true)` and shows \"This project is full\" if the limit is reached.\n\nThe request first passes through `src/proxy.ts`, which only checks that a session cookie exists. Real authorization happens in the layouts and in the action.\n\n**2. The Server Action and its wrapper**\n\n`createIssueAction` in `src/actions/issues/create-issue.ts` is a thin wrapper around `run = withAction(createIssueSchema, handler, { revalidate: [\"issues\"], cacheProfile: \"minutes\" })`. `withAction` in `src/actions/_lib/with-action.ts` runs the following steps in order:\n\n1. **Zod parse.** `createIssueSchema` in `src/schemas/issue.ts` checks `orgId`, `projectId`, `title` (3–200 characters), `description` (≤20,000), `labelIds` (≤20), and defaults for the rest. On failure it returns `toActionResult(error)` and never touches the database.\n2. **Actor resolution.** `resolveActorFor` sees no `orgSlug` in the payload, so it uses `orgId` and calls `requireActorFor(orgId)` in `src/lib/actor.ts`. That function reads the session through `getSessionPrincipal` (`src/lib/session.ts`, which hashes the cookie token and resolves the session row via `session-service`), checks `activeOrgId` is non-null, loads the org, and calls `resolveActorForOrg`. That checks for an active membership and builds an `Actor` of `{userId, orgId, role}`. It then runs `assertOrgScope`. Failures throw `UnauthorizedError` or `NoMembershipError`, which `toActionResult` (`src/lib/errors.ts`) maps to `ActionResult` errors.\n\n**3. The action handler**\n\nInside the handler, the action runs its own permission check. It calls `can(actor, \"issue:create\", {...})` from `src/lib/permissions.ts`. That consults `ROLE_MATRIX`, where `issue:create` requires `member`. If the check fails it throws `ForbiddenActionError`.\n\nNext, `assertProjectHasRoom` runs. It calls `getOrganizationSummary` (`organization-service.ts`, which asserts `org:read` and loads the plan) and `getPlanLimits` (`src/config/plan-limits.ts`). It counts existing issues with `listIssues(..., includeArchived: true)`, and throws `PlanLimitError` if `total >= issuesPerProject`.\n\n**4. The service: `createIssue` in `src/server/services/issue-service.ts`**\n\nThis is where the write rules live. It runs these steps in order:\n\n- `assertOrgScope(actor, input.orgId)`.\n- `projectRepo.findProjectById(orgId, projectId)` through `requireFound`, then `assertNotArchived`, then `assertCan(actor, \"issue:create\", projectResource(project))`.\n- `orgRepo.findOrgById`, then `issueRepo.countIssues(orgId, projectId)` and `wouldExceedLimit(org.plan, \"issuesPerProject\", used)`. This is a second quota check.\n- `issueRepo.nextIssueNumber`, which returns `max(number) + 1` for the project.\n- `issueRepo.insertIssue(input, actor.userId, number)` in `src/server/repositories/issue-repository.ts`. This inserts the `issues` row (`id` from `newId()`, timestamps, `authorId` from the actor) and then a separate insert into `issue_labels` if any labels were given. There is no transaction. The table has a unique index on `(project_id, number)`, defined in `src/server/db/schema/issues.ts`.\n- `emit(\"issue.created\", {...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority})`.\n\n**5. The event bus and subscribers**\n\n`emit` in `src/lib/event-bus.ts` runs every handler for the event type through `Promise.allSettled`. Rejections go to error sinks and are never rethrown. The handlers are registered once at boot. `src/instrumentation.ts` calls `registerEventHandlers()` from `src/server/services/event-registry.ts`, which wires the groups below. For `issue.created`, these run inside the request, and `emit` awaits them:\n\n- **Activity:** `registerActivityListeners` in `activity-service.ts` writes an activity row, \"Created issue …\".\n- **Search:** `registerSearchListeners` in `search-service.ts` re-reads the issue with `findIssueById` and indexes it.\n- **Usage:** `registerUsageListeners` in `usage-service.ts` calls `usageRepo.incrementUsage(orgId, { issuesUsed: 1 })`.\n- **Webhooks:** `registerWebhookListeners` in `webhook-service.ts` calls `enqueueForOrg`. That lists the org's endpoints, keeps only enabled ones subscribed to `issue.created`, and writes a delivery row for each. A scheduled drain later sends them. The scheduler is in `src/server/jobs/scheduler.ts`, and the queue is in `src/server/jobs/queue.ts`. Delivery happens outside the request.\n\nNotifications do not react to creation. `notification-service.ts` subscribes to `issue.assigned`, not `issue.created`.\n\n**6. Return path**\n\nBack in `withAction`, the wrapper calls `revalidateTagged([\"issues\"], minutes)`, which wraps Next's `revalidateTag` in `src/lib/cache.ts`. The handler also invalidates the org, project and issue tags. The result is wrapped as `{ ok: true, data: issue, submittedAt }` by `stamp`, and the client takes it from there.\n\n**Findings from reading the path**\n\n- **Archived issues are counted inconsistently.** The page and the action count archived issues toward the quota, as their comments say. `issueRepo.countIssues` defaults to live rows only, so the service's own quota check excludes them. The action runs first and is stricter, so users see the intended rule, but the service-level backstop is weaker than its comment suggests. The usage counter also decrements on `issue.archived`, so the usage meter does not match the quota.\n- **The quota check and the write are not atomic.** The count and the insert are separated by several `await`s. Two concurrent submissions at the limit can both pass. The issue insert and the label insert are also not in a transaction, so a failed label insert leaves an issue without its labels. The `register` and `delete-label` actions say they use transactions. This path does not.\n- **A concurrent duplicate number fails with a raw database error.** The unique index stops duplicate `(project_id, number)` rows, but the losing request gets a constraint error. I did not trace how `toAppError` classifies that error.\n- **An assignee set at creation gets no notification.** `issue.assigned` is only emitted from `assignIssue`. `createIssue` emits only `issue.created`, and the notification fan-out only listens for `issue.assigned`.\n- **Side effects are not tied to the insert.** Activity, search, usage and webhook writes run after the insert, in-process, with no outbox. If the process dies between the insert and `emit`, those side effects are lost. Subscriber errors are swallowed, so the action still reports success.\n- **`labelIds`, `assigneeId` and `parentId` are not checked for org membership in this path.** `createIssue` and `insertIssue` write them as given, and `issue_labels` is written with the caller's `orgId`. I did not find a check that the label, assignee or parent belongs to that org. The IDs are not guessable, but this is a tenant-scope gap if the schemas do not enforce it.",
+  "ttft_ms": 1064,
+  "type": "result",
+  "duration_ms": 89039,
+  "uuid": "72f9064e-b857-4f64-b993-41287142339c",
+  "ttft_stream_ms": 548,
+  "time_to_request_ms": 37,
+  "first_content_frame_ms": 548,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

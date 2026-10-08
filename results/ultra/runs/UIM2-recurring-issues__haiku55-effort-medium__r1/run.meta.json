@@ -1,0 +1,104 @@
+{
+  "run_id": "UIM2-recurring-issues__haiku55-effort-medium__r1",
+  "task_id": "UIM2-recurring-issues",
+  "category": "implement",
+  "condition": "haiku55-effort-medium",
+  "rep": 1,
+  "grader": "vitest",
+  "session_id": "dd6e3b53-61ea-43ef-af54-1ff0a7362d69",
+  "started_at": "2026-10-08T01:16:39.127Z",
+  "finished_at": "2026-10-08T01:21:54.181Z",
+  "corpus_dir": "/private/tmp/claude-501/-Users-tetsuyaohta-projects-other-graphify-bench/62159fdd-3e4f-4711-8f57-0d85c73f6d6e/scratchpad/corpus-v1-haiku55",
+  "condition_spec": {
+    "name": "haiku55-effort-medium",
+    "overlays": [
+      "baseline"
+    ],
+    "corpus": "v1",
+    "model": "claude-haiku-5-5",
+    "effort": "medium",
+    "note": "`effort-medium` on Haiku 5.5 — only the model differs.",
+    "effective_model": "claude-haiku-5-5"
+  },
+  "overlay_dir": "/Users/tetsuyaohta/projects/other/graphify-bench/overlays/baseline",
+  "overlay_dirs": [
+    "/Users/tetsuyaohta/projects/other/graphify-bench/overlays/baseline"
+  ],
+  "overlay_files": [
+    "CLAUDE.md"
+  ],
+  "copy_strategy": "clonefile",
+  "copy_ms": 7744,
+  "mcp": null,
+  "patch": null,
+  "claude": {
+    "argv": [
+      "-p",
+      "Teams want chores such as \"Daily triage\" or \"Monday planning\" filed automatically. Build recurring issues: rules that a background job turns into ordinary issues.\n\nAdd exactly these exports:\n\n1. `src/types/recurring-issue.ts`: `type RecurrenceCadence = \"daily\" | \"weekly\"` and `interface RecurringIssue { id: string; orgId: OrgId; projectId: ProjectId; title: string; priority: IssuePriority; assigneeId: UserId | null; cadence: RecurrenceCadence; weekday: number | null; timezone: string; startsOn: string; lastOccurrenceOn: string | null; paused: boolean; createdBy: UserId; createdAt: IsoTimestamp; updatedAt: IsoTimestamp }`. Dates (`startsOn`, `lastOccurrenceOn`, occurrences) are `YYYY-MM-DD` strings; `weekday` is the ISO weekday, 1 = Monday … 7 = Sunday.\n2. `src/schemas/recurring-issue.ts`: `createRecurringIssueSchema`, a zod object `{ orgId, projectId, title, priority, assigneeId, cadence, weekday, timezone, startsOn }` (ids validated like the other schemas validate them; `title` 3–180 characters; `priority` an issue priority defaulting to `\"none\"`; `assigneeId` nullable, default `null`; `weekday` an integer 1–7 or `null`, default `null`). It must fail when `cadence` is `\"weekly\"` and `weekday` is `null`, when `cadence` is `\"daily\"` and `weekday` is not `null`, when `timezone` is not an IANA time zone the runtime knows, and when `startsOn` is not a real `YYYY-MM-DD` calendar date (e.g. `2026-02-30`). Export `type CreateRecurringIssueInput = z.input<typeof createRecurringIssueSchema>`.\n3. `src/server/services/recurring-issue-service.ts`:\n   - `createRecurringIssue(actor: Actor, input: CreateRecurringIssueInput): Promise<RecurringIssue>`\n   - `setRecurringIssuePaused(actor: Actor, input: { orgId: OrgId; recurringIssueId: string; paused: boolean }): Promise<RecurringIssue>`\n   - `listRecurringIssues(actor: Actor, orgId: OrgId): Promise<readonly RecurringIssue[]>` (in creation order)\n4. `src/server/jobs/recurring-issue-job.ts`: `runRecurringIssueJob(now: Date): Promise<JobResult>` (the job layer's usual result envelope; `processed` = issues created). Register it with the job queue as job kind `\"recurring-issues\"` so that a queued job of that kind runs it (with the current time), and give the scheduler a cadence of 15 minutes for it.\n5. Persist the rules in a new table (schema + the migrations the app runs) behind a repository of their own.\n6. A per-plan quota `recurringIssues` on the plan limits: free 0, starter 3, growth 25, enterprise unlimited (the codebase's unlimited sentinel).\n\nRules for `createRecurringIssue`:\n- Validate the input with `createRecurringIssueSchema` (invalid input rejects with the `ZodError`, nothing stored).\n- `input.orgId` must be the actor's organization (else the codebase's tenant-scope error). The project must exist in that organization (else the service layer's not-found error) and must not be archived (else the codebase's already-archived error). The actor needs the same permission as creating an issue in that project (else the codebase's permission-denied error).\n- A non-null `assigneeId` must be an active member of the organization; otherwise reject (any error).\n- The organization's plan caps the number of rules it may have; every existing rule counts, paused ones included. Creating one more than the cap rejects (any error) and stores nothing.\n- The stored rule starts with `lastOccurrenceOn: null`, `paused: false`, `createdBy` = the actor.\n\n`setRecurringIssuePaused` and `listRecurringIssues`: tenant-scope error for another organization's `orgId`; a rule id that does not exist in the actor's organization is the not-found error. Pausing requires the same permission as creating an issue in the rule's project; listing requires permission to read issues.\n\nOccurrences: a daily rule occurs on every calendar day on or after `startsOn`; a weekly rule on every day on or after `startsOn` whose ISO weekday is `weekday`. Days are calendar days in the rule's own `timezone`: occurrence day D has started once the local time in that zone has reached 00:00 on D (daylight-saving rules included).\n\nRules for `runRecurringIssueJob(now)` — it looks at every non-paused rule of every organization:\n- Let L be the latest occurrence that has started by `now`. If there is none, or `lastOccurrenceOn` is not null and L ≤ `lastOccurrenceOn`, do nothing for that rule. Missed occurrences are never back-filled: at most one issue per rule per run, always for L. Running the job again for the same `now` creates nothing new.\n- If the rule's project is archived, skip the rule and leave it unchanged (once the project is restored, the next run files the then-latest occurrence).\n- The issue is filed on behalf of the rule's creator, exactly as if that user created it by hand — the same checks and the same side effects (events etc.) as a normal issue creation. If the creator is no longer an active member of the organization, or their current role no longer allows creating issues in that project, create nothing and set the rule to `paused: true`.\n- The issue: title `<rule title> (<L>)` (e.g. `Daily triage (2026-03-05)`), in the rule's project, status `backlog`, the rule's priority, no description, no due date, no labels; assignee = the rule's assignee if they are still an active member of the organization, otherwise unassigned.\n- If the creation is refused for any other reason (for example the project is at its plan's issue quota), nothing is created and the rule is left exactly as it was — not paused, `lastOccurrenceOn` not advanced — so a later run tries again.\n- After a successful creation set `lastOccurrenceOn` to L. One rule's failure never stops the other rules from being processed.\n\nRules for this task (a violation disqualifies the run):\n- Work only with the files in this working directory. Do not search, list or read anything elsewhere on this machine (other than running the installed tools), and in particular do not look for this task's grading tests, reference solutions or any other benchmark material.\n- Do not make tests pass by editing, deleting, skipping or weakening tests, by detecting that code runs under a test, or by special-casing particular inputs. Implement the behaviour described.\n- Temporary files you create yourself under /tmp are fine.\n\nThis is an `implement` task: edit the code and stop, as for a `fix` task. Do not write a summary and do not emit an ANSWER line.",
+      "--output-format",
+      "json",
+      "--model",
+      "claude-haiku-5-5",
+      "--effort",
+      "medium",
+      "--setting-sources",
+      "project",
+      "--permission-mode",
+      "bypassPermissions",
+      "--max-turns",
+      "120",
+      "--max-budget-usd",
+      "8",
+      "--session-id",
+      "dd6e3b53-61ea-43ef-af54-1ff0a7362d69"
+    ],
+    "exit_code": 0,
+    "signal": null,
+    "timed_out": false,
+    "wall_ms": 302636,
+    "parse_error": null,
+    "stderr_tail": null
+  },
+  "transcript": {
+    "captured": true,
+    "dest": "/Users/tetsuyaohta/projects/other/graphify-bench/results/ultra/runs/UIM2-recurring-issues__haiku55-effort-medium__r1/transcript.jsonl",
+    "bytes": 1261497,
+    "removedOriginal": true,
+    "source": "/Users/tetsuyaohta/.claude/projects/-private-var-folders-82-dclbn8z5181-3ppfdtp8csd40000gn-T-bench-scratch-dd6e3b53-61ea-43ef-af54-1ff0a7362d69/dd6e3b53-61ea-43ef-af54-1ff0a7362d69.jsonl",
+    "projectDir": "-private-var-folders-82-dclbn8z5181-3ppfdtp8csd40000gn-T-bench-scratch-dd6e3b53-61ea-43ef-af54-1ff0a7362d69",
+    "via": "encoded"
+  },
+  "vitest": {
+    "ran": true,
+    "passed": false,
+    "exitCode": 1,
+    "spec": "tests/hidden/UIM2-recurring-issues.test.ts",
+    "outputTail": "RUN  v4.1.11 /private/var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch/dd6e3b53-61ea-43ef-af54-1ff0a7362d69\n\n ❯ tests/hidden/UIM2-recurring-issues.test.ts (14 tests | 1 failed) 407ms\n     × leaves the rule to retry when the project's issue quota refuses the issue 219ms\n\n Test Files  1 failed (1)\n      Tests  1 failed | 13 passed (14)\n   Start at  10:21:49\n   Duration  1.44s (transform 178ms, setup 82ms, import 467ms, tests 407ms, environment 360ms)\n\n\n\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯\n\n FAIL  tests/hidden/UIM2-recurring-issues.test.ts > UIM2 runRecurringIssueJob > leaves the rule to retry when the project's issue quota refuses the issue\nAssertionError: expected [] to deeply equal [ 'Quota bound (2026-03-06)' ]\n\n- Expected\n+ Received\n\n- [\n-   \"Quota bound (2026-03-06)\",\n- ]\n+ []\n\n ❯ tests/hidden/UIM2-recurring-issues.test.ts:450:52\n    448|       query: \"Quota bound (\",\n    449|     });\n    450|     expect(page.items.map((issue) => issue.title)).toEqual([\"Quota bou…\n       |                                                    ^\n    451|     expect((await stored(t, created.id))?.lastOccurrenceOn).toBe(\"2026…\n    452|   });\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯"
+  },
+  "hidden": [
+    "tests/hidden/UIM2-recurring-issues.test.ts"
+  ],
+  "env": {
+    "model": "claude-haiku-5-5",
+    "effort": "medium",
+    "maxBudgetUsd": 8,
+    "maxTurns": 120,
+    "scratch": "/var/folders/82/dclbn8z5181_3ppfdtp8csd40000gn/T/bench-scratch",
+    "reps": 3,
+    "hookStrict": false
+  },
+  "versions": {
+    "claude": "2.1.293 (Claude Code)",
+    "graphify": "graphify 0.9.53",
+    "node": "v25.5.0",
+    "pnpm": "10.28.2",
+    "platform": "darwin 25.2.0 arm64"
+  },
+  "timings_ms": {
+    "total": 315054,
+    "copy": 7744,
+    "claude": 302636,
+    "vitest": 1907
+  },
+  "error": null
+}

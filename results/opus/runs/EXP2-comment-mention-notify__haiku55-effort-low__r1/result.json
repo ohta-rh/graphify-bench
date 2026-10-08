@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 26112,
+  "stop_reason": "end_turn",
+  "session_id": "417302b9-eb60-4dd7-991a-c33096d273a2",
+  "total_cost_usd": 0.010327820000000001,
+  "usage": {
+    "input_tokens": 14,
+    "cache_creation_input_tokens": 30568,
+    "cache_read_input_tokens": 178582,
+    "output_tokens": 4854,
+    "output_tokens_details": {
+      "thinking_tokens": 1331
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 30568,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2820,
+        "cache_read_input_tokens": 37103,
+        "cache_creation_input_tokens": 4171,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 4171
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 14,
+      "outputTokens": 4854,
+      "cacheReadInputTokens": 178582,
+      "cacheCreationInputTokens": 30568,
+      "webSearchRequests": 0,
+      "costUSD": 0.010327820000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 1331,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 7,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "The path has four stages: the server extracts handles from the body, resolves them to member ids, carries those ids on a domain event, and a subscriber writes per-recipient rows whose channels come from preferences. Email is the part that does not fully work the way the names suggest.\n\n**1. Handle extraction (`src/lib/mentions.ts`)**\n`extractMentions` strips fenced and inline code with `withoutCode`, then runs `MENTION_PATTERN`. That pattern requires `@` at the start of the line or after whitespace or `([<[`, so email addresses don't match. It returns distinct lowercased handles in first-appearance order. `handleOf` defines a handle as the lowercased local part of a member's email.\n\n**2. Handle to user id (`src/actions/comments/create-comment.ts` → `src/server/services/comment-service.ts`)**\n`createCommentAction` runs through `withAction` and the Zod schema, checks `can(actor, \"comment:create\", …)`, and charges the rate limit. It then calls `createComment`. That function checks org scope, loads the issue, runs `assertCan` and `assertNotArchived`, and applies a second rate limit. It then calls `resolveMentionedUsers`, which:\n- loads up to `MENTION_LOOKUP_LIMIT` (100) members via `memberRepo.listMembers`;\n- calls `resolveMentions(body, members.items)` to map handles to `userId`s, silently dropping unknown handles;\n- unions that with any client-supplied `mentionedUserIds` (from the composer's optimistic state), keeping only ids that are members of the org.\n\nMentions are resolved on the server, so the client list is only a supplement.\n\n**3. What carries the list forward**\n`commentRepo.insertComment` stores the resolved ids on the comment row as JSON. Then `emit(\"comment.created\", { …actorEnvelope, commentId, issueId, mentionedUserIds })` is called. `emit` (`src/lib/event-bus.ts`) awaits every subscriber with `Promise.allSettled`, so the fan-out finishes before `createComment` returns, and handler errors are reported to sinks rather than thrown. The fan-out does not re-parse the markdown; it reads this payload.\n\n**4. Fan-out (`src/server/services/notification-service.ts`)**\n`notification-service` attaches its subscribers at module load through `registerFanOut()`. It is loaded as a side effect of `event-registry.ts`, which `src/instrumentation.ts` calls at process start. The `comment.created` subscriber does two things:\n- It notifies the issue's author and assignee with kind `comment_created`.\n- If `mentionedUserIds` is non-empty, it calls `notify(orgId, \"comment_mention\", mentionedUserIds, …)`.\n\n`notify` runs for each recipient:\n- It skips the actor (`recipientId === payload.actorId`).\n- It loads the recipient's `notification-preference-repository.getPreference(orgId, recipientId, kind)`.\n- `resolveChannels(preference, flags)` returns `[\"in_app\", \"email\"]` if there is no preference row. Otherwise `in_app` is included when `preference.inApp` is set, and `email` is included when `preference.email` is set and either `digestOnly` is off or the `digest_email` flag is enabled. If the result is empty, no row is written.\n- Surviving recipients are written in one bulk insert by `notificationRepo.insertNotifications`, which stores `channels` as JSON.\n\nSo the in-app row exists when `in_app` is in `channels`. The email outcome is decided only by the recorded `channels` value and the preferences.\n\n**Where email actually goes**\nThis is the part I'd flag. `notify` never calls `sendEmail`. The `email` value is just stored on the row. The only mail sent from this data is in `src/server/jobs/digest-email-job.ts`. That job runs at the org's `digestHourUtc`, finds `listDigestRecipients` (users with `digestOnly` preferences, via `digest-service.ts`), builds a bundle of their unread notifications from the last day, renders it with `renderEmail(\"digest\", …)`, and sends it with `sendEmail` from `email-service.ts`. `sendEmail` only writes a log line, since there is no transport. The `\"mention\"` template exists in `email-service.ts` and `src/emails/render.ts`, but nothing calls it. The auth service uses `welcome` and `password-reset` directly.\n\nIn practice, a mentioned user with default preferences gets an in-app row, and the row lists `email` in its channels. No mention email goes out from the fan-out path. An email only reaches a mentioned user through the digest, and only if they opted into `digestOnly` and the org has the `digest_email` flag. I read this from the code and did not run it.\n\n**Outcome summary for the mentioned person**\n- Unknown handle, or the author mentioning themselves: no row.\n- Preference row with `inApp` off and no usable email channel: no row.\n- Default or in-app preference: one `comment_mention` row, visible via `listNotifications` in the inbox and the bell count (`countUnread`).\n- Email: only via the daily digest, under the conditions above.\n\n**Things I noticed that you may want to check**\n- Member lookup is capped at the first 100 members, ordered by `createdAt` descending, so in orgs with more than 100 members, older members' handles may not resolve. I read this from `resolveMentionedUsers` and `listMembers` but did not test it.\n- A mentioned user who is also the issue's author or assignee gets two rows, one `comment_created` and one `comment_mention`. The watcher list is not deduplicated against the mention list.\n\nI did not read the client-side pieces (`mention-textarea.tsx`, `mention-query.ts`, `comment-composer.tsx`) in depth. They build the autocomplete and send `mentionedUserIds`, and the server does not depend on them for correctness.",
+  "ttft_ms": 865,
+  "type": "result",
+  "duration_ms": 26564,
+  "uuid": "34076fa1-f959-4b54-b9e4-61d9743c470f",
+  "ttft_stream_ms": 657,
+  "time_to_request_ms": 28,
+  "first_content_frame_ms": 657,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

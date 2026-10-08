@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 80735,
+  "stop_reason": "end_turn",
+  "session_id": "4713311c-f49c-4522-8834-cc55e9f7a8e4",
+  "total_cost_usd": 0.02504966,
+  "usage": {
+    "input_tokens": 22,
+    "cache_creation_input_tokens": 60826,
+    "cache_read_input_tokens": 518276,
+    "output_tokens": 15399,
+    "output_tokens_details": {
+      "thinking_tokens": 8688
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 60826,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 6410,
+        "cache_read_input_tokens": 70544,
+        "cache_creation_input_tokens": 988,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 988
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 22,
+      "outputTokens": 15399,
+      "cacheReadInputTokens": 518276,
+      "cacheCreationInputTokens": 60826,
+      "webSearchRequests": 0,
+      "costUSD": 0.02504966,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 8688,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 20,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "The short version: the index is a plain table in the same SQLite database, not a separate search engine. Every issue write goes through an in-process event bus, and a subscriber re-reads the row and upserts one denormalised text document. A query is a `LIKE` substring match on that table, behind several gates. I read the code but did not run the tests or exercise the app.\n\n**Write side: how an edited title reaches the index**\n\n1. `updateIssueAction` in `src/actions/issues/update-issue.ts` runs through `withAction` (`src/actions/_lib/with-action.ts`). That parses the input with `updateIssueSchema`, resolves the actor, and checks `can(actor, \"issue:update\")`.\n2. It calls `updateIssue` in `src/server/services/issue-service.ts`. That checks tenant scope, loads the issue, runs `assertCan` and `assertNotArchived`, and then calls `issueRepo.updateIssue` in `src/server/repositories/issue-repository.ts`, which runs the SQL `UPDATE` on `issues`.\n3. Right after the row is written, the service calls `emit(\"issue.updated\", …)` with `changedFields`. `emit` in `src/lib/event-bus.ts` awaits every subscriber with `Promise.allSettled`. A rejected handler is passed to the error sinks and never rethrown.\n4. The subscriber was attached at process start. `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which calls `registerSearchListeners()` in `src/server/services/search-service.ts`.\n5. The `issue.updated` handler does not trust the payload. It re-reads the issue with `issueRepo.findIssueById` and calls `indexIssue`, which passes `[title, description].join(\"\\n\")` to `upsertSearchDocument` in `src/server/repositories/search-repository.ts`.\n6. `upsertSearchDocument` looks up the existing row by org, kind and subject id. If it finds one, it updates `content`, `projectId` and `indexedAt` in place. Otherwise it inserts a new row. The function has no `await` between the read and the write, so two calls in one process cannot interleave.\n\nBecause `emit` is awaited inside `updateIssue`, the index row is already updated when the action returns. There is no transaction around the two writes, though. If the index write throws, the new title is saved and the index is stale, and the only trace is an error sink.\n\n**What is stored**\n\nEach row of `search_index` (schema in `src/server/db/schema/webhooks.ts`, lines 54–70) holds an `id`, `org_id`, `subject_kind` (`issue`, `comment` or `project`), `subject_id`, `project_id` (null for comments), `content`, and `indexed_at`, which is refreshed on every upsert. For an issue, `content` is the title, a newline, and the description. The only index is non-unique, on `(org_id, subject_kind)`, so the one-row-per-subject rule is enforced only by the upsert code.\n\n**Read side: what a query goes through**\n\nThere are two entry points. The page at `src/app/(dashboard)/[orgSlug]/search/page.tsx` calls `search()` directly. The command palette reaches it through `searchAction` (`src/actions/search/search.ts`) or the GET route `src/app/api/search/route.ts`. I did not find where the dialog's `onSearch` prop is wired, so I have not confirmed which of the two the palette uses. Both apply the same gates.\n\nFor the action, the order is:\n1. `withAction` validates the input against `searchQuerySchema` in `src/schemas/search.ts`: `q` must be 1–200 characters, and `kinds` defaults to `[\"issue\"]`.\n2. `resolveActorFor` loads the actor from `orgSlug`.\n3. The handler checks `can(actor, \"org:read\")`, then calls `isEnabled(\"advanced_search\")`. If the flag is off, `kinds` is silently narrowed to issues. Nothing is refused here.\n4. `search()` in `src/server/services/search-service.ts` runs `assertOrgScope`, then `assertCan(actor, \"issue:read\", …)`, then `consumeRateLimit(orgId, \"search:query\")` from `src/lib/rate-limit.ts`. Only after that does it check plan flags.\n5. If `q` contains a colon and `advanced_search` is off, `search()` throws \"Field-scoped search is not included in this plan\".\n6. `searchRepo.searchDocuments` builds the filters: org predicate, `LIKE '%q%'` on `content`, optional kind and project filters. It counts the matches, applies the keyset cursor on `(indexed_at, id)`, orders newest-first, and fetches one extra row to detect a next page.\n7. Back in `search()`, each row becomes a hit. The title is the first line of `content`, the snippet is up to 60 characters either side of the first case-insensitive match, and `href` is built from the kind.\n\nThe route runs the same gates in a different order. It checks the `orgSlug` and `q` parameters, then `org:read`, then the `command_palette` flag, then `searchQuerySchema` with a limit of 10. Only then does it call `search()`. The route refuses when `command_palette` is off, but the action does not check that flag.\n\n**Valid-looking queries that get refused**\n\n- **A colon on a plan without `advanced_search`.** `Bug: login` is refused by `search-service.ts` after the rate-limit token is spent. The dialog passes raw text when the flag is off (`parseSearchQuery` in `src/components/domain/search/query-syntax.ts`), and `search-dialog.tsx` turns a failed result into an empty list. The user sees \"no results\", not an error. The page does not catch the throw.\n- **Rate limit.** `search:query` has a base capacity of 120 with a refill of 60 per minute, scaled by the org's plan. Exhausting it returns \"Search rate limit reached\".\n- **Length.** A query over 200 characters, or an empty one, fails the Zod check. The route returns \"Bad search query\".\n- **Permission.** `org:read` or `issue:read` failures throw before any query runs.\n\nTwo things run without refusal and still surprise people. The `LIKE` pattern is not escaped, so `_` and `%` in the query act as wildcards. And SQLite's `LIKE` is case-insensitive for ASCII by default.\n\n**Gaps in keeping the index in step**\n\n- **Comment edits are not indexed.** `comment-service.ts` emits only `comment.created` and `comment.deleted`, and there is no `comment.updated` event. `updateComment` does not reindex.\n- **Project edits are not indexed.** `updateProject` in `src/server/services/project-service.ts` emits nothing.\n- **Restored projects stay out of the index.** `project.restored` is emitted, but no search listener handles it.\n- **`search.reindex_requested` is never emitted** anywhere in `src`. It has a listener and a type, nothing more.\n- **The nightly repair does nothing.** `scheduler.ts` enqueues `search-reindex` with an empty payload. The queue case in `src/server/jobs/queue.ts` (line 145) returns early when `orgId` is not a string. Even when it runs, `runSearchReindexJob` in `src/server/jobs/search-reindex-job.ts` reads only the first 100 projects and issues and ignores the cursor.",
+  "ttft_ms": 1202,
+  "type": "result",
+  "duration_ms": 81339,
+  "uuid": "6a59e6f3-8d46-4df3-bfac-1ab6ead7b8b8",
+  "ttft_stream_ms": 651,
+  "time_to_request_ms": 55,
+  "first_content_frame_ms": 651,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

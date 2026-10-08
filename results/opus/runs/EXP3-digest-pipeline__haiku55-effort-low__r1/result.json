@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 49693,
+  "stop_reason": "end_turn",
+  "session_id": "11d03103-1b53-420c-9735-ea89042f17a6",
+  "total_cost_usd": 0.01570869,
+  "usage": {
+    "input_tokens": 18,
+    "cache_creation_input_tokens": 39649,
+    "cache_read_input_tokens": 291009,
+    "output_tokens": 9734,
+    "output_tokens_details": {
+      "thinking_tokens": 3944
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39649,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 3076,
+        "cache_read_input_tokens": 47349,
+        "cache_creation_input_tokens": 3006,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 3006
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 18,
+      "outputTokens": 9734,
+      "cacheReadInputTokens": 291009,
+      "cacheCreationInputTokens": 39649,
+      "webSearchRequests": 0,
+      "costUSD": 0.01570869,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 3944,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 12,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Taskflow's daily digest runs as an in-process job that wakes every minute, gates each organization to its configured UTC hour, collects unread notifications from the last 24 hours for each digest subscriber, and sends one email per person. Several parts are stubs or look wrong, which I flag at the end.\n\n**1. What triggers it**\n\nTwo entry points both call `runDigestEmailJob(now)` in `src/server/jobs/digest-email-job.ts`:\n\n- **In-process scheduler.** `src/instrumentation.ts` `register()` runs `registerEventHandlers()` and `startScheduler()` once per Node process. `startScheduler()` in `src/server/jobs/scheduler.ts` sets a `setInterval` of 60 seconds, unref'd, which calls `tick(new Date())`.\n- **HTTP cron route.** `POST /api/cron/digest` in `src/app/api/cron/digest/route.ts` calls `assertCronSecret(request)` from `src/app/api/_lib/responses.ts`, then `runDigestEmailJob(new Date())`. The secret comes from `TASKFLOW_CRON_SECRET` and the header is `x-taskflow-cron`. If the secret is unset, cron is disabled rather than open.\n\nInside the scheduler, `tick()` loops over `CADENCE_MINUTES`. For `\"digest-email\"` the cadence is 60 minutes. `isDue()` checks `lastRunAt`, and if the job is due it calls `enqueue()` with id `digest-email:<minute>`. It then calls `drain()` in `src/server/jobs/queue.ts`. `drain()` takes due jobs oldest first, and `runHandler()` dynamically imports `./digest-email-job` and calls `runDigestEmailJob(new Date())`. A thrown error is retried with backoff (1s, 2s, 4s…, capped at 60s) up to `MAX_ATTEMPTS = 5`, then dropped.\n\nThere is a third path, `registerDigestBridge()` in `src/server/services/event-registry.ts`, which turns a `digest.due` event into a queued `digest-email` job. Nothing in `src/` emits `digest.due`; it appears only in `src/types/event.ts` and the bridge. So that path is currently dead.\n\n**2. Which organizations are due**\n\n`runDigestEmailJob` first calls `usageRepo.listOrgIdsForRollup(ORG_BATCH)` with `ORG_BATCH = 50`. That function is in `src/server/repositories/usage-repository.ts`. It reads the `organizationUsage` table ordered by `measuredAt` ascending and limits to 50. Each org ID is then loaded with `orgRepo.findOrgById`.\n\nFor each org, `shouldRunForOrg(org, now)` in the same job file returns false if `org.archivedAt !== null`, or if `now.getUTCHours() !== org.settings.digestHourUtc`. The hour is set in the org settings form, `src/app/(dashboard)/[orgSlug]/settings/organization-settings-form.tsx`, with a default of 7.\n\nThe org must also pass `isEnabled(\"digest_email\", buildFlagContext(null, org))` from `src/lib/feature-flags.ts` and `src/server/services/feature-flag-service.ts`. The flag is defined in `src/config/feature-flags.ts` with a `plan` strategy, `minPlan: \"growth\"`, and `overridable: true`.\n\n**3. Who is subscribed**\n\n`listDigestRecipients(orgId)` in `src/server/services/digest-service.ts` calls `preferenceRepo.listDigestSubscribers(orgId)` in `src/server/repositories/notification-preference-repository.ts`. That returns distinct user IDs with any preference row in the org where `digestOnly = true`. The subscription is a per-kind preference, and any one kind set to digest-only is enough.\n\n**4. How one person's digest is built**\n\nPer recipient, inside a try block in `runDigestEmailJob`:\n\n1. `buildDigest(orgId, recipientId, windowStart, windowEnd)` in `digest-service.ts`. The window is rolling: `windowEnd = now` and `windowStart = now − 24h`, formatted by `toIsoTimestamp`. `buildDigest` re-checks the org and the flag. It calls `notificationRepo.listUnreadSince` in `src/server/repositories/notification-repository.ts`, which returns rows with `readAt IS NULL`, the same org and recipient, and `createdAt >= windowStart`. It filters `createdAt <= windowEnd`, maps each row to a `DigestEntry`, and caps at `DIGEST_MAX_ENTRIES = 50` from `src/config/constants.ts`. If there are fewer than `MIN_ENTRIES = 1` entries, it returns `null`.\n2. `userRepo.findUserById` loads the recipient. A missing user is skipped.\n3. `renderDigest(bundle, recipient)` calls `renderEmail(\"digest\", …)` from `src/server/services/email-service.ts`.\n4. `sendEmail({ to, ...rendered })` from the same file.\n5. For each entry, `notificationRepo.markRead(orgId, entry.notificationId, windowEnd)` sets `readAt`. This is the deduplication mechanism.\n6. `result.processed += 1`. Any thrown error increments `result.failed` and logs, without stopping the loop.\n\nUpstream, the rows come from the notification fan-out in `src/server/services/notification-service.ts`. `notify()` looks up each recipient's preference through `getPreference`, then `resolveChannels()` decides the channels. `digestOnly` suppresses the immediate email, but the in-app row is still written. Email is allowed only if the org has the `digest_email` flag. The rows are inserted with `readAt` null, which is what the digest later collects.\n\n**5. When a subscribed person gets no email that day**\n\n- The scheduler is not running (instrumentation not loaded), or the cron route is not hit and the process is not up, or `TASKFLOW_CRON_SECRET` is unset or wrong.\n- The org is not among the 50 rows returned by `listOrgIdsForRollup`.\n- The org is archived.\n- The current UTC hour is not `digestHourUtc`. There is no catch-up; if the hour is missed, that day is missed.\n- The org's plan is below `growth` and no override is set.\n- The recipient has no unread notifications created in the last 24 hours. `buildDigest` returns `null`.\n- The recipient's unread notifications were all marked read in the UI before the run.\n- The user record no longer exists.\n- An exception in building or sending the digest for that person. It is counted as failed and not retried for that person.\n- A retried job runs at a later hour. `shouldRunForOrg` then uses that later hour and skips every org, so the retry is effectively a no-op.\n\n**Problems I noticed while reading**\n\n- `listOrgIdsForRollup` is a usage-rollup query, not an organizations query. It only sees orgs that have an `organizationUsage` row. It also takes the 50 oldest-measured rows with no pagination, so any org beyond that set may never be digested.\n- `renderEmail` in `email-service.ts` is a stub. It builds a `<table>` of every prop key and value, so the email contains `recipientName`, `entryCount`, `windowStart`, `windowEnd`, `headline` and `orgId`, not the entry list. The React template `src/emails/digest-email.tsx` is registered in `src/emails/render.ts`, but the digest path does not use it. Its props also do not match what `digest-service.ts` passes.\n- `sendEmail` only logs an `email.sent` line. Nothing is actually delivered.\n- `listDigestSubscribers` ignores the `email` flag. A person with `digestOnly = true` and `email = false` still gets a digest if they have in-app rows.\n- `markRead` runs after `sendEmail`. If `sendEmail` succeeds and a later `markRead` throws, the next day's window could resend those entries.\n\nI did not run the test suite; this is a read-only explanation.",
+  "ttft_ms": 1294,
+  "type": "result",
+  "duration_ms": 50132,
+  "uuid": "729c9035-aa4f-46b0-908a-053497448972",
+  "ttft_stream_ms": 677,
+  "time_to_request_ms": 40,
+  "first_content_frame_ms": 677,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

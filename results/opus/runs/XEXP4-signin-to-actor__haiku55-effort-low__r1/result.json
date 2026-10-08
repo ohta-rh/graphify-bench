@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 27181,
+  "stop_reason": "end_turn",
+  "session_id": "ec622205-dbda-4d14-b423-baa111f48cec",
+  "total_cost_usd": 0.012212400000000002,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 34373,
+    "cache_read_input_tokens": 251520,
+    "output_tokens": 5642,
+    "output_tokens_details": {
+      "thinking_tokens": 796
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 34373,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2918,
+        "cache_read_input_tokens": 44185,
+        "cache_creation_input_tokens": 894,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 894
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 16,
+      "outputTokens": 5642,
+      "cacheReadInputTokens": 251520,
+      "cacheCreationInputTokens": 34373,
+      "webSearchRequests": 0,
+      "costUSD": 0.012212400000000002,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 796,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 9,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "The sign-in path has five stages: the form posts to a Server Action, which checks credentials and creates a session. Later requests turn the cookie back into a user, then into an org-scoped actor, and the workspace layouts and sidebar authorize against that actor.\n\n**1. The form and the Server Action.** `src/app/(auth)/login/login-form.tsx` calls `loginAction` from `src/actions/auth/login.ts`. The action first validates input with `loginSchema` (`src/schemas/auth.ts`). It then calls `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")` from `src/lib/rate-limit.ts`, which runs before any password check. It does not use `withAction()`, because no tenant or actor exists yet. On success, the form calls `router.push(next)`.\n\n**2. Credential check.** `loginAction` calls `login()` in `src/server/services/auth-service.ts`. That function charges the same rate-limit bucket again, then:\n- `userRepo.findUserByEmail` looks up the user. Unknown emails and wrong passwords both return \"Those credentials did not match\".\n- `userRepo.findPasswordHash` loads the stored hash, and `verifyPassword` (`src/lib/hash.ts`) compares it with the submitted password.\n\n**3. Session creation.** `login()` calls `createSessionToken(userId)` in `src/server/services/session-service.ts`. It generates a 32-byte random token with `randomToken` and sets a 30-day expiry. It stores only `hashToken(token)` via `sessionRepo.createSession` (`src/server/repositories/session-repository.ts`). That row has `activeOrgId: null` and is not tied to any tenant. The raw token is never stored.\n\n**4. Cookie and handoff.** Back in `loginAction`, `resolveSession(token)` reads the principal back from the database. `setSessionCookie` in `src/lib/session.ts` writes the raw token as the cookie named by `SESSION_COOKIE_NAME` (from `src/schemas/session.ts`). The cookie is `httpOnly`, `sameSite: lax`, `secure` in production, `path=/`, and expires at the session's `expiresAt`. The browser receives only that cookie and a `SessionPrincipal` (`userId`, `email`, `activeOrgId`, `expiresAt`) defined in `src/types/member.ts`. The principal contains no token or hash.\n\n**5. Re-establishing identity on later requests.** The request passes through `src/proxy.ts`, exported as `proxy`. It only checks that the cookie exists and is not on the public-prefix list. If the cookie is missing, it redirects to `/login?next=…`. It does not query the database. The real check comes next:\n- `src/app/(dashboard)/layout.tsx` calls `getSessionPrincipal()` from `src/lib/session.ts`. That calls `getSessionToken()`, then `resolveSession(token)` in `session-service.ts`, which hashes the token and calls `findSessionByTokenHash` in the session repository. That query joins `sessions` to `users`, rejects rows whose `expiresAt` has passed, and returns a principal. `getSessionPrincipal` checks expiry again before returning it. If the result is `null`, the layout calls `redirect(\"/login\")`.\n\n**6. Turning identity into an Actor.** `src/app/(dashboard)/[orgSlug]/layout.tsx` takes `orgSlug` from the URL and does the following:\n- Calls `getSessionPrincipal()` again. If it is `null`, the layout throws `UnauthorizedActionError`, which is a different failure path from the outer layout's redirect.\n- Calls `resolveOrgBySlug(orgSlug)` from `src/server/services/organization-service.ts`. A missing org returns 404.\n- Calls `resolveActorForOrg(principal, orgSlug)` in `session-service.ts`. That looks up the org, then `memberRepo.findMember(org.id, userId)`. The membership must be `status === \"active\"`. The function builds `Actor { userId, orgId, role }` and calls `assertOrgScope` from `src/lib/tenant.ts`. It also calls `memberRepo.touchLastSeen`. A non-member gets 404 from the layout.\n- Builds the flag snapshot with `buildFlagContext` and `snapshotFlags`, and loads sidebar data, including projects, unread notifications and plan limits.\n- Renders `OrgProvider` (`src/hooks/org-context.tsx`) and `DashboardShell` (`src/app/(dashboard)/[orgSlug]/_components/dashboard-shell.tsx`), passing the `actor` down.\n\nRoute Handlers and Server Actions use a different helper in `src/lib/actor.ts`: `getActor(orgSlug)` or `requireActorFor(orgId)`. Both call the same `getSessionPrincipal` and `resolveActorForOrg` functions. The helpers throw `UnauthorizedError` or `NoMembershipError`, and `tryGetActor` returns `null` instead.\n\n**7. Role-tailored sidebar and authorization.** `src/components/domain/nav/app-sidebar.tsx` calls `visibleNav(SIDEBAR_NAV, actor, flags)` and `visibleNav(SETTINGS_NAV, actor, flags)` from `src/config/nav.ts`. For each item it checks the feature flag and then `can(actor, item.action, navResource(...))`. `can()` in `src/lib/permissions.ts` is the single authorization entry point. It checks the org match, then `ROLE_MATRIX`, which maps each action to a minimum role, using `ROLE_RANK` from `src/types/member.ts`. It then applies ownership escalations. The client uses `usePermission` (`src/hooks/use-permission.ts`), which calls the same `can()`.\n\n**Things I noticed while tracing:**\n- **Rate limit charged twice.** `loginAction` and `login()` each call `consumeRateLimit` on the same bucket, so one attempt uses two units.\n- **Logout does not revoke the session.** `destroySession` in `session-service.ts` resolves the principal, then calls `purgeExpiredSessions`. That removes only expired rows, so the live session survives. The `logout(sessionId)` in `auth-service.ts` does revoke, but the principal has no session id to pass to it.\n- **`requireActorFor` comment is ahead of the code.** Its doc says the session's active org must match. The code only checks that `activeOrgId` is non-null and then compares the org the actor was resolved for.\n- **Unverified.** I did not read `hashToken`, `verifyPassword`, `ROLE_RANK`, `memberRepo.touchLastSeen`, or `shell`/`buildFlagContext` internals. Their behavior above is inferred from call sites.",
+  "ttft_ms": 908,
+  "type": "result",
+  "duration_ms": 27903,
+  "uuid": "85e24808-d149-41c5-82dd-a86d1c2a5388",
+  "ttft_stream_ms": 613,
+  "time_to_request_ms": 31,
+  "first_content_frame_ms": 614,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

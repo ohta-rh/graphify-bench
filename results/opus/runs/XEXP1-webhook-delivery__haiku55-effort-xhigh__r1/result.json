@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 145781,
+  "stop_reason": "end_turn",
+  "session_id": "871564fd-949a-450f-b996-73ca6b572e75",
+  "total_cost_usd": 0.03496792,
+  "usage": {
+    "input_tokens": 26,
+    "cache_creation_input_tokens": 68481,
+    "cache_read_input_tokens": 624212,
+    "output_tokens": 30054,
+    "output_tokens_details": {
+      "thinking_tokens": 21658
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 68481,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 16983,
+        "cache_read_input_tokens": 77337,
+        "cache_creation_input_tokens": 1850,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1850
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 26,
+      "outputTokens": 30054,
+      "cacheReadInputTokens": 624212,
+      "cacheCreationInputTokens": 68481,
+      "webSearchRequests": 0,
+      "costUSD": 0.03496792,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 21658,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 24,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Short version: the app durably records a delivery row for each matching endpoint, and a background job drains those rows. Nothing in the current code makes an HTTP request to the customer's URL. The job \"delivers\" by computing a signature, logging it, and marking the row `delivered`. The path as written:\n\n**1. Browser submit to server action.** The new-issue page (`src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx`) passes `createIssueAction` to `IssueForm` as `onSubmit`. The form submits through `useFormAction` (`src/hooks/use-form-action.ts`). `createIssueAction` in `src/actions/issues/create-issue.ts` is wrapped by `withAction` (`src/actions/_lib/with-action.ts`), which zod-parses the input, resolves the actor from `orgSlug`, and runs the handler. The handler checks `issue:create` with `can()`, checks the project quota, then calls `createIssue`.\n\n**2. The service publishes a fact.** `createIssue` (`src/server/services/issue-service.ts:42-81`) checks tenant scope, project existence and archive state, permission, and the `issuesPerProject` quota. It allocates a number, inserts the row, and calls `emit(\"issue.created\", {...actorEnvelope(actor), issueId, projectId, title, assigneeId, priority})`. The issue service does not know webhooks exist.\n\n**3. The bus fans out.** `emit` in `src/lib/event-bus.ts:54-72` runs every subscriber for that type under `Promise.allSettled`. Subscribers are attached once per process: `src/instrumentation.ts` calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, which calls `registerWebhookListeners()` alongside the activity, search, usage, and notification handlers. Because `emit` awaits all of them, the action does not return until the webhook enqueue writes have finished.\n\n**4. Choosing endpoints.** The `issue.created` subscriber in `registerWebhookListeners` (`src/server/services/webhook-service.ts:101-139`) calls `enqueueForOrg` (lines 141-156). That loads the org's endpoints with `webhookRepo.listEndpoints`, skips disabled ones, parses the `eventTypes` JSON column, and keeps only endpoints whose list contains `\"issue.created\"`. For each match, `webhookRepo.enqueueDelivery` (`src/server/repositories/webhook-repository.ts:107-131`) inserts a `webhook_deliveries` row with `status: \"pending\"`, `attempts: 0`, and the body `JSON.stringify(event)`. The body holds the envelope fields plus `issueId`, `title`, and so on. It does not contain the event type, which is stored only in the row's `event_type` column. Filtering happens here, at fan-out, and the job never re-checks it.\n\n**5. Something drains the rows.** `startScheduler()` (`src/server/jobs/scheduler.ts`) sets an unref'd 60-second interval. Each `tick` enqueues a `webhook-delivery` job if its one-minute cadence is due, then calls `drain()` in `src/server/jobs/queue.ts:52-95`. `runHandler` dynamically imports `runWebhookDeliveryJob`. So the latency from issue creation to processing is up to about a minute. The in-memory queue is only the trigger; the durable state is the table. A second trigger exists: `POST /api/cron/webhook-delivery` (`src/app/api/cron/webhook-delivery/route.ts`) checks `assertCronSecret` (header `x-taskflow-cron` against `TASKFLOW_CRON_SECRET`, `src/app/api/_lib/responses.ts:33-42`) and calls the same job. See item 3 below for why it probably never gets that far.\n\n**6. The job claims and \"sends\".** `runWebhookDeliveryJob` (`src/server/jobs/webhook-delivery-job.ts:32-87`) calls `claimPendingDeliveries(25)`. That takes the 25 oldest `pending` rows across all tenants and bumps each one's `attempts`. For each row:\n- If the plan has no webhooks or the `webhooks` flag is off (`orgAllowsWebhooks`, lines 95-101), it marks the row `failed`.\n- If `attempts > 6`, it marks the row `failed`.\n- If the endpoint is missing or disabled, it marks the row `failed`.\n- Otherwise it computes `signPayload(endpoint.secret, delivery.payload)`, logs `webhook delivered` with the first 16 hex characters of the signature, and calls `markDelivered`.\n\nNo network call happens anywhere in that loop.\n\n**7. When it does not succeed.** There are three layers, and they do not behave as the comments suggest:\n- *Per row:* the job never returns a row to `pending`. Plan, flag, disabled-endpoint, and attempt-limit failures are all terminal. Disabling an endpoint fails everything queued for it, and re-enabling does not revive those rows.\n- *Per batch:* if something throws mid-loop, the rows after the throw were already claimed, so they stay `pending` with an inflated attempt count. The next pass picks them up with no time gate.\n- *Per job:* `drain()` catches the throw and re-queues the whole job with `runAt = now + backoffMs(attempts)`. That is the queue's own backoff (1s, 2s, 4s…, capped at 60s). After five failed runs the job is dropped with a log line.\n\nThe `backoffMs` in `webhook-delivery-job.ts:90-93` (1s up to 5 minutes) is only logged. `claimPendingDeliveries` has no next-attempt column, so no per-delivery backoff ever delays anything. The cron route's comment that deliveries are \"retried here with the backoff the job computes\" is therefore inaccurate.\n\n**8. How the receiver is meant to verify.** The only defined mechanism is `signPayload` (`webhook-service.ts:92-94`): HMAC-SHA256 over the UTF-8 bytes of the payload string, hex-encoded, keyed with the endpoint's `secret`. `createWebhook` mints that secret with `randomToken(32)`, a base64url string. It is the HMAC key as-is, not base64-decoded. A receiver should therefore take the raw body bytes as received, compute `HMAC-SHA256(secret, rawBody)` in hex, and compare in constant time.\n\nThe receiver does not actually get what it needs:\n- No signature header is defined or sent. The job only logs 16 characters of the signature.\n- Nothing time-stamped is signed, so there is no replay protection.\n- There is no delivery ID, and an issue event body carries no event type.\n- The secret is never shown. `webhook-manager.tsx` never references it, although the create action returns the full row, including `secret`, to the browser.\n- The test route (`src/app/api/webhooks/[endpointId]/test/route.ts`) signs a `webhook.test` payload and returns the signature in its JSON response. It sends nothing, and its `delivered` field is just `endpoint.enabled`.\n\n**Problems found while tracing** (from reading the code; I did not run the app or the tests):\n1. **No outbound HTTP.** `grep` finds no `fetch(` or HTTP client in `src/`. The job comment says this is deliberate for an offline build, but the cron and test routes read as if real delivery happens.\n2. **Fan-out failures are silently lost.** `emit` catches handler rejections and passes them to `reportHandlerError`, which does nothing unless a sink was registered with `onHandlerError`. Nothing in `src/` registers one. If `enqueueForOrg` throws, the issue is still created, and there is no delivery row and no log line.\n3. **The HTTP cron trigger is probably unreachable.** `src/proxy.ts` requires a session cookie for every path not in `PUBLIC_PREFIXES`, and `/api/cron/...` is not listed. A scheduler request with no cookie is redirected to `/login` before `assertCronSecret` runs, even though the comment in `responses.ts` says platform schedulers call these routes without a cookie.\n4. **Two retry caps.** `WEBHOOK_MAX_ATTEMPTS = 5` in `src/config/constants.ts:20` is unused. The job uses its own `MAX_ATTEMPTS = 6`.\n5. **No concurrency guard.** The claim is a select followed by per-row updates, and a row keeps `pending` until after the send. If the in-process tick and the HTTP route overlap, both can claim the same rows. Once real HTTP exists, that means duplicate sends.\n6. **A second producer.** `src/app/api/webhooks/inbound/route.ts` emits `webhook.delivery_requested` under `ANONYMOUS_ORG_ID`, which reaches no endpoints unless that ID is a real org. It is outside the issue path but feeds the same queue.",
+  "ttft_ms": 1657,
+  "type": "result",
+  "duration_ms": 146462,
+  "uuid": "d04426fc-3815-45e4-8b03-523bf64dc9b3",
+  "ttft_stream_ms": 909,
+  "time_to_request_ms": 29,
+  "first_content_frame_ms": 909,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

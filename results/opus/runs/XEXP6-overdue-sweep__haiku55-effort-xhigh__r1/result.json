@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 183458,
+  "stop_reason": "end_turn",
+  "session_id": "18993273-896d-4301-9467-a2abd3fa09ee",
+  "total_cost_usd": 0.06523161,
+  "usage": {
+    "input_tokens": 32,
+    "cache_creation_input_tokens": 91526,
+    "cache_read_input_tokens": 913593,
+    "output_tokens": 38032,
+    "output_tokens_details": {
+      "thinking_tokens": 26964
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 91526,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 2849,
+        "cache_read_input_tokens": 90412,
+        "cache_creation_input_tokens": 11820,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 11820
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 32,
+      "outputTokens": 38032,
+      "cacheReadInputTokens": 913593,
+      "cacheCreationInputTokens": 91526,
+      "webSearchRequests": 0,
+      "costUSD": 0.06523161,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 26964,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 35,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "An overdue issue is announced by a once-an-hour sweep, but the \"once\" guarantee lives only in process memory, and the email half of the chosen channels is not wired up. I read the code paths and did not run the test suite.\n\n**1. Startup.** `register()` in `src/instrumentation.ts` runs once per Node process. It calls `registerEventHandlers()` in `src/server/services/event-registry.ts`, then `startScheduler()`. The registry imports `src/server/services/notification-service.ts` for its side effect (line 21), which subscribes the `issue.overdue` handler at module load. `startScheduler()` in `src/server/jobs/scheduler.ts` starts a 60-second `setInterval`, `unref`'d so it never blocks shutdown.\n\n**2. What starts a sweep.** Each tick calls `tick(now)`, which checks `isDue` for every kind in `CADENCE_MINUTES`. `overdue-issues` is due if it has never run or 60 minutes have passed since `lastRunAt`. A due kind is enqueued as `overdue-issues:<minute>` through `enqueue` in `src/server/jobs/queue.ts`. Then `drain()` runs up to 25 due jobs, oldest first. `runHandler` dynamically imports `src/server/jobs/overdue-issue-job.ts` and calls `runOverdueIssueJob(new Date())`. The first sweep happens about 60 seconds after startup, then roughly hourly. If the job throws, the queue re-queues it with backoff (1s, 2s, 4s, 8s, capped at 60s) and drops it after 5 attempts. Retries bypass the cadence gate.\n\nThere is a second trigger, `POST /api/cron/overdue` in `src/app/api/cron/overdue/route.ts`. It checks `assertCronSecret` and calls `runOverdueIssueJob` inline, skipping both queue and cadence. Nothing in the repo schedules it, so it needs an external caller.\n\n**3. Narrowing to the issues that count.** `runOverdueIssueJob` first checks `shouldFilterArchived`, then gets up to 50 org IDs from `listOrgIdsForRollup` in `src/server/repositories/usage-repository.ts:133`. That helper returns the orgs with the oldest `organization_usage.measuredAt`, which is also what the usage rollup uses. So the overdue sweep's org coverage depends on rollup bookkeeping. Orgs with no usage row never appear, and unlike the digest job, the sweep doesn't check whether the org is archived.\n\nFor each org, `listOverdueIssues` in `src/server/repositories/issue-repository.ts:507` runs one query: same org, `archived_at IS NULL`, `due_at IS NOT NULL`, `due_at < now`, and status in backlog, todo, in_progress or in_review. Done and canceled are excluded. The job then skips issue IDs already in its `reported` set.\n\n**4. What the checker takes responsibility for.** Only announcing. For each remaining issue it calls `emit(\"issue.overdue\", {…, assigneeId})` and does nothing else: no preference lookup, no row writes, no mail. Unassigned issues are still emitted and marked reported; the subscriber returns early (`notification-service.ts:194`). `emit` in `src/lib/event-bus.ts:54` runs every subscriber with `Promise.allSettled` and never throws. Rejected handlers go only to sinks registered with `onHandlerError`, and nothing in `src` registers one.\n\n**5. What stops repeats.** Three mechanisms with different strength:\n- The hourly cadence in `scheduler.ts` is why an issue isn't announced every few minutes.\n- The `reported` set in `overdue-issue-job.ts:28` is the real \"once\" guarantee. The job adds an ID after `emit` (line 67) and skips it afterward. It is in memory only. A restart clears it, so every still-overdue issue is announced again on the next sweep. Two processes would each announce. The set is never pruned and is keyed on issue ID, not `dueAt`, so an issue rescheduled to another past date, or reopened, is not announced again in that process. The test at `tests/server/jobs.test.ts:109` checks one pass only; no test runs two.\n- Queue ID dedupe only stops the same kind being queued twice while the first is still pending. It does nothing across hours.\n\n**6. Delivery to one person.** The subscriber calls `notify(orgId, \"issue_overdue\", [assigneeId], …)` in `notification-service.ts:46`. For that one recipient, `notify` reads their preference through `getPreference` in `src/server/repositories/notification-preference-repository.ts`. With no row, the default channels are in_app and email. `resolveChannels` (line 156) keeps `in_app` if `inApp` is on. It keeps `email` only if `email` is on and either `digestOnly` is off or the org has the `digest_email` flag. If nothing survives, no row is written. Otherwise `insertNotifications` (`src/server/repositories/notification-repository.ts:91`) writes one row, with channels stored as JSON.\n\nIn-app delivery is server-read. The dashboard layout (`src/app/(dashboard)/[orgSlug]/layout.tsx`) counts unread rows for the signed-in user and passes that to `NotificationBell` through `TopBar`. The `@panel/notifications` page and `/inbox` list rows. All go through `listNotifications`, which asserts `notification:read` against the recipient. `src/lib/permissions.ts:80` allows that only when `recipientId === actor.userId`, so one person sees only their own alerts. But the `channels` column is never read on display, so `inApp: false` with email on still shows the alert in the bell. The client store `src/hooks/notification-store.ts` and `useNotifications` are not rendered by anything.\n\nEmail is not sent at fan-out. The `email` entry is recorded and nothing reads it to send. The only mail in this path is the daily digest. `runDigestEmailJob` (`src/server/jobs/digest-email-job.ts:30`) runs on the same scheduler, only during the org's UTC digest hour and only if `digest_email` is enabled. It mails users with any `digestOnly` preference. `buildDigest` (`src/server/services/digest-service.ts:27`) pulls every unread row from the last 24 hours regardless of kind or channel, so an overdue alert can reach a digest even when the user turned email off for that kind. The job then marks those rows read. \"Sending\" only logs: `sendEmail` in `src/server/services/email-service.ts:42` makes no network call. The React overdue template (`src/emails/overdue-email.tsx`, via `src/emails/render.ts`) is reached only from tests.\n\n**Gaps found, in order of impact:**\n1. A failed notification write is lost. The `try/catch` in `overdue-issue-job.ts:57–75` never fires because `emit` never rejects, `reported.add` runs anyway, and `result.failed` stays 0. Nothing is logged, and the issue is not retried until a restart.\n2. The email channel is effectively absent for overdue alerts. `digestOnly` suppresses an immediate email that is never sent.\n3. `inApp: false` is not enforced on read.\n4. Digests ignore kind and channel.\n5. `OVERDUE_LOOKAHEAD_HOURS` (`src/config/constants.ts:26`) is unused at runtime. Its comment says it controls how far ahead the job looks, but the job uses only `now`.\n6. The header in `queue.ts` says jobs \"never run inside a request\", but the cron route does run the job inline. It shares the same `reported` set, so dedupe still holds within a process.\n\nThe due-date cutoff is consistent: the UI stores due dates at 23:59:59.999Z (`src/components/domain/issue/issue-due-date-field.tsx:24`), and the query uses the same instant.",
+  "ttft_ms": 1124,
+  "type": "result",
+  "duration_ms": 184083,
+  "uuid": "1f4fd9a1-bfc5-4f1f-91f5-0eba4150b3c1",
+  "ttft_stream_ms": 632,
+  "time_to_request_ms": 40,
+  "first_content_frame_ms": 632,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

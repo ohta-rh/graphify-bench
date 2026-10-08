@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 141220,
+  "stop_reason": "end_turn",
+  "session_id": "90458e95-2cde-4c14-af39-a32276e7bfe9",
+  "total_cost_usd": 0.07533721,
+  "usage": {
+    "input_tokens": 28,
+    "cache_creation_input_tokens": 89374,
+    "cache_read_input_tokens": 892191,
+    "output_tokens": 31259,
+    "output_tokens_details": {
+      "thinking_tokens": 21536
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 89374,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 13808,
+        "cache_read_input_tokens": 98385,
+        "cache_creation_input_tokens": 1695,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1695
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 28,
+      "outputTokens": 31259,
+      "cacheReadInputTokens": 892191,
+      "cacheCreationInputTokens": 89374,
+      "webSearchRequests": 0,
+      "costUSD": 0.07533721,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 21536,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 20,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "Sign-in is a Server Action that checks a scrypt hash, inserts a `sessions` row holding only a SHA-256 of a random token, and sets the raw token as an httpOnly cookie. Later requests hash the cookie, look up the row, and get a `SessionPrincipal`, which says who the user is but not what they can do. Authorization needs an `Actor`, which is built per organization from the membership row, and every permission decision goes through `can()` in `src/lib/permissions.ts`.\n\nThe order of calls, from the form to the sidebar:\n\n`LoginForm` → `loginAction` → `login()` → `createSessionToken` → `sessionRepo.createSession` → `setSessionCookie` → `router.push(\"/orgs\")` → `orgs/page.tsx` redirects to `/[orgSlug]` → `[orgSlug]/layout.tsx` → `resolveActorForOrg` → `snapshotFlags` → `DashboardShell` → `AppSidebar` → `visibleNav` → `can()`\n\n### 1. Credentials are checked\n\n1. `LoginForm` (`src/app/(auth)/login/login-form.tsx`) is a client component using `useActionState`. It parses the fields with `loginSchema` (`src/schemas/auth.ts`) only to show field errors early, then calls `loginAction` directly. The server re-parses everything.\n2. `loginAction` (`src/actions/auth/login.ts`, a `\"use server\"` module) validates again, then charges `consumeRateLimit(ANONYMOUS_ORG_ID, \"auth:login\")`. That is an in-process token bucket in `src/lib/rate-limit.ts`. Because there is no tenant yet, this action cannot use `withAction`.\n3. `login()` in `src/server/services/auth-service.ts` (line 88) charges the limiter again under a different sentinel. It looks the user up with `userRepo.findUserByEmail`, which lowercases the email, then loads the stored hash with `findPasswordHash`. `verifyPassword` in `src/lib/hash.ts` runs scrypt with the stored salt and compares with `timingSafeEqual`. Stored hashes look like `scrypt:<salt>:<key>`. An unknown email and a wrong password both produce \"Those credentials did not match\".\n\n### 2. What is created, stored, and sent to the browser\n\n- `login()` calls `createSessionToken(user.id)` (`src/server/services/session-service.ts:27`). It makes 32 random bytes as a base64url string and sets expiry 30 days out. It then calls `sessionRepo.createSession` (`src/server/repositories/session-repository.ts:22`).\n- The `sessions` row (`src/server/db/schema/users.ts`) stores `user_id`, `active_org_id` (null at sign-in), `token_hash` (SHA-256 of the token, with a unique index), `expires_at`, and timestamps. The raw token is never stored.\n- `loginAction` calls `setSessionCookie(token, expiresAt)` (`src/lib/session.ts:33`). The cookie is named `taskflow_session` (`SESSION_COOKIE_NAME` in `src/schemas/session.ts`). It is httpOnly, `sameSite: \"lax\"`, `secure` in production, `path: \"/\"`, and expires with the row.\n- The action returns a `SessionPrincipal` (`src/types/member.ts`) built by `resolveSession(token)` from the stored row: `userId`, `email`, `activeOrgId`, `expiresAt`. It contains no token and no role. The form uses it only to know the sign-in worked, then calls `router.push(next)`. `next` comes from `login/page.tsx` and defaults to `/orgs`. `safeDestination` only accepts same-site paths. A visitor who is already signed in is redirected away from the form.\n\n### 3. How a later request re-establishes identity\n\nThe browser sends the cookie with every request, and two layers read it.\n\n1. `proxy()` in `src/proxy.ts` runs first. It passes public prefixes through. For everything else it only checks that the cookie is present, and redirects to `/login?next=…` if it is not. It cannot reach the database. The `x-taskflow-authenticated` header it sets is a response header that nothing reads.\n2. The real check happens in the server components. `(dashboard)/layout.tsx` calls `getSessionPrincipal()` (`src/lib/session.ts:23`). That reads the cookie with `getSessionToken()` and calls `resolveSession(token)` (`session-service.ts:40`), which hashes the token and calls `sessionRepo.findSessionByTokenHash` (`session-repository.ts:53`). That query joins `users` and returns nothing for an expired row. A null result sends the layout to `redirect(\"/login\")`.\n\n### 4. How \"still signed in\" is decided\n\nA user is signed in when a `sessions` row matches the cookie's hash and its `expires_at` is in the future. The cookie alone is not enough. Expiry is checked in the query and again in `getSessionPrincipal`.\n\nThe lifetime is a fixed 30 days and nothing extends it. `touchLastSeen` writes `members.last_seen_at`, not the session. `purgeExpiredSessions` is the only way expired rows get deleted, and its only caller is `destroySession`.\n\nThe \"Keep me signed in\" checkbox has no effect. `login-form.tsx` reads `rememberMe` and `loginSchema` validates it, but `login()` only uses `email` and `password`. Every session lasts 30 days.\n\n### 5. From bare identity to an authorization context\n\nThe principal has no org and no role, so each organization gets its own `Actor`, which is `{ userId, orgId, role, isPlatformStaff? }`.\n\n1. `resolveActorForOrg(principal, orgSlug)` (`session-service.ts:55`) finds the org by slug, excluding archived orgs. It loads the caller's live membership with `memberRepo.findMember` and rejects anything not `status === \"active\"`. It builds the `Actor` from the membership row, runs `assertOrgScope`, and updates `lastSeenAt`. The role is read from the database on each request, so a role change applies on the next navigation.\n2. Callers: `[orgSlug]/layout.tsx` calls it directly and calls `notFound()` when the org is missing or the caller has no membership. Those two cases return the same 404 on purpose. `getActor(orgSlug)` in `src/lib/actor.ts:37` wraps it and throws `UnauthorizedError` or `NoMembershipError`. Pages reach it through `loadTenantContext` (`[orgSlug]/_lib/tenant-context.ts`), and Server Actions reach it through `withAction` (`src/actions/_lib/with-action.ts`).\n3. The layout computes `snapshotFlags(buildFlagContext(actor, org))`, loads the sidebar data, and renders `OrgProvider` (`src/hooks/org-context.tsx`) around `DashboardShell`.\n4. `DashboardShell` renders `AppSidebar`, which calls `visibleNav(SIDEBAR_NAV, actor, flags)` (`src/config/nav.ts:182`). Each item's `action` goes through `can()` and its `flag` through the snapshot. Nothing in the sidebar checks `actor.role`. For example, `activity:read` requires `member` and `org:manage_billing` requires `owner`, so a viewer does not see Activity or Billing.\n5. `can()` (`src/lib/permissions.ts:96`) is the single decision point. It checks, in order: the cross-tenant guard, the `isPlatformStaff` bypass (nothing in the codebase sets it), `ROLE_MATRIX` compared through `ROLE_RANK`, then ownership escalations for issues, comments, and notifications.\n6. Services take the `Actor` as their first argument and re-check it. `listIssues` (`src/server/services/issue-service.ts:257`) calls `assertOrgScope` and then `assertCan(actor, \"issue:read\", …)`. `listProjects` does the same. Server Actions resolve the actor in `withAction` from `orgSlug` or `orgId` in the input, or from `activeOrgId`, before the handler runs.\n\nSo the chain is cookie → `SessionPrincipal` → per-org `Actor` → `can()`, with a tenant check at each step.\n\n### Problems noticed while tracing\n\nI found these by reading the code. I did not run anything.\n\n- **Logout does not revoke the session.** `logoutAction` calls `destroySession` (`session-service.ts:115`). That resolves the principal and then calls `purgeExpiredSessions(now)`, which deletes only rows already past `expires_at`. The row for the token being logged out is still live. The cookie is cleared, but the token's hash keeps resolving for the rest of its 30 days. The docstring says the sweep clears the row, which is not what the code does. `AuthService.logout(sessionId)` would call `revokeSession`, but nothing calls it.\n- **`active_org_id` is never written.** `setActiveOrg` has no callers, and `switchOrgAction` does not call it, even though the comment in `session-service.ts` says the action does. The UI doesn't use `switchOrgAction` either. The org switcher navigates by URL. Because `activeOrgId` stays null, `requireActorFor` (`src/lib/actor.ts:68`) always throws `NoMembershipError`, and `withAction` fails for any action that has no org in its input. `registerAction` also returns `activeOrgId: org.id` while storing null.\n- **Each login attempt costs two rate-limit tokens.** `loginAction` charges `\"\"` and `login()` charges a 26-zero sentinel. These are separate buckets, so each one's limit still holds, but the two constants describe the same concept.\n- **Unknown emails return faster than wrong passwords.** `login()` throws before `verifyPassword` when the user is not found (`auth-service.ts:97`). Response timing therefore reveals which emails have accounts, even though the messages match.\n- **Suspended members see the org in the chooser.** `listOrgsForUser` filters on `members.archived_at` but not `status`. `resolveActorForOrg` does check `status`, so clicking the org returns a 404.\n- **The sidebar is not filtered on the server.** `dashboard-shell.tsx` says permission work happens once on the server, but `AppSidebar` is a client component that runs `visibleNav` and `can()` itself. That is display only. Enforcement lives in the services.\n- **Reads write to the database.** `resolveActorForOrg` updates `lastSeenAt` on every render. The layout and the page each call it, so one navigation writes twice.",
+  "ttft_ms": 1378,
+  "type": "result",
+  "duration_ms": 141900,
+  "uuid": "0a22058d-df55-4052-931f-bfe1f9775739",
+  "ttft_stream_ms": 695,
+  "time_to_request_ms": 32,
+  "first_content_frame_ms": 695,
+  "queued_turn_count": 0,
+  "result_index": 0
+}

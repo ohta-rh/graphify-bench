@@ -1,0 +1,99 @@
+{
+  "duration_api_ms": 43164,
+  "stop_reason": "end_turn",
+  "session_id": "8f34d2f8-a391-4ee7-a260-13242e77f684",
+  "total_cost_usd": 0.014745900000000003,
+  "usage": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 39677,
+    "cache_read_input_tokens": 268490,
+    "output_tokens": 8248,
+    "output_tokens_details": {
+      "thinking_tokens": 3555
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 39677,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "not_available",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 4316,
+        "cache_read_input_tokens": 48932,
+        "cache_creation_input_tokens": 1451,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1451
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "modelUsage": {
+    "claude-haiku-5-5": {
+      "inputTokens": 16,
+      "outputTokens": 8248,
+      "cacheReadInputTokens": 268490,
+      "cacheCreationInputTokens": 39677,
+      "webSearchRequests": 0,
+      "costUSD": 0.014745900000000003,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 3555,
+      "canonicalModel": "claude-haiku-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subagent_stats": {
+    "spawned": 0,
+    "requested": {
+      "background": 0,
+      "foreground": 0,
+      "unset": 0
+    },
+    "started_in_background": 0,
+    "max_depth": 0,
+    "spawned_by_subagents": 0,
+    "completed": 0,
+    "failed": 0,
+    "killed": {
+      "parent": 0,
+      "user": 0,
+      "system": 0
+    },
+    "refused": {
+      "depth_limit": 0,
+      "concurrency_limit": 0,
+      "budget": 0
+    },
+    "by_type": {}
+  },
+  "safety_stops": 0,
+  "is_error": false,
+  "num_turns": 10,
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "The path runs from server startup, through a 60-second scheduler tick and a queued job, to an in-app notification row. Email is the weak link: the overdue path never sends an email directly, and the one email route that reaches the assignee is the daily digest.\n\n**1. What starts the check.** `src/instrumentation.ts` `register()` runs once per Node server process. It calls `registerEventHandlers()` from `src/server/services/event-registry.ts`, which also loads `notification-service.ts` as a side effect, and then `startScheduler()` from `src/server/jobs/scheduler.ts`. That starts a `setInterval` every `TICK_INTERVAL_MS` (60 s), `unref()`ed so it never blocks shutdown. Each tick calls `tick(now)`. `CADENCE_MINUTES` sets `\"overdue-issues\": 60`. `isDue()` compares against the `lastRunAt` map, so the first tick after boot runs the job immediately and later runs wait an hour. `tick` enqueues a job with id `overdue-issues:<minute>` into the in-memory queue in `src/server/jobs/queue.ts`, then calls `drain()`.\n\n**2. How the queue runs it.** `drain()` takes due jobs oldest-first, up to 25 per pass, and removes each before running it. `runHandler()` dynamically imports `overdue-issue-job.ts` and calls `runOverdueIssueJob(now)`. If the handler throws, the job is re-pushed with exponential backoff (1 s, 2 s, 4 s, 8 s, capped at 60 s) until `MAX_ATTEMPTS` (5), then dropped. The next hourly run happens regardless.\n\n**3. How the set of issues is narrowed.** `runOverdueIssueJob` in `src/server/jobs/overdue-issue-job.ts` does three things:\n- It calls `shouldFilterArchived(LIVE_ONLY)` as a guard. It always returns true here, so this is effectively a sanity check.\n- It calls `usageRepo.listOrgIdsForRollup(50)`, which returns up to 50 org IDs ordered by `measuredAt`. This is a usage-rollup query reused as the org list, so orgs beyond the first 50 are not swept on a given pass. I did not verify whether `measuredAt` rotates across passes.\n- For each org it calls `issueRepo.listOverdueIssues(orgId, stamp)` in `src/server/repositories/issue-repository.ts`. The SQL keeps only rows in that org, with `archivedAt` null, `dueAt` not null and `dueAt < now`, and status in `backlog`, `todo`, `in_progress` or `in_review`. Closed statuses are excluded.\n\n`OVERDUE_LOOKAHEAD_HOURS = 24` in `src/config/constants.ts` is defined but never referenced. The query has no lookahead, so that constant is dead config.\n\n**4. What the job does and does not own.** The job only announces facts. For each surviving issue it calls `emit(\"issue.overdue\", {orgId, actorId: null, occurredAt, issueId, projectId, dueAt, assigneeId})`. It does not pick recipients, read preferences, or write notifications. The event payload type is in `src/types/event.ts`.\n\nError handling is weaker than the try/catch suggests. `emit()` in `src/lib/event-bus.ts` uses `Promise.allSettled` and reports handler failures to error sinks instead of rethrowing. The job's `catch` therefore only fires if `emit` itself throws, which is rare. The job then adds the issue to `reported` even if every subscriber failed. A failed notification is never retried.\n\n**5. What stops repeat announcements.** A module-level `reported: Set<string>` in `overdue-issue-job.ts` holds issue IDs. An issue is skipped on later sweeps once it is in the set, and it is added only after a successful `emit`. Its limits:\n- It lives only as long as the process, so a restart re-announces every still-overdue issue.\n- It is never pruned, so it grows without bound.\n- An issue reopened and then overdue again is never re-announced in the same process.\n- `resetOverdueTracking()` exists for tests only.\n\n**6. How the alert reaches the assignee.** The bus delivers `issue.overdue` to the handler registered in `registerFanOut()` in `src/server/services/notification-service.ts`. That handler returns early if `assigneeId` is null, then calls `notify(orgId, \"issue_overdue\", [assigneeId], {...})`. `notify()` does the following:\n- Loads the org plan and flags via `orgRepo.findOrgById`.\n- For the recipient, calls `preferenceRepo.getPreference(orgId, userId, kind)` in `src/server/repositories/notification-preference-repository.ts`.\n- Calls `resolveChannels()`. With no preference row, the channels are `[\"in_app\", \"email\"]`. Otherwise `in_app` follows `inApp`. `email` is kept only if `preference.email` is set and, when `digestOnly` is set, the `digest_email` flag is on. An empty result skips the recipient.\n- Writes one row per recipient through `notificationRepo.insertNotifications` in `src/server/repositories/notification-repository.ts`, with the chosen channels stored as JSON.\n\n**7. Where the person actually gets told.**\n- **In-app:** the row is in the `notifications` table. The recipient pulls it through `listNotifications` in `notification-service.ts`, which requires `notification:read` on their own ID.\n- **Email:** the `channels` column may say `\"email\"`, but nothing sends an overdue email at notify time. `sendEmail` is called only from `digest-email-job.ts` and from `auth-service.ts` (welcome and password reset). `renderEmail(\"overdue\", …)` is never called, so `src/emails/overdue-email.tsx` is unused. The only route to an email is the daily digest. `digest-email-job.ts` runs at the org's configured UTC hour for users returned by `listDigestRecipients` (anyone with a `digestOnly` preference). `buildDigest` in `digest-service.ts` takes all unread notifications from the last 24 hours, regardless of their stored channels, and returns null if there are fewer than `MIN_ENTRIES`. The job then sends one email and marks those notifications read, so they are not digested twice.\n\nSo an overdue alert is announced once per issue per process, is stored once as an in-app row for its assignee, and reaches email only through the digest. If a user chose immediate email, the code does not deliver it.",
+  "ttft_ms": 1041,
+  "type": "result",
+  "duration_ms": 43771,
+  "uuid": "4cc6b010-dd68-414d-9134-e985b1bc0dff",
+  "ttft_stream_ms": 772,
+  "time_to_request_ms": 34,
+  "first_content_frame_ms": 772,
+  "queued_turn_count": 0,
+  "result_index": 0
+}
