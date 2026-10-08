@@ -1,0 +1,527 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/actions/projects/change-project-lead.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/actions/projects/change-project-lead.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/actions/projects/change-project-lead.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/actions/projects/change-project-lead.ts	2026-10-08 11:07:28
+@@ -0,0 +1,32 @@
++"use server";
++
++/** Changes a project's lead through its dedicated permission and service path. */
++
++import { withAction } from "@/actions/_lib/with-action";
++import { CACHE_PROFILES, projectTag, revalidateTagged } from "@/lib/cache";
++import {
++  changeProjectLeadSchema,
++  type ChangeProjectLeadInput,
++} from "@/schemas/project";
++import { changeProjectLead } from "@/server/services/project-service";
++import type { ActionResult } from "@/types/api";
++import type { Project } from "@/types/project";
++
++const run = withAction<typeof changeProjectLeadSchema, Project>(
++  changeProjectLeadSchema,
++  async (raw, actor) => {
++    const project = await changeProjectLead(
++      actor,
++      raw as ChangeProjectLeadInput,
++    );
++    revalidateTagged([projectTag(project.id)], CACHE_PROFILES.minutes);
++    return project;
++  },
++  { revalidate: ["projects"], cacheProfile: "minutes" },
++);
++
++export async function changeProjectLeadAction(
++  raw: unknown,
++): Promise<ActionResult<Project>> {
++  return run(raw);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/actions/projects/update-project.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/actions/projects/update-project.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/actions/projects/update-project.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/actions/projects/update-project.ts	2026-10-08 11:07:28
+@@ -30,7 +30,7 @@
+       orgId: input.orgId,
+       projectId: input.projectId,
+       visibility: input.visibility ?? "org",
+-      leadId: input.leadId ?? actor.userId,
++      leadId: null,
+     });
+     if (!allowed) {
+       throw new ForbiddenActionError("project:update");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/page.tsx /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/page.tsx
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/page.tsx	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/page.tsx	2026-10-08 11:07:57
+@@ -1,21 +1,15 @@
+-/**
+- * Project settings including archive.
+- *
+- * Owner D. Editing needs `project:update`; archiving needs `project:archive`,
+- * which sits higher in `ROLE_MATRIX` — so the archive block is gated
+- * separately rather than assumed from the first check.
+- *
+- * Must call (do not reimplement): can
+- */
++/** Project settings with separate gates for editing, lead changes and archive. */
+ 
+ import { notFound } from "next/navigation";
+ import type { Metadata } from "next";
+ import { archiveProjectAction } from "@/actions/projects/archive-project";
++import { changeProjectLeadAction } from "@/actions/projects/change-project-lead";
+ import { updateProjectAction } from "@/actions/projects/update-project";
+ import { can } from "@/lib/permissions";
+ import { listMembers } from "@/server/services/member-service";
+ import { loadProjectContext } from "../../../_lib/project-context";
+ import { ArchiveProjectPanel } from "./archive-project-panel";
++import { ProjectLeadForm } from "./project-lead-form";
+ import { ProjectSettingsForm } from "./project-settings-form";
+ 
+ type PageParams = { orgSlug: string; projectSlug: string };
+@@ -46,29 +40,57 @@
+     leadId: project.leadId,
+   } as const;
+ 
+-  if (!can(actor, "project:update", resource)) {
++  const mayUpdate = can(actor, "project:update", resource);
++  const mayChangeLead = can(actor, "project:change_lead", resource);
++  if (!mayUpdate && !mayChangeLead) {
+     notFound();
+   }
+   const mayArchive = can(actor, "project:archive", resource);
+ 
+-  const members = await listMembers(actor, {
+-    orgId: org.id,
+-    limit: MEMBER_PICKER_LIMIT,
+-  });
++  const members = mayChangeLead
++    ? await listMembers(actor, {
++        orgId: org.id,
++        limit: MEMBER_PICKER_LIMIT,
++      })
++    : null;
++  const eligibleLeads = members?.items.filter(
++    (member) =>
++      member.status === "active" &&
++      can(
++        { userId: member.userId, orgId: org.id, role: member.role },
++        "project:update",
++        resource,
++      ),
++  );
+ 
+   return (
+     <div className="max-w-xl space-y-10">
+-      <section className="space-y-6">
+-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+-          Project details
+-        </h2>
+-        <ProjectSettingsForm
+-          orgId={org.id}
+-          project={project}
+-          members={members.items}
+-          onSubmit={updateProjectAction}
+-        />
+-      </section>
++      {mayUpdate ? (
++        <section className="space-y-6">
++          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
++            Project details
++          </h2>
++          <ProjectSettingsForm
++            orgId={org.id}
++            project={project}
++            onSubmit={updateProjectAction}
++          />
++        </section>
++      ) : null}
++
++      {mayChangeLead ? (
++        <section className="space-y-6">
++          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
++            Project lead
++          </h2>
++          <ProjectLeadForm
++            orgId={org.id}
++            project={project}
++            members={eligibleLeads ?? []}
++            onSubmit={changeProjectLeadAction}
++          />
++        </section>
++      ) : null}
+ 
+       {mayArchive ? (
+         <section className="rounded-md border border-amber-200 bg-amber-50 p-6">
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-lead-form.tsx /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-lead-form.tsx
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-lead-form.tsx	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-lead-form.tsx	2026-10-08 11:07:28
+@@ -0,0 +1,96 @@
++"use client";
++
++/** Dedicated editor for handing project leadership to an active member. */
++
++import { useActionState } from "react";
++import { fieldErrorsFromZod } from "@/lib/errors";
++import { changeProjectLeadSchema } from "@/schemas/project";
++import type { ActionResult } from "@/types/api";
++import type { OrgId, UserId } from "@/types/common";
++import type { MemberWithUser } from "@/types/member";
++import type { Project } from "@/types/project";
++
++export type ProjectLeadFormProps = {
++  orgId: OrgId;
++  project: Project;
++  members: readonly MemberWithUser[];
++  onSubmit: (input: unknown) => Promise<ActionResult<Project>>;
++};
++
++type LeadState = ActionResult<Project> | null;
++
++export function ProjectLeadForm(props: ProjectLeadFormProps) {
++  const { orgId, project, members, onSubmit } = props;
++
++  const [state, submit, pending] = useActionState<LeadState, FormData>(
++    async (_previous, formData) => {
++      const leadId = String(formData.get("leadId") ?? "");
++      const parsed = changeProjectLeadSchema.safeParse({
++        orgId,
++        projectId: project.id,
++        leadId: leadId.length === 0 ? null : (leadId as UserId),
++      });
++
++      if (!parsed.success) {
++        return {
++          ok: false,
++          error: {
++            code: "validation_failed",
++            message: "Check the fields below.",
++            fieldErrors: fieldErrorsFromZod(parsed.error),
++          },
++        };
++      }
++
++      return onSubmit(parsed.data);
++    },
++    null,
++  );
++
++  const fieldErrors = state?.ok === false ? (state.error.fieldErrors ?? {}) : {};
++
++  return (
++    <form action={submit} className="space-y-4">
++      {state?.ok === true ? (
++        <p className="rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
++          Project lead updated.
++        </p>
++      ) : null}
++      {state?.ok === false ? (
++        <p role="alert" className="text-sm text-rose-600">
++          {state.error.message}
++        </p>
++      ) : null}
++
++      <div className="space-y-1">
++        <label htmlFor="leadId" className="text-sm font-medium">
++          Lead
++        </label>
++        <select
++          id="leadId"
++          name="leadId"
++          defaultValue={project.leadId ?? ""}
++          className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
++        >
++          <option value="">No lead</option>
++          {members.map((member) => (
++            <option key={member.id} value={member.userId}>
++              {member.user.name}
++            </option>
++          ))}
++        </select>
++        {fieldErrors.leadId !== undefined ? (
++          <p className="text-xs text-rose-600">{fieldErrors.leadId[0]}</p>
++        ) : null}
++      </div>
++
++      <button
++        type="submit"
++        disabled={pending}
++        className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
++      >
++        {pending ? "Saving…" : "Save lead"}
++      </button>
++    </form>
++  );
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx	2026-10-08 11:07:57
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ /**
+- * Editor for name, description, visibility, status, lead and colour.
++ * Editor for project metadata.
+  *
+  * Owner D. Private to the project settings route. `updateProjectSchema` makes
+  * every field optional, so the form sends the whole set and lets the service
+@@ -12,25 +12,22 @@
+ import { fieldErrorsFromZod } from "@/lib/errors";
+ import { updateProjectSchema } from "@/schemas/project";
+ import type { ActionResult } from "@/types/api";
+-import type { OrgId, UserId } from "@/types/common";
+-import type { MemberWithUser } from "@/types/member";
++import type { OrgId } from "@/types/common";
+ import type { Project } from "@/types/project";
+ 
+ export type ProjectSettingsFormProps = {
+   orgId: OrgId;
+   project: Project;
+-  members: readonly MemberWithUser[];
+   onSubmit: (input: unknown) => Promise<ActionResult<Project>>;
+ };
+ 
+ type SettingsState = ActionResult<Project> | null;
+ 
+ export function ProjectSettingsForm(props: ProjectSettingsFormProps) {
+-  const { orgId, project, members, onSubmit } = props;
++  const { orgId, project, onSubmit } = props;
+ 
+   const [state, submit, pending] = useActionState<SettingsState, FormData>(
+     async (_previous, formData) => {
+-      const leadId = String(formData.get("leadId") ?? "");
+       const description = String(formData.get("description") ?? "").trim();
+ 
+       const parsed = updateProjectSchema.safeParse({
+@@ -41,7 +38,6 @@
+         visibility: String(formData.get("visibility") ?? project.visibility),
+         status: String(formData.get("status") ?? project.status),
+         color: String(formData.get("color") ?? project.color),
+-        leadId: leadId.length === 0 ? null : (leadId as UserId),
+       });
+ 
+       if (!parsed.success) {
+@@ -132,38 +128,17 @@
+         </div>
+       </div>
+ 
+-      <div className="grid gap-4 sm:grid-cols-2">
+-        <div className="space-y-1">
+-          <label htmlFor="leadId" className="text-sm font-medium">
+-            Lead
+-          </label>
+-          <select
+-            id="leadId"
+-            name="leadId"
+-            defaultValue={project.leadId ?? ""}
+-            className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+-          >
+-            <option value="">No lead</option>
+-            {members.map((member) => (
+-              <option key={member.id} value={member.userId}>
+-                {member.user.name}
+-              </option>
+-            ))}
+-          </select>
+-        </div>
+-
+-        <div className="space-y-1">
+-          <label htmlFor="color" className="text-sm font-medium">
+-            Colour
+-          </label>
+-          <input
+-            id="color"
+-            name="color"
+-            type="color"
+-            defaultValue={project.color}
+-            className="h-9 w-16 rounded border border-slate-300"
+-          />
+-        </div>
++      <div className="space-y-1">
++        <label htmlFor="color" className="text-sm font-medium">
++          Colour
++        </label>
++        <input
++          id="color"
++          name="color"
++          type="color"
++          defaultValue={project.color}
++          className="h-9 w-16 rounded border border-slate-300"
++        />
+       </div>
+ 
+       <button
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/lib/permissions.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/lib/permissions.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/lib/permissions.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/lib/permissions.ts	2026-10-08 11:08:06
+@@ -18,7 +18,7 @@
+  *   1. cross-tenant guard (`actor.orgId` must equal `resource.orgId`)
+  *   2. platform staff bypass
+  *   3. role matrix lookup
+- *   4. ownership escalations (authors edit their own issues/comments)
++ *   4. ownership escalations (for example, project leads may change the lead)
+  */
+ 
+ /** Minimum role required for each action, before ownership escalations. */
+@@ -35,6 +35,7 @@
+   "project:create": "member",
+   "project:read": "viewer",
+   "project:update": "member",
++  "project:change_lead": "admin",
+   "project:archive": "admin",
+   "project:delete": "owner",
+   "issue:create": "member",
+@@ -54,8 +55,9 @@
+   "webhook:manage": "admin",
+ };
+ 
+-/** Actions an actor may perform on their own content regardless of role rank. */
++/** Actions an actor may perform on resources they own regardless of role rank. */
+ const OWNERSHIP_ESCALATIONS: Readonly<Partial<Record<PermissionAction, true>>> = {
++  "project:change_lead": true,
+   "issue:update": true,
+   "issue:archive": true,
+   "comment:update": true,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/schemas/project.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/schemas/project.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/schemas/project.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/schemas/project.ts	2026-10-08 11:07:02
+@@ -32,11 +32,16 @@
+   description: z.string().max(2_000).nullable().optional(),
+   visibility: projectVisibilitySchema.optional(),
+   status: projectStatusSchema.optional(),
+-  leadId: userIdSchema.nullable().optional(),
+   color: hexColorSchema.optional(),
+   targetDate: isoTimestampSchema.nullable().optional(),
+ });
+ 
++export const changeProjectLeadSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  leadId: userIdSchema.nullable(),
++});
++
+ export const archiveProjectSchema = z.object({
+   orgId: orgIdSchema,
+   projectId: projectIdSchema,
+@@ -54,5 +59,6 @@
+ 
+ export type CreateProjectInput = z.infer<typeof createProjectSchema>;
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
++export type ChangeProjectLeadInput = z.infer<typeof changeProjectLeadSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/server/repositories/project-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/server/repositories/project-repository.ts	2026-10-08 11:07:02
+@@ -19,6 +19,7 @@
+ import { toProject } from "./_mappers";
+ import type {
+   CreateProjectInput,
++  ChangeProjectLeadInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+@@ -155,7 +156,6 @@
+         ? {}
+         : { visibility: input.visibility }),
+       ...(input.status === undefined ? {} : { status: input.status }),
+-      ...(input.leadId === undefined ? {} : { leadId: input.leadId }),
+       ...(input.color === undefined ? {} : { color: input.color }),
+       ...(input.targetDate === undefined
+         ? {}
+@@ -173,6 +173,24 @@
+ 
+   if (!row) throw new Error(`Project ${input.projectId} not found`);
+   return toProject(row);
++}
++
++export async function changeProjectLead(
++  input: ChangeProjectLeadInput,
++): Promise<Project | null> {
++  const row = getDb()
++    .update(projects)
++    .set({ leadId: input.leadId, updatedAt: toIsoTimestamp(new Date()) })
++    .where(
++      and(
++        orgPredicate(projects.orgId, input.orgId),
++        eq(projects.id, input.projectId),
++      ),
++    )
++    .returning()
++    .get();
++
++  return row ? toProject(row) : null;
+ }
+ 
+ export async function archiveProject(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/server/services/project-service.ts	2026-10-08 11:07:02
+@@ -10,6 +10,7 @@
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+@@ -20,6 +21,7 @@
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
++  ChangeProjectLeadInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+@@ -86,6 +88,45 @@
+   assertNotArchived("Project", project.id, project);
+ 
+   return projectRepo.updateProject(input);
++}
++
++export async function changeProjectLead(
++  actor: Actor,
++  input: ChangeProjectLeadInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:change_lead", projectResource(project));
++  assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== null) {
++    const member = await memberRepo.findMember(input.orgId, input.leadId);
++    const activeMember = requireFound(
++      member?.status === "active" ? member : null,
++      "Member",
++      input.leadId,
++    );
++    assertCan(
++      {
++        userId: activeMember.userId,
++        orgId: input.orgId,
++        role: activeMember.role,
++      },
++      "project:update",
++      projectResource(project),
++    );
++  }
++
++  return requireFound(
++    await projectRepo.changeProjectLead(input),
++    "Project",
++    input.projectId,
++  );
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/types/permission.ts /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/types/permission.ts
+--- /private/tmp/luna-scratch-20261008/43767984-4063-4aa7-9278-794a04177b34/src/types/permission.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/177619eb-9fb6-4198-8897-6a082c079270/src/types/permission.ts	2026-10-08 11:07:02
+@@ -27,6 +27,7 @@
+   | "project:create"
+   | "project:read"
+   | "project:update"
++  | "project:change_lead"
+   | "project:archive"
+   | "project:delete"
+   | "issue:create"

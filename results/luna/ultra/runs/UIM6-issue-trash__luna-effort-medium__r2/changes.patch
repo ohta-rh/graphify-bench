@@ -1,0 +1,293 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/lib/errors.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/lib/errors.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/lib/errors.ts	2026-10-08 13:10:13
+@@ -10,7 +10,7 @@
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+-import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { AlreadyArchivedError, RestoreRefusedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+@@ -34,6 +34,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof RestoreRefusedError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -94,6 +95,10 @@
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
+     };
++  }
++
++  if (error instanceof RestoreRefusedError) {
++    return { code: "conflict", message: error.message, meta: { reason: error.reason } };
+   }
+ 
+   if (error instanceof InvalidSlugError) {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/lib/soft-delete.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/lib/soft-delete.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/lib/soft-delete.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/lib/soft-delete.ts	2026-10-08 13:10:10
+@@ -58,6 +58,15 @@
+   }
+ }
+ 
++export class RestoreRefusedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly reason: "not_archived" | "expired" | "project_archived" | "quota") {
++    super(`Issue restore refused: ${reason}`);
++    this.name = "RestoreRefusedError";
++  }
++}
++
+ /** Guard for archive actions, so double-archiving is a domain-level conflict. */
+ export function assertNotArchived(
+   entity: string,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/db/migrate.ts	2026-10-08 13:10:39
+@@ -154,6 +154,7 @@
+      archived_at TEXT
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS issues_project_number_idx ON issues (project_id, number)`,
++  `CREATE TABLE IF NOT EXISTS project_issue_sequences (project_id TEXT PRIMARY KEY NOT NULL, last_number INTEGER NOT NULL)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_status_idx ON issues (org_id, status)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/db/schema/issues.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/db/schema/issues.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/db/schema/issues.ts	2026-10-08 13:10:39
+@@ -44,6 +44,12 @@
+   ],
+ );
+ 
++/** High water mark survives permanent issue purges so numbers are never reused. */
++export const projectIssueSequences = sqliteTable("project_issue_sequences", {
++  projectId: text("project_id").primaryKey().notNull(),
++  lastNumber: integer("last_number").notNull(),
++});
++
+ export const labels = sqliteTable(
+   "labels",
+   {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/jobs/cleanup-archived-job.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/jobs/cleanup-archived-job.ts	2026-10-08 13:10:28
+@@ -18,6 +18,7 @@
+ const ORG_BATCH = 25;
+ const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
++const BYTES_PER_MB = 1024 * 1024;
+ 
+ const logger = createLogger("cleanup-archived-job");
+ 
+@@ -43,20 +44,20 @@
+         new Date(now.getTime() - retentionDays * MS_PER_DAY),
+       );
+ 
+-      const archived = await issueRepo.listIssues({
+-        orgId,
+-        limit: PAGE_SIZE,
+-        cursor: null,
+-        includeArchived: true,
+-      });
+-
+-      for (const issue of archived.items) {
+-        if (!isArchived(issue)) continue;
+-        if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
+-
+-        await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
+-        result.processed += 1;
+-      }
++      let cursor: string | null = null;
++      do {
++        const archived = await issueRepo.listArchivedIssues({ orgId, limit: PAGE_SIZE, cursor });
++        for (const issue of archived.items) {
++          if (!isArchived(issue) || issue.archivedAt === null || issue.archivedAt > cutoff) continue;
++          const purged = await issueRepo.purgeIssue(orgId, issue.id);
++          await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
++          for (const commentId of purged.commentIds) await searchRepo.deleteSearchDocument(orgId, "comment", commentId);
++          const storageMb = purged.attachmentSizes.reduce((sum, bytes) => sum + Math.ceil(bytes / BYTES_PER_MB), 0);
++          if (storageMb) await usageRepo.incrementUsage(orgId, { storageMbUsed: -storageMb });
++          result.processed += 1;
++        }
++        cursor = archived.nextCursor;
++      } while (cursor !== null);
+ 
+       try {
+         const purged = await activityRepo.purgeActivityBefore(orgId, cutoff);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/repositories/issue-repository.ts	2026-10-08 13:10:39
+@@ -22,7 +22,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issues, projectIssueSequences } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -293,14 +293,16 @@
+   orgId: OrgId,
+   projectId: ProjectId,
+ ): Promise<number> {
+-  const row = getDb()
++  const db = getDb();
++  const row = db
+     .select({ value: sql<number | null>`max(${issues.number})` })
+     .from(issues)
+     .where(
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const sequence = db.select({ value: projectIssueSequences.lastNumber }).from(projectIssueSequences).where(eq(projectIssueSequences.projectId, projectId)).get();
++  return Math.max(row?.value ?? 0, sequence?.value ?? 0) + 1;
+ }
+ 
+ export async function insertIssue(
+@@ -335,6 +337,9 @@
+     .returning()
+     .get();
+ 
++  db.insert(projectIssueSequences).values({ projectId: input.projectId, lastNumber: issueNumber })
++    .onConflictDoUpdate({ target: projectIssueSequences.projectId, set: { lastNumber: issueNumber } }).run();
++
+   if (input.labelIds.length > 0) {
+     db.insert(issueLabels)
+       .values(
+@@ -478,6 +483,23 @@
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+   return toIssue(row);
++}
++
++/** Permanently remove an expired issue and its owned rows. Returns the comments and attachment sizes for index and quota cleanup. */
++export async function purgeIssue(orgId: OrgId, issueId: IssueId): Promise<{ commentIds: string[]; attachmentSizes: number[] }> {
++  const db = getDb();
++  const commentRows = db.select({ id: comments.id }).from(comments).where(and(orgPredicate(comments.orgId, orgId), eq(comments.issueId, issueId))).all();
++  const attachmentRows = db.select({ sizeBytes: attachments.sizeBytes }).from(attachments).where(and(orgPredicate(attachments.orgId, orgId), eq(attachments.issueId, issueId))).all();
++  db.delete(issueLabels).where(and(orgPredicate(issueLabels.orgId, orgId), eq(issueLabels.issueId, issueId))).run();
++  db.delete(comments).where(and(orgPredicate(comments.orgId, orgId), eq(comments.issueId, issueId))).run();
++  db.delete(attachments).where(and(orgPredicate(attachments.orgId, orgId), eq(attachments.issueId, issueId))).run();
++  db.delete(issues).where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId))).run();
++  return { commentIds: commentRows.map((row) => row.id), attachmentSizes: attachmentRows.map((row) => row.sizeBytes) };
++}
++
++/** Lists archived rows for cleanup in stable pages, including expired candidates. */
++export async function listArchivedIssues(input: { orgId: OrgId; limit: number; cursor: string | null }): Promise<Page<Issue>> {
++  return listIssues({ orgId: input.orgId, limit: input.limit, cursor: input.cursor, includeArchived: true });
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/activity-service.ts	2026-10-08 13:10:21
+@@ -176,6 +176,15 @@
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.restored", (payload) =>
++      record(payload.orgId, "issue.restored", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: "Restored issue",
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/issue-service.ts	2026-10-08 13:10:18
+@@ -3,10 +3,10 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, assertNotArchived
+  */
+-import { wouldExceedLimit } from "@/config/plan-limits";
++import { getPlanLimits, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { assertNotArchived, isArchived, RestoreRefusedError } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -212,6 +212,31 @@
+   });
+ 
+   return archived;
++}
++
++export async function restoreIssue(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<Issue> {
++  assertOrgScope(actor, orgId);
++  const issue = requireFound(await issueRepo.findIssueById(orgId, issueId), "Issue", issueId);
++  assertCan(actor, "issue:archive", issueResource(issue));
++  if (!isArchived(issue)) throw new RestoreRefusedError("not_archived");
++
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  const retentionMs = getPlanLimits(org.plan).retentionDays * 24 * 60 * 60 * 1000;
++  if (issue.archivedAt === null || Date.now() - Date.parse(issue.archivedAt) >= retentionMs) {
++    throw new RestoreRefusedError("expired");
++  }
++  const project = requireFound(await projectRepo.findProjectById(orgId, issue.projectId), "Project", issue.projectId);
++  if (isArchived(project)) throw new RestoreRefusedError("project_archived");
++  const used = await issueRepo.countIssues(orgId, issue.projectId);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) throw new RestoreRefusedError("quota");
++
++  const restored = await issueRepo.restoreIssue(orgId, issueId);
++  await emit("issue.restored", { ...actorEnvelope(actor), issueId: restored.id, projectId: restored.projectId });
++  return restored;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/search-service.ts	2026-10-08 13:10:21
+@@ -140,6 +140,10 @@
+       const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+       if (issue) await indexIssue(payload.orgId, issue);
+     }),
++    subscribe("issue.restored", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("issue.updated", async (payload) => {
+       const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+       if (issue) await indexIssue(payload.orgId, issue);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/usage-service.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/usage-service.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/server/services/usage-service.ts	2026-10-08 13:10:21
+@@ -77,6 +77,9 @@
+     subscribe("issue.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { issuesUsed: -1 });
+     }),
++    subscribe("issue.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { issuesUsed: 1 });
++    }),
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/types/event.ts /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/7cb381af-8c9d-4eea-b65d-1ac6ed7d19e6/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/172f6649-3f93-488a-b713-04f8e5e55739/src/types/event.ts	2026-10-08 13:10:18
+@@ -61,6 +61,7 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.restored": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;

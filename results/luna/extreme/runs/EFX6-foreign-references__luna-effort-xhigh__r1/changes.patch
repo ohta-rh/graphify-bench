@@ -1,0 +1,303 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/lib/errors.ts /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/lib/errors.ts
+--- /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/lib/errors.ts	2026-10-08 16:18:11
+@@ -12,6 +12,8 @@
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
++import { NotFoundError } from "@/server/services/_support";
++import { ActionNotFoundError } from "@/actions/_lib/action-errors";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
+@@ -35,6 +37,8 @@
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
++    error instanceof NotFoundError ||
++    error instanceof ActionNotFoundError ||
+     error instanceof ZodError
+   );
+ }
+@@ -93,6 +97,17 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof NotFoundError || error instanceof ActionNotFoundError) {
++    return {
++      code: "not_found",
++      message: error.message,
++      meta:
++        error instanceof NotFoundError
++          ? { entity: error.entity, id: error.id }
++          : { what: error.what },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/repositories/label-repository.ts /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/repositories/label-repository.ts
+--- /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/repositories/label-repository.ts	2026-10-08 16:18:11
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/comment-service.ts	2026-10-08 16:16:30
++++ /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/comment-service.ts	2026-10-08 16:18:11
+@@ -16,6 +16,7 @@
+   actorEnvelope,
+   commentResource,
+   issueResource,
++  NotFoundError,
+   requireFound,
+ } from "./_support";
+ import type {
+@@ -26,6 +27,7 @@
+ import type { Comment, CommentThreadNode } from "@/types/comment";
+ import type { IssueId, OrgId, UserId } from "@/types/common";
+ import type { Actor } from "@/types/member";
++import type { MemberWithUser } from "@/types/member";
+ 
+ /** How long after posting an author may still edit their own comment. */
+ const EDIT_WINDOW_MS = 15 * 60 * 1000;
+@@ -56,6 +58,21 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (
++      parent.archivedAt !== null ||
++      parent.issueId !== input.issueId ||
++      parent.parentId !== null
++    ) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -168,23 +185,32 @@
+ }
+ 
+ /**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
++ * Resolve handles and client-provided ids against every active member. The
++ * client list is advisory only; stale or forged ids are silently discarded.
+  */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const members: MemberWithUser[] = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({
++      orgId,
++      limit: MENTION_LOOKUP_LIMIT,
++      cursor,
++      status: "active",
++    });
++    members.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
++  const activeUserIds = new Set(members.map((member) => member.userId));
++  const resolved = resolveMentions(body, members);
++  const suppliedActiveIds = clientProvided.filter((userId) =>
++    activeUserIds.has(userId),
++  );
+ 
+-  return [...new Set([...resolved, ...clientProvided])];
++  return [...new Set([...resolved, ...suppliedActiveIds])];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/issue-service.ts	2026-10-08 16:18:53
+@@ -14,9 +14,11 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   issueResource,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -50,9 +52,15 @@
+     "Project",
+     input.projectId,
+   );
+-  assertNotArchived("Project", project.id, project);
++  if (project.archivedAt !== null) {
++    throw new NotFoundError("Project", project.id);
++  }
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  await requireCurrentMember(input.orgId, input.assigneeId);
++  await requireLiveParentIssue(input.orgId, project.id, input.parentId);
++  const labelIds = await requireOrgLabels(input.orgId, input.labelIds);
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -66,7 +74,11 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const issue = await issueRepo.insertIssue(
++    { ...input, labelIds },
++    actor.userId,
++    number,
++  );
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -94,8 +106,16 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+-  const after = await issueRepo.updateIssue(input);
++  const safeInput =
++    input.labelIds === undefined
++      ? input
++      : {
++          ...input,
++          labelIds: await requireOrgLabels(input.orgId, input.labelIds),
++        };
+ 
++  const after = await issueRepo.updateIssue(safeInput);
++
+   await emit("issue.updated", {
+     ...actorEnvelope(actor),
+     issueId: after.id,
+@@ -160,6 +180,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await requireCurrentMember(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -280,4 +301,48 @@
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function requireCurrentMember(
++  orgId: OrgId,
++  userId: Issue["assigneeId"],
++): Promise<void> {
++  if (userId === null) return;
++
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member === null || member.status !== "active") {
++    throw new NotFoundError("Member", userId);
++  }
++}
++
++async function requireLiveParentIssue(
++  orgId: OrgId,
++  projectId: ProjectId,
++  parentId: Issue["parentId"],
++): Promise<void> {
++  if (parentId === null) return;
++
++  const parent = requireFound(
++    await issueRepo.findIssueById(orgId, parentId),
++    "Issue",
++    parentId,
++  );
++  if (parent.archivedAt !== null || parent.projectId !== projectId) {
++    throw new NotFoundError("Issue", parentId);
++  }
++}
++
++async function requireOrgLabels(
++  orgId: OrgId,
++  labelIds: CreateIssueInput["labelIds"],
++): Promise<CreateIssueInput["labelIds"]> {
++  const uniqueLabelIds = [...new Set(labelIds)];
++  if (uniqueLabelIds.length === 0) return uniqueLabelIds;
++
++  const labels = await labelRepo.listLabels(orgId);
++  const available = new Set(labels.map((label) => label.id));
++  const missing = uniqueLabelIds.find((labelId) => !available.has(labelId));
++  if (missing !== undefined) throw new NotFoundError("Label", missing);
++
++  return uniqueLabelIds;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/bf09adef-e5bd-44b5-9f62-172a71de818f/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c955e1f2-b08c-4a04-a821-201b0e7d9f5e/src/server/services/project-service.ts	2026-10-08 16:18:11
+@@ -11,9 +11,11 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+   actorEnvelope,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -46,6 +48,8 @@
+     input.orgId,
+   );
+ 
++  await requireCurrentMember(input.orgId, input.leadId);
++
+   const used = await projectRepo.countProjects(input.orgId);
+   if (wouldExceedLimit(org.plan, "projects", used)) {
+     throw new Error(
+@@ -85,7 +89,23 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  if (input.leadId !== undefined) {
++    await requireCurrentMember(input.orgId, input.leadId);
++  }
++
+   return projectRepo.updateProject(input);
++}
++
++async function requireCurrentMember(
++  orgId: OrgId,
++  userId: Project["leadId"],
++): Promise<void> {
++  if (userId === null) return;
++
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member === null || member.status !== "active") {
++    throw new NotFoundError("Member", userId);
++  }
+ }
+ 
+ /**

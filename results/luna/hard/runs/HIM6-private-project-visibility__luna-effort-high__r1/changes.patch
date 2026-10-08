@@ -1,0 +1,406 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/repositories/issue-repository.ts	2026-10-08 11:14:30
+@@ -90,13 +90,21 @@
+ }
+ 
+ /** Builds the shared predicate list behind `listIssues` and its count. */
+-function issueFilters(input: IssueFilterInput): readonly SQL[] {
++function issueFilters(
++  input: IssueFilterInput,
++  visibleProjectIds?: readonly ProjectId[],
++): readonly SQL[] {
+   const scope: ArchiveScope = shouldFilterArchived(input)
+     ? {}
+     : { includeArchived: true };
+ 
+   return compact(
+     orgPredicate(issues.orgId, input.orgId),
++    visibleProjectIds === undefined
++      ? undefined
++      : visibleProjectIds.length === 0
++        ? sql`0 = 1`
++        : inArray(issues.projectId, [...visibleProjectIds]),
+     livePredicate(issues.archivedAt, scope),
+     input.projectId === undefined
+       ? undefined
+@@ -141,9 +149,10 @@
+ 
+ export async function listIssues(
+   input: IssueFilterInput,
++  visibleProjectIds?: readonly ProjectId[],
+ ): Promise<Page<Issue>> {
+   const db = getDb();
+-  const filters = issueFilters(input);
++  const filters = issueFilters(input, visibleProjectIds);
+   const sort = { sortColumn: issues.createdAt, idColumn: issues.id };
+ 
+   const total = db
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/repositories/project-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/repositories/project-repository.ts	2026-10-08 11:14:26
+@@ -49,8 +49,21 @@
+   return row ? toProject(row) : null;
+ }
+ 
++/** All project rows used to resolve actor-specific visibility before paging. */
++export async function listProjectsForVisibility(
++  orgId: OrgId,
++): Promise<readonly Project[]> {
++  return getDb()
++    .select()
++    .from(projects)
++    .where(orgPredicate(projects.orgId, orgId))
++    .all()
++    .map(toProject);
++}
++
+ export async function listProjects(
+   input: ListProjectsInput,
++  visibleProjectIds?: readonly ProjectId[],
+ ): Promise<Page<Project>> {
+   const db = getDb();
+   const sort = { sortColumn: projects.createdAt, idColumn: projects.id };
+@@ -63,6 +76,11 @@
+ 
+   const filters = compact(
+     orgPredicate(projects.orgId, input.orgId),
++    visibleProjectIds === undefined
++      ? undefined
++      : visibleProjectIds.length === 0
++        ? sql`0 = 1`
++        : inArray(projects.id, [...visibleProjectIds]),
+     livePredicate(projects.archivedAt, scope),
+     input.status === undefined ? undefined : eq(projects.status, input.status),
+     input.query === undefined
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/attachment-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/attachment-service.ts	2026-10-08 11:15:15
+@@ -10,6 +10,8 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { assertProjectVisible } from "./project-service";
+ import { issueResource, requireFound } from "./_support";
+ import type {
+   CreateAttachmentInput,
+@@ -33,6 +35,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueProjectVisible(actor, issue.orgId, issue.projectId);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   return attachmentRepo.listAttachments(orgId, issueId);
+@@ -55,6 +58,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueProjectVisible(actor, issue.orgId, issue.projectId);
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+   const org = requireFound(
+@@ -101,12 +105,26 @@
+     "Issue",
+     attachment.issueId,
+   );
++  await assertIssueProjectVisible(actor, issue.orgId, issue.projectId);
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+     storageMbUsed: -Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
+   });
++}
++
++async function assertIssueProjectVisible(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: import("@/types/common").ProjectId,
++): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  await assertProjectVisible(actor, project);
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/comment-service.ts	2026-10-08 11:15:00
+@@ -12,6 +12,8 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { assertProjectVisible } from "./project-service";
+ import {
+   actorEnvelope,
+   commentResource,
+@@ -53,6 +55,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueProjectVisible(actor, issue.orgId, issue.projectId);
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -100,6 +103,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await assertCommentProjectVisible(actor, comment.issueId, input.orgId);
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -126,6 +130,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await assertCommentProjectVisible(actor, comment.issueId, input.orgId);
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -157,9 +162,36 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueProjectVisible(actor, issue.orgId, issue.projectId);
+   assertCan(actor, "comment:read", issueResource(issue));
+ 
+   return commentRepo.listThread(orgId, issueId);
++}
++
++async function assertCommentProjectVisible(
++  actor: Actor,
++  issueId: IssueId,
++  orgId: OrgId,
++): Promise<void> {
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  await assertIssueProjectVisible(actor, orgId, issue.projectId);
++}
++
++async function assertIssueProjectVisible(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: import("@/types/common").ProjectId,
++): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  await assertProjectVisible(actor, project);
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/issue-service.ts	2026-10-08 11:14:55
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertProjectVisible, canViewProject } from "./project-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -50,6 +51,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
+@@ -91,6 +93,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueProjectVisible(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -120,6 +123,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueProjectVisible(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -158,6 +162,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueProjectVisible(actor, before);
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -200,6 +205,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueProjectVisible(actor, issue);
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -241,6 +247,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueProjectVisible(actor, issue);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   const labels = await labelRepo.listLabelsForIssues(orgId, [issue.id]);
+@@ -262,7 +269,16 @@
+   // A cross-project list is an org-wide read; per-project visibility is
+   // enforced when the caller opens an individual issue.
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+-  return issueRepo.listIssues(input);
++  const projects = await projectRepo.listProjectsForVisibility(input.orgId);
++  const visibleProjectIds = await Promise.all(
++    projects.map(async (project) =>
++      (await canViewProject(actor, project)) ? project.id : null,
++    ),
++  );
++  return issueRepo.listIssues(
++    input,
++    visibleProjectIds.filter((id): id is ProjectId => id !== null),
++  );
+ }
+ 
+ export async function getBoard(
+@@ -277,7 +293,20 @@
+     "Project",
+     projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function assertIssueProjectVisible(
++  actor: Actor,
++  issue: Issue,
++): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(issue.orgId, issue.projectId),
++    "Project",
++    issue.projectId,
++  );
++  await assertProjectVisible(actor, project);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/77c5c2f9-c5e7-428e-9ce4-33af4ead3472/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/adc7e7ce-c928-466e-bd49-cff4a885bd69/src/server/services/project-service.ts	2026-10-08 11:15:12
+@@ -12,10 +12,12 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as projectMemberRepo from "@/server/repositories/project-member-repository";
+ import {
+   actorEnvelope,
+   orgResource,
+   projectResource,
++  NotFoundError,
+   requireFound,
+ } from "./_support";
+ import type {
+@@ -82,6 +84,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -103,6 +106,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -137,6 +141,7 @@
+     "Project",
+     projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+@@ -161,6 +166,7 @@
+     "Project",
+     slug,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:read", projectResource(project));
+ 
+   return {
+@@ -176,7 +182,16 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:read", orgResource(input.orgId));
+ 
+-  const page = await projectRepo.listProjects(input);
++  const projects = await projectRepo.listProjectsForVisibility(input.orgId);
++  const visibleProjectIds = await Promise.all(
++    projects.map(async (project) =>
++      (await canViewProject(actor, project)) ? project.id : null,
++    ),
++  );
++  const page = await projectRepo.listProjects(
++    input,
++    visibleProjectIds.filter((id): id is ProjectId => id !== null),
++  );
+ 
+   const items = await Promise.all(
+     page.items.map(async (project) => ({
+@@ -186,6 +201,38 @@
+   );
+ 
+   return { items, nextCursor: page.nextCursor, total: page.total };
++}
++
++/** Whether an actor can see this project and its contents. */
++export async function canViewProject(
++  actor: Actor,
++  project: Project,
++): Promise<boolean> {
++  if (actor.orgId !== project.orgId) return false;
++  if (project.visibility !== "private") return true;
++  if (
++    actor.isPlatformStaff === true ||
++    actor.role === "admin" ||
++    actor.role === "owner" ||
++    project.leadId === actor.userId
++  ) {
++    return true;
++  }
++  return projectMemberRepo.isProjectMember(
++    project.orgId,
++    project.id,
++    actor.userId,
++  );
++}
++
++/** Hide inaccessible private projects as missing before normal RBAC checks. */
++export async function assertProjectVisible(
++  actor: Actor,
++  project: Project,
++): Promise<void> {
++  if (!(await canViewProject(actor, project))) {
++    throw new NotFoundError("Project", project.id);
++  }
+ }
+ 
+ /**

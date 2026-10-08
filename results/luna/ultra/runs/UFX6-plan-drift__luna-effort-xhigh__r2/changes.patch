@@ -1,0 +1,230 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/lib/rate-limit.ts /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/lib/rate-limit.ts
+--- /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/lib/rate-limit.ts	2026-10-08 12:07:24
+@@ -8,6 +8,7 @@
+  * to a free org's ceiling; the per-bucket shape below is the base rate.
+  */
+ import { getPlanLimits } from "@/config/plan-limits";
++import * as organizationRepo from "@/server/repositories/organization-repository";
+ import type { PlanId } from "@/types/billing";
+ import type { IsoTimestamp, OrgId } from "@/types/common";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -32,14 +33,14 @@
+ /** Applied to any key not in the table above. */
+ const DEFAULT_BUCKET: RateLimitConfig = { capacity: 30, refillPerMinute: 10 };
+ 
+-type BucketState = { tokens: number; updatedAt: number };
++type BucketState = { tokens: number; updatedAt: number; capacity: number };
+ 
+ const buckets = new Map<string, BucketState>();
+ 
+-/** Plan-aware org context; services set this when they know the org's plan. */
++/** Optional fallback for callers without a persisted organization row. */
+ const planByOrg = new Map<OrgId, PlanId>();
+ 
+-/** Records an org's plan so subsequent bucket sizes scale with its quota. */
++/** Records a fallback plan for org ids that do not have a persisted row. */
+ export function setOrgPlan(orgId: OrgId, plan: PlanId): void {
+   planByOrg.set(orgId, plan);
+ }
+@@ -53,9 +54,8 @@
+  * and the plan catalogue can never drift apart: the plan is the source of
+  * the ceiling, this table only sets the relative shape.
+  */
+-function configFor(orgId: OrgId, bucketKey: string): RateLimitConfig {
++function configFor(plan: PlanId, bucketKey: string): RateLimitConfig {
+   const base = getBucketConfig(bucketKey);
+-  const plan = planByOrg.get(orgId) ?? "free";
+   const hourly = getPlanLimits(plan).apiRequestsPerHour;
+   const factor = Number.isFinite(hourly) ? Math.max(1, hourly / 100) : 100;
+ 
+@@ -78,24 +78,39 @@
+   bucketKey: string,
+   cost = 1,
+ ): Promise<RateLimitVerdict> {
+-  const config = configFor(orgId, bucketKey);
++  // Read through the organization repository on every call so a plan change
++  // affects the next request and legacy denormalized plan values are ignored.
++  const organization = await organizationRepo.findOrgById(orgId);
++  const plan = organization?.plan ?? planByOrg.get(orgId) ?? "free";
++  const config = configFor(plan, bucketKey);
+   const key = `${orgId}:${bucketKey}`;
+   const nowMs = Date.now();
+ 
+-  const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
++  const state = buckets.get(key) ?? {
++    tokens: config.capacity,
++    updatedAt: nowMs,
++    capacity: config.capacity,
++  };
+   const elapsedMinutes = (nowMs - state.updatedAt) / 60_000;
++  const capacityIncrease = Math.max(0, config.capacity - state.capacity);
+   const tokens = Math.min(
+     config.capacity,
+-    state.tokens + elapsedMinutes * config.refillPerMinute,
++    state.tokens + elapsedMinutes * config.refillPerMinute + capacityIncrease,
+   );
+ 
+   const allowed = tokens >= cost;
+   const remaining = allowed ? tokens - cost : tokens;
+-  buckets.set(key, { tokens: remaining, updatedAt: nowMs });
++  buckets.set(key, {
++    tokens: remaining,
++    updatedAt: nowMs,
++    capacity: config.capacity,
++  });
+ 
+   const deficit = allowed ? config.capacity - remaining : cost - remaining;
+   const minutesToReset =
+-    config.refillPerMinute > 0 ? Math.max(0, deficit) / config.refillPerMinute : 0;
++    config.refillPerMinute > 0
++      ? Math.max(0, deficit) / config.refillPerMinute
++      : 0;
+ 
+   return {
+     allowed,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/server/repositories/organization-repository.ts	2026-10-08 12:06:51
+@@ -7,9 +7,10 @@
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
++import type { PlanId } from "@/types/billing";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -19,20 +20,26 @@
+ 
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row
++    ? toOrganizationWithCurrentPlan(row.org, row.subscriptionPlan)
++    : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row
++    ? toOrganizationWithCurrentPlan(row.org, row.subscriptionPlan)
++    : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -40,9 +47,10 @@
+   userId: UserId,
+ ): Promise<readonly Organization[]> {
+   const rows = getDb()
+-    .select({ org: organizations })
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(
+       and(
+         eq(members.userId, userId),
+@@ -52,7 +60,9 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return rows.map((row) =>
++    toOrganizationWithCurrentPlan(row.org, row.subscriptionPlan),
++  );
+ }
+ 
+ /**
+@@ -83,7 +93,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return toOrganizationWithCurrentPlan(row, null);
+ }
+ 
+ export async function updateOrg(
+@@ -110,8 +120,11 @@
+     .where(eq(organizations.id, orgId))
+     .returning()
+     .get();
++  if (!row) throw new Error(`Organization ${orgId} not found`);
+ 
+-  return toOrganization(row);
++  const updated = await findOrgById(orgId);
++  if (!updated) throw new Error(`Organization ${orgId} not found`);
++  return updated;
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+@@ -123,7 +136,20 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  const archived = await findOrgById(orgId);
++  if (!archived) throw new Error(`Organization ${orgId} not found`);
++  return archived;
++}
++
++/** Subscription plans override the denormalized organization value. */
++function toOrganizationWithCurrentPlan(
++  row: Parameters<typeof toOrganization>[0],
++  subscriptionPlan: PlanId | null,
++): Organization {
++  const organization = toOrganization(row);
++  return subscriptionPlan === null
++    ? organization
++    : { ...organization, plan: subscriptionPlan };
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/server/repositories/subscription-repository.ts /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/server/repositories/subscription-repository.ts
+--- /private/tmp/luna-scratch-20261008/a4213f00-408e-44af-aaf7-3a07a24a01ce/src/server/repositories/subscription-repository.ts	2026-10-08 12:04:53
++++ /private/tmp/luna-scratch-20261008/006b9cb9-5458-4af5-ba83-e807f55a8aad/src/server/repositories/subscription-repository.ts	2026-10-08 12:06:41
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -112,8 +112,9 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Only subscriptions that are still trialing are eligible; a plan chosen
++ * during the trial is active and must not be downgraded when the original
++ * trial window ends.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -125,6 +126,7 @@
+       and(
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
++        eq(subscriptions.status, "trialing"),
+         ne(subscriptions.plan, "free"),
+       ),
+     )

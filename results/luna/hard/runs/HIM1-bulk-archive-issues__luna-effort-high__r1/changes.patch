@@ -1,0 +1,118 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/schemas/issue.ts /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/schemas/issue.ts
+--- /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/schemas/issue.ts	2026-10-08 11:34:23
+@@ -70,6 +70,11 @@
+   issueId: issueIdSchema,
+ });
+ 
++export const bulkArchiveIssuesSchema = z.object({
++  orgId: orgIdSchema,
++  issueIds: z.array(issueIdSchema).min(1).max(50),
++});
++
+ export const issueFilterSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -106,5 +111,6 @@
+ export type UpdateIssueInput = z.infer<typeof updateIssueSchema>;
+ export type ChangeIssueStatusInput = z.infer<typeof changeIssueStatusSchema>;
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
++export type BulkArchiveIssuesInput = z.infer<typeof bulkArchiveIssuesSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/server/repositories/issue-repository.ts	2026-10-08 11:34:23
+@@ -70,6 +70,34 @@
+   return toIssue(row, (labels[row.id] ?? []).map((label) => label.id));
+ }
+ 
++/** Finds matching issues in one organization, including archived rows. */
++export async function findIssuesByIds(
++  orgId: OrgId,
++  issueIds: readonly IssueId[],
++): Promise<readonly Issue[]> {
++  if (issueIds.length === 0) return [];
++
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        inArray(issues.id, [...issueIds]),
++      ),
++    )
++    .all();
++  if (rows.length === 0) return [];
++
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map((row) => row.id as IssueId),
++  );
++  return rows.map((row) =>
++    toIssue(row, (labels[row.id] ?? []).map((label) => label.id)),
++  );
++}
++
+ export async function findIssueByNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/f11812a1-403c-49eb-9dac-0370820741b6/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/8693c44d-e34d-411c-a6f5-f90517312dfe/src/server/services/issue-service.ts	2026-10-08 11:34:23
+@@ -23,6 +23,7 @@
+ } from "./_support";
+ import type {
+   AssignIssueInput,
++  BulkArchiveIssuesInput,
+   ChangeIssueStatusInput,
+   CreateIssueInput,
+   IssueFilterInput,
+@@ -212,6 +213,46 @@
+   });
+ 
+   return archived;
++}
++
++export async function bulkArchiveIssues(
++  actor: Actor,
++  input: BulkArchiveIssuesInput,
++): Promise<{ archived: readonly IssueId[]; skipped: readonly IssueId[] }> {
++  assertOrgScope(actor, input.orgId);
++
++  const requestedIds = [...new Set(input.issueIds)];
++  const found = await issueRepo.findIssuesByIds(input.orgId, requestedIds);
++  const byId = new Map(found.map((issue) => [issue.id, issue]));
++  const archivedCandidates: Issue[] = [];
++  const skipped: IssueId[] = [];
++
++  for (const issueId of requestedIds) {
++    const issue = byId.get(issueId);
++    if (!issue || issue.archivedAt !== null) {
++      skipped.push(issueId);
++      continue;
++    }
++    // Check every live candidate before writing any row, so a denial is atomic.
++    assertCan(actor, "issue:archive", issueResource(issue));
++    archivedCandidates.push(issue);
++  }
++
++  const archived: IssueId[] = [];
++  for (const issue of archivedCandidates) {
++    const result = await issueRepo.archiveIssue(input.orgId, issue.id);
++    archived.push(result.id);
++  }
++
++  for (const issue of archivedCandidates) {
++    await emit("issue.archived", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++    });
++  }
++
++  return { archived, skipped };
+ }
+ 
+ /**

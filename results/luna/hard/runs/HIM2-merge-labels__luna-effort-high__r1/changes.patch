@@ -1,0 +1,151 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/schemas/label.ts /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/schemas/label.ts
+--- /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/schemas/label.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/schemas/label.ts	2026-10-08 10:58:45
+@@ -21,5 +21,17 @@
+   labelId: labelIdSchema,
+ });
+ 
++export const mergeLabelsSchema = z
++  .object({
++    orgId: orgIdSchema,
++    sourceLabelId: labelIdSchema,
++    targetLabelId: labelIdSchema,
++  })
++  .refine((input) => input.sourceLabelId !== input.targetLabelId, {
++    message: "Source and target labels must be different",
++    path: ["targetLabelId"],
++  });
++
+ export type CreateLabelInput = z.infer<typeof createLabelSchema>;
+ export type UpdateLabelInput = z.infer<typeof updateLabelSchema>;
++export type MergeLabelsInput = z.infer<typeof mergeLabelsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/server/repositories/label-repository.ts /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/server/repositories/label-repository.ts
+--- /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/server/repositories/label-repository.ts	2026-10-08 10:58:45
+@@ -7,7 +7,7 @@
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { toLabel } from "./_mappers";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import type { CreateLabelInput, MergeLabelsInput, UpdateLabelInput } from "@/schemas/label";
+ import type { IssueId, LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ 
+@@ -84,6 +84,82 @@
+   db.delete(labels)
+     .where(and(orgPredicate(labels.orgId, orgId), eq(labels.id, labelId)))
+     .run();
++}
++
++/** Moves all source assignments to the target and removes the source label atomically. */
++export async function mergeLabels(
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number } | null> {
++  if (input.sourceLabelId === input.targetLabelId) return null;
++
++  const db = getDb();
++  return db.transaction((tx) => {
++    const found = tx
++      .select()
++      .from(labels)
++      .where(
++        and(
++          orgPredicate(labels.orgId, input.orgId),
++          inArray(labels.id, [input.sourceLabelId, input.targetLabelId]),
++        ),
++      )
++      .all();
++    const source = found.find((row) => row.id === input.sourceLabelId);
++    const target = found.find((row) => row.id === input.targetLabelId);
++    if (!source || !target) return null;
++
++    const sourceAssignments = tx
++      .select({ issueId: issueLabels.issueId })
++      .from(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, input.orgId),
++          eq(issueLabels.labelId, input.sourceLabelId),
++        ),
++      )
++      .all();
++
++    for (const { issueId } of sourceAssignments) {
++      const targetAlreadyAssigned = tx
++        .select({ issueId: issueLabels.issueId })
++        .from(issueLabels)
++        .where(
++          and(
++            orgPredicate(issueLabels.orgId, input.orgId),
++            eq(issueLabels.issueId, issueId),
++            eq(issueLabels.labelId, input.targetLabelId),
++          ),
++        )
++        .get();
++      if (targetAlreadyAssigned) {
++        tx.delete(issueLabels)
++          .where(
++            and(
++              orgPredicate(issueLabels.orgId, input.orgId),
++              eq(issueLabels.issueId, issueId),
++              eq(issueLabels.labelId, input.sourceLabelId),
++            ),
++          )
++          .run();
++      } else {
++        tx.update(issueLabels)
++          .set({ labelId: input.targetLabelId })
++          .where(
++            and(
++              orgPredicate(issueLabels.orgId, input.orgId),
++              eq(issueLabels.issueId, issueId),
++              eq(issueLabels.labelId, input.sourceLabelId),
++            ),
++          )
++          .run();
++      }
++    }
++
++    tx.delete(labels)
++      .where(and(orgPredicate(labels.orgId, input.orgId), eq(labels.id, input.sourceLabelId)))
++      .run();
++    return { label: toLabel(target), issuesRelabelled: sourceAssignments.length };
++  });
+ }
+ 
+ /** Replaces the whole label set of one issue in a single round trip. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/server/services/label-service.ts /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/server/services/label-service.ts
+--- /private/tmp/luna-scratch-20261008/f359d3c5-3b12-464a-99fe-5421a7b62bf7/src/server/services/label-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54dc88af-041a-4221-a538-f9040b6e0302/src/server/services/label-service.ts	2026-10-08 10:58:45
+@@ -6,8 +6,8 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as labelRepo from "@/server/repositories/label-repository";
+-import { orgResource } from "./_support";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import { NotFoundError, orgResource } from "./_support";
++import type { CreateLabelInput, MergeLabelsInput, UpdateLabelInput } from "@/schemas/label";
+ import type { LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -58,4 +58,20 @@
+   assertOrgScope(actor, orgId);
+   assertCan(actor, "project:archive", orgResource(orgId));
+   await labelRepo.deleteLabel(orgId, labelId);
++}
++
++export async function mergeLabels(
++  actor: Actor,
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number }> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "project:archive", orgResource(input.orgId));
++  if (input.sourceLabelId === input.targetLabelId) {
++    throw new Error("Source and target labels must be different");
++  }
++  const result = await labelRepo.mergeLabels(input);
++  if (!result) {
++    throw new NotFoundError("Label", input.sourceLabelId);
++  }
++  return result;
+ }

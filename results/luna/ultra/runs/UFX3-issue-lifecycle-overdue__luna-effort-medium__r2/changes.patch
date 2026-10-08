@@ -1,0 +1,129 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/jobs/overdue-issue-job.ts	2026-10-08 12:13:41
+@@ -12,9 +12,6 @@
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+ 
+@@ -45,13 +42,15 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await usageRepo.listLiveOrgIds();
++    const overdueIds = new Set<string>();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
++        overdueIds.add(issue.id);
+         if (reported.has(issue.id)) continue;
+ 
+         try {
+@@ -74,6 +73,9 @@
+           });
+         }
+       }
++    }
++    for (const issueId of reported) {
++      if (!overdueIds.has(issueId)) reported.delete(issueId);
+     }
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/issue-repository.ts	2026-10-08 12:13:04
++++ /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/issue-repository.ts	2026-10-08 12:13:41
+@@ -427,7 +427,7 @@
+           : current.startedAt,
+       completedAt: TERMINAL_STATUSES.includes(status)
+         ? stamp
+-        : current.completedAt,
++        : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -522,6 +522,7 @@
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           ne(issues.status, "done"),
++          ne(issues.status, "canceled"),
+         ),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/project-repository.ts	2026-10-08 12:13:04
++++ /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/project-repository.ts	2026-10-08 12:13:41
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNotNull, like, lt, ne, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -231,7 +231,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, ["done", "canceled"])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -242,6 +242,8 @@
+     .where(
+       and(
+         scope,
++        ne(issues.status, "done"),
++        ne(issues.status, "canceled"),
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/repositories/usage-repository.ts	2026-10-08 12:13:41
+@@ -10,6 +10,7 @@
+   organizationUsage,
+   projects,
+ } from "@/server/db";
++import { organizations } from "@/server/db/schema/organizations";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toUsage } from "./_mappers";
+ import { brandId } from "./_mappers";
+@@ -140,5 +141,15 @@
+     .limit(Math.max(1, limit))
+     .all();
+ 
++  return rows.map((row) => brandId<OrgId>(row.orgId));
++}
++
++/** Every organization that has not been deleted. */
++export async function listLiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ orgId: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .all();
+   return rows.map((row) => brandId<OrgId>(row.orgId));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/a7cfb01d-e413-4d68-902d-705c66c8ca01/src/server/services/notification-service.ts	2026-10-08 12:13:04
++++ /private/tmp/luna-scratch-20261008/afdc048c-96a5-47b1-a4e3-f325ff1cc31c/src/server/services/notification-service.ts	2026-10-08 12:13:41
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,

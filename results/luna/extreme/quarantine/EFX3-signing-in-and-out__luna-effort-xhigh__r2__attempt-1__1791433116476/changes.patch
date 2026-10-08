@@ -1,0 +1,105 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/actions/_lib/action-errors.ts /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/actions/_lib/action-errors.ts
+--- /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/actions/_lib/action-errors.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/actions/_lib/action-errors.ts	2026-10-08 13:18:33
+@@ -11,7 +11,10 @@
+ import type { LimitedResource } from "@/types/billing";
+ import type { IsoTimestamp } from "@/types/common";
+ import type { PermissionAction } from "@/types/permission";
++import { RateLimitedError } from "@/lib/rate-limit";
+ 
++export { RateLimitedError };
++
+ /** No session at all, or a session whose active organization is gone. */
+ export class UnauthorizedActionError extends Error {
+   readonly code = "unauthorized" as const;
+@@ -47,19 +50,6 @@
+   ) {
+     super(`Plan limit reached for ${resource}: ${used}/${limit}`);
+     this.name = "PlanLimitError";
+-  }
+-}
+-
+-/** The token bucket in `@/lib/rate-limit` refused the request. */
+-export class RateLimitedError extends Error {
+-  readonly code = "rate_limited" as const;
+-
+-  constructor(
+-    readonly bucketKey: string,
+-    readonly resetAt: IsoTimestamp,
+-  ) {
+-    super(`Rate limit exceeded for ${bucketKey}; retry after ${resetAt}`);
+-    this.name = "RateLimitedError";
+   }
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/lib/errors.ts /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/lib/errors.ts
+--- /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/lib/errors.ts	2026-10-08 13:18:33
+@@ -12,6 +12,7 @@
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
++import { RateLimitedError } from "@/lib/rate-limit";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
+@@ -35,6 +36,7 @@
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
+     error instanceof InvalidSlugError ||
++    error instanceof RateLimitedError ||
+     error instanceof ZodError
+   );
+ }
+@@ -102,6 +104,14 @@
+       message: error.message,
+       fieldErrors: { slug: [error.message] },
+       meta: { value: error.value },
++    };
++  }
++
++  if (error instanceof RateLimitedError) {
++    return {
++      code: "rate_limited",
++      message: "Too many attempts. Try again shortly.",
++      meta: { bucketKey: error.bucketKey, resetAt: error.resetAt },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/lib/rate-limit.ts /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/lib/rate-limit.ts
+--- /private/tmp/luna-scratch-20261008/c28fdd8e-fdb0-4e80-a4fd-d9698a2a96b5/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/c6de6cf5-0721-47e5-b46c-ffac5579cc10/src/lib/rate-limit.ts	2026-10-08 13:18:33
+@@ -20,7 +20,21 @@
+ 
+ export type RateLimitConfig = { capacity: number; refillPerMinute: number };
+ 
++/** Raised by a service when a scoped token bucket has no remaining capacity. */
++export class RateLimitedError extends Error {
++  readonly code = "rate_limited" as const;
++
++  constructor(
++    readonly bucketKey: string,
++    readonly resetAt: IsoTimestamp,
++  ) {
++    super(`Rate limit exceeded for ${bucketKey}; retry after ${resetAt}`);
++    this.name = "RateLimitedError";
++  }
++}
++
+ export const RATE_LIMIT_BUCKETS: Readonly<Record<string, RateLimitConfig>> = {
++  "auth:login": { capacity: 5, refillPerMinute: 1 },
+   "member:invite": { capacity: 20, refillPerMinute: 2 },
+   "comment:create": { capacity: 60, refillPerMinute: 20 },
+   "issue:create": { capacity: 60, refillPerMinute: 20 },
+@@ -77,9 +91,10 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  scopeKey?: string,
+ ): Promise<RateLimitVerdict> {
+   const config = configFor(orgId, bucketKey);
+-  const key = `${orgId}:${bucketKey}`;
++  const key = `${orgId}:${bucketKey}:${scopeKey?.toLowerCase() ?? ""}`;
+   const nowMs = Date.now();
+ 
+   const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };

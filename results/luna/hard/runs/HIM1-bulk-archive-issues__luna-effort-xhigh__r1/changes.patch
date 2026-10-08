@@ -1,0 +1,122 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/schemas/issue.ts /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/schemas/issue.ts
+--- /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/schemas/issue.ts	2026-10-08 11:37:15
+@@ -70,6 +70,11 @@
+   issueId: issueIdSchema,
+ });
+ 
++export const bulkArchiveIssuesSchema = z.object({
++  orgId: orgIdSchema,
++  issueIds: z.array(issueIdSchema).min(1).max(50),
++});
++
+ export const issueFilterSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -106,5 +111,6 @@
+ export type UpdateIssueInput = z.infer<typeof updateIssueSchema>;
+ export type ChangeIssueStatusInput = z.infer<typeof changeIssueStatusSchema>;
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
++export type BulkArchiveIssuesInput = z.infer<typeof bulkArchiveIssuesSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/server/repositories/issue-repository.ts	2026-10-08 11:37:15
+@@ -70,6 +70,32 @@
+   return toIssue(row, (labels[row.id] ?? []).map((label) => label.id));
+ }
+ 
++export async function findIssuesByIds(
++  orgId: OrgId,
++  issueIds: readonly IssueId[],
++): Promise<readonly Issue[]> {
++  if (issueIds.length === 0) return [];
++
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        inArray(issues.id, [...issueIds]),
++      ),
++    )
++    .all();
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map((row) => row.id as IssueId),
++  );
++
++  return rows.map((row) =>
++    toIssue(row, (labels[row.id] ?? []).map((label) => label.id)),
++  );
++}
++
+ export async function findIssueByNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/68d09d7f-cf07-4ef2-8417-9998c60e1453/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/28f1fad8-c8c2-4b83-ac7a-5cc396e1e9f5/src/server/services/issue-service.ts	2026-10-08 11:37:15
+@@ -23,6 +23,7 @@
+ } from "./_support";
+ import type {
+   AssignIssueInput,
++  BulkArchiveIssuesInput,
+   ChangeIssueStatusInput,
+   CreateIssueInput,
+   IssueFilterInput,
+@@ -212,6 +213,52 @@
+   });
+ 
+   return archived;
++}
++
++export async function bulkArchiveIssues(
++  actor: Actor,
++  input: BulkArchiveIssuesInput,
++): Promise<{ archived: readonly IssueId[]; skipped: readonly IssueId[] }> {
++  assertOrgScope(actor, input.orgId);
++
++  const requestedIds = [...new Set(input.issueIds)];
++  const matches = await issueRepo.findIssuesByIds(input.orgId, requestedIds);
++  const issueById = new Map(matches.map((issue) => [issue.id, issue]));
++  const toArchive: Issue[] = [];
++  const skipped: IssueId[] = [];
++
++  for (const issueId of requestedIds) {
++    const issue = issueById.get(issueId);
++    if (issue === undefined || issue.archivedAt !== null) {
++      skipped.push(issueId);
++      continue;
++    }
++
++    // Check every eligible issue before writing or publishing anything, so a
++    // denied issue rejects the whole batch without partial side effects.
++    assertCan(actor, "issue:archive", issueResource(issue));
++    toArchive.push(issue);
++  }
++
++  const archivedIssues: Issue[] = [];
++  for (const issue of toArchive) {
++    archivedIssues.push(
++      await issueRepo.archiveIssue(input.orgId, issue.id),
++    );
++  }
++
++  for (const issue of archivedIssues) {
++    await emit("issue.archived", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++    });
++  }
++
++  return {
++    archived: archivedIssues.map((issue) => issue.id),
++    skipped,
++  };
+ }
+ 
+ /**

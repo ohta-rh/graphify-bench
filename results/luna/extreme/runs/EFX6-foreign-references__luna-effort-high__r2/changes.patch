@@ -1,0 +1,235 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/repositories/label-repository.ts /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/repositories/label-repository.ts
+--- /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/repositories/label-repository.ts	2026-10-08 15:33:24
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/comment-service.ts	2026-10-08 15:32:27
++++ /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/comment-service.ts	2026-10-08 15:33:43
+@@ -17,6 +17,7 @@
+   commentResource,
+   issueResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   CreateCommentInput,
+@@ -25,13 +26,13 @@
+ } from "@/schemas/comment";
+ import type { Comment, CommentThreadNode } from "@/types/comment";
+ import type { IssueId, OrgId, UserId } from "@/types/common";
+-import type { Actor } from "@/types/member";
++import type { Actor, MemberWithUser } from "@/types/member";
+ 
+ /** How long after posting an author may still edit their own comment. */
+ const EDIT_WINDOW_MS = 15 * 60 * 1000;
+ 
+-/** How many members are scanned when resolving `@handle` mentions. */
+-const MENTION_LOOKUP_LIMIT = 100;
++/** Maximum member page size when resolving `@handle` mentions. */
++const MENTION_PAGE_SIZE = 100;
+ 
+ /** Token bucket protecting the comment thread from burst posting. */
+ const COMMENT_CREATE_BUCKET = "comment:create";
+@@ -56,6 +57,21 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (
++      parent.archivedAt !== null ||
++      parent.issueId !== issue.id ||
++      parent.parentId !== null
++    ) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -168,23 +184,32 @@
+ }
+ 
+ /**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
++ * Resolve both composer ids and body handles against current active members.
++ * Client supplied ids are untrusted and are filtered through the same list.
+  */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const members: MemberWithUser[] = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({
++      orgId,
++      status: "active",
++      limit: MENTION_PAGE_SIZE,
++      cursor,
++    });
++    members.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
++  const activeUserIds = new Set(members.map((member) => member.userId));
++  const resolved = resolveMentions(body, members);
+ 
+-  return [...new Set([...resolved, ...clientProvided])];
++  return [...new Set([
++    ...resolved,
++    ...clientProvided.filter((userId) => activeUserIds.has(userId)),
++  ])];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/issue-service.ts	2026-10-08 15:33:10
+@@ -14,12 +14,14 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   issueResource,
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   AssignIssueInput,
+@@ -53,6 +55,19 @@
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  await assertActiveMember(input.orgId, input.assigneeId);
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await issueRepo.findIssueById(input.orgId, input.parentId),
++      "Issue",
++      input.parentId,
++    );
++    if (parent.archivedAt !== null || parent.projectId !== project.id) {
++      throw new NotFoundError("Issue", input.parentId);
++    }
++  }
++  await assertLabelsExist(input.orgId, input.labelIds);
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -93,6 +108,9 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  if (input.labelIds !== undefined) {
++    await assertLabelsExist(input.orgId, input.labelIds);
++  }
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -160,6 +178,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertActiveMember(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -280,4 +299,24 @@
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function assertActiveMember(
++  orgId: OrgId,
++  userId: import("@/types/common").UserId | null,
++): Promise<void> {
++  if (userId === null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member?.status !== "active") throw new NotFoundError("Member", userId);
++}
++
++async function assertLabelsExist(
++  orgId: OrgId,
++  labelIds: readonly import("@/types/common").LabelId[],
++): Promise<void> {
++  if (labelIds.length === 0) return;
++  const labels = await labelRepo.listLabels(orgId);
++  const available = new Set(labels.map((label) => label.id));
++  const invalidId = labelIds.find((labelId) => !available.has(labelId));
++  if (invalidId !== undefined) throw new NotFoundError("Label", invalidId);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/c3432922-b197-4769-8b22-e2616325daec/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/825a1abf-847a-46c4-a8a2-0abeba5eae62/src/server/services/project-service.ts	2026-10-08 15:33:14
+@@ -12,11 +12,13 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
+@@ -39,6 +41,7 @@
+ ): Promise<Project> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
++  await assertActiveLead(input.orgId, input.leadId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -84,6 +87,9 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++  if (input.leadId !== undefined) {
++    await assertActiveLead(input.orgId, input.leadId);
++  }
+ 
+   return projectRepo.updateProject(input);
+ }
+@@ -198,4 +204,13 @@
+ ): Promise<string> {
+   const taken = await projectRepo.listTakenProjectSlugs(orgId);
+   return uniqueSlug(name, taken);
++}
++
++async function assertActiveLead(
++  orgId: OrgId,
++  userId: import("@/types/common").UserId | null,
++): Promise<void> {
++  if (userId === null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member?.status !== "active") throw new NotFoundError("Member", userId);
+ }

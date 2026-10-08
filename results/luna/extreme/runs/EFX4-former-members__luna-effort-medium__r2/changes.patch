@@ -1,0 +1,245 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/repositories/member-repository.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/repositories/member-repository.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/repositories/member-repository.ts	2026-10-08 15:13:16
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/repositories/member-repository.ts	2026-10-08 15:13:47
+@@ -6,7 +6,7 @@
+ import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+-import { getDb, members, users } from "@/server/db";
++import { getDb, issues, members, projects, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -176,6 +176,24 @@
+ 
+   if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
+   return toMember(row);
++}
++
++export async function reactivateMember(
++  orgId: OrgId, memberId: MemberId, role: Role, invitedBy: UserId, joinedAt: IsoTimestamp,
++): Promise<Member> {
++  const row = getDb().update(members).set({ role, invitedBy, joinedAt, archivedAt: null, status: "active", updatedAt: joinedAt })
++    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
++    .returning().get();
++  if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
++  return toMember(row);
++}
++
++export async function clearFormerMemberReferences(orgId: OrgId, userId: UserId): Promise<void> {
++  const db = getDb();
++  db.update(issues).set({ assigneeId: null })
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.assigneeId, userId))).run();
++  db.update(projects).set({ leadId: null })
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.leadId, userId))).run();
+ }
+ 
+ export async function touchLastSeen(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/digest-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/digest-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/digest-service.ts	2026-10-08 15:13:53
+@@ -8,6 +8,7 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import { renderEmail } from "./email-service";
+ import { buildFlagContext } from "./feature-flag-service";
+ import type { RenderedEmail } from "@/server/services/email-service";
+@@ -30,6 +31,8 @@
+   windowStart: IsoTimestamp,
+   windowEnd: IsoTimestamp,
+ ): Promise<DigestBundle | null> {
++  const membership = await memberRepo.findMember(orgId, recipientId);
++  if (!membership || membership.status !== "active" || membership.archivedAt !== null) return null;
+   const org = await orgRepo.findOrgById(orgId);
+   if (!org) return null;
+ 
+@@ -65,7 +68,13 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  const ids = await preferenceRepo.listDigestSubscribers(orgId);
++  const live: UserId[] = [];
++  for (const id of ids) {
++    const membership = await memberRepo.findMember(orgId, id);
++    if (membership?.status === "active" && membership.archivedAt === null) live.push(id);
++  }
++  return live;
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/invitation-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/invitation-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/invitation-service.ts	2026-10-08 15:13:53
+@@ -135,19 +135,17 @@
+   }
+ 
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+-  if (existing) return existing;
++  const acceptedAt = toIsoTimestamp(new Date());
++  const member = existing
++    ? existing.archivedAt !== null
++      ? await memberRepo.reactivateMember(invitation.orgId, existing.id, invitation.role, invitation.invitedBy, acceptedAt)
++      : existing
++    : await memberRepo.insertMember(invitation.orgId, userId, invitation.role, invitation.invitedBy);
+ 
+-  const member = await memberRepo.insertMember(
+-    invitation.orgId,
+-    userId,
+-    invitation.role,
+-    invitation.invitedBy,
+-  );
+-
+   await invitationRepo.markInvitationAccepted(
+     invitation.orgId,
+     invitation.id,
+-    toIsoTimestamp(new Date()),
++    acceptedAt,
+   );
+ 
+   await emit("member.joined", {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/issue-service.ts	2026-10-08 15:14:06
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -52,6 +53,7 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++  await assertCurrentMember(input.orgId, input.assigneeId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -93,6 +95,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  if (input.assigneeId !== undefined) await assertCurrentMember(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -122,7 +125,6 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+-
+   if (before.status === input.status) return before;
+ 
+   const after = await issueRepo.setIssueStatus(
+@@ -142,6 +144,12 @@
+   return after;
+ }
+ 
++async function assertCurrentMember(orgId: OrgId, userId: import("@/types/common").UserId | null | undefined): Promise<void> {
++  if (userId == null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (!member || member.status !== "active" || member.archivedAt !== null) throw new Error("Assignee must be an active organization member");
++}
++
+ /**
+  * Assignment has its own permission because a member may reassign work they
+  * do not otherwise own. Un-assigning publishes `issue.updated` instead, since
+@@ -160,6 +168,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertCurrentMember(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/member-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/member-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/member-service.ts	2026-10-08 15:13:47
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+@@ -49,6 +50,7 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:update_role", memberResource(member));
++  assertNotArchived("Member", member.id, member);
+ 
+   if (!hasRoleAtLeast(actor.role, input.role)) {
+     throw new Error(
+@@ -90,10 +92,12 @@
+     input.memberId,
+   );
+   assertCan(actor, "member:remove", memberResource(member));
++  assertNotArchived("Member", member.id, member);
+ 
+   await assertLastOwnerRetained(input.orgId, input.memberId, "member");
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
++  await memberRepo.clearFormerMemberReferences(input.orgId, member.userId);
+ 
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/notification-service.ts	2026-10-08 15:13:53
+@@ -10,6 +10,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { notificationResource, requireFound } from "./_support";
+@@ -64,6 +65,8 @@
+ 
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
++    const membership = await memberRepo.findMember(orgId, recipientId);
++    if (!membership || membership.status !== "active" || membership.archivedAt !== null) continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/e6ac2cb1-14a2-497c-b4c4-52fa448cb3a6/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0e966754-17be-4363-bd37-56de5355bacc/src/server/services/project-service.ts	2026-10-08 15:13:58
+@@ -12,6 +12,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   orgResource,
+@@ -39,6 +40,7 @@
+ ): Promise<Project> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
++  await assertCurrentLead(input.orgId, input.leadId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -84,8 +86,15 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++  if (input.leadId !== undefined) await assertCurrentLead(input.orgId, input.leadId);
+ 
+   return projectRepo.updateProject(input);
++}
++
++async function assertCurrentLead(orgId: OrgId, userId: import("@/types/common").UserId | null | undefined): Promise<void> {
++  if (userId == null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (!member || member.status !== "active" || member.archivedAt !== null) throw new Error("Project lead must be an active organization member");
+ }
+ 
+ /**

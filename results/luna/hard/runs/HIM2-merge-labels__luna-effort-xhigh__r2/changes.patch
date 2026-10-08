@@ -1,0 +1,164 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/schemas/label.ts /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/schemas/label.ts
+--- /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/schemas/label.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/schemas/label.ts	2026-10-08 11:07:53
+@@ -21,5 +21,17 @@
+   labelId: labelIdSchema,
+ });
+ 
++export const mergeLabelsSchema = z
++  .object({
++    orgId: orgIdSchema,
++    sourceLabelId: labelIdSchema,
++    targetLabelId: labelIdSchema,
++  })
++  .refine((input) => input.sourceLabelId !== input.targetLabelId, {
++    path: ["targetLabelId"],
++    message: "Source and target labels must be different",
++  });
++
+ export type CreateLabelInput = z.infer<typeof createLabelSchema>;
+ export type UpdateLabelInput = z.infer<typeof updateLabelSchema>;
++export type MergeLabelsInput = z.infer<typeof mergeLabelsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/server/repositories/label-repository.ts /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/server/repositories/label-repository.ts
+--- /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/server/repositories/label-repository.ts	2026-10-08 11:07:53
+@@ -86,6 +86,93 @@
+     .run();
+ }
+ 
++/**
++ * Repoints every source assignment to the target and removes the source label.
++ * The transaction validates both labels before changing any rows.
++ */
++export async function mergeLabels(
++  orgId: OrgId,
++  sourceLabelId: LabelId,
++  targetLabelId: LabelId,
++): Promise<
++  | { label: IssueLabel; issuesRelabelled: number }
++  | { missingLabelId: LabelId }
++> {
++  const db = getDb();
++  return db.transaction((tx) => {
++    const source = tx
++      .select({ id: labels.id })
++      .from(labels)
++      .where(
++        and(
++          orgPredicate(labels.orgId, orgId),
++          eq(labels.id, sourceLabelId),
++        ),
++      )
++      .get();
++    if (!source) return { missingLabelId: sourceLabelId };
++
++    const target = tx
++      .select()
++      .from(labels)
++      .where(
++        and(
++          orgPredicate(labels.orgId, orgId),
++          eq(labels.id, targetLabelId),
++        ),
++      )
++      .get();
++    if (!target) return { missingLabelId: targetLabelId };
++
++    const sourceAssignments = and(
++      orgPredicate(issueLabels.orgId, orgId),
++      eq(issueLabels.labelId, sourceLabelId),
++    );
++    const issuesRelabelled = tx
++      .select({ issueId: issueLabels.issueId })
++      .from(issueLabels)
++      .where(sourceAssignments)
++      .all().length;
++
++    // Remove source rows for issues that already have the target, avoiding
++    // the issue_labels unique index when the remaining rows are updated.
++    tx.delete(issueLabels)
++      .where(
++        and(
++          sourceAssignments,
++          inArray(
++            issueLabels.issueId,
++            tx
++              .select({ issueId: issueLabels.issueId })
++              .from(issueLabels)
++              .where(
++                and(
++                  orgPredicate(issueLabels.orgId, orgId),
++                  eq(issueLabels.labelId, targetLabelId),
++                ),
++              ),
++          ),
++        ),
++      )
++      .run();
++
++    tx.update(issueLabels)
++      .set({ labelId: targetLabelId })
++      .where(sourceAssignments)
++      .run();
++    tx.delete(labels)
++      .where(
++        and(
++          orgPredicate(labels.orgId, orgId),
++          eq(labels.id, sourceLabelId),
++        ),
++      )
++      .run();
++
++    return { label: toLabel(target), issuesRelabelled };
++  });
++}
++
+ /** Replaces the whole label set of one issue in a single round trip. */
+ export async function setIssueLabels(
+   orgId: OrgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/server/services/label-service.ts /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/server/services/label-service.ts
+--- /private/tmp/luna-scratch-20261008/888b4be6-0c5a-46f9-b102-c48acaaf8418/src/server/services/label-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/b68bc353-b757-4300-b8d4-0fdb0ff31d28/src/server/services/label-service.ts	2026-10-08 11:07:53
+@@ -6,8 +6,12 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as labelRepo from "@/server/repositories/label-repository";
+-import { orgResource } from "./_support";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import { NotFoundError, orgResource } from "./_support";
++import type {
++  CreateLabelInput,
++  MergeLabelsInput,
++  UpdateLabelInput,
++} from "@/schemas/label";
+ import type { LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -58,4 +62,27 @@
+   assertOrgScope(actor, orgId);
+   assertCan(actor, "project:archive", orgResource(orgId));
+   await labelRepo.deleteLabel(orgId, labelId);
++}
++
++/** Replaces one org-wide label with another and removes the source label. */
++export async function mergeLabels(
++  actor: Actor,
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number }> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "project:archive", orgResource(input.orgId));
++
++  if (input.sourceLabelId === input.targetLabelId) {
++    throw new Error("Source and target labels must be different");
++  }
++
++  const result = await labelRepo.mergeLabels(
++    input.orgId,
++    input.sourceLabelId,
++    input.targetLabelId,
++  );
++  if ("missingLabelId" in result) {
++    throw new NotFoundError("Label", result.missingLabelId);
++  }
++  return result;
+ }

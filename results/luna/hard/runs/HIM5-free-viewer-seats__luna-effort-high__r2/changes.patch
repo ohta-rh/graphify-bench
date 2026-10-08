@@ -1,0 +1,588 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/actions/members/accept-invitation.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/actions/members/accept-invitation.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/actions/members/accept-invitation.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/actions/members/accept-invitation.ts	2026-10-08 11:51:53
+@@ -5,20 +5,16 @@
+  *
+  * Owner D. Runs for a signed-in user who is *not yet* a member of the target
+  * org, so there is no `Actor` to resolve and the action cannot use
+- * `withAction()`. The seat quota is re-checked at acceptance time because the
+- * organization may have filled up since the invitation was sent.
++ * `withAction()`. The service checks the reserved billable seat at acceptance.
+  *
+- * Must call (do not reimplement): acceptInvitationTokenSchema, getPlanLimits
++ * Must call (do not reimplement): acceptInvitationTokenSchema
+  */
+ 
+-import { PlanLimitError, UnauthorizedActionError } from "@/actions/_lib/action-errors";
+-import { getPlanLimits } from "@/config/plan-limits";
++import { UnauthorizedActionError } from "@/actions/_lib/action-errors";
+ import { toActionResult } from "@/lib/errors";
+ import { getSessionPrincipal } from "@/lib/session";
+ import { acceptInvitationTokenSchema } from "@/schemas/invitation";
+ import { acceptInvitation } from "@/server/services/invitation-service";
+-import { resolveActor } from "@/server/services/member-service";
+-import { getOrganizationSummary } from "@/server/services/organization-service";
+ import type { ActionResult } from "@/types/api";
+ import type { Member } from "@/types/member";
+ 
+@@ -35,28 +31,9 @@
+     }
+ 
+     const member = await acceptInvitation(principal.userId, parsed.data);
+-    await assertSeatAvailable(member);
+ 
+     return { ok: true, data: member, submittedAt: new Date().toISOString() };
+   } catch (error) {
+     return toActionResult(error);
+-  }
+-}
+-
+-/**
+- * Confirms the newly created membership still fits the plan. Reading usage
+- * requires an actor inside the org, which only exists once the membership row
+- * has been written — hence the check runs after `acceptInvitation`.
+- */
+-async function assertSeatAvailable(member: Member): Promise<void> {
+-  const actor = await resolveActor(member.userId, member.orgId);
+-  if (actor === null) {
+-    throw new UnauthorizedActionError("That invitation is no longer valid.");
+-  }
+-
+-  const summary = await getOrganizationSummary(actor, member.orgId);
+-  const limits = getPlanLimits(summary.organization.plan);
+-  if (summary.usage.seatsUsed > limits.seats) {
+-    throw new PlanLimitError("seats", limits.seats, summary.usage.seatsUsed);
+   }
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/actions/members/invite-member.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/actions/members/invite-member.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/actions/members/invite-member.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/actions/members/invite-member.ts	2026-10-08 11:51:53
+@@ -1,30 +1,27 @@
+ "use server";
+ 
+ /**
+- * Invites one member; enforces the seat quota and the invite rate limit.
++ * Invites one member; enforces the invite rate limit before the service checks
++ * the billable seat quota.
+  *
+- * Owner D. Pending invitations count against `seats` — otherwise an org on the
+- * free plan could queue fifty invitations and blow past three seats the moment
+- * they are accepted.
++ * Pending invitations for billable roles count against `seats`, preserving the
++ * reservation until the invite is accepted or revoked.
+  *
+- * Must call (do not reimplement): inviteMemberSchema, can, getPlanLimits,
+- * consumeRateLimit, getActor, toActionResult
++ * Must call (do not reimplement): inviteMemberSchema, can, consumeRateLimit,
++ * getActor, toActionResult
+  */
+ 
+ import {
+   ForbiddenActionError,
+-  PlanLimitError,
+   RateLimitedError,
+ } from "@/actions/_lib/action-errors";
+ import { PENDING_MEMBER_ID } from "@/actions/_lib/permission-resources";
+ import { withAction } from "@/actions/_lib/with-action";
+-import { getPlanLimits } from "@/config/plan-limits";
+ import { CACHE_PROFILES, orgTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+ import { consumeRateLimit } from "@/lib/rate-limit";
+ import { inviteMemberSchema, type InviteMemberInput } from "@/schemas/member";
+ import { inviteMember } from "@/server/services/invitation-service";
+-import { getOrganizationSummary } from "@/server/services/organization-service";
+ import type { ActionResult } from "@/types/api";
+ import type { Invitation } from "@/types/member";
+ 
+@@ -49,12 +46,6 @@
+     const verdict = await consumeRateLimit(input.orgId, INVITE_BUCKET);
+     if (!verdict.allowed) {
+       throw new RateLimitedError(INVITE_BUCKET, verdict.resetAt);
+-    }
+-
+-    const summary = await getOrganizationSummary(actor, input.orgId);
+-    const limits = getPlanLimits(summary.organization.plan);
+-    if (summary.usage.seatsUsed + 1 > limits.seats) {
+-      throw new PlanLimitError("seats", limits.seats, summary.usage.seatsUsed);
+     }
+ 
+     const invitation = await inviteMember(actor, input);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/app/(dashboard)/[orgSlug]/settings/members/page.tsx /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/app/(dashboard)/[orgSlug]/settings/members/page.tsx
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/app/(dashboard)/[orgSlug]/settings/members/page.tsx	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/app/(dashboard)/[orgSlug]/settings/members/page.tsx	2026-10-08 11:50:49
+@@ -96,7 +96,7 @@
+         <div>
+           <h1 className="text-xl font-semibold tracking-tight">Members</h1>
+           <p className="mt-1 text-sm text-slate-600">
+-            {members.total} of {limits.seats} seats used on the {org.plan} plan.
++            {seats.used} of {limits.seats} seats used on the {org.plan} plan.
+           </p>
+         </div>
+         <Link
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/components/domain/member/invite-member-form.tsx /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/components/domain/member/invite-member-form.tsx
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/components/domain/member/invite-member-form.tsx	2026-09-02 11:09:12
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/components/domain/member/invite-member-form.tsx	2026-10-08 11:50:08
+@@ -52,6 +52,7 @@
+   // The quota number comes from the plan table, never from a literal.
+   const limits = getPlanLimits(seatCheck.plan);
+   const seatsExhausted = seatCheck.exceeded || seatCheck.remaining <= 0;
++  const billableSeatUnavailable = seatsExhausted && role !== "viewer";
+ 
+   async function handleSubmit(): Promise<void> {
+     const parsed = inviteMemberSchema.safeParse({ orgId, email, role });
+@@ -65,7 +66,7 @@
+ 
+   return (
+     <div className="invite-member-form space-y-3">
+-      {seatsExhausted ? (
++      {billableSeatUnavailable ? (
+         <Alert tone="warning" title="Seat limit reached">
+           The {seatCheck.plan} plan includes {formatLimit(limits.seats)} seats
+           and {seatCheck.used} are in use. Upgrade to invite more teammates.
+@@ -79,7 +80,7 @@
+           value={email}
+           placeholder="teammate@example.com"
+           invalid={invalid !== null}
+-          disabled={seatsExhausted}
++          disabled={billableSeatUnavailable}
+           onChange={setEmail}
+         />
+       </FormField>
+@@ -88,7 +89,6 @@
+         <RoleSelect
+           value={role}
+           actor={actor}
+-          disabled={seatsExhausted}
+           onChange={setRole}
+         />
+       </FormField>
+@@ -98,7 +98,7 @@
+       <Button
+         type="button"
+         loading={pending}
+-        disabled={pending || seatsExhausted || email.length === 0}
++        disabled={pending || billableSeatUnavailable || email.length === 0}
+         onClick={() => void handleSubmit()}
+       >
+         Send invitation
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/db/seed.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/db/seed.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/db/seed.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/db/seed.ts	2026-10-08 11:50:49
+@@ -307,7 +307,7 @@
+     db.insert(organizationUsage)
+       .values({
+         orgId,
+-        seatsUsed: seededUsers.length,
++        seatsUsed: seededUsers.filter((user) => user.role !== "viewer").length,
+         projectsUsed: spec.projects.length,
+         issuesUsed: spec.projects.length * ISSUES_PER_PROJECT,
+         storageMbUsed: 0,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/invitation-repository.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/invitation-repository.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/invitation-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/invitation-repository.ts	2026-10-08 11:49:55
+@@ -1,7 +1,7 @@
+ /**
+  * Pending invitations, keyed by token hash for the unauthenticated accept flow.
+  */
+-import { and, count, desc, eq, isNull } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, invitations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -130,6 +130,25 @@
+     .where(
+       and(
+         orgPredicate(invitations.orgId, orgId),
++        isNull(invitations.acceptedAt),
++        isNull(invitations.revokedAt),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Counts pending invitations for roles that occupy a plan seat. */
++export async function countBillablePendingInvitations(
++  orgId: OrgId,
++): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(invitations)
++    .where(
++      and(
++        orgPredicate(invitations.orgId, orgId),
++        inArray(invitations.role, ["owner", "admin", "member"]),
+         isNull(invitations.acceptedAt),
+         isNull(invitations.revokedAt),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/member-repository.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/member-repository.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/member-repository.ts	2026-10-08 11:50:49
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -100,7 +100,7 @@
+   );
+ }
+ 
+-/** The seat count every plan check compares against. */
++/** Counts active memberships of every role, for member-list summaries. */
+ export async function countActiveMembers(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+@@ -109,6 +109,23 @@
+       and(
+         orgPredicate(members.orgId, orgId),
+         eq(members.status, "active"),
++        liveMemberPredicate(),
++      ),
++    )
++    .get();
++  return row?.value ?? 0;
++}
++
++/** Counts active members whose roles occupy a plan seat. */
++export async function countBillableActiveMembers(orgId: OrgId): Promise<number> {
++  const row = getDb()
++    .select({ value: count() })
++    .from(members)
++    .where(
++      and(
++        orgPredicate(members.orgId, orgId),
++        eq(members.status, "active"),
++        inArray(members.role, ["owner", "admin", "member"]),
+         liveMemberPredicate(),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/repositories/usage-repository.ts	2026-10-08 11:49:56
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, inArray, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -56,6 +56,7 @@
+       and(
+         eq(members.orgId, orgId),
+         eq(members.status, "active"),
++        inArray(members.role, ["owner", "admin", "member"]),
+         isNull(members.archivedAt),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/invitation-service.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/invitation-service.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/invitation-service.ts	2026-10-08 11:51:53
+@@ -17,7 +17,7 @@
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+ import type { InviteMemberInput, InviteMembersInput } from "@/schemas/member";
+ import type { InvitationId, UserId } from "@/types/common";
+-import type { Actor, Invitation, Member } from "@/types/member";
++import { isBillableRole, type Actor, type Invitation, type Member } from "@/types/member";
+ 
+ /** Token bucket protecting the invite mailer from being used as a spam relay. */
+ const INVITE_BUCKET = "member:invite";
+@@ -68,11 +68,15 @@
+   );
+ 
+   const seatsUsed =
+-    (await memberRepo.countActiveMembers(input.orgId)) +
+-    (await invitationRepo.countPendingInvitations(input.orgId));
++    (await memberRepo.countBillableActiveMembers(input.orgId)) +
++    (await invitationRepo.countBillablePendingInvitations(input.orgId));
++  const seatsRequested = input.invites.filter((invite) =>
++    isBillableRole(invite.role),
++  ).length;
+ 
+   if (
+-    wouldExceedLimit(org.plan, "seats", seatsUsed, input.invites.length)
++    seatsRequested > 0 &&
++    wouldExceedLimit(org.plan, "seats", seatsUsed, seatsRequested)
+   ) {
+     const limits = getPlanLimits(org.plan);
+     throw new Error(
+@@ -136,6 +140,23 @@
+ 
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+   if (existing) return existing;
++
++  if (isBillableRole(invitation.role)) {
++    const [org, activeMembers, pendingInvitations] = await Promise.all([
++      orgRepo.findOrgById(invitation.orgId),
++      memberRepo.countBillableActiveMembers(invitation.orgId),
++      invitationRepo.countBillablePendingInvitations(invitation.orgId),
++    ]);
++    if (!org) throw new Error(`Organization ${invitation.orgId} not found`);
++
++    const seatsUsed = activeMembers + pendingInvitations;
++    const limits = getPlanLimits(org.plan);
++    if (seatsUsed > limits.seats) {
++      throw new Error(
++        `Plan ${org.plan} includes ${limits.seats} seats and ${seatsUsed} are taken`,
++      );
++    }
++  }
+ 
+   const member = await memberRepo.insertMember(
+     invitation.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/member-service.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/member-service.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/member-service.ts	2026-10-08 11:50:08
+@@ -3,11 +3,14 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, hasRoleAtLeast
+  */
++import { getPlanLimits } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+-import { hasRoleAtLeast } from "@/types/member";
++import * as invitationRepo from "@/server/repositories/invitation-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import { hasRoleAtLeast, isBillableRole } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+@@ -58,6 +61,22 @@
+ 
+   await assertLastOwnerRetained(input.orgId, input.memberId, input.role);
+ 
++  if (!isBillableRole(member.role) && isBillableRole(input.role)) {
++    const [org, activeMembers, pendingInvitations] = await Promise.all([
++      orgRepo.findOrgById(input.orgId),
++      memberRepo.countBillableActiveMembers(input.orgId),
++      invitationRepo.countBillablePendingInvitations(input.orgId),
++    ]);
++    if (!org) throw new Error(`Organization ${input.orgId} not found`);
++
++    const limits = getPlanLimits(org.plan);
++    if (activeMembers + pendingInvitations + 1 > limits.seats) {
++      throw new Error(
++        `Plan ${org.plan} includes ${limits.seats} seats and ${activeMembers + pendingInvitations} are taken`,
++      );
++    }
++  }
++
+   const updated = await memberRepo.updateMemberRole(
+     input.orgId,
+     input.memberId,
+@@ -99,6 +118,7 @@
+     ...actorEnvelope(actor),
+     memberId: removed.id,
+     userId: removed.userId,
++    role: removed.role,
+   });
+ 
+   return removed;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/organization-service.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/organization-service.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/organization-service.ts	2026-10-08 11:50:08
+@@ -42,14 +42,14 @@
+ 
+   const owner = await memberRepo.insertMember(org.id, ownerId, "owner", null);
+   await subscriptionRepo.insertSubscription(org.id, input.plan, "monthly");
+-  await usageRepo.recomputeUsage(org.id);
+-
+   await emit("member.joined", {
+     ...envelope(org.id, ownerId),
+     memberId: owner.id,
+     userId: ownerId,
+     role: owner.role,
+   });
++
++  await usageRepo.recomputeUsage(org.id);
+ 
+   return org;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/usage-service.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/usage-service.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/server/services/usage-service.ts	2026-10-08 11:50:08
+@@ -9,6 +9,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
++import { isBillableRole } from "@/types/member";
+ import type { OrgId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
+ import type { Actor } from "@/types/member";
+@@ -87,10 +88,20 @@
+       });
+     }),
+     subscribe("member.joined", async (payload) => {
+-      await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
++      if (isBillableRole(payload.role)) {
++        await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
++      }
+     }),
+     subscribe("member.removed", async (payload) => {
+-      await usageRepo.incrementUsage(payload.orgId, { seatsUsed: -1 });
++      if (isBillableRole(payload.role)) {
++        await usageRepo.incrementUsage(payload.orgId, { seatsUsed: -1 });
++      }
++    }),
++    subscribe("member.role_changed", async (payload) => {
++      const delta = Number(isBillableRole(payload.to)) - Number(isBillableRole(payload.from));
++      if (delta !== 0) {
++        await usageRepo.incrementUsage(payload.orgId, { seatsUsed: delta });
++      }
+     }),
+   ];
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/types/event.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/types/event.ts	2026-10-08 11:50:08
+@@ -80,7 +80,7 @@
+     from: Role;
+     to: Role;
+   };
+-  "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/types/member.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/types/member.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/src/types/member.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/src/types/member.ts	2026-10-08 11:51:27
+@@ -16,6 +16,11 @@
+  */
+ export type Role = "owner" | "admin" | "member" | "viewer";
+ 
++/** True when a membership role uses a paid plan seat. */
++export function isBillableRole(role: Role): boolean {
++  return role === "owner" || role === "admin" || role === "member";
++}
++
+ export const ROLES: readonly Role[] = ["owner", "admin", "member", "viewer"];
+ 
+ export const ROLE_RANK: Readonly<Record<Role, number>> = {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/server/jobs.test.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/server/jobs.test.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/server/jobs.test.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/server/jobs.test.ts	2026-10-08 11:50:29
+@@ -189,7 +189,7 @@
+     });
+ 
+     expect(usage.issuesUsed).toBe(live.total);
+-    expect(usage.seatsUsed).toBe(4);
++    expect(usage.seatsUsed).toBe(3);
+   });
+ });
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/server/plan-limits.test.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/server/plan-limits.test.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/server/plan-limits.test.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/server/plan-limits.test.ts	2026-10-08 11:50:49
+@@ -26,7 +26,7 @@
+ import type { Tenant } from "./_support/fixtures";
+ 
+ let cleanup: () => void;
+-/** Free plan: 3 seats, 2 projects. The fixture seeds four members. */
++/** Free plan: 3 billable seats, 2 projects. The fixture seeds four members. */
+ let free: Tenant;
+ let growth: Tenant;
+ 
+@@ -55,6 +55,19 @@
+     ).rejects.toThrow(/seats/i);
+   });
+ 
++  it("allows viewer invitations when the billable seat quota is full", async () => {
++    const tenant = await createTenant("viewer-invites-free", "free");
++    await expect(
++      invitationService.inviteMembers(tenant.actors.owner, {
++        orgId: tenant.org.id,
++        invites: [
++          { email: "viewer-a@frugal.test", role: "viewer" },
++          { email: "viewer-b@frugal.test", role: "viewer" },
++        ],
++      }),
++    ).resolves.toHaveLength(2);
++  });
++
+   it("writes no invitation row when the quota rejects the batch", async () => {
+     await expect(
+       invitationRepo.countPendingInvitations(free.org.id),
+@@ -154,7 +167,7 @@
+       resource: "seats",
+       plan: "free",
+       limit: 3,
+-      used: 4,
++      used: 3,
+       remaining: 0,
+       exceeded: true,
+     });
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/services/invitation-service.test.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/services/invitation-service.test.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/services/invitation-service.test.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/services/invitation-service.test.ts	2026-10-08 11:50:29
+@@ -49,10 +49,10 @@
+     ).rejects.toBeInstanceOf(PermissionDeniedError);
+   });
+ 
+-  // wouldExceedLimit(plan, "seats", seatsUsed) blocks the fourth seat on free.
++  // Billable active members and invitations are compared with the plan quota.
+   it("refuses an invite that would exceed the plan's seat quota", async () => {
+-    // The free plan tops out at 3 seats; createTenant already seeds 4 active
+-    // members (owner, admin, member, viewer), so the org starts over quota.
++    // The free plan tops out at 3 seats; createTenant seeds 3 billable members
++    // plus a free viewer.
+     const tenant = await createTenant("invite-seat-quota", "free");
+ 
+     await expect(
+@@ -68,9 +68,9 @@
+   it("checks the seat quota once for a bulk invite", async () => {
+     const tenant = await createTenant("invite-bulk-quota", "starter");
+ 
+-    // Bring the org to 9 of its 10 starter seats: 4 from createTenant, 5 more
+-    // inserted directly so only a single seat remains.
+-    for (let i = 0; i < 5; i += 1) {
++    // Bring the org to 9 of its 10 billable starter seats: 3 from createTenant
++    // and 6 more inserted directly, plus the free viewer.
++    for (let i = 0; i < 6; i += 1) {
+       const user = await userRepo.insertUser({
+         email: `filler${i}@invite-bulk-quota.test`,
+         name: `Filler ${i}`,
+@@ -78,7 +78,7 @@
+       });
+       await memberRepo.insertMember(tenant.org.id, user.id, "member", null);
+     }
+-    await expect(memberRepo.countActiveMembers(tenant.org.id)).resolves.toBe(9);
++    await expect(memberRepo.countActiveMembers(tenant.org.id)).resolves.toBe(10);
+ 
+     // A batch of two exceeds the one remaining seat; the check runs once for
+     // the whole batch, so nothing is created — not even the first invite.
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/services/member-service.test.ts /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/services/member-service.test.ts
+--- /private/tmp/luna-scratch-20261008/ebcc38b5-4806-4460-a9d8-fabcabd4d0ca/tests/services/member-service.test.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/95948857-1710-4f3c-9233-34c42ddb8835/tests/services/member-service.test.ts	2026-10-08 11:51:11
+@@ -56,6 +56,24 @@
+     ).rejects.toThrow(/at least one owner/);
+   });
+ 
++  it("refuses a viewer promotion when all billable seats are taken", async () => {
++    const tenant = await createTenant("member-role-seat-limit", "free");
++    const target = await memberRepo.findMember(tenant.org.id, tenant.userIds.viewer);
++    if (!target) throw new Error("fixture member missing");
++
++    await expect(
++      memberService.updateMemberRole(tenant.actors.owner, {
++        orgId: tenant.org.id,
++        memberId: target.id,
++        role: "member",
++      }),
++    ).rejects.toThrow(/seats/i);
++
++    await expect(
++      memberRepo.findMember(tenant.org.id, tenant.userIds.viewer),
++    ).resolves.toMatchObject({ role: "viewer" });
++  });
++
+   // Demoting an owner is fine while another owner exists.
+   it("allows demoting an owner when another owner remains", async () => {
+     const tenant = await createTenant("member-second-owner", "growth");

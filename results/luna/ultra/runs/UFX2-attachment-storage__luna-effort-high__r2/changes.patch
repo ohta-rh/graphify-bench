@@ -1,0 +1,180 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/jobs/trial-expiry-job.ts /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/jobs/trial-expiry-job.ts	2026-10-08 12:42:20
+@@ -38,13 +38,15 @@
+ 
+       if (
+         usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.projectsUsed > freeLimits.projects ||
++        usage.storageMbUsed > freeLimits.storageMb
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+           orgId,
+           seats: usage.seatsUsed,
+           projects: usage.projectsUsed,
++          storageMb: usage.storageMbUsed,
+         });
+         continue;
+       }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/repositories/attachment-repository.ts /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/repositories/attachment-repository.ts
+--- /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/repositories/attachment-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/repositories/attachment-repository.ts	2026-10-08 12:42:14
+@@ -29,6 +29,24 @@
+   return rows.map(toAttachment);
+ }
+ 
++/** Finds an attachment inside one workspace, including files on archived issues. */
++export async function findAttachmentById(
++  orgId: OrgId,
++  attachmentId: AttachmentId,
++): Promise<IssueAttachment | null> {
++  const row = getDb()
++    .select()
++    .from(attachments)
++    .where(
++      and(
++        orgPredicate(attachments.orgId, orgId),
++        eq(attachments.id, attachmentId),
++      ),
++    )
++    .get();
++  return row ? toAttachment(row) : null;
++}
++
+ export async function insertAttachment(
+   input: CreateAttachmentInput,
+   uploadedBy: UserId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/repositories/usage-repository.ts	2026-10-08 12:41:38
++++ /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/repositories/usage-repository.ts	2026-10-08 12:42:33
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, isNull } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -73,17 +73,22 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  const attachmentSizes = db
++    .select({ sizeBytes: attachments.sizeBytes })
+     .from(attachments)
+-    .get();
++    .where(eq(attachments.orgId, orgId))
++    .all();
++  const storageMbUsed = attachmentSizes.reduce(
++    (total, attachment) => total + Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
++    0,
++  );
+ 
+   const next = {
+     orgId,
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed,
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/services/attachment-service.ts	2026-10-08 12:41:38
++++ /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/services/attachment-service.ts	2026-10-08 12:42:33
+@@ -15,7 +15,7 @@
+   CreateAttachmentInput,
+   DeleteAttachmentInput,
+ } from "@/schemas/attachment";
+-import type { IssueId, OrgId } from "@/types/common";
++import type { AttachmentId, IssueId, OrgId } from "@/types/common";
+ import type { IssueAttachment } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -84,8 +84,7 @@
+ }
+ 
+ /**
+- * Removing an attachment gives the megabytes back to the quota — only whole
+- * ones, so a removal can never push the counter below what is really stored.
++ * Removing an attachment returns exactly the megabytes charged on upload.
+  */
+ export async function removeAttachment(
+   actor: Actor,
+@@ -108,30 +107,14 @@
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+-    storageMbUsed: -Math.floor(attachment.sizeBytes / BYTES_PER_MB),
++    storageMbUsed: -Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
+   });
+ }
+ 
+-/**
+- * The attachment repository only reads by issue, because that is the only way
+- * the UI ever reaches one. A delete arrives with just an id, so the org's
+- * issues are walked until the row turns up.
+- */
++/** Looks up the file directly within its workspace, regardless of issue state. */
+ async function findAttachment(
+   orgId: OrgId,
+-  attachmentId: string,
++  attachmentId: AttachmentId,
+ ): Promise<IssueAttachment | null> {
+-  const page = await issueRepo.listIssues({
+-    orgId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  for (const issue of page.items) {
+-    const rows = await attachmentRepo.listAttachments(orgId, issue.id);
+-    const match = rows.find((row) => row.id === attachmentId);
+-    if (match) return match;
+-  }
+-
+-  return null;
++  return attachmentRepo.findAttachmentById(orgId, attachmentId);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/services/billing-service.ts /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/services/billing-service.ts
+--- /private/tmp/luna-scratch-20261008/b93f88d0-ff0d-4e78-8af9-bb3debbbd70e/src/server/services/billing-service.ts	2026-10-08 12:41:38
++++ /private/tmp/luna-scratch-20261008/4492bdde-c7a9-456d-a277-6158da7e3da6/src/server/services/billing-service.ts	2026-10-08 12:42:20
+@@ -11,7 +11,6 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+-import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as invoiceRepo from "@/server/repositories/invoice-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+@@ -221,12 +220,8 @@
+   return org.plan;
+ }
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+ /**
+- * Maps a quota dimension onto the counter that measures it. Storage is read
+- * from the attachment table itself: the cached counter only moves on the
+- * upload path, so it would lag behind what is actually stored.
++ * Maps a quota dimension onto the same usage counter used by upload guards.
+  */
+ async function usageFor(
+   orgId: OrgId,
+@@ -242,9 +237,7 @@
+     case "issuesPerProject":
+       return usage.issuesUsed;
+     case "storageMb":
+-      return Math.round(
+-        (await attachmentRepo.sumStorageBytes(orgId)) / BYTES_PER_MB,
+-      );
++      return usage.storageMbUsed;
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
+     case "apiRequestsPerHour":

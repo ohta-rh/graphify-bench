@@ -1,0 +1,379 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/components/domain/activity/activity-labels.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/components/domain/activity/activity-labels.ts	2026-10-08 16:09:02
+@@ -27,6 +27,8 @@
+   "member.joined": "joined the organization",
+   "member.role_changed": "changed a role",
+   "member.removed": "removed a member",
++  "member.suspended": "suspended a member",
++  "member.reinstated": "reinstated a member",
+   "billing.plan_changed": "changed the plan",
+   "flag.toggled": "toggled a feature flag",
+ };
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/schemas/activity.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/schemas/activity.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/schemas/activity.ts	2026-10-08 16:08:18
+@@ -26,6 +26,8 @@
+   "member.joined",
+   "member.role_changed",
+   "member.removed",
++  "member.suspended",
++  "member.reinstated",
+   "billing.plan_changed",
+   "flag.toggled",
+ ]);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/db/schema/members.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/db/schema/members.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/db/schema/members.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/db/schema/members.ts	2026-10-08 16:09:34
+@@ -15,7 +15,7 @@
+     role: text("role", { enum: ["owner", "admin", "member", "viewer"] })
+       .notNull()
+       .default("member"),
+-    status: text("status", { enum: ["active", "invited", "suspended"] })
++    status: text("status", { enum: ["active", "invited", "suspended", "removed"] })
+       .notNull()
+       .default("active"),
+     invitedBy: text("invited_by"),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/member-repository.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/member-repository.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/member-repository.ts	2026-10-08 16:09:34
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, shouldFilterArchived
+  */
+-import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { getDb, members, users } from "@/server/db";
+@@ -108,7 +108,7 @@
+     .where(
+       and(
+         orgPredicate(members.orgId, orgId),
+-        eq(members.status, "active"),
++        inArray(members.status, ["active", "suspended"]),
+         liveMemberPredicate(),
+       ),
+     )
+@@ -116,6 +116,21 @@
+   return row?.value ?? 0;
+ }
+ 
++export async function setMemberStatus(orgId: OrgId, memberId: MemberId, status: "active" | "suspended"): Promise<Member> {
++  const row = getDb().update(members).set({ status, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId), isNull(members.archivedAt)))
++    .returning().get();
++  if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
++  return toMember(row);
++}
++
++export async function countActiveOwners(orgId: OrgId): Promise<number> {
++  const row = getDb().select({ value: count() }).from(members).where(and(
++    orgPredicate(members.orgId, orgId), eq(members.role, "owner"), eq(members.status, "active"), isNull(members.archivedAt),
++  )).get();
++  return row?.value ?? 0;
++}
++
+ export async function insertMember(
+   orgId: OrgId,
+   userId: UserId,
+@@ -166,7 +181,7 @@
+ ): Promise<Member> {
+   const row = getDb()
+     .update(members)
+-    .set({ ...archivePatch(), status: "suspended" })
++    .set({ ...archivePatch(), status: "removed" })
+     .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
+     .returning()
+     .get();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/organization-repository.ts	2026-10-08 16:09:14
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNull, like, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -46,6 +46,7 @@
+     .where(
+       and(
+         eq(members.userId, userId),
++        ne(members.status, "suspended"),
+         isNull(members.archivedAt),
+         isNull(organizations.archivedAt),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/repositories/usage-repository.ts	2026-10-08 16:09:06
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, inArray, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -55,7 +55,7 @@
+     .where(
+       and(
+         eq(members.orgId, orgId),
+-        eq(members.status, "active"),
++        inArray(members.status, ["active", "suspended"]),
+         isNull(members.archivedAt),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/activity-service.ts	2026-10-08 16:08:32
+@@ -222,6 +222,8 @@
+         summary: `Role ${payload.from} → ${payload.to}`,
+       }).then(() => undefined),
+     ),
++    subscribe("member.suspended", (payload) => record(payload.orgId, "member.suspended", { actorId: payload.actorId, subjectKind: "member", subjectId: payload.memberId, projectId: null, summary: "Suspended member" }).then(() => undefined)),
++    subscribe("member.reinstated", (payload) => record(payload.orgId, "member.reinstated", { actorId: payload.actorId, subjectKind: "member", subjectId: payload.memberId, projectId: null, summary: "Reinstated member" }).then(() => undefined)),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/comment-service.ts	2026-10-08 16:08:48
+@@ -178,6 +178,7 @@
+ ): Promise<readonly UserId[]> {
+   const members = await memberRepo.listMembers({
+     orgId,
++    status: "active",
+     limit: MENTION_LOOKUP_LIMIT,
+     cursor: null,
+   });
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/digest-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/digest-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/digest-service.ts	2026-10-08 16:09:14
+@@ -8,6 +8,7 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import { renderEmail } from "./email-service";
+ import { buildFlagContext } from "./feature-flag-service";
+ import type { RenderedEmail } from "@/server/services/email-service";
+@@ -32,6 +33,8 @@
+ ): Promise<DigestBundle | null> {
+   const org = await orgRepo.findOrgById(orgId);
+   if (!org) return null;
++  const member = await memberRepo.findMember(orgId, recipientId);
++  if (member?.status === "suspended") return null;
+ 
+   if (!isEnabled("digest_email", buildFlagContext(null, org))) return null;
+ 
+@@ -65,7 +68,13 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  const users = await preferenceRepo.listDigestSubscribers(orgId);
++  const active: UserId[] = [];
++  for (const userId of users) {
++    const member = await memberRepo.findMember(orgId, userId);
++    if (member?.status !== "suspended") active.push(userId);
++  }
++  return active;
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/issue-service.ts	2026-10-08 16:09:23
+@@ -14,6 +14,8 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
++import { MemberSuspendedError } from "./member-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -29,10 +31,16 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
++async function assertAssigneeActive(orgId: OrgId, userId: UserId | null | undefined): Promise<void> {
++  if (userId == null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (member?.status === "suspended") throw new MemberSuspendedError(userId);
++}
++
+ /**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+@@ -52,6 +60,7 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++  await assertAssigneeActive(input.orgId, input.assigneeId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -93,6 +102,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  if (input.assigneeId !== undefined) await assertAssigneeActive(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -122,7 +132,6 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+-
+   if (before.status === input.status) return before;
+ 
+   const after = await issueRepo.setIssueStatus(
+@@ -160,6 +169,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertAssigneeActive(input.orgId, input.assigneeId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/member-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/member-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/member-service.ts	2026-10-08 16:08:53
+@@ -8,7 +8,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+-import { actorEnvelope, memberResource, requireFound } from "./_support";
++import { actorEnvelope, memberResource, NotFoundError, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
+@@ -20,6 +20,11 @@
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+ 
++export class MemberSuspendedError extends Error {
++  readonly code = "conflict" as const;
++  constructor(readonly userId: UserId) { super(`Member ${userId} is suspended`); this.name = "MemberSuspendedError"; }
++}
++
+ export async function listMembers(
+   actor: Actor,
+   input: ListMembersInput,
+@@ -104,6 +109,31 @@
+   return removed;
+ }
+ 
++export async function suspendMember(actor: Actor, input: { orgId: OrgId; memberId: MemberId }): Promise<Member> {
++  assertOrgScope(actor, input.orgId);
++  const member = requireFound(await memberRepo.findMemberById(input.orgId, input.memberId), "Member", input.memberId);
++  if (member.archivedAt !== null) throw new NotFoundError("Member", input.memberId);
++  assertCan(actor, "member:remove", memberResource(member));
++  if (member.userId === actor.userId || !hasRoleAtLeast(actor.role, member.role)) throw new Error("Cannot suspend this member");
++  if (member.status === "suspended") return member;
++  if (member.role === "owner" && await memberRepo.countActiveOwners(input.orgId) <= 1) throw new Error("An organization must keep at least one active owner");
++  const updated = await memberRepo.setMemberStatus(input.orgId, input.memberId, "suspended");
++  await emit("member.suspended", { ...actorEnvelope(actor), memberId: updated.id, userId: updated.userId });
++  return updated;
++}
++
++export async function reinstateMember(actor: Actor, input: { orgId: OrgId; memberId: MemberId }): Promise<Member> {
++  assertOrgScope(actor, input.orgId);
++  const member = requireFound(await memberRepo.findMemberById(input.orgId, input.memberId), "Member", input.memberId);
++  if (member.archivedAt !== null) throw new NotFoundError("Member", input.memberId);
++  assertCan(actor, "member:remove", memberResource(member));
++  if (member.userId === actor.userId || !hasRoleAtLeast(actor.role, member.role)) throw new Error("Cannot reinstate this member");
++  if (member.status !== "suspended") return member;
++  const updated = await memberRepo.setMemberStatus(input.orgId, input.memberId, "active");
++  await emit("member.reinstated", { ...actorEnvelope(actor), memberId: updated.id, userId: updated.userId });
++  return updated;
++}
++
+ /**
+  * Turns a (user, org) pair into the `Actor` every service method takes. The
+  * only place an `Actor` is minted from stored state — jobs and the session
+@@ -132,7 +162,7 @@
+   if (nextRole === "owner") return;
+ 
+   const member = await memberRepo.findMemberById(orgId, memberId);
+-  if (!member || member.role !== "owner") return;
++  if (!member || member.role !== "owner" || member.status !== "active") return;
+ 
+   const page = await memberRepo.listMembers({
+     orgId,
+@@ -141,7 +171,7 @@
+     cursor: null,
+   });
+ 
+-  const remaining = page.items.filter((row) => row.id !== memberId);
++  const remaining = page.items.filter((row) => row.id !== memberId && row.status === "active");
+   if (remaining.length === 0) {
+     throw new Error(
+       "An organization must keep at least one owner; transfer ownership first",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/server/services/notification-service.ts	2026-10-08 16:09:14
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+@@ -64,6 +65,8 @@
+ 
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
++    const member = await memberRepo.findMember(orgId, recipientId);
++    if (member?.status === "suspended") continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/activity.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/activity.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/activity.ts	2026-10-08 16:08:17
+@@ -27,6 +27,8 @@
+   | "member.joined"
+   | "member.role_changed"
+   | "member.removed"
++  | "member.suspended"
++  | "member.reinstated"
+   | "billing.plan_changed"
+   | "flag.toggled";
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/event.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/event.ts	2026-10-08 16:08:17
+@@ -81,6 +81,8 @@
+     to: Role;
+   };
+   "member.removed": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.suspended": EventEnvelope & { memberId: MemberId; userId: UserId };
++  "member.reinstated": EventEnvelope & { memberId: MemberId; userId: UserId };
+   "billing.plan_changed": EventEnvelope & { from: PlanId; to: PlanId };
+   "billing.limit_exceeded": EventEnvelope & {
+     resource: LimitedResource;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/member.ts /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/member.ts
+--- /private/tmp/luna-scratch-20261008/af170004-0228-4ad7-8db2-0f45bf3c9cdb/src/types/member.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/eda150fc-e57e-4705-89e1-3183b7b776f5/src/types/member.ts	2026-10-08 16:09:34
+@@ -25,7 +25,7 @@
+   viewer: 1,
+ };
+ 
+-export type MemberStatus = "active" | "invited" | "suspended";
++export type MemberStatus = "active" | "invited" | "suspended" | "removed";
+ 
+ export interface User extends Timestamps {
+   readonly id: UserId;

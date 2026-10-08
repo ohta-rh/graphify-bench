@@ -1,0 +1,793 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/components/domain/notification/notification-preferences-form.tsx /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/components/domain/notification/notification-preferences-form.tsx
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/components/domain/notification/notification-preferences-form.tsx	2026-09-02 11:09:12
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/components/domain/notification/notification-preferences-form.tsx	2026-10-08 13:02:14
+@@ -43,6 +43,7 @@
+   issue_status_changed: "Issue status changed",
+   issue_due_soon: "Issue due soon",
+   issue_overdue: "Issue overdue",
++  issue_unblocked: "Issue unblocked",
+   comment_created: "New comment",
+   comment_mention: "I was mentioned",
+   member_invited: "Member invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/lib/errors.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/lib/errors.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/lib/errors.ts	2026-10-08 13:05:10
+@@ -12,6 +12,7 @@
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
++import { IssueBlockedError } from "@/server/services/issue-dependency-service";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+ 
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof IssueBlockedError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -93,6 +95,14 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof IssueBlockedError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { blockerIds: error.blockerIds.join(",") },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/schemas/notification.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/schemas/notification.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/schemas/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/schemas/notification.ts	2026-10-08 13:04:48
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { NOTIFICATION_KINDS } from "@/types/notification";
+ import type { NotificationKind } from "@/types/notification";
+ import {
+   notificationIdSchema,
+@@ -7,19 +8,7 @@
+   userIdSchema,
+ } from "./common";
+ 
+-export const notificationKindSchema = z.enum([
+-  "issue_assigned",
+-  "issue_status_changed",
+-  "issue_due_soon",
+-  "issue_overdue",
+-  "comment_created",
+-  "comment_mention",
+-  "member_invited",
+-  "member_joined",
+-  "project_archived",
+-  "plan_limit_reached",
+-  "digest_ready",
+-]);
++export const notificationKindSchema = z.enum(NOTIFICATION_KINDS);
+ 
+ export const notificationChannelSchema = z.enum(["in_app", "email", "webhook"]);
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/migrate.ts	2026-10-08 13:02:14
+@@ -158,6 +158,15 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS issue_dependencies (
++     org_id TEXT NOT NULL,
++     issue_id TEXT NOT NULL,
++     blocker_id TEXT NOT NULL,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS issue_dependencies_pk ON issue_dependencies (org_id, issue_id, blocker_id)`,
++  `CREATE INDEX IF NOT EXISTS issue_dependencies_org_blocker_idx ON issue_dependencies (org_id, blocker_id)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/schema/issues.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/schema/issues.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/schema/issues.ts	2026-10-08 13:02:14
+@@ -44,6 +44,28 @@
+   ],
+ );
+ 
++export const issueDependencies = sqliteTable(
++  "issue_dependencies",
++  {
++    ...tenantColumns,
++    issueId: text("issue_id").notNull(),
++    blockerId: text("blocker_id").notNull(),
++    createdBy: text("created_by").notNull(),
++    createdAt: text("created_at").notNull(),
++  },
++  (table) => [
++    uniqueIndex("issue_dependencies_pk").on(
++      table.orgId,
++      table.issueId,
++      table.blockerId,
++    ),
++    index("issue_dependencies_org_blocker_idx").on(
++      table.orgId,
++      table.blockerId,
++    ),
++  ],
++);
++
+ export const labels = sqliteTable(
+   "labels",
+   {
+@@ -87,5 +109,6 @@
+ 
+ export type IssueRow = typeof issues.$inferSelect;
+ export type NewIssueRow = typeof issues.$inferInsert;
++export type IssueDependencyRow = typeof issueDependencies.$inferSelect;
+ export type LabelRow = typeof labels.$inferSelect;
+ export type AttachmentRow = typeof attachments.$inferSelect;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/schema/notifications.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/schema/notifications.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/db/schema/notifications.ts	2026-10-08 13:04:48
+@@ -1,19 +1,6 @@
+ import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+ import { idColumn, tenantColumns, timestampColumns } from "./_shared";
+-
+-const NOTIFICATION_KINDS = [
+-  "issue_assigned",
+-  "issue_status_changed",
+-  "issue_due_soon",
+-  "issue_overdue",
+-  "comment_created",
+-  "comment_mention",
+-  "member_invited",
+-  "member_joined",
+-  "project_archived",
+-  "plan_limit_reached",
+-  "digest_ready",
+-] as const;
++import { NOTIFICATION_KINDS } from "@/types/notification";
+ 
+ export const notifications = sqliteTable(
+   "notifications",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/index.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/index.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/index.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/index.ts	2026-10-08 13:04:48
+@@ -13,6 +13,7 @@
+ export * as invitationRepository from "./invitation-repository";
+ export * as invoiceRepository from "./invoice-repository";
+ export * as issueRepository from "./issue-repository";
++export * as issueDependencyRepository from "./issue-dependency-repository";
+ export * as labelRepository from "./label-repository";
+ export * as memberRepository from "./member-repository";
+ export * as notificationPreferenceRepository from "./notification-preference-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/issue-dependency-repository.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/issue-dependency-repository.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/issue-dependency-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/issue-dependency-repository.ts	2026-10-08 13:06:34
+@@ -0,0 +1,206 @@
++/** Persistence and graph queries for issue dependency links. */
++import {
++  and,
++  asc,
++  eq,
++  isNull,
++  notInArray,
++} from "drizzle-orm";
++import { getDb, issueDependencies, issues } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
++import { brandId, brandStamp, toIssue } from "./_mappers";
++import { listLabelsForIssues } from "./label-repository";
++import type { IssueId, OrgId, UserId } from "@/types/common";
++import type { Issue, IssueDependency } from "@/types/issue";
++
++function toIssueDependency(
++  row: typeof issueDependencies.$inferSelect,
++): IssueDependency {
++  return {
++    orgId: brandId<OrgId>(row.orgId),
++    issueId: brandId<IssueId>(row.issueId),
++    blockerId: brandId<IssueId>(row.blockerId),
++    createdBy: brandId<UserId>(row.createdBy),
++    createdAt: brandStamp(row.createdAt),
++  };
++}
++
++export async function addDependency(
++  orgId: OrgId,
++  issueId: IssueId,
++  blockerId: IssueId,
++  createdBy: UserId,
++): Promise<IssueDependency> {
++  return getDb().transaction((tx) => {
++    const whereLink = and(
++      orgPredicate(issueDependencies.orgId, orgId),
++      eq(issueDependencies.issueId, issueId),
++      eq(issueDependencies.blockerId, blockerId),
++    );
++    const existing = tx
++      .select()
++      .from(issueDependencies)
++      .where(whereLink)
++      .get();
++    if (existing) return toIssueDependency(existing);
++
++    const rows = tx
++      .select({
++        issueId: issueDependencies.issueId,
++        blockerId: issueDependencies.blockerId,
++      })
++      .from(issueDependencies)
++      .where(orgPredicate(issueDependencies.orgId, orgId))
++      .all();
++    if (wouldCreateCycle(rows, issueId, blockerId)) {
++      throw new Error("Issue dependency would create a cycle");
++    }
++
++    const row = tx
++      .insert(issueDependencies)
++      .values({
++        orgId,
++        issueId,
++        blockerId,
++        createdBy,
++        createdAt: toIsoTimestamp(new Date()),
++      })
++      .returning()
++      .get();
++    return toIssueDependency(row);
++  });
++}
++
++/** Follows existing blocked-by links from `blockerId` to detect a cycle. */
++function wouldCreateCycle(
++  rows: readonly { issueId: string; blockerId: string }[],
++  issueId: IssueId,
++  blockerId: IssueId,
++): boolean {
++  const blockersByIssue = new Map<IssueId, IssueId[]>();
++  for (const row of rows) {
++    const dependentId = brandId<IssueId>(row.issueId);
++    const linkedBlockerId = brandId<IssueId>(row.blockerId);
++    const linked = blockersByIssue.get(dependentId) ?? [];
++    linked.push(linkedBlockerId);
++    blockersByIssue.set(dependentId, linked);
++  }
++
++  const visited = new Set<IssueId>();
++  const pending = [blockerId];
++  while (pending.length > 0) {
++    const current = pending.pop()!;
++    if (current === issueId) return true;
++    if (visited.has(current)) continue;
++    visited.add(current);
++    pending.push(...(blockersByIssue.get(current) ?? []));
++  }
++  return false;
++}
++
++export async function deleteDependency(
++  orgId: OrgId,
++  issueId: IssueId,
++  blockerId: IssueId,
++): Promise<boolean> {
++  const deleted = getDb()
++    .delete(issueDependencies)
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++        eq(issueDependencies.blockerId, blockerId),
++      ),
++    )
++    .returning({ issueId: issueDependencies.issueId })
++    .get();
++  return deleted !== undefined;
++}
++
++/** Includes closed blockers but excludes archived blockers, ordered by issue number. */
++export async function listBlockers(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select({ blocker: issues })
++    .from(issueDependencies)
++    .innerJoin(
++      issues,
++      and(
++        eq(issues.id, issueDependencies.blockerId),
++        eq(issues.orgId, issueDependencies.orgId),
++      ),
++    )
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++        isNull(issues.archivedAt),
++      ),
++    )
++    .orderBy(asc(issues.number))
++    .all();
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map(({ blocker }) => brandId<IssueId>(blocker.id)),
++  );
++  return rows.map(({ blocker }) =>
++    toIssue(
++      blocker,
++      (labels[blocker.id] ?? []).map((label) => label.id),
++    ),
++  );
++}
++
++export async function listOpenBlockerIds(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly IssueId[]> {
++  const rows = getDb()
++    .select({ blockerId: issueDependencies.blockerId })
++    .from(issueDependencies)
++    .innerJoin(
++      issues,
++      and(
++        eq(issues.id, issueDependencies.blockerId),
++        eq(issues.orgId, issueDependencies.orgId),
++      ),
++    )
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.issueId, issueId),
++        isNull(issues.archivedAt),
++        notInArray(issues.status, ["done", "canceled"]),
++      ),
++    )
++    .all();
++  return rows.map(({ blockerId }) => brandId<IssueId>(blockerId));
++}
++
++/** All issues linked to this blocker, including archived or closed dependents. */
++export async function listDependents(
++  orgId: OrgId,
++  blockerId: IssueId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select({ dependent: issues })
++    .from(issueDependencies)
++    .innerJoin(
++      issues,
++      and(
++        eq(issues.id, issueDependencies.issueId),
++        eq(issues.orgId, issueDependencies.orgId),
++      ),
++    )
++    .where(
++      and(
++        orgPredicate(issueDependencies.orgId, orgId),
++        eq(issueDependencies.blockerId, blockerId),
++      ),
++    )
++    .all();
++  return rows.map(({ dependent }) => toIssue(dependent));
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/issue-repository.ts	2026-10-08 13:03:12
+@@ -285,6 +285,25 @@
+   return row?.value ?? 0;
+ }
+ 
++/** Live issue ids about to be archived by a project cascade. */
++export async function listLiveIssueIdsForProject(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<readonly IssueId[]> {
++  const rows = getDb()
++    .select({ id: issues.id })
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        eq(issues.projectId, projectId),
++        livePredicate(issues.archivedAt, {}),
++      ),
++    )
++    .all();
++  return rows.map(({ id }) => id as IssueId);
++}
++
+ /**
+  * Next per-project issue number. Archived issues keep their number, so the
+  * max is taken over every row rather than the live ones.
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/notification-preference-repository.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/notification-preference-repository.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/repositories/notification-preference-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/repositories/notification-preference-repository.ts	2026-10-08 13:05:10
+@@ -5,6 +5,7 @@
+ import { getDb, notificationPreferences } from "@/server/db";
+ import { orgPredicate } from "./base-repository";
+ import { brandId, toPreference } from "./_mappers";
++import { NOTIFICATION_KINDS } from "@/types/notification";
+ import type { UpdateNotificationPreferenceInput } from "@/schemas/notification";
+ import type { OrgId, UserId } from "@/types/common";
+ import type {
+@@ -26,7 +27,19 @@
+       ),
+     )
+     .all();
+-  return rows.map(toPreference);
++  const stored = new Map<NotificationKind, NotificationPreference>();
++  for (const row of rows) stored.set(row.kind, toPreference(row));
++  return NOTIFICATION_KINDS.map(
++    (kind) =>
++      stored.get(kind) ?? {
++        orgId,
++        userId,
++        kind,
++        inApp: true,
++        email: true,
++        digestOnly: false,
++      },
++  );
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/event-registry.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/event-registry.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/event-registry.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/event-registry.ts	2026-10-08 13:05:07
+@@ -6,20 +6,17 @@
+ import { subscribe } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
+ import { enqueue } from "@/server/jobs/queue";
++import * as issueDependencyRepo from "@/server/repositories/issue-dependency-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
+ import { toIsoTimestamp } from "@/types/common";
++import type { IssueId, OrgId, UserId } from "@/types/common";
++import { notify } from "./notification-service";
+ import { registerActivityListeners } from "./activity-service";
+ import { registerSearchListeners } from "./search-service";
+ import { registerUsageListeners } from "./usage-service";
+ import { registerWebhookListeners } from "./webhook-service";
+ import type { Unsubscribe } from "@/types/event";
+ 
+-/**
+- * Importing this module also loads `notification-service` transitively, which
+- * attaches the notification fan-out on first import — that hub has no
+- * `register*` entry point of its own.
+- */
+-import "./notification-service";
+-
+ const logger = createLogger("event-registry");
+ 
+ /** Non-null between `registerEventHandlers()` and `unregisterEventHandlers()`. */
+@@ -39,6 +36,7 @@
+     registerUsageListeners(),
+     registerWebhookListeners(),
+     registerDigestBridge(),
++    registerIssueUnblockedListeners(),
+   ];
+ 
+   detach = () => {
+@@ -72,4 +70,96 @@
+       },
+     });
+   });
++}
++
++/** Rechecks dependents once a blocker has closed. */
++function registerIssueUnblockedListeners(): Unsubscribe {
++  const offs: Unsubscribe[] = [
++    subscribe("issue.status_changed", async (payload) => {
++      const wasOpen = payload.from !== "done" && payload.from !== "canceled";
++      const isClosed = payload.to === "done" || payload.to === "canceled";
++      if (wasOpen && isClosed) {
++        await notifyUnblockedDependents(
++          payload.orgId,
++          [payload.issueId],
++          payload.actorId,
++        );
++      }
++    }),
++    subscribe("issue.archived", async (payload) => {
++      const blocker = await issueRepo.findIssueById(
++        payload.orgId,
++        payload.issueId,
++      );
++      if (blocker && blocker.status !== "done" && blocker.status !== "canceled") {
++        await notifyUnblockedDependents(
++          payload.orgId,
++          [payload.issueId],
++          payload.actorId,
++        );
++      }
++    }),
++    subscribe("project.archived", async (payload) => {
++      const archivedOpenBlockers: IssueId[] = [];
++      for (const issueId of payload.archivedIssueIds ?? []) {
++        const issue = await issueRepo.findIssueById(payload.orgId, issueId);
++        if (issue && issue.status !== "done" && issue.status !== "canceled") {
++          archivedOpenBlockers.push(issueId);
++        }
++      }
++      if (archivedOpenBlockers.length > 0) {
++        await notifyUnblockedDependents(
++          payload.orgId,
++          archivedOpenBlockers,
++          payload.actorId,
++        );
++      }
++    }),
++  ];
++
++  return () => {
++    for (const off of offs) off();
++  };
++}
++
++/** Dedupes dependents when one operation closes multiple blockers at once. */
++async function notifyUnblockedDependents(
++  orgId: OrgId,
++  blockerIds: readonly IssueId[],
++  actorId: UserId | null,
++): Promise<void> {
++  const dependentIds = new Set<IssueId>();
++  for (const blockerId of blockerIds) {
++    const dependents = await issueDependencyRepo.listDependents(
++      orgId,
++      blockerId,
++    );
++    for (const dependent of dependents) dependentIds.add(dependent.id);
++  }
++
++  for (const issueId of dependentIds) {
++    const issue = await issueRepo.findIssueById(orgId, issueId);
++    if (
++      !issue ||
++      issue.archivedAt !== null ||
++      issue.status === "done" ||
++      issue.status === "canceled" ||
++      issue.assigneeId === null
++    ) {
++      continue;
++    }
++
++    const openBlockerIds = await issueDependencyRepo.listOpenBlockerIds(
++      orgId,
++      issue.id,
++    );
++    if (openBlockerIds.length > 0) continue;
++
++    await notify(orgId, "issue_unblocked", [issue.assigneeId], {
++      title: "Issue unblocked",
++      body: `Issue ${issue.id} has no open blockers remaining`,
++      href: `/issues/${issue.id}`,
++      actorId,
++    });
++  }
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/index.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/index.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/index.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/index.ts	2026-10-08 13:04:48
+@@ -15,6 +15,7 @@
+ export * as featureFlagService from "./feature-flag-service";
+ export * as invitationService from "./invitation-service";
+ export * as issueService from "./issue-service";
++export * as issueDependencyService from "./issue-dependency-service";
+ export * as labelService from "./label-service";
+ export * as memberService from "./member-service";
+ export * as notificationService from "./notification-service";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/issue-dependency-service.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/issue-dependency-service.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/issue-dependency-service.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/issue-dependency-service.ts	2026-10-08 13:06:41
+@@ -0,0 +1,89 @@
++/** Business rules for blocked-by links between issues. */
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import { issueResource, requireFound } from "./_support";
++import type { IssueId, OrgId } from "@/types/common";
++import type { Issue, IssueDependency } from "@/types/issue";
++import type { Actor } from "@/types/member";
++
++export class IssueBlockedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(public readonly blockerIds: readonly IssueId[]) {
++    super("Issue cannot be completed while it has open blockers");
++    this.name = "IssueBlockedError";
++  }
++}
++
++export async function addBlocker(
++  actor: Actor,
++  input: { orgId: OrgId; issueId: IssueId; blockerId: IssueId },
++): Promise<IssueDependency> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++
++  const blocker = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.blockerId),
++    "Issue",
++    input.blockerId,
++  );
++  assertNotArchived("Issue", blocker.id, blocker);
++
++  if (input.issueId === input.blockerId) {
++    throw new Error("An issue cannot block itself");
++  }
++
++  return dependencyRepo.addDependency(
++    input.orgId,
++    input.issueId,
++    input.blockerId,
++    actor.userId,
++  );
++}
++
++export async function removeBlocker(
++  actor: Actor,
++  input: { orgId: OrgId; issueId: IssueId; blockerId: IssueId },
++): Promise<boolean> {
++  assertOrgScope(actor, input.orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(issue));
++
++  return dependencyRepo.deleteDependency(
++    input.orgId,
++    input.issueId,
++    input.blockerId,
++  );
++}
++
++export async function listBlockers(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++
++  return dependencyRepo.listBlockers(orgId, issueId);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/issue-service.ts	2026-10-08 13:03:48
+@@ -14,6 +14,8 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import { IssueBlockedError } from "./issue-dependency-service";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -124,6 +126,16 @@
+   assertNotArchived("Issue", before.id, before);
+ 
+   if (before.status === input.status) return before;
++
++  if (input.status === "done") {
++    const blockerIds = await dependencyRepo.listOpenBlockerIds(
++      input.orgId,
++      input.issueId,
++    );
++    if (blockerIds.length > 0) {
++      throw new IssueBlockedError(blockerIds);
++    }
++  }
+ 
+   const after = await issueRepo.setIssueStatus(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/server/services/project-service.ts	2026-10-08 13:03:22
+@@ -106,6 +106,9 @@
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  const archivedIssueIds = input.archiveIssues
++    ? await issueRepo.listLiveIssueIdsForProject(input.orgId, input.projectId)
++    : [];
+   const issuesArchived = input.archiveIssues
+     ? await issueRepo.archiveIssuesForProject(input.orgId, input.projectId)
+     : 0;
+@@ -119,6 +122,7 @@
+     ...actorEnvelope(actor),
+     projectId: archived.id,
+     issuesArchived,
++    archivedIssueIds,
+   });
+ 
+   return archived;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/event.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/event.ts	2026-10-08 13:03:48
+@@ -34,6 +34,7 @@
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
++    archivedIssueIds?: readonly IssueId[];
+   };
+   "project.restored": EventEnvelope & { projectId: ProjectId };
+   "issue.created": EventEnvelope & {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/issue.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/issue.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/issue.ts	2026-10-08 13:02:14
+@@ -58,6 +58,14 @@
+   readonly labelIds: readonly LabelId[];
+ }
+ 
++export interface IssueDependency {
++  readonly orgId: OrgId;
++  readonly issueId: IssueId;
++  readonly blockerId: IssueId;
++  readonly createdBy: UserId;
++  readonly createdAt: IsoTimestamp;
++}
++
+ export interface IssueLabel extends TenantScoped {
+   readonly id: LabelId;
+   readonly name: string;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/notification.ts /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/notification.ts
+--- /private/tmp/luna-scratch-20261008/159581dd-ab53-4524-a046-0e2d7c4f27ff/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/54378bc5-5125-4b38-b6a7-42b16fdee603/src/types/notification.ts	2026-10-08 13:04:48
+@@ -6,18 +6,22 @@
+   UserId,
+ } from "./common";
+ 
+-export type NotificationKind =
+-  | "issue_assigned"
+-  | "issue_status_changed"
+-  | "issue_due_soon"
+-  | "issue_overdue"
+-  | "comment_created"
+-  | "comment_mention"
+-  | "member_invited"
+-  | "member_joined"
+-  | "project_archived"
+-  | "plan_limit_reached"
+-  | "digest_ready";
++export const NOTIFICATION_KINDS = [
++  "issue_assigned",
++  "issue_status_changed",
++  "issue_due_soon",
++  "issue_overdue",
++  "issue_unblocked",
++  "comment_created",
++  "comment_mention",
++  "member_invited",
++  "member_joined",
++  "project_archived",
++  "plan_limit_reached",
++  "digest_ready",
++] as const;
++
++export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
+ 
+ export type NotificationChannel = "in_app" | "email" | "webhook";
+ 

@@ -1,0 +1,123 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/schemas/organization.ts /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/schemas/organization.ts
+--- /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/schemas/organization.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/schemas/organization.ts	2026-10-08 11:01:42
+@@ -3,16 +3,34 @@
+ import { slugSchema } from "./slug";
+ import { planIdSchema } from "./billing";
+ 
++const organizationSettingFields = {
++  defaultIssueStatus: z.enum([
++    "backlog",
++    "todo",
++    "in_progress",
++    "in_review",
++    "done",
++    "canceled",
++  ]),
++  allowPublicProjects: z.boolean(),
++  requireTwoFactor: z.boolean(),
++  digestHourUtc: z.number().int().min(0).max(23),
++  enabledFlagOverrides: z.array(z.string()),
++};
++
+ export const organizationSettingsSchema = z.object({
+-  defaultIssueStatus: z
+-    .enum(["backlog", "todo", "in_progress", "in_review", "done", "canceled"])
+-    .default("backlog"),
+-  allowPublicProjects: z.boolean().default(false),
+-  requireTwoFactor: z.boolean().default(false),
+-  digestHourUtc: z.number().int().min(0).max(23).default(7),
+-  enabledFlagOverrides: z.array(z.string()).default([]),
++  defaultIssueStatus: organizationSettingFields.defaultIssueStatus.default("backlog"),
++  allowPublicProjects: organizationSettingFields.allowPublicProjects.default(false),
++  requireTwoFactor: organizationSettingFields.requireTwoFactor.default(false),
++  digestHourUtc: organizationSettingFields.digestHourUtc.default(7),
++  enabledFlagOverrides: organizationSettingFields.enabledFlagOverrides.default([]),
+ });
+ 
++/** Validates a settings patch without filling omitted keys with defaults. */
++export const organizationSettingsPatchSchema = z.object(
++  organizationSettingFields,
++).partial();
++
+ export const createOrganizationSchema = z.object({
+   name: z.string().min(2).max(64),
+   slug: slugSchema,
+@@ -23,7 +41,7 @@
+   orgId: orgIdSchema,
+   name: z.string().min(2).max(64).optional(),
+   logoUrl: z.url().nullable().optional(),
+-  settings: organizationSettingsSchema.partial().optional(),
++  settings: organizationSettingsPatchSchema.optional(),
+ });
+ 
+ export const transferOwnershipSchema = z.object({
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/server/repositories/organization-repository.ts	2026-10-08 11:01:49
+@@ -90,27 +90,35 @@
+   orgId: OrgId,
+   patch: UpdateOrganizationInput,
+ ): Promise<Organization> {
+-  const current = await findOrgById(orgId);
+-  if (!current) throw new Error(`Organization ${orgId} not found`);
++  const settings = patch.settings;
+ 
+-  const settings = { ...current.settings, ...(patch.settings ?? {}) };
+-
+   const row = getDb()
+     .update(organizations)
+     .set({
+       ...(patch.name === undefined ? {} : { name: patch.name }),
+       ...(patch.logoUrl === undefined ? {} : { logoUrl: patch.logoUrl }),
+-      defaultIssueStatus: settings.defaultIssueStatus,
+-      allowPublicProjects: settings.allowPublicProjects,
+-      requireTwoFactor: settings.requireTwoFactor,
+-      digestHourUtc: settings.digestHourUtc,
+-      enabledFlagOverrides: JSON.stringify(settings.enabledFlagOverrides),
++      ...(settings?.defaultIssueStatus === undefined
++        ? {}
++        : { defaultIssueStatus: settings.defaultIssueStatus }),
++      ...(settings?.allowPublicProjects === undefined
++        ? {}
++        : { allowPublicProjects: settings.allowPublicProjects }),
++      ...(settings?.requireTwoFactor === undefined
++        ? {}
++        : { requireTwoFactor: settings.requireTwoFactor }),
++      ...(settings?.digestHourUtc === undefined
++        ? {}
++        : { digestHourUtc: settings.digestHourUtc }),
++      ...(settings?.enabledFlagOverrides === undefined
++        ? {}
++        : { enabledFlagOverrides: JSON.stringify(settings.enabledFlagOverrides) }),
+       updatedAt: toIsoTimestamp(new Date()),
+     })
+     .where(eq(organizations.id, orgId))
+     .returning()
+     .get();
+ 
++  if (!row) throw new Error(`Organization ${orgId} not found`);
+   return toOrganization(row);
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/server/services/organization-service.ts /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/server/services/organization-service.ts
+--- /private/tmp/luna-scratch-20261008/b4af3c55-16b7-47fa-9f47-7d4fa1ba10aa/src/server/services/organization-service.ts	2026-10-08 11:01:05
++++ /private/tmp/luna-scratch-20261008/6d0eac61-6895-4ff5-8b71-f7058d315add/src/server/services/organization-service.ts	2026-10-08 11:01:44
+@@ -7,7 +7,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
+ import { assertOrgScope } from "@/lib/tenant";
+-import { organizationSettingsSchema } from "@/schemas/organization";
++import { organizationSettingsPatchSchema } from "@/schemas/organization";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+@@ -68,7 +68,7 @@
+   const patch: UpdateOrganizationInput =
+     input.settings === undefined
+       ? input
+-      : { ...input, settings: organizationSettingsSchema.parse(input.settings) };
++      : { ...input, settings: organizationSettingsPatchSchema.parse(input.settings) };
+ 
+   const updated = await orgRepo.updateOrg(input.orgId, patch);
+ 

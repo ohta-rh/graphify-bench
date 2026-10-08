@@ -1,0 +1,248 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/jobs/search-reindex-job.ts /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/jobs/search-reindex-job.ts	2026-10-08 12:50:22
++++ /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/jobs/search-reindex-job.ts	2026-10-08 12:51:39
+@@ -7,6 +7,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
+ import {
+   indexComment,
+   indexIssue,
+@@ -32,57 +33,41 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
+-
+-    for (const project of projects.items) {
++    await searchRepo.clearOrganization(orgId);
++    let projectCursor: string | null = null;
++    do {
++      const projects = await projectRepo.listProjects({ orgId, limit: PAGE_SIZE, cursor: projectCursor, includeArchived: true });
+       try {
+-        await indexProject(orgId, project);
+-        result.processed += 1;
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index project", {
+-          projectId: project.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
++        for (const project of projects.items) {
++          try { await indexProject(orgId, project); result.processed += 1; }
++          catch (error) { result.failed += 1; logger.error("failed to index project", { projectId: project.id, reason: error instanceof Error ? error.message : String(error) }); }
++        }
++      } finally {
++        projectCursor = projects.nextCursor;
+       }
+-    }
++    } while (projectCursor !== null);
+ 
+-    const issues = await issueRepo.listIssues({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
+-
+-    for (const issue of issues.items) {
+-      try {
+-        await indexIssue(orgId, issue);
+-        result.processed += 1;
+-
+-        const comments = await commentRepo.listComments({
+-          orgId,
+-          issueId: issue.id,
+-          includeArchived: true,
+-          limit: PAGE_SIZE,
+-          cursor: null,
+-        });
+-
+-        for (const comment of comments.items) {
+-          await indexComment(orgId, comment);
+-          result.processed += 1;
++    let issueCursor: string | null = null;
++    do {
++      const issues = await issueRepo.listIssues({ orgId, limit: PAGE_SIZE, cursor: issueCursor, includeArchived: true });
++      for (const issue of issues.items) {
++        try {
++          await indexIssue(orgId, issue); result.processed += 1;
++          let commentCursor: string | null = null;
++          do {
++            const comments = await commentRepo.listComments({ orgId, issueId: issue.id, includeArchived: true, limit: PAGE_SIZE, cursor: commentCursor });
++            for (const comment of comments.items) {
++              try { await indexComment(orgId, comment); result.processed += 1; }
++              catch (error) { result.failed += 1; logger.error("failed to index comment", { commentId: comment.id, reason: error instanceof Error ? error.message : String(error) }); }
++            }
++            commentCursor = comments.nextCursor;
++          } while (commentCursor !== null);
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index issue", { issueId: issue.id, reason: error instanceof Error ? error.message : String(error) });
+         }
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index issue", {
+-          issueId: issue.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
+       }
+-    }
++      issueCursor = issues.nextCursor;
++    } while (issueCursor !== null);
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/repositories/search-repository.ts /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/repositories/search-repository.ts
+--- /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/repositories/search-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/repositories/search-repository.ts	2026-10-08 12:51:55
+@@ -1,7 +1,7 @@
+ /**
+  * Denormalised search index kept in step by `SearchService`.
+  */
+-import { and, count, desc, eq, inArray, like } from "drizzle-orm";
++import { and, count, desc, eq, inArray, like, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -95,6 +95,11 @@
+     input.projectId === undefined
+       ? undefined
+       : eq(searchIndex.projectId, input.projectId),
++    sql`case ${searchIndex.subjectKind}
++      when 'project' then exists (select 1 from projects p where p.id = ${searchIndex.subjectId} and p.org_id = ${searchIndex.orgId} and p.archived_at is null)
++      when 'issue' then exists (select 1 from issues i join projects p on p.id = i.project_id and p.org_id = i.org_id where i.id = ${searchIndex.subjectId} and i.org_id = ${searchIndex.orgId} and i.archived_at is null and p.archived_at is null)
++      when 'comment' then exists (select 1 from comments c join issues i on i.id = c.issue_id and i.org_id = c.org_id join projects p on p.id = i.project_id and p.org_id = i.org_id where c.id = ${searchIndex.subjectId} and c.org_id = ${searchIndex.orgId} and c.archived_at is null and i.archived_at is null and p.archived_at is null)
++      else 0 end = 1`,
+   );
+ 
+   const total = db
+@@ -118,6 +123,11 @@
+     (row) => row,
+     (row) => ({ id: row.id, sortValue: row.indexedAt }),
+   );
++}
++
++/** Remove only this tenant's documents before an exact rebuild. */
++export async function clearOrganization(orgId: OrgId): Promise<void> {
++  getDb().delete(searchIndex).where(orgPredicate(searchIndex.orgId, orgId)).run();
+ }
+ 
+ /** Drift alarm input: how many documents this org currently has indexed. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/services/comment-service.ts	2026-10-08 12:51:20
+@@ -107,7 +107,13 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const updated = await commentRepo.updateComment(input);
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++  });
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/server/services/search-service.ts	2026-10-08 12:51:55
+@@ -86,6 +86,11 @@
+ }
+ 
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
++  const project = await projectRepo.findProjectById(orgId, issue.projectId);
++  if (issue.archivedAt !== null || !project || project.archivedAt !== null) {
++    await removeFromIndex(orgId, "issue", issue.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "issue",
+@@ -99,12 +104,18 @@
+   orgId: OrgId,
+   comment: Comment,
+ ): Promise<void> {
++  const issue = await issueRepo.findIssueById(orgId, comment.issueId);
++  const project = issue ? await projectRepo.findProjectById(orgId, issue.projectId) : null;
++  if (comment.archivedAt !== null || !issue || issue.archivedAt !== null || !project || project.archivedAt !== null) {
++    await removeFromIndex(orgId, "comment", comment.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    issue.projectId,
+   );
+ }
+ 
+@@ -112,6 +123,11 @@
+   orgId: OrgId,
+   project: Project,
+ ): Promise<void> {
++  const current = await projectRepo.findProjectById(orgId, project.id);
++  if (project.archivedAt !== null || !current || current.archivedAt !== null) {
++    await removeFromIndex(orgId, "project", project.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "project",
+@@ -154,6 +170,10 @@
+       );
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
++    subscribe("comment.updated", async (payload) => {
++      const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++      if (comment) await indexComment(payload.orgId, comment);
++    }),
+     subscribe("comment.deleted", async (payload) => {
+       await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+@@ -166,6 +186,24 @@
+     }),
+     subscribe("project.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
++    }),
++    subscribe("project.restored", async (payload) => {
++      const project = await projectRepo.findProjectById(payload.orgId, payload.projectId);
++      if (project) await indexProject(payload.orgId, project);
++      let issueCursor: string | null = null;
++      do {
++        const issues = await issueRepo.listIssues({ orgId: payload.orgId, projectId: payload.projectId, limit: 100, cursor: issueCursor });
++        for (const issue of issues.items) {
++          await indexIssue(payload.orgId, issue);
++          let commentCursor: string | null = null;
++          do {
++            const comments = await commentRepo.listComments({ orgId: payload.orgId, issueId: issue.id, limit: 100, cursor: commentCursor });
++            for (const comment of comments.items) await indexComment(payload.orgId, comment);
++            commentCursor = comments.nextCursor;
++          } while (commentCursor !== null);
++        }
++        issueCursor = issues.nextCursor;
++      } while (issueCursor !== null);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+       if (payload.subjectKind !== "issue") return;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/types/event.ts /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/0267454b-187e-42c2-93ff-fa45563ebdd6/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/1a226562-495d-40f6-baa9-a1862e1d479b/src/types/event.ts	2026-10-08 12:51:30
+@@ -72,6 +72,7 @@
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
+   };
++  "comment.updated": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };

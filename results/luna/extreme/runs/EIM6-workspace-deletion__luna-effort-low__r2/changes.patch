@@ -1,0 +1,457 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/config/constants.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/config/constants.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/config/constants.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/config/constants.ts	2026-10-08 15:51:29
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** How long a deleted workspace can be restored before permanent removal. */
++export const DELETED_WORKSPACE_RETENTION_DAYS: number = 30;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/lib/permissions.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/lib/permissions.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/lib/permissions.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/lib/permissions.ts	2026-10-08 15:51:29
+@@ -26,6 +26,7 @@
+   "org:read": "viewer",
+   "org:update": "admin",
+   "org:delete": "owner",
++  "org:restore": "owner",
+   "org:manage_billing": "owner",
+   "org:manage_flags": "admin",
+   "member:read": "viewer",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/schemas/activity.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/schemas/activity.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/schemas/activity.ts	2026-10-08 15:51:29
+@@ -9,6 +9,8 @@
+ 
+ export const activityActionSchema = z.enum([
+   "organization.updated",
++  "organization.deleted",
++  "organization.restored",
+   "project.created",
+   "project.updated",
+   "project.archived",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/cleanup-archived-job.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/cleanup-archived-job.ts	2026-10-08 15:53:19
+@@ -1,9 +1,10 @@
+ /**
+- * Permanently removes rows archived longer ago than the plan's `retentionDays`.
++ * Permanently removes deleted workspaces after their recovery window, then applies existing row retention.
+  *
+  * Must call (do not reimplement): getPlanLimits, isArchived
+  */
+ import { getPlanLimits } from "@/config/plan-limits";
++import { DELETED_WORKSPACE_RETENTION_DAYS } from "@/config/constants";
+ import { createLogger } from "@/lib/logger";
+ import { isArchived } from "@/lib/soft-delete";
+ import * as activityRepo from "@/server/repositories/activity-repository";
+@@ -11,6 +12,8 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { getDb, organizations, users, members, invitations, projects, projectMembers, issues, labels, issueLabels, attachments, comments, notifications, notificationPreferences, activityEvents, subscriptions, invoices, webhookEndpoints, webhookDeliveries, searchIndex, organizationUsage, sessions } from "@/server/db";
++import { eq } from "drizzle-orm";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -22,21 +25,36 @@
+ const logger = createLogger("cleanup-archived-job");
+ 
+ /**
+- * The retention sweep. Soft-deleted rows are kept for as long as the plan
+- * promises and no longer: the cut-off comes from `retentionDays`, so an
+- * enterprise tenant keeps years of history where a free one keeps a month.
+- *
+- * Only the search documents are actually dropped here — the issue rows stay,
+- * because the audit log still points at them — while the audit rows past the
+- * window are purged outright.
++ * Deleted workspaces are purged as a unit after the fixed recovery window.
++ * Existing issue and activity retention continues for live workspaces.
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgCutoff = toIsoTimestamp(
++      new Date(now.getTime() - DELETED_WORKSPACE_RETENTION_DAYS * MS_PER_DAY),
++    );
++    const expiredOrgIds = await orgRepo.listExpiredArchivedOrgIds(orgCutoff);
++    for (const orgId of expiredOrgIds) {
++      const db = getDb();
++      db.transaction((tx) => {
++        const tables = [
++          projectMembers, issueLabels, attachments, comments, notifications,
++          notificationPreferences, activityEvents, invoices, subscriptions,
++          webhookDeliveries, webhookEndpoints, searchIndex, labels, issues,
++          projects, invitations, members, organizationUsage,
++        ] as const;
++        for (const table of tables) tx.delete(table).where(eq(table.orgId, orgId)).run();
++        tx.update(sessions).set({ activeOrgId: null }).where(eq(sessions.activeOrgId, orgId)).run();
++        tx.update(users).set({ activeOrgId: null }).where(eq(users.activeOrgId, orgId)).run();
++        tx.delete(organizations).where(eq(organizations.id, orgId)).run();
++      });
++      result.processed += 1;
++    }
++    const orgIds = await orgRepo.listActiveOrgIds(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+-      if (!org) continue;
++      if (!org || org.archivedAt !== null) continue;
+ 
+       const { retentionDays } = getPlanLimits(org.plan);
+       const cutoff = toIsoTimestamp(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/digest-email-job.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/digest-email-job.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/digest-email-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/digest-email-job.ts	2026-10-08 15:52:43
+@@ -7,7 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgListRepo from "@/server/repositories/organization-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+ import { buildDigest, listDigestRecipients, renderDigest } from "@/server/services/digest-service";
+ import { sendEmail } from "@/server/services/email-service";
+@@ -29,7 +29,7 @@
+  */
+ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
+   return runJob("digest-email", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgListRepo.listActiveOrgIds(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/overdue-issue-job.ts	2026-10-08 15:52:43
+@@ -7,7 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -45,7 +45,7 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/usage-rollup-job.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/usage-rollup-job.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/usage-rollup-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/usage-rollup-job.ts	2026-10-08 15:52:45
+@@ -5,6 +5,7 @@
+  */
+ import { createLogger } from "@/lib/logger";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { recomputeUsage } from "@/server/services/usage-service";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -22,7 +23,7 @@
+  */
+ export async function runUsageRollupJob(now: Date): Promise<JobResult> {
+   return runJob("usage-rollup", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
+       try {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/webhook-delivery-job.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/webhook-delivery-job.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/jobs/webhook-delivery-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/jobs/webhook-delivery-job.ts	2026-10-08 15:52:08
+@@ -36,6 +36,12 @@
+     for (const delivery of claimed) {
+       const orgId = delivery.orgId as OrgId;
+ 
++      const org = await orgRepo.findOrgById(orgId);
++      if (org && org.archivedAt !== null) {
++        await webhookRepo.markDeliveryFailed(orgId, delivery.id, "organization is deleted");
++        result.failed += 1;
++        continue;
++      }
+       if (!(await orgAllowsWebhooks(orgId))) {
+         await webhookRepo.markDeliveryFailed(
+           orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/organization-repository.ts	2026-10-08 15:52:43
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNotNull, isNull, like, lte } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+@@ -124,6 +124,29 @@
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+   return toOrganization(row);
++}
++
++export async function restoreOrg(orgId: OrgId): Promise<Organization> {
++  const row = getDb()
++    .update(organizations)
++    .set({ archivedAt: null, updatedAt: toIsoTimestamp(new Date()) })
++    .where(eq(organizations.id, orgId))
++    .returning()
++    .get();
++  if (!row) throw new Error(`Organization ${orgId} not found`);
++  return toOrganization(row);
++}
++
++export async function listExpiredArchivedOrgIds(before: string): Promise<readonly OrgId[]> {
++  const rows = getDb().select({ id: organizations.id }).from(organizations)
++    .where(and(isNotNull(organizations.archivedAt), lte(organizations.archivedAt, before))).all();
++  return rows.map((row) => row.id as OrgId);
++}
++
++export async function listActiveOrgIds(limit: number): Promise<readonly OrgId[]> {
++  const rows = getDb().select({ id: organizations.id }).from(organizations)
++    .where(isNull(organizations.archivedAt)).limit(Math.max(1, limit)).all();
++  return rows.map((row) => row.id as OrgId);
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/subscription-repository.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/subscription-repository.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/subscription-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/subscription-repository.ts	2026-10-08 15:52:56
+@@ -1,9 +1,9 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, isNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, subscriptions } from "@/server/db";
++import { getDb, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { toSubscription } from "./_mappers";
+@@ -17,11 +17,12 @@
+   orgId: OrgId,
+ ): Promise<Subscription | null> {
+   const row = getDb()
+-    .select()
++    .select({ subscription: subscriptions })
+     .from(subscriptions)
+-    .where(orgPredicate(subscriptions.orgId, orgId))
++    .innerJoin(organizations, eq(organizations.id, subscriptions.orgId))
++    .where(and(orgPredicate(subscriptions.orgId, orgId), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toSubscription(row) : null;
++  return row ? toSubscription(row.subscription) : null;
+ }
+ 
+ /** New organizations start on a trial period rather than an active plan. */
+@@ -115,10 +116,12 @@
+   before: IsoTimestamp,
+ ): Promise<readonly Subscription[]> {
+   const rows = getDb()
+-    .select()
++    .select({ subscription: subscriptions })
+     .from(subscriptions)
++    .innerJoin(organizations, eq(organizations.id, subscriptions.orgId))
+     .where(
+       and(
++        isNull(organizations.archivedAt),
+         eq(subscriptions.status, "trialing"),
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+@@ -127,5 +130,5 @@
+     )
+     .all();
+ 
+-  return rows.map(toSubscription);
++  return rows.map((row) => toSubscription(row.subscription));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/repositories/usage-repository.ts	2026-10-08 15:53:07
+@@ -8,6 +8,7 @@
+   issues,
+   members,
+   organizationUsage,
++  organizations,
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -23,6 +24,13 @@
+  * is asked about. A limit check must never fail because the rollup has not run.
+  */
+ export async function getUsage(orgId: OrgId): Promise<OrganizationUsage> {
++  const org = getDb().select({ id: organizations.id, archivedAt: organizations.archivedAt })
++    .from(organizations).where(eq(organizations.id, orgId)).get();
++  if (!org || org.archivedAt !== null) {
++    const existing = getDb().select().from(organizationUsage).where(eq(organizationUsage.orgId, orgId)).get();
++    if (existing) return toUsage(existing);
++    throw new Error(`Organization ${orgId} not found`);
++  }
+   const row = getDb()
+     .select()
+     .from(organizationUsage)
+@@ -136,6 +144,8 @@
+   const rows = getDb()
+     .select({ orgId: organizationUsage.orgId })
+     .from(organizationUsage)
++    .innerJoin(organizations, eq(organizations.id, organizationUsage.orgId))
++    .where(isNull(organizations.archivedAt))
+     .orderBy(organizationUsage.measuredAt)
+     .limit(Math.max(1, limit))
+     .all();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/activity-service.ts	2026-10-08 15:51:45
+@@ -157,6 +157,18 @@
+         summary: `Created project ${payload.name}`,
+       }).then(() => undefined),
+     ),
++    subscribe("organization.deleted", (payload) =>
++      record(payload.orgId, "organization.deleted", {
++        actorId: payload.actorId, subjectKind: "organization", subjectId: payload.orgId,
++        projectId: null, summary: `Deleted workspace ${payload.slug}`,
++      }).then(() => undefined),
++    ),
++    subscribe("organization.restored", (payload) =>
++      record(payload.orgId, "organization.restored", {
++        actorId: payload.actorId, subjectKind: "organization", subjectId: payload.orgId,
++        projectId: null, summary: `Restored workspace ${payload.slug}`,
++      }).then(() => undefined),
++    ),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/invitation-service.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/invitation-service.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/invitation-service.ts	2026-10-08 15:51:45
+@@ -12,6 +12,7 @@
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import { NotFoundError } from "./_support";
+ import { toIsoTimestamp } from "@/types/common";
+ import { envelope, orgResource, requireFound } from "./_support";
+ import type { AcceptInvitationTokenInput } from "@/schemas/invitation";
+@@ -123,6 +124,8 @@
+     "Invitation",
+     "token",
+   );
++  const organization = await orgRepo.findOrgById(invitation.orgId);
++  if (!organization || organization.archivedAt !== null) throw new NotFoundError("Organization", invitation.orgId);
+ 
+   if (invitation.revokedAt !== null) {
+     throw new Error("That invitation has been revoked");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/notification-service.ts	2026-10-08 15:52:56
+@@ -52,6 +52,7 @@
+   if (recipients.length === 0) return [];
+ 
+   const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return [];
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/organization-service.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/organization-service.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/server/services/organization-service.ts	2026-10-08 15:53:07
+@@ -5,6 +5,7 @@
+  */
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+@@ -13,7 +14,7 @@
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { record } from "./activity-service";
+-import { envelope, orgResource, requireFound } from "./_support";
++import { envelope, orgResource, requireFound, NotFoundError } from "./_support";
+ import type {
+   CreateOrganizationInput,
+   DeleteOrganizationInput,
+@@ -22,6 +23,7 @@
+ import type { OrgId, UserId } from "@/types/common";
+ import type { Actor } from "@/types/member";
+ import type { Organization, OrganizationSummary } from "@/types/organization";
++import { DELETED_WORKSPACE_RETENTION_DAYS } from "@/config/constants";
+ 
+ /**
+  * Creates an organization and everything it cannot exist without: the owner's
+@@ -92,12 +94,30 @@
+     "Organization",
+     input.orgId,
+   );
++  if (org.archivedAt !== null) throw new AlreadyArchivedError("Organization", input.orgId);
+ 
+   if (org.slug !== input.confirmSlug) {
+     throw new Error("The confirmation does not match this organization's slug");
+   }
++  const deleted = await orgRepo.archiveOrg(input.orgId);
++  await emit("organization.deleted", { ...envelope(input.orgId, actor.userId), slug: deleted.slug });
++  return deleted;
++}
+ 
+-  return orgRepo.archiveOrg(input.orgId);
++export async function restoreOrganization(userId: UserId, orgId: OrgId): Promise<Organization> {
++  const org = await orgRepo.findOrgById(orgId);
++  if (!org) throw new NotFoundError("Organization", orgId);
++  const member = await memberRepo.findMember(orgId, userId);
++  if (!member || member.status !== "active") throw new NotFoundError("Organization", orgId);
++  const actor: Actor = { userId, orgId, role: member.role };
++  assertCan(actor, "org:restore", orgResource(orgId));
++  if (org.archivedAt === null) return org;
++  const deletionTime = new Date(org.archivedAt).getTime();
++  const retentionMs = DELETED_WORKSPACE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
++  if (Date.now() >= deletionTime + retentionMs) throw new NotFoundError("Organization", orgId);
++  const restored = await orgRepo.restoreOrg(orgId);
++  await emit("organization.restored", { ...envelope(orgId, userId), slug: restored.slug });
++  return restored;
+ }
+ 
+ /** The header/shell payload: the org plus the counters the sidebar shows. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/activity.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/activity.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/activity.ts	2026-10-08 15:51:29
+@@ -10,6 +10,8 @@
+  *  bus keys so `ActivityService` can map one to the other mechanically. */
+ export type ActivityAction =
+   | "organization.updated"
++  | "organization.deleted"
++  | "organization.restored"
+   | "project.created"
+   | "project.updated"
+   | "project.archived"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/event.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/event.ts	2026-10-08 15:51:29
+@@ -26,6 +26,8 @@
+  * derive their handler signatures from it.
+  */
+ export interface TaskflowEventMap {
++  "organization.deleted": EventEnvelope & { slug: string };
++  "organization.restored": EventEnvelope & { slug: string };
+   "project.created": EventEnvelope & {
+     projectId: ProjectId;
+     name: string;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/permission.ts /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/permission.ts
+--- /private/tmp/luna-scratch-20261008/24cb65a8-d4fd-4f6b-8bb0-6096cc6cfb3d/src/types/permission.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/297d33dd-027e-4718-8926-ffd9d3400dbb/src/types/permission.ts	2026-10-08 15:51:29
+@@ -18,6 +18,7 @@
+   | "org:read"
+   | "org:update"
+   | "org:delete"
++  | "org:restore"
+   | "org:manage_billing"
+   | "org:manage_flags"
+   | "member:read"

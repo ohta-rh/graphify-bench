@@ -1,0 +1,211 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/repositories/issue-repository.ts	2026-10-08 11:00:36
+@@ -22,7 +22,14 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issues,
++  projects,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -516,6 +523,18 @@
+         ...compact(
+           orgPredicate(issues.orgId, orgId),
+           livePredicate(issues.archivedAt, {}),
++          inArray(
++            issues.projectId,
++            getDb()
++              .select({ projectId: projects.id })
++              .from(projects)
++              .where(
++                and(
++                  orgPredicate(projects.orgId, orgId),
++                  livePredicate(projects.archivedAt, {}),
++                ),
++              ),
++          ),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/_support.ts /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/_support.ts
+--- /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/_support.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/_support.ts	2026-10-08 11:00:56
+@@ -1,12 +1,13 @@
+ /**
+  * Private helpers shared by the service layer.
+  *
+- * Two jobs only: build the `PermissionResource` descriptors `can()` expects
+- * from a loaded row, and stamp the `EventEnvelope` every domain event carries.
+- * Neither re-implements a cross-cutting concern — they are adapters onto
+- * `@/lib/permissions` and `@/lib/event-bus`.
++ * Shared service adapters: build the `PermissionResource` descriptors `can()`
++ * expects, stamp event envelopes, and enforce the archived parent-project
++ * write guard for issues.
+  */
+ import { toIsoTimestamp } from "@/types/common";
++import { assertNotArchived } from "@/lib/soft-delete";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import type { Comment } from "@/types/comment";
+ import type { OrgId, UserId } from "@/types/common";
+ import type { EventEnvelope } from "@/types/event";
+@@ -39,6 +40,19 @@
+     throw new NotFoundError(entity, id);
+   }
+   return value;
++}
++
++/** An archived parent project freezes writes to each issue beneath it. */
++export async function assertIssueProjectNotArchived(
++  orgId: OrgId,
++  issue: Pick<Issue, "projectId">,
++): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, issue.projectId),
++    "Project",
++    issue.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
+ }
+ 
+ export function orgResource(orgId: OrgId): PermissionResource {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/attachment-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/attachment-service.ts	2026-10-08 11:00:32
+@@ -5,12 +5,17 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+-import { issueResource, requireFound } from "./_support";
++import {
++  assertIssueProjectNotArchived,
++  issueResource,
++  requireFound,
++} from "./_support";
+ import type {
+   CreateAttachmentInput,
+   DeleteAttachmentInput,
+@@ -56,6 +61,8 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(input.orgId, issue);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -102,6 +109,8 @@
+     attachment.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(input.orgId, issue);
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/comment-service.ts	2026-10-08 11:00:29
+@@ -14,6 +14,7 @@
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
++  assertIssueProjectNotArchived,
+   commentResource,
+   issueResource,
+   requireFound,
+@@ -55,6 +56,7 @@
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(input.orgId, issue);
+ 
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+@@ -103,6 +105,14 @@
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(input.orgId, issue);
++
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+     throw new Error("The edit window for this comment has closed");
+   }
+@@ -128,6 +138,14 @@
+   );
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(input.orgId, issue);
+ 
+   const { archivedAt } = archivePatch();
+   const archived = await commentRepo.archiveComment(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/2140f8f4-f02e-4702-99ea-21ffe7bf438a/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/2d1c9e06-9652-4251-9364-7367df4971d1/src/server/services/issue-service.ts	2026-10-08 11:00:23
+@@ -16,6 +16,7 @@
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import {
+   actorEnvelope,
++  assertIssueProjectNotArchived,
+   issueResource,
+   orgResource,
+   projectResource,
+@@ -93,6 +94,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertIssueProjectNotArchived(input.orgId, before);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -122,6 +124,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertIssueProjectNotArchived(input.orgId, before);
+ 
+   if (before.status === input.status) return before;
+ 
+@@ -160,6 +163,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertIssueProjectNotArchived(input.orgId, before);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -202,6 +206,7 @@
+   );
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectNotArchived(orgId, issue);
+ 
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
+ 

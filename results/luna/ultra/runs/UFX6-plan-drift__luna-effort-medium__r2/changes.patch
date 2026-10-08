@@ -1,0 +1,136 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/lib/rate-limit.ts /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/lib/rate-limit.ts
+--- /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/lib/rate-limit.ts	2026-10-08 12:27:20
+@@ -8,6 +8,8 @@
+  * to a free org's ceiling; the per-bucket shape below is the base rate.
+  */
+ import { getPlanLimits } from "@/config/plan-limits";
++import { findSubscription } from "@/server/repositories/subscription-repository";
++import { findOrgById } from "@/server/repositories/organization-repository";
+ import type { PlanId } from "@/types/billing";
+ import type { IsoTimestamp, OrgId } from "@/types/common";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -36,14 +38,6 @@
+ 
+ const buckets = new Map<string, BucketState>();
+ 
+-/** Plan-aware org context; services set this when they know the org's plan. */
+-const planByOrg = new Map<OrgId, PlanId>();
+-
+-/** Records an org's plan so subsequent bucket sizes scale with its quota. */
+-export function setOrgPlan(orgId: OrgId, plan: PlanId): void {
+-  planByOrg.set(orgId, plan);
+-}
+-
+ export function getBucketConfig(bucketKey: string): RateLimitConfig {
+   return RATE_LIMIT_BUCKETS[bucketKey] ?? DEFAULT_BUCKET;
+ }
+@@ -53,9 +47,10 @@
+  * and the plan catalogue can never drift apart: the plan is the source of
+  * the ceiling, this table only sets the relative shape.
+  */
+-function configFor(orgId: OrgId, bucketKey: string): RateLimitConfig {
++async function configFor(orgId: OrgId, bucketKey: string): Promise<RateLimitConfig> {
+   const base = getBucketConfig(bucketKey);
+-  const plan = planByOrg.get(orgId) ?? "free";
++  const subscription = await findSubscription(orgId);
++  const plan = subscription?.plan ?? (await findOrgById(orgId))?.plan ?? "free";
+   const hourly = getPlanLimits(plan).apiRequestsPerHour;
+   const factor = Number.isFinite(hourly) ? Math.max(1, hourly / 100) : 100;
+ 
+@@ -78,7 +73,7 @@
+   bucketKey: string,
+   cost = 1,
+ ): Promise<RateLimitVerdict> {
+-  const config = configFor(orgId, bucketKey);
++  const config = await configFor(orgId, bucketKey);
+   const key = `${orgId}:${bucketKey}`;
+   const nowMs = Date.now();
+ 
+@@ -107,5 +102,4 @@
+ /** Test-only: drops every bucket and org plan association. */
+ export function resetRateLimits(): void {
+   buckets.clear();
+-  planByOrg.clear();
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/server/repositories/organization-repository.ts	2026-10-08 12:27:12
+@@ -7,7 +7,7 @@
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+@@ -19,20 +19,22 @@
+ 
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? { ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan } : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? { ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan } : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -40,9 +42,10 @@
+   userId: UserId,
+ ): Promise<readonly Organization[]> {
+   const rows = getDb()
+-    .select({ org: organizations })
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(
+       and(
+         eq(members.userId, userId),
+@@ -52,7 +55,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return rows.map((row) => ({ ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan }));
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/server/repositories/subscription-repository.ts /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/server/repositories/subscription-repository.ts
+--- /private/tmp/luna-scratch-20261008/d1117d20-72fa-43f5-9a52-34c61b359a43/src/server/repositories/subscription-repository.ts	2026-10-08 12:26:46
++++ /private/tmp/luna-scratch-20261008/f948dee9-f2ab-4c9d-9e56-80bdb9fa6fe8/src/server/repositories/subscription-repository.ts	2026-10-08 12:27:24
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -125,6 +125,8 @@
+       and(
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
++        eq(subscriptions.status, "trialing"),
++        // Paid plan selection during a trial changes status to active.
+         ne(subscriptions.plan, "free"),
+       ),
+     )

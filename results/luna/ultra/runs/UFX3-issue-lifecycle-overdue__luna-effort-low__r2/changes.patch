@@ -1,0 +1,157 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/jobs/overdue-issue-job.ts	2026-10-08 13:03:06
+@@ -7,7 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+@@ -25,11 +25,11 @@
+  * finds a still-open, still-overdue issue — this is what keeps the job from
+  * re-emitting `issue.overdue` for it on every pass.
+  */
+-const reported = new Set<string>();
++let previouslyOverdue = new Set<string>();
+ 
+ /** Test-only: clears the reported set so a fresh scenario starts empty. */
+ export function resetOverdueTracking(): void {
+-  reported.clear();
++  previouslyOverdue = new Set();
+ }
+ 
+ /**
+@@ -45,14 +45,16 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listLiveOrgIds(ORG_BATCH);
++    const currentlyOverdue = new Set<string>();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
++        currentlyOverdue.add(issue.id);
+         if (issue.dueAt === null) continue;
+-        if (reported.has(issue.id)) continue;
++        if (previouslyOverdue.has(issue.id)) continue;
+ 
+         try {
+           await emit("issue.overdue", {
+@@ -64,7 +66,6 @@
+             dueAt: issue.dueAt,
+             assigneeId: issue.assigneeId,
+           });
+-          reported.add(issue.id);
+           result.processed += 1;
+         } catch (error) {
+           result.failed += 1;
+@@ -75,5 +76,6 @@
+         }
+       }
+     }
++    previouslyOverdue = currentlyOverdue;
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/issue-repository.ts	2026-10-08 13:02:36
++++ /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/issue-repository.ts	2026-10-08 13:03:06
+@@ -425,9 +425,7 @@
+         status === "in_progress" && current.startedAt === null
+           ? stamp
+           : current.startedAt,
+-      completedAt: TERMINAL_STATUSES.includes(status)
+-        ? stamp
+-        : current.completedAt,
++      completedAt: TERMINAL_STATUSES.includes(status) ? stamp : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -522,6 +520,7 @@
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           ne(issues.status, "done"),
++          ne(issues.status, "canceled"),
+         ),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/organization-repository.ts	2026-10-08 13:03:06
+@@ -55,6 +55,18 @@
+   return rows.map((row) => toOrganization(row.org));
+ }
+ 
++/** Every workspace that has not been deleted, including newly created ones. */
++export async function listLiveOrgIds(limit: number): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .orderBy(organizations.createdAt)
++    .limit(Math.max(1, limit))
++    .all();
++  return rows.map((row) => row.id as OrgId);
++}
++
+ /**
+  * Creates the org row. The slug is de-duplicated here rather than in the
+  * service so a race on the unique index still resolves to a usable slug.
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/repositories/project-repository.ts	2026-10-08 13:02:36
++++ /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/repositories/project-repository.ts	2026-10-08 13:03:15
+@@ -3,7 +3,18 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import {
++  and,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNotNull,
++  like,
++  lt,
++  ne,
++  sql,
++} from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -231,7 +242,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, ["done", "canceled"])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -244,6 +255,8 @@
+         scope,
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
++        ne(issues.status, "done"),
++        ne(issues.status, "canceled"),
+       ),
+     )
+     .get();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/092ea097-5fcc-4b62-bb09-43b6ec59e1e2/src/server/services/notification-service.ts	2026-10-08 13:02:36
++++ /private/tmp/luna-scratch-20261008/aa5f1203-a3d5-4208-b71e-8c09422725ea/src/server/services/notification-service.ts	2026-10-08 13:03:06
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,

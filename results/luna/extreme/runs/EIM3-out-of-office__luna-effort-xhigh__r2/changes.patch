@@ -1,0 +1,579 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/schemas/member.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/schemas/member.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/schemas/member.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/schemas/member.ts	2026-10-08 15:55:15
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ import {
+   emailSchema,
++  isoTimestampSchema,
+   memberIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+@@ -49,6 +50,21 @@
+   memberId: memberIdSchema,
+ });
+ 
++export const setAbsenceSchema = z
++  .object({
++    orgId: orgIdSchema,
++    userId: userIdSchema,
++    delegateUserId: userIdSchema.nullable().default(null),
++    startsAt: isoTimestampSchema,
++    endsAt: isoTimestampSchema,
++    note: z.string().max(200).nullable().default(null),
++  })
++  .refine(
++    ({ startsAt, endsAt }) =>
++      new Date(endsAt).getTime() > new Date(startsAt).getTime(),
++    { path: ["endsAt"], message: "Absence end must be after its start" },
++  );
++
+ export const listMembersSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -69,5 +85,6 @@
+ export type InviteMembersInput = z.infer<typeof inviteMembersSchema>;
+ export type UpdateMemberRoleInput = z.infer<typeof updateMemberRoleSchema>;
+ export type RemoveMemberInput = z.infer<typeof removeMemberSchema>;
++export type SetAbsenceInput = z.infer<typeof setAbsenceSchema>;
+ export type ListMembersInput = z.infer<typeof listMembersSchema>;
+ export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/db/migrate.ts	2026-10-08 15:53:47
+@@ -90,6 +90,16 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS members_org_user_idx ON members (org_id, user_id)`,
+   `CREATE INDEX IF NOT EXISTS members_org_role_idx ON members (org_id, role)`,
++  `CREATE TABLE IF NOT EXISTS member_absences (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     delegate_user_id TEXT,
++     starts_at TEXT NOT NULL,
++     ends_at TEXT NOT NULL,
++     note TEXT
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS member_absences_org_user_idx ON member_absences (org_id, user_id)`,
++  `CREATE INDEX IF NOT EXISTS member_absences_org_delegate_idx ON member_absences (org_id, delegate_user_id)`,
+   `CREATE TABLE IF NOT EXISTS invitations (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/db/schema/members.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/db/schema/members.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/db/schema/members.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/db/schema/members.ts	2026-10-08 15:53:47
+@@ -30,6 +30,23 @@
+   ],
+ );
+ 
++/** One replaceable out-of-office window per member in each workspace. */
++export const memberAbsences = sqliteTable(
++  "member_absences",
++  {
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    delegateUserId: text("delegate_user_id"),
++    startsAt: text("starts_at").notNull(),
++    endsAt: text("ends_at").notNull(),
++    note: text("note"),
++  },
++  (table) => [
++    uniqueIndex("member_absences_org_user_idx").on(table.orgId, table.userId),
++    index("member_absences_org_delegate_idx").on(table.orgId, table.delegateUserId),
++  ],
++);
++
+ export const invitations = sqliteTable(
+   "invitations",
+   {
+@@ -53,5 +70,6 @@
+ );
+ 
+ export type MemberRow = typeof members.$inferSelect;
++export type MemberAbsenceRow = typeof memberAbsences.$inferSelect;
+ export type NewMemberRow = typeof members.$inferInsert;
+ export type InvitationRow = typeof invitations.$inferSelect;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/_mappers.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/_mappers.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/_mappers.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/_mappers.ts	2026-10-08 15:54:06
+@@ -9,6 +9,7 @@
+   ActivityEventRow,
+   AttachmentRow,
+   CommentRow,
++  MemberAbsenceRow,
+   InvitationRow,
+   InvoiceRow,
+   IssueRow,
+@@ -44,7 +45,7 @@
+   UserId,
+ } from "@/types/common";
+ import type { Issue, IssueAttachment, IssueLabel } from "@/types/issue";
+-import type { Invitation, Member, User } from "@/types/member";
++import type { Invitation, Member, MemberAbsence, User } from "@/types/member";
+ import type {
+   Notification,
+   NotificationChannel,
+@@ -152,6 +153,20 @@
+     createdAt: brandStamp(row.createdAt),
+     updatedAt: brandStamp(row.updatedAt),
+     archivedAt: brandStampOrNull(row.archivedAt),
++  };
++}
++
++export function toMemberAbsence(row: MemberAbsenceRow): MemberAbsence {
++  return {
++    orgId: brandId<OrgId>(row.orgId),
++    userId: brandId<UserId>(row.userId),
++    delegateUserId:
++      row.delegateUserId === null
++        ? null
++        : brandId<UserId>(row.delegateUserId),
++    startsAt: brandStamp(row.startsAt),
++    endsAt: brandStamp(row.endsAt),
++    note: row.note,
+   };
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/member-absence-repository.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/member-absence-repository.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/member-absence-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/member-absence-repository.ts	2026-10-08 15:54:06
+@@ -0,0 +1,83 @@
++/** Workspace-scoped, replaceable absence records for active members. */
++import { and, eq } from "drizzle-orm";
++import { getDb, memberAbsences } from "@/server/db";
++import type { SetAbsenceInput } from "@/schemas/member";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
++import type { MemberAbsence } from "@/types/member";
++import { orgPredicate } from "./base-repository";
++import { toMemberAbsence } from "./_mappers";
++
++export async function findAbsence(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<MemberAbsence | null> {
++  const row = getDb()
++    .select()
++    .from(memberAbsences)
++    .where(
++      and(
++        orgPredicate(memberAbsences.orgId, orgId),
++        eq(memberAbsences.userId, userId),
++      ),
++    )
++    .get();
++  return row ? toMemberAbsence(row) : null;
++}
++
++/** Returns an absence only when `at` lies in its half-open interval. */
++export async function findAbsenceAt(
++  orgId: OrgId,
++  userId: UserId,
++  at: IsoTimestamp,
++): Promise<MemberAbsence | null> {
++  const absence = await findAbsence(orgId, userId);
++  if (absence === null) return null;
++
++  const instant = new Date(at).getTime();
++  return new Date(absence.startsAt).getTime() <= instant &&
++    instant < new Date(absence.endsAt).getTime()
++    ? absence
++    : null;
++}
++
++export async function upsertAbsence(
++  input: SetAbsenceInput,
++): Promise<MemberAbsence> {
++  const row = getDb()
++    .insert(memberAbsences)
++    .values({
++      orgId: input.orgId,
++      userId: input.userId,
++      delegateUserId: input.delegateUserId,
++      startsAt: input.startsAt,
++      endsAt: input.endsAt,
++      note: input.note,
++    })
++    .onConflictDoUpdate({
++      target: [memberAbsences.orgId, memberAbsences.userId],
++      set: {
++        delegateUserId: input.delegateUserId,
++        startsAt: input.startsAt,
++        endsAt: input.endsAt,
++        note: input.note,
++      },
++    })
++    .returning()
++    .get();
++  return toMemberAbsence(row);
++}
++
++export async function deleteAbsence(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  getDb()
++    .delete(memberAbsences)
++    .where(
++      and(
++        orgPredicate(memberAbsences.orgId, orgId),
++        eq(memberAbsences.userId, userId),
++      ),
++    )
++    .run();
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/member-repository.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/member-repository.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/repositories/member-repository.ts	2026-10-08 15:54:06
+@@ -6,7 +6,7 @@
+ import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+-import { getDb, members, users } from "@/server/db";
++import { getDb, memberAbsences, members, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -164,12 +164,37 @@
+   orgId: OrgId,
+   memberId: MemberId,
+ ): Promise<Member> {
+-  const row = getDb()
+-    .update(members)
+-    .set({ ...archivePatch(), status: "suspended" })
+-    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
+-    .returning()
+-    .get();
++  const db = getDb();
++  const row = db.transaction((tx) => {
++    const archived = tx
++      .update(members)
++      .set({ ...archivePatch(), status: "suspended" })
++      .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
++      .returning()
++      .get();
++
++    if (archived) {
++      tx.delete(memberAbsences)
++        .where(
++          and(
++            orgPredicate(memberAbsences.orgId, orgId),
++            eq(memberAbsences.userId, archived.userId),
++          ),
++        )
++        .run();
++      tx.update(memberAbsences)
++        .set({ delegateUserId: null })
++        .where(
++          and(
++            orgPredicate(memberAbsences.orgId, orgId),
++            eq(memberAbsences.delegateUserId, archived.userId),
++          ),
++        )
++        .run();
++    }
++
++    return archived;
++  });
+ 
+   if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
+   return toMember(row);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/issue-service.ts	2026-10-08 15:55:15
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as absenceRepo from "@/server/repositories/member-absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -29,7 +30,8 @@
+   MoveIssueInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+-import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, OrgId, Page, ProjectId, UserId } from "@/types/common";
++import { toIsoTimestamp } from "@/types/common";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -66,7 +68,18 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const assignedInput = {
++    ...input,
++    assigneeId:
++      input.assigneeId === null
++        ? null
++        : await resolveAssignmentTarget(
++            input.orgId,
++            input.assigneeId,
++            actor.userId,
++          ),
++  };
++  const issue = await issueRepo.insertIssue(assignedInput, actor.userId, number);
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -77,6 +90,16 @@
+     priority: issue.priority,
+   });
+ 
++  if (issue.assigneeId !== null) {
++    await emit("issue.assigned", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++      previousAssigneeId: null,
++      assigneeId: issue.assigneeId,
++    });
++  }
++
+   return issue;
+ }
+ 
+@@ -161,13 +184,21 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  const assigneeId =
++    input.assigneeId === null
++      ? null
++      : await resolveAssignmentTarget(
++          input.orgId,
++          input.assigneeId,
++          actor.userId,
++        );
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+-    input.assigneeId,
++    assigneeId,
+   );
+ 
+-  if (input.assigneeId === null) {
++  if (assigneeId === null) {
+     await emit("issue.updated", {
+       ...actorEnvelope(actor),
+       issueId: after.id,
+@@ -182,10 +213,26 @@
+     issueId: after.id,
+     projectId: after.projectId,
+     previousAssigneeId: before.assigneeId,
+-    assigneeId: input.assigneeId,
++    assigneeId,
+   });
+ 
+   return after;
++}
++
++/** One-hop reassignment for a new assignment action at its action instant. */
++async function resolveAssignmentTarget(
++  orgId: OrgId,
++  requestedUserId: UserId,
++  actorId: UserId,
++): Promise<UserId> {
++  if (requestedUserId === actorId) return requestedUserId;
++
++  const absence = await absenceRepo.findAbsenceAt(
++    orgId,
++    requestedUserId,
++    toIsoTimestamp(new Date()),
++  );
++  return absence?.delegateUserId ?? requestedUserId;
+ }
+ 
+ export async function archiveIssue(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/member-service.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/member-service.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/member-service.ts	2026-10-08 15:55:15
+@@ -6,16 +6,24 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as absenceRepo from "@/server/repositories/member-absence-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
+   RemoveMemberInput,
++  SetAbsenceInput,
+   UpdateMemberRoleInput,
+ } from "@/schemas/member";
+ import type { MemberId, OrgId, Page, UserId } from "@/types/common";
+-import type { Actor, Member, MemberWithUser, Role } from "@/types/member";
++import type {
++  Actor,
++  Member,
++  MemberAbsence,
++  MemberWithUser,
++  Role,
++} from "@/types/member";
+ 
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+@@ -102,6 +110,74 @@
+   });
+ 
+   return removed;
++}
++
++/** Creates or replaces a member's workspace-specific absence window. */
++export async function setAbsence(
++  actor: Actor,
++  input: SetAbsenceInput,
++): Promise<MemberAbsence> {
++  assertOrgScope(actor, input.orgId);
++
++  const member = await requireActiveMember(input.orgId, input.userId);
++  assertMayChangeAbsence(actor, member);
++
++  const start = new Date(input.startsAt).getTime();
++  const end = new Date(input.endsAt).getTime();
++  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
++    throw new Error("Absence end must be after its start");
++  }
++
++  if (input.delegateUserId !== null) {
++    if (input.delegateUserId === input.userId) {
++      throw new Error("A member cannot delegate their absence to themselves");
++    }
++    await requireActiveMember(input.orgId, input.delegateUserId);
++  }
++
++  return absenceRepo.upsertAbsence(input);
++}
++
++/** Clears the target member's absence; an already-clear member is unchanged. */
++export async function clearAbsence(
++  actor: Actor,
++  orgId: OrgId,
++  userId: UserId,
++): Promise<void> {
++  assertOrgScope(actor, orgId);
++
++  const member = await requireActiveMember(orgId, userId);
++  assertMayChangeAbsence(actor, member);
++  await absenceRepo.deleteAbsence(orgId, userId);
++}
++
++/** Returns a scheduled or current absence until its exclusive end instant. */
++export async function getAbsence(
++  actor: Actor,
++  orgId: OrgId,
++  userId: UserId,
++): Promise<MemberAbsence | null> {
++  assertOrgScope(actor, orgId);
++  await requireActiveMember(orgId, userId);
++
++  const absence = await absenceRepo.findAbsence(orgId, userId);
++  if (absence === null) return null;
++  return new Date(absence.endsAt).getTime() > Date.now() ? absence : null;
++}
++
++async function requireActiveMember(orgId: OrgId, userId: UserId): Promise<Member> {
++  const member = await memberRepo.findMember(orgId, userId);
++  return requireFound(
++    member?.status === "active" ? member : null,
++    "Member",
++    userId,
++  );
++}
++
++function assertMayChangeAbsence(actor: Actor, member: Member): void {
++  if (member.userId !== actor.userId) {
++    assertCan(actor, "member:update_role", memberResource(member));
++  }
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/server/services/notification-service.ts	2026-10-08 15:57:00
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as absenceRepo from "@/server/repositories/member-absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -192,15 +193,36 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+-      title: "An issue is overdue",
+-      body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+-      href: `/issues/${payload.issueId}`,
+-      actorId: null,
+-    });
++    const absence = await absenceRepo.findAbsenceAt(
++      payload.orgId,
++      payload.assigneeId,
++      payload.occurredAt,
++    );
++    await notify(
++      payload.orgId,
++      "issue_overdue",
++      [absence?.delegateUserId ?? payload.assigneeId],
++      {
++        title: "An issue is overdue",
++        body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
++        href: `/issues/${payload.issueId}`,
++        actorId: null,
++      },
++    );
+   });
+ 
+   subscribe("comment.created", async (payload) => {
++    const mentionedRecipients = new Set(payload.mentionedUserIds);
++    const awayLookups = payload.mentionedUserIds.map((userId) =>
++      absenceRepo.findAbsenceAt(payload.orgId, userId, payload.occurredAt),
++    );
++    const absences = await Promise.all(awayLookups);
++    absences.forEach((absence) => {
++      if (absence?.delegateUserId) {
++        mentionedRecipients.add(absence.delegateUserId);
++      }
++    });
++
+     const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+     const watchers = issue
+       ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+@@ -213,11 +235,11 @@
+       actorId: payload.actorId,
+     });
+ 
+-    if (payload.mentionedUserIds.length > 0) {
++    if (mentionedRecipients.size > 0) {
+       await notify(
+         payload.orgId,
+         "comment_mention",
+-        payload.mentionedUserIds,
++        [...mentionedRecipients],
+         {
+           title: "You were mentioned",
+           body: `You were mentioned on issue ${payload.issueId}`,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/types/member.ts /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/types/member.ts
+--- /private/tmp/luna-scratch-20261008/277be38e-4219-478e-9ded-8305bdde1d9b/src/types/member.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/c06f2a70-4b34-496a-804e-3520c5e4a369/src/types/member.ts	2026-10-08 15:53:47
+@@ -51,6 +51,15 @@
+   readonly user: User;
+ }
+ 
++/** A member's workspace-scoped out-of-office window and optional delegate. */
++export interface MemberAbsence extends TenantScoped {
++  readonly userId: UserId;
++  readonly delegateUserId: UserId | null;
++  readonly startsAt: IsoTimestamp;
++  readonly endsAt: IsoTimestamp;
++  readonly note: string | null;
++}
++
+ export interface Invitation extends Timestamps, TenantScoped {
+   readonly id: InvitationId;
+   readonly email: string;

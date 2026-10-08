@@ -1,0 +1,300 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/repositories/project-member-repository.ts /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/repositories/project-member-repository.ts
+--- /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/repositories/project-member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/repositories/project-member-repository.ts	2026-10-08 11:44:27
+@@ -25,6 +25,12 @@
+   return rows.map((row) => brandId<UserId>(row.userId));
+ }
+ 
++export async function listVisibleProjectIds(orgId: OrgId, userId: UserId): Promise<readonly ProjectId[]> {
++  const rows = getDb().select({ projectId: projectMembers.projectId }).from(projectMembers)
++    .where(and(orgPredicate(projectMembers.orgId, orgId), eq(projectMembers.userId, userId))).all();
++  return rows.map((row) => brandId<ProjectId>(row.projectId));
++}
++
+ /** Idempotent: re-adding an existing member is a no-op, not a conflict. */
+ export async function addProjectMember(
+   orgId: OrgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/repositories/project-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/repositories/project-repository.ts	2026-10-08 11:44:30
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, inArray, isNotNull, like, lt, sql } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNotNull, like, lt, sql, or, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -24,6 +24,8 @@
+ } from "@/schemas/project";
+ import type { ArchiveScope, OrgId, Page, ProjectId } from "@/types/common";
+ import type { Project, ProjectStats } from "@/types/project";
++import type { Actor } from "@/types/member";
++import * as projectMemberRepo from "./project-member-repository";
+ 
+ export async function findProjectById(
+   orgId: OrgId,
+@@ -51,6 +53,7 @@
+ 
+ export async function listProjects(
+   input: ListProjectsInput,
++  actor?: Actor,
+ ): Promise<Page<Project>> {
+   const db = getDb();
+   const sort = { sortColumn: projects.createdAt, idColumn: projects.id };
+@@ -61,6 +64,11 @@
+     ? {}
+     : { includeArchived: true };
+ 
++  let visibilityFilter: import("drizzle-orm").SQL | undefined;
++  if (actor && actor.role !== "admin" && actor.role !== "owner" && actor.isPlatformStaff !== true) {
++    const memberships = await projectMemberRepo.listVisibleProjectIds(input.orgId, actor.userId);
++    visibilityFilter = or(ne(projects.visibility, "private"), eq(projects.leadId, actor.userId), memberships.length ? inArray(projects.id, memberships) : undefined)!;
++  }
+   const filters = compact(
+     orgPredicate(projects.orgId, input.orgId),
+     livePredicate(projects.archivedAt, scope),
+@@ -68,6 +76,7 @@
+     input.query === undefined
+       ? undefined
+       : like(projects.name, `%${input.query}%`),
++    visibilityFilter,
+   );
+ 
+   const total = db
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/comment-service.ts	2026-10-08 11:44:39
+@@ -12,11 +12,14 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { canViewProject } from "./project-service";
+ import {
+   actorEnvelope,
+   commentResource,
+   issueResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   CreateCommentInput,
+@@ -36,6 +39,12 @@
+ /** Token bucket protecting the comment thread from burst posting. */
+ const COMMENT_CREATE_BUCKET = "comment:create";
+ 
++async function requireCommentIssueView(actor: Actor, issueId: IssueId): Promise<void> {
++  const issue = requireFound(await issueRepo.findIssueById(actor.orgId, issueId), "Issue", issueId);
++  const project = requireFound(await projectRepo.findProjectById(actor.orgId, issue.projectId), "Project", issue.projectId);
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Issue", issueId);
++}
++
+ /**
+  * Posts a comment on a live issue. Mentions written as `@handle` in the body
+  * are resolved against the org's members here, so the stored row and the
+@@ -53,6 +62,8 @@
+     "Issue",
+     input.issueId,
+   );
++  const project = requireFound(await projectRepo.findProjectById(input.orgId, issue.projectId), "Project", issue.projectId);
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Issue", issue.id);
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -100,6 +111,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await requireCommentIssueView(actor, comment.issueId);
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -126,6 +138,7 @@
+     "Comment",
+     input.commentId,
+   );
++  await requireCommentIssueView(actor, comment.issueId);
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -157,6 +170,8 @@
+     "Issue",
+     issueId,
+   );
++  const project = requireFound(await projectRepo.findProjectById(orgId, issue.projectId), "Project", issue.projectId);
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Issue", issueId);
+   assertCan(actor, "comment:read", issueResource(issue));
+ 
+   return commentRepo.listThread(orgId, issueId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/issue-service.ts	2026-10-08 11:44:34
+@@ -14,12 +14,14 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { canViewProject } from "./project-service";
+ import {
+   actorEnvelope,
+   issueResource,
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   AssignIssueInput,
+@@ -33,6 +35,11 @@
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
++async function requireIssueProjectView(actor: Actor, issue: Issue): Promise<void> {
++  const project = requireFound(await projectRepo.findProjectById(issue.orgId, issue.projectId), "Project", issue.projectId);
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Issue", issue.id);
++}
++
+ /**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+@@ -51,6 +58,7 @@
+     input.projectId,
+   );
+   assertNotArchived("Project", project.id, project);
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Project", project.id);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
+   const org = requireFound(
+@@ -91,6 +99,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await requireIssueProjectView(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -120,6 +129,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await requireIssueProjectView(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -158,6 +168,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await requireIssueProjectView(actor, before);
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -200,6 +211,7 @@
+     "Issue",
+     issueId,
+   );
++  await requireIssueProjectView(actor, issue);
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -241,6 +253,7 @@
+     "Issue",
+     issueId,
+   );
++  await requireIssueProjectView(actor, issue);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   const labels = await labelRepo.listLabelsForIssues(orgId, [issue.id]);
+@@ -262,7 +275,10 @@
+   // A cross-project list is an org-wide read; per-project visibility is
+   // enforced when the caller opens an individual issue.
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+-  return issueRepo.listIssues(input);
++  const page = await issueRepo.listIssues(input);
++  const visible = await Promise.all(page.items.map(async issue => ({ issue, allowed: await canViewProject(actor, requireFound(await projectRepo.findProjectById(input.orgId, issue.projectId), "Project", issue.projectId)) })));
++  const items = visible.filter(x => x.allowed).map(x => x.issue);
++  return { ...page, items, total: visible.filter(x => x.allowed).length };
+ }
+ 
+ export async function getBoard(
+@@ -277,6 +293,7 @@
+     "Project",
+     projectId,
+   );
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Project", project.id);
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/5ec0b5c9-5623-426f-bb7e-11ada47a196e/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/be1fe2cd-7ab8-4f3f-8c46-187754bc9b7e/src/server/services/project-service.ts	2026-10-08 11:44:46
+@@ -12,8 +12,10 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as projectMemberRepo from "@/server/repositories/project-member-repository";
+ import {
+   actorEnvelope,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -28,6 +30,16 @@
+ import type { Actor } from "@/types/member";
+ import type { Project, ProjectWithStats } from "@/types/project";
+ 
++export async function canViewProject(actor: Actor, project: Project): Promise<boolean> {
++  if (project.visibility !== "private") return true;
++  if (actor.isPlatformStaff === true || actor.role === "admin" || actor.role === "owner" || project.leadId === actor.userId) return true;
++  return projectMemberRepo.isProjectMember(project.orgId, project.id, actor.userId);
++}
++
++async function requireProjectView(actor: Actor, project: Project): Promise<void> {
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Project", project.id);
++}
++
+ /**
+  * Creates a project once the plan still has room for one. The key is derived
+  * from the name when the caller left it blank, so the issue numbering scheme
+@@ -82,6 +94,7 @@
+     "Project",
+     input.projectId,
+   );
++  await requireProjectView(actor, project);
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -103,6 +116,7 @@
+     "Project",
+     input.projectId,
+   );
++  await requireProjectView(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -137,6 +151,7 @@
+     "Project",
+     projectId,
+   );
++  await requireProjectView(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+@@ -161,6 +176,7 @@
+     "Project",
+     slug,
+   );
++  await requireProjectView(actor, project);
+   assertCan(actor, "project:read", projectResource(project));
+ 
+   return {
+@@ -176,7 +192,7 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:read", orgResource(input.orgId));
+ 
+-  const page = await projectRepo.listProjects(input);
++  const page = await projectRepo.listProjects(input, actor);
+ 
+   const items = await Promise.all(
+     page.items.map(async (project) => ({

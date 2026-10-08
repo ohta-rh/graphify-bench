@@ -1,0 +1,525 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/drizzle/0001_recurring_issues.sql /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/drizzle/0001_recurring_issues.sql
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/drizzle/0001_recurring_issues.sql	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/drizzle/0001_recurring_issues.sql	2026-10-08 12:58:31
+@@ -0,0 +1,19 @@
++CREATE TABLE IF NOT EXISTS recurring_issues (
++  id TEXT PRIMARY KEY NOT NULL,
++  org_id TEXT NOT NULL,
++  project_id TEXT NOT NULL,
++  title TEXT NOT NULL,
++  priority TEXT NOT NULL DEFAULT 'none',
++  assignee_id TEXT,
++  cadence TEXT NOT NULL,
++  weekday INTEGER,
++  timezone TEXT NOT NULL,
++  starts_on TEXT NOT NULL,
++  last_occurrence_on TEXT,
++  paused INTEGER NOT NULL DEFAULT 0,
++  created_by TEXT NOT NULL,
++  created_at TEXT NOT NULL,
++  updated_at TEXT NOT NULL
++);
++--> statement-breakpoint
++CREATE INDEX IF NOT EXISTS recurring_issues_org_created_idx ON recurring_issues (org_id, created_at, id);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/config/plan-limits.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/config/plan-limits.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/config/plan-limits.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/config/plan-limits.ts	2026-10-08 12:58:21
+@@ -15,6 +15,7 @@
+   readonly seats: number;
+   readonly projects: number;
+   readonly issuesPerProject: number;
++  readonly recurringIssues: number;
+   readonly storageMb: number;
+   readonly apiRequestsPerHour: number;
+   readonly webhooks: number;
+@@ -32,6 +33,7 @@
+     seats: 3,
+     projects: 2,
+     issuesPerProject: 100,
++    recurringIssues: 0,
+     storageMb: 100,
+     apiRequestsPerHour: 100,
+     webhooks: 0,
+@@ -44,6 +46,7 @@
+     seats: 10,
+     projects: 10,
+     issuesPerProject: 1_000,
++    recurringIssues: 3,
+     storageMb: 2_000,
+     apiRequestsPerHour: 1_000,
+     webhooks: 2,
+@@ -56,6 +59,7 @@
+     seats: 50,
+     projects: 100,
+     issuesPerProject: 10_000,
++    recurringIssues: 25,
+     storageMb: 20_000,
+     apiRequestsPerHour: 10_000,
+     webhooks: 10,
+@@ -76,6 +80,7 @@
+     seats: UNLIMITED,
+     projects: UNLIMITED,
+     issuesPerProject: UNLIMITED,
++    recurringIssues: UNLIMITED,
+     storageMb: 500_000,
+     apiRequestsPerHour: 100_000,
+     webhooks: UNLIMITED,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/schemas/index.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/schemas/index.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/schemas/index.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/schemas/index.ts	2026-10-08 12:59:16
+@@ -13,6 +13,7 @@
+ export * from "./invitation";
+ export * from "./project";
+ export * from "./issue";
++export * from "./recurring-issue";
+ export * from "./comment";
+ export * from "./label";
+ export * from "./attachment";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/schemas/recurring-issue.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/schemas/recurring-issue.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/schemas/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/schemas/recurring-issue.ts	2026-10-08 12:59:16
+@@ -0,0 +1,41 @@
++import { z } from "zod";
++import { issuePrioritySchema } from "./issue";
++import { orgIdSchema, projectIdSchema, userIdSchema } from "./common";
++
++const dateOnlySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
++  const [year, month, day] = value.split("-").map(Number);
++  const date = new Date(0);
++  date.setUTCHours(0, 0, 0, 0);
++  date.setUTCFullYear(year, month - 1, day);
++  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
++}, "must be a real YYYY-MM-DD calendar date");
++
++const timezoneSchema = z.string().min(1).refine((timezone) => {
++  try {
++    new Intl.DateTimeFormat("en", { timeZone: timezone });
++    return true;
++  } catch {
++    return false;
++  }
++}, "must be a recognized IANA time zone");
++
++export const createRecurringIssueSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  title: z.string().min(3, "give the issue a title").max(180),
++  priority: issuePrioritySchema.default("none"),
++  assigneeId: userIdSchema.nullable().default(null),
++  cadence: z.enum(["daily", "weekly"]),
++  weekday: z.number().int().min(1).max(7).nullable().default(null),
++  timezone: timezoneSchema,
++  startsOn: dateOnlySchema,
++}).superRefine((input, context) => {
++  if (input.cadence === "weekly" && input.weekday === null) {
++    context.addIssue({ code: "custom", path: ["weekday"], message: "weekly recurrence requires a weekday" });
++  }
++  if (input.cadence === "daily" && input.weekday !== null) {
++    context.addIssue({ code: "custom", path: ["weekday"], message: "daily recurrence cannot specify a weekday" });
++  }
++});
++
++export type CreateRecurringIssueInput = z.input<typeof createRecurringIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/migrate.ts	2026-10-08 12:58:31
+@@ -312,6 +312,24 @@
+      indexed_at TEXT NOT NULL
+    )`,
+   `CREATE INDEX IF NOT EXISTS search_index_org_kind_idx ON search_index (org_id, subject_kind)`,
++  `CREATE TABLE IF NOT EXISTS recurring_issues (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     title TEXT NOT NULL,
++     priority TEXT NOT NULL DEFAULT 'none',
++     assignee_id TEXT,
++     cadence TEXT NOT NULL,
++     weekday INTEGER,
++     timezone TEXT NOT NULL,
++     starts_on TEXT NOT NULL,
++     last_occurrence_on TEXT,
++     paused INTEGER NOT NULL DEFAULT 0,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS recurring_issues_org_created_idx ON recurring_issues (org_id, created_at, id)`,
+ ];
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/schema/index.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/schema/index.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/schema/index.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/schema/index.ts	2026-10-08 12:58:21
+@@ -14,3 +14,4 @@
+ export * from "./activity";
+ export * from "./billing";
+ export * from "./webhooks";
++export * from "./recurring-issues";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/schema/recurring-issues.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/schema/recurring-issues.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/db/schema/recurring-issues.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/db/schema/recurring-issues.ts	2026-10-08 12:58:21
+@@ -0,0 +1,21 @@
++import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const recurringIssues = sqliteTable("recurring_issues", {
++  id: idColumn(),
++  ...tenantColumns,
++  projectId: text("project_id").notNull(),
++  title: text("title").notNull(),
++  priority: text("priority", { enum: ["none", "low", "medium", "high", "urgent"] }).notNull().default("none"),
++  assigneeId: text("assignee_id"),
++  cadence: text("cadence", { enum: ["daily", "weekly"] }).notNull(),
++  weekday: integer("weekday"),
++  timezone: text("timezone").notNull(),
++  startsOn: text("starts_on").notNull(),
++  lastOccurrenceOn: text("last_occurrence_on"),
++  paused: integer("paused", { mode: "boolean" }).notNull().default(false),
++  createdBy: text("created_by").notNull(),
++  ...timestampColumns,
++}, (table) => [index("recurring_issues_org_created_idx").on(table.orgId, table.createdAt, table.id)]);
++
++export type RecurringIssueRow = typeof recurringIssues.$inferSelect;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/queue.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/queue.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/queue.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/queue.ts	2026-10-08 12:59:05
+@@ -20,7 +20,8 @@
+   | "usage-rollup"
+   | "search-reindex"
+   | "cleanup-archived"
+-  | "trial-expiry";
++  | "trial-expiry"
++  | "recurring-issues";
+ 
+ /** Attempts after which a job is dropped rather than retried again. */
+ const MAX_ATTEMPTS = 5;
+@@ -157,6 +158,11 @@
+     case "trial-expiry": {
+       const { runTrialExpiryJob } = await import("./trial-expiry-job");
+       await runTrialExpiryJob(now);
++      return;
++    }
++    case "recurring-issues": {
++      const { runRecurringIssueJob } = await import("./recurring-issue-job");
++      await runRecurringIssueJob(now);
+       return;
+     }
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/recurring-issue-job.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/recurring-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/recurring-issue-job.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/recurring-issue-job.ts	2026-10-08 12:59:05
+@@ -0,0 +1,87 @@
++import { can } from "@/lib/permissions";
++import { createIssue } from "@/server/services/issue-service";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { createIssueSchema } from "@/schemas/issue";
++import { projectResource } from "@/server/services/_support";
++import { runJob } from "./types";
++import type { JobResult } from "./types";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import type { Actor } from "@/types/member";
++
++function dateInTimezone(now: Date, timezone: string): string {
++  const parts = new Intl.DateTimeFormat("en-US", {
++    timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit",
++  }).formatToParts(now);
++  const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "";
++  return `${part("year")}-${part("month")}-${part("day")}`;
++}
++
++function previousDate(date: string, days: number): string {
++  const value = new Date(`${date}T00:00:00.000Z`);
++  value.setUTCDate(value.getUTCDate() - days);
++  return value.toISOString().slice(0, 10);
++}
++
++function latestStartedOccurrence(rule: RecurringIssue, now: Date): string | null {
++  const localToday = dateInTimezone(now, rule.timezone);
++  if (localToday < rule.startsOn) return null;
++  if (rule.cadence === "daily") return localToday;
++  const weekday = new Date(`${localToday}T00:00:00.000Z`).getUTCDay() || 7;
++  const difference = (weekday - (rule.weekday ?? weekday) + 7) % 7;
++  const occurrence = previousDate(localToday, difference);
++  return occurrence >= rule.startsOn ? occurrence : null;
++}
++
++export async function runRecurringIssueJob(now: Date): Promise<JobResult> {
++  return runJob("recurring-issues", async (result) => {
++    const rules = await recurringRepo.listAllRunnable();
++    for (const rule of rules) {
++      try {
++        const occurrence = latestStartedOccurrence(rule, now);
++        if (occurrence === null || (rule.lastOccurrenceOn !== null && occurrence <= rule.lastOccurrenceOn)) continue;
++
++        const project = await projectRepo.findProjectById(rule.orgId, rule.projectId);
++        if (!project || project.archivedAt !== null) continue;
++
++        const creator = await memberRepo.findMember(rule.orgId, rule.createdBy);
++        if (!creator || creator.status !== "active") {
++          await recurringRepo.updateState(rule.orgId, rule.id, { paused: true });
++          continue;
++        }
++
++        const actor: Actor = { userId: rule.createdBy, orgId: rule.orgId, role: creator.role };
++        if (!can(actor, "issue:create", projectResource(project))) {
++          await recurringRepo.updateState(rule.orgId, rule.id, { paused: true });
++          continue;
++        }
++
++        let assigneeId = rule.assigneeId;
++        if (assigneeId !== null) {
++          const assignee = await memberRepo.findMember(rule.orgId, assigneeId);
++          if (!assignee || assignee.status !== "active") assigneeId = null;
++        }
++
++        await createIssue(actor, createIssueSchema.parse({
++          orgId: rule.orgId,
++          projectId: rule.projectId,
++          title: `${rule.title} (${occurrence})`,
++          priority: rule.priority,
++          assigneeId,
++          status: "backlog",
++          description: null,
++          dueAt: null,
++          labelIds: [],
++          parentId: null,
++          estimate: null,
++        }));
++        await recurringRepo.updateState(rule.orgId, rule.id, { lastOccurrenceOn: occurrence });
++        result.processed += 1;
++      } catch {
++        // A single invalid/stale rule or a refused issue must not stop the scan.
++        result.failed += 1;
++      }
++    }
++  });
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/scheduler.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/scheduler.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/jobs/scheduler.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/jobs/scheduler.ts	2026-10-08 12:59:05
+@@ -18,6 +18,7 @@
+   "search-reindex": 1_440,
+   "cleanup-archived": 1_440,
+   "trial-expiry": 360,
++  "recurring-issues": 15,
+ };
+ 
+ const logger = createLogger("job-scheduler");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/repositories/index.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/repositories/index.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/repositories/index.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/repositories/index.ts	2026-10-08 12:58:39
+@@ -20,6 +20,7 @@
+ export * as organizationRepository from "./organization-repository";
+ export * as projectMemberRepository from "./project-member-repository";
+ export * as projectRepository from "./project-repository";
++export * as recurringIssueRepository from "./recurring-issue-repository";
+ export * as searchRepository from "./search-repository";
+ export * as sessionRepository from "./session-repository";
+ export * as subscriptionRepository from "./subscription-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/repositories/recurring-issue-repository.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/repositories/recurring-issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/repositories/recurring-issue-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/repositories/recurring-issue-repository.ts	2026-10-08 12:59:16
+@@ -0,0 +1,71 @@
++import { and, asc, count, eq } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, recurringIssues } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import type { OrgId, ProjectId, UserId } from "@/types/common";
++import type { IssuePriority } from "@/types/issue";
++import type { RecurrenceCadence, RecurringIssue } from "@/types/recurring-issue";
++
++function map(row: typeof recurringIssues.$inferSelect): RecurringIssue {
++  return {
++    id: row.id,
++    orgId: row.orgId as OrgId,
++    projectId: row.projectId as ProjectId,
++    title: row.title,
++    priority: row.priority as IssuePriority,
++    assigneeId: row.assigneeId as UserId | null,
++    cadence: row.cadence as RecurrenceCadence,
++    weekday: row.weekday,
++    timezone: row.timezone,
++    startsOn: row.startsOn,
++    lastOccurrenceOn: row.lastOccurrenceOn,
++    paused: row.paused,
++    createdBy: row.createdBy as UserId,
++    createdAt: row.createdAt as RecurringIssue["createdAt"],
++    updatedAt: row.updatedAt as RecurringIssue["updatedAt"],
++  };
++}
++
++export async function countForOrg(orgId: OrgId): Promise<number> {
++  const row = getDb().select({ value: count() }).from(recurringIssues)
++    .where(eq(recurringIssues.orgId, orgId)).get();
++  return row?.value ?? 0;
++}
++
++export async function insert(input: {
++  orgId: OrgId; projectId: ProjectId; title: string; priority: IssuePriority;
++  assigneeId: UserId | null; cadence: RecurrenceCadence; weekday: number | null;
++  timezone: string; startsOn: string; createdBy: UserId;
++}): Promise<RecurringIssue> {
++  const stamp = toIsoTimestamp(new Date());
++  const row = getDb().insert(recurringIssues).values({
++    id: newId(), ...input, lastOccurrenceOn: null, paused: false,
++    createdAt: stamp, updatedAt: stamp,
++  }).returning().get();
++  return map(row);
++}
++
++export async function findById(orgId: OrgId, id: string): Promise<RecurringIssue | null> {
++  const row = getDb().select().from(recurringIssues)
++    .where(and(eq(recurringIssues.orgId, orgId), eq(recurringIssues.id, id))).get();
++  return row ? map(row) : null;
++}
++
++export async function listForOrg(orgId: OrgId): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues).where(eq(recurringIssues.orgId, orgId))
++    .orderBy(asc(recurringIssues.createdAt), asc(recurringIssues.id)).all().map(map);
++}
++
++export async function listAllRunnable(): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues).where(eq(recurringIssues.paused, false))
++    .orderBy(asc(recurringIssues.createdAt), asc(recurringIssues.id)).all().map(map);
++}
++
++export async function updateState(
++  orgId: OrgId, id: string, patch: { paused?: boolean; lastOccurrenceOn?: string },
++): Promise<RecurringIssue> {
++  const row = getDb().update(recurringIssues).set({ ...patch, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(eq(recurringIssues.orgId, orgId), eq(recurringIssues.id, id))).returning().get();
++  if (!row) throw new Error(`Recurring issue ${id} not found`);
++  return map(row);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/services/index.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/services/index.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/services/index.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/services/index.ts	2026-10-08 12:59:25
+@@ -20,6 +20,7 @@
+ export * as notificationService from "./notification-service";
+ export * as organizationService from "./organization-service";
+ export * as projectService from "./project-service";
++export * as recurringIssueService from "./recurring-issue-service";
+ export * as searchService from "./search-service";
+ export * as sessionService from "./session-service";
+ export * as usageService from "./usage-service";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/services/recurring-issue-service.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/services/recurring-issue-service.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/server/services/recurring-issue-service.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/server/services/recurring-issue-service.ts	2026-10-08 12:59:16
+@@ -0,0 +1,76 @@
++import { getPlanLimits } from "@/config/plan-limits";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { createRecurringIssueSchema } from "@/schemas/recurring-issue";
++import { orgResource, projectResource, requireFound } from "./_support";
++import type { CreateRecurringIssueInput } from "@/schemas/recurring-issue";
++import type { OrgId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { RecurringIssue } from "@/types/recurring-issue";
++
++export async function createRecurringIssue(
++  actor: Actor,
++  input: CreateRecurringIssueInput,
++): Promise<RecurringIssue> {
++  const parsed = createRecurringIssueSchema.parse(input);
++  assertOrgScope(actor, parsed.orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(parsed.orgId, parsed.projectId),
++    "Project", parsed.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++  assertCan(actor, "issue:create", projectResource(project));
++
++  if (parsed.assigneeId !== null) {
++    const member = await memberRepo.findMember(parsed.orgId, parsed.assigneeId);
++    if (!member || member.status !== "active") {
++      throw new Error(`Assignee ${parsed.assigneeId} is not an active organization member`);
++    }
++  }
++
++  const org = requireFound(await orgRepo.findOrgById(parsed.orgId), "Organization", parsed.orgId);
++  const used = await recurringRepo.countForOrg(parsed.orgId);
++  if (used >= getPlanLimits(org.plan).recurringIssues) {
++    throw new Error(`Plan ${org.plan} allows no more recurring issues`);
++  }
++
++  return recurringRepo.insert({ ...parsed, createdBy: actor.userId });
++}
++
++export async function setRecurringIssuePaused(
++  actor: Actor,
++  input: { orgId: OrgId; recurringIssueId: string; paused: boolean },
++): Promise<RecurringIssue> {
++  assertOrgScope(actor, input.orgId);
++  const rule = requireFound(
++    await recurringRepo.findById(input.orgId, input.recurringIssueId),
++    "Recurring issue", input.recurringIssueId,
++  );
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, rule.projectId),
++    "Project", rule.projectId,
++  );
++  assertCan(actor, "issue:create", projectResource(project));
++  return recurringRepo.updateState(input.orgId, rule.id, { paused: input.paused });
++}
++
++export async function listRecurringIssues(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly RecurringIssue[]> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "issue:read", orgResource(orgId));
++  const rules = await recurringRepo.listForOrg(orgId);
++  for (const rule of rules) {
++    const project = requireFound(
++      await projectRepo.findProjectById(orgId, rule.projectId), "Project", rule.projectId,
++    );
++    assertCan(actor, "issue:read", projectResource(project));
++  }
++  return rules;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/types/index.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/types/index.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/types/index.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/types/index.ts	2026-10-08 12:59:16
+@@ -6,6 +6,7 @@
+ export * from "./organization";
+ export * from "./project";
+ export * from "./issue";
++export * from "./recurring-issue";
+ export * from "./comment";
+ export * from "./notification";
+ export * from "./billing";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/types/recurring-issue.ts /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/types/recurring-issue.ts
+--- /private/tmp/luna-scratch-20261008/dfb954e9-5141-4dcf-aedc-fe8022c3b45d/src/types/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/337c6216-efd8-49c0-b6fb-d74b987ef608/src/types/recurring-issue.ts	2026-10-08 12:58:21
+@@ -0,0 +1,23 @@
++import type { IsoTimestamp, OrgId, ProjectId, UserId } from "./common";
++import type { IssuePriority } from "./issue";
++
++export type RecurrenceCadence = "daily" | "weekly";
++
++export interface RecurringIssue {
++  readonly id: string;
++  readonly orgId: OrgId;
++  readonly projectId: ProjectId;
++  readonly title: string;
++  readonly priority: IssuePriority;
++  readonly assigneeId: UserId | null;
++  readonly cadence: RecurrenceCadence;
++  /** ISO weekday: Monday = 1, Sunday = 7. */
++  readonly weekday: number | null;
++  readonly timezone: string;
++  readonly startsOn: string;
++  readonly lastOccurrenceOn: string | null;
++  readonly paused: boolean;
++  readonly createdBy: UserId;
++  readonly createdAt: IsoTimestamp;
++  readonly updatedAt: IsoTimestamp;
++}

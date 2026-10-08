@@ -1,0 +1,354 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/actions/_lib/with-action.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/actions/_lib/with-action.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/actions/_lib/with-action.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/actions/_lib/with-action.ts	2026-10-08 15:30:33
+@@ -11,6 +11,8 @@
+  */
+ 
+ import { getActor, requireActorFor } from "@/lib/actor";
++import { findOrgById } from "@/server/repositories/organization-repository";
++import { resolveActorForOrg } from "@/server/services/session-service";
+ import { CACHE_PROFILES, revalidateTagged } from "@/lib/cache";
+ import { toActionResult } from "@/lib/errors";
+ import { getSessionPrincipal } from "@/lib/session";
+@@ -34,6 +36,8 @@
+   revalidate?: readonly string[];
+   /** cacheLife profile handed to `revalidateTag` — required in Next 16. */
+   cacheProfile?: string;
++  /** Used only by the close action to report a conflict for stale tabs. */
++  includeArchivedOrg?: boolean;
+ };
+ 
+ type OrgBearingInput = { orgSlug?: unknown; orgId?: unknown };
+@@ -45,14 +49,25 @@
+  * from a `[orgSlug]` route; actions whose payload carries the branded `orgId`
+  * instead resolve through `requireActorFor()`.
+  */
+-async function resolveActorFor(input: unknown, fromInput: boolean): Promise<Actor> {
++async function resolveActorFor(
++  input: unknown,
++  fromInput: boolean,
++  includeArchivedOrg: boolean,
++): Promise<Actor> {
+   if (fromInput && typeof input === "object" && input !== null) {
+     const record = input as OrgBearingInput;
+     if (typeof record.orgSlug === "string" && record.orgSlug.length > 0) {
+-      return getActor(record.orgSlug);
++      return getActor(record.orgSlug, includeArchivedOrg);
+     }
+     if (typeof record.orgId === "string" && record.orgId.length > 0) {
+-      return requireActorFor(record.orgId as OrgId);
++      if (!includeArchivedOrg) return requireActorFor(record.orgId as OrgId);
++      const org = await findOrgById(record.orgId as OrgId);
++      if (!org) throw new UnauthorizedActionError();
++      const principal = await getSessionPrincipal();
++      if (!principal) throw new UnauthorizedActionError();
++      const actor = await resolveActorForOrg(principal, org.slug, true);
++      if (!actor) throw new UnauthorizedActionError();
++      return actor;
+     }
+   }
+ 
+@@ -83,7 +98,11 @@
+     }
+ 
+     try {
+-      const actor = await resolveActorFor(parsed.data, options.requireOrg !== false);
++      const actor = await resolveActorFor(
++        parsed.data,
++        options.requireOrg !== false,
++        options.includeArchivedOrg === true,
++      );
+       const data = (await handler(parsed.data, actor)) as TData;
+ 
+       const tags = options.revalidate ?? [];
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/actions/organizations/delete-organization.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/actions/organizations/delete-organization.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/actions/organizations/delete-organization.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/actions/organizations/delete-organization.ts	2026-10-08 15:30:25
+@@ -38,7 +38,7 @@
+     revalidatePath("/orgs");
+     return organization;
+   },
+-  { revalidate: ["organization"], cacheProfile: "minutes" },
++  { revalidate: ["organization"], cacheProfile: "minutes", includeArchivedOrg: true },
+ );
+ 
+ export async function deleteOrganizationAction(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/lib/actor.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/lib/actor.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/lib/actor.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/lib/actor.ts	2026-10-08 15:30:25
+@@ -34,11 +34,14 @@
+ }
+ 
+ /** The `Actor` for `orgSlug`, or a throw. Use this in Server Actions. */
+-export async function getActor(orgSlug: string): Promise<Actor> {
++export async function getActor(
++  orgSlug: string,
++  includeArchived = false,
++): Promise<Actor> {
+   const principal = await getSessionPrincipal();
+   if (principal === null) throw new UnauthorizedError();
+ 
+-  const actor = await resolveActorForOrg(principal, orgSlug);
++  const actor = await resolveActorForOrg(principal, orgSlug, includeArchived);
+   if (actor === null) throw new NoMembershipError(orgSlug);
+ 
+   return actor;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/overdue-issue-job.ts	2026-10-08 15:30:33
+@@ -7,6 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -48,6 +49,8 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/search-reindex-job.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/search-reindex-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/search-reindex-job.ts	2026-10-08 15:30:33
+@@ -7,6 +7,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import {
+   indexComment,
+   indexIssue,
+@@ -28,6 +29,9 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
++    const org = await orgRepo.findOrgById(orgId);
++    if (!org || org.archivedAt !== null) return;
++
+     const projects = await projectRepo.listProjects({
+       orgId,
+       limit: PAGE_SIZE,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/trial-expiry-job.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/trial-expiry-job.ts	2026-10-08 15:30:51
+@@ -7,6 +7,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -34,6 +35,8 @@
+ 
+     for (const subscription of expiring) {
+       const orgId = subscription.orgId as OrgId;
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
+       const usage = await usageRepo.getUsage(orgId);
+ 
+       if (
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/webhook-delivery-job.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/webhook-delivery-job.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/jobs/webhook-delivery-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/jobs/webhook-delivery-job.ts	2026-10-08 15:30:33
+@@ -94,7 +94,7 @@
+ 
+ async function orgAllowsWebhooks(orgId: OrgId): Promise<boolean> {
+   const org = await orgRepo.findOrgById(orgId);
+-  if (!org) return false;
++  if (!org || org.archivedAt !== null) return false;
+ 
+   if (getPlanLimits(org.plan).webhooks <= 0) return false;
+   return isEnabled("webhooks", buildFlagContext(null, org));
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/repositories/organization-repository.ts	2026-10-08 15:29:28
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/repositories/organization-repository.ts	2026-10-08 15:30:58
+@@ -8,6 +8,8 @@
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+ import { getDb, members, organizations } from "@/server/db";
++import { subscriptions, webhookDeliveries } from "@/server/db";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+@@ -27,9 +29,8 @@
+ }
+ 
+ /**
+- * Slug lookup for the `[orgSlug]` routes. A closed workspace keeps its slug
+- * and is returned like any other row; the caller sees `archivedAt` and
+- * decides what to render.
++ * Slug lookup retains closed rows so the address remains reserved and a stale
++ * close request can return a conflict. Tenant resolution rejects closed rows.
+  */
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+@@ -48,7 +49,13 @@
+     .select({ org: organizations })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
+-    .where(and(eq(members.userId, userId), isNull(members.archivedAt)))
++    .where(
++      and(
++        eq(members.userId, userId),
++        isNull(members.archivedAt),
++        isNull(organizations.archivedAt),
++      ),
++    )
+     .all();
+ 
+   return rows.map((row) => toOrganization(row.org));
+@@ -114,14 +121,37 @@
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+-  const row = getDb()
+-    .update(organizations)
+-    .set(archivePatch())
+-    .where(eq(organizations.id, orgId))
+-    .returning()
+-    .get();
++  const db = getDb();
++  const stamp = new Date();
++  const archivedAt = archivePatch(stamp);
++  const row = db.transaction((tx) => {
++    const closed = tx
++      .update(organizations)
++      .set(archivedAt)
++      .where(and(eq(organizations.id, orgId), isNull(organizations.archivedAt)))
++      .returning()
++      .get();
++    if (!closed) return null;
+ 
+-  if (!row) throw new Error(`Organization ${orgId} not found`);
++    const stampIso = archivedAt.archivedAt;
++    tx.update(subscriptions)
++      .set({ status: "canceled", cancelAt: stampIso, currentPeriodEnd: stampIso, updatedAt: stampIso })
++      .where(eq(subscriptions.orgId, orgId))
++      .run();
++    tx.delete(webhookDeliveries)
++      .where(and(eq(webhookDeliveries.orgId, orgId), eq(webhookDeliveries.status, "pending")))
++      .run();
++    return closed;
++  });
++
++  if (!row) {
++    const current = await findOrgById(orgId);
++    if (current?.archivedAt !== null && current !== null) {
++      throw new AlreadyArchivedError("organization", orgId);
++    }
++    throw new Error(`Organization ${orgId} not found`);
++  }
++
+   return toOrganization(row);
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/repositories/usage-repository.ts	2026-10-08 15:30:51
+@@ -8,6 +8,7 @@
+   issues,
+   members,
+   organizationUsage,
++  organizations,
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -136,6 +137,8 @@
+   const rows = getDb()
+     .select({ orgId: organizationUsage.orgId })
+     .from(organizationUsage)
++    .innerJoin(organizations, eq(organizations.id, organizationUsage.orgId))
++    .where(isNull(organizations.archivedAt))
+     .orderBy(organizationUsage.measuredAt)
+     .limit(Math.max(1, limit))
+     .all();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/invitation-service.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/invitation-service.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/invitation-service.ts	2026-10-08 15:30:41
+@@ -124,6 +124,11 @@
+     "token",
+   );
+ 
++  const organization = await orgRepo.findOrgById(invitation.orgId);
++  if (!organization || organization.archivedAt !== null) {
++    throw new Error("That workspace is closed");
++  }
++
+   if (invitation.revokedAt !== null) {
+     throw new Error("That invitation has been revoked");
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/notification-service.ts	2026-10-08 15:30:33
+@@ -52,12 +52,13 @@
+   if (recipients.length === 0) return [];
+ 
+   const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return [];
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+-    plan: org?.plan ?? "free",
++    plan: org.plan,
+     role: null,
+-    overrides: org?.settings.enabledFlagOverrides,
++    overrides: org.settings.enabledFlagOverrides,
+   };
+ 
+   const rows = [];
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/organization-service.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/organization-service.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/organization-service.ts	2026-10-08 15:30:25
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -96,6 +97,8 @@
+   if (org.slug !== input.confirmSlug) {
+     throw new Error("The confirmation does not match this organization's slug");
+   }
++
++  assertNotArchived("organization", org.id, org);
+ 
+   return orgRepo.archiveOrg(input.orgId);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/session-service.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/session-service.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/session-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/session-service.ts	2026-10-08 15:30:25
+@@ -55,9 +55,10 @@
+ export async function resolveActorForOrg(
+   principal: SessionPrincipal,
+   orgSlug: string,
++  includeArchived = false,
+ ): Promise<Actor | null> {
+   const org = await orgRepo.findOrgBySlug(orgSlug);
+-  if (!org) return null;
++  if (!org || (!includeArchived && org.archivedAt !== null)) return null;
+ 
+   const member = await memberRepo.findMember(org.id, principal.userId);
+   if (!member || member.status !== "active") return null;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/webhook-service.ts /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/webhook-service.ts
+--- /private/tmp/luna-scratch-20261008/f4c63138-177e-44ce-bd07-09ff018df8a6/src/server/services/webhook-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/370143f8-11eb-4598-98db-b13934dcd1d8/src/server/services/webhook-service.ts	2026-10-08 15:30:33
+@@ -143,6 +143,9 @@
+   eventType: string,
+   payload: string,
+ ): Promise<void> {
++  const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return;
++
+   const endpoints = await webhookRepo.listEndpoints(orgId);
+ 
+   for (const endpoint of endpoints) {

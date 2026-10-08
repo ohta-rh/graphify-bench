@@ -1,0 +1,417 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/db/migrate.ts	2026-10-08 12:42:40
+@@ -312,6 +312,7 @@
+      indexed_at TEXT NOT NULL
+    )`,
+   `CREATE INDEX IF NOT EXISTS search_index_org_kind_idx ON search_index (org_id, subject_kind)`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS search_index_subject_idx ON search_index (org_id, subject_kind, subject_id)`,
+ ];
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/db/schema/webhooks.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/db/schema/webhooks.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/db/schema/webhooks.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/db/schema/webhooks.ts	2026-10-08 12:41:51
+@@ -1,4 +1,4 @@
+-import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+ import { idColumn, tenantColumns, timestampColumns } from "./_shared";
+ 
+ export const webhookEndpoints = sqliteTable(
+@@ -66,6 +66,7 @@
+   },
+   (table) => [
+     index("search_index_org_kind_idx").on(table.orgId, table.subjectKind),
++    uniqueIndex("search_index_subject_idx").on(table.orgId, table.subjectKind, table.subjectId),
+   ],
+ );
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/jobs/search-reindex-job.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/jobs/search-reindex-job.ts	2026-10-08 12:40:35
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/jobs/search-reindex-job.ts	2026-10-08 12:42:33
+@@ -1,20 +1,18 @@
+ /**
+  * Rebuilds the search index for one organization; used after a bulk import or an index drift alarm.
+  *
+- * Must call (do not reimplement): indexIssue, indexComment, indexProject
++ * Must call (do not reimplement): rebuildSearchDocuments
+  */
+ import { createLogger } from "@/lib/logger";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+-  indexComment,
+-  indexIssue,
+-  indexProject,
++  rebuildSearchDocuments,
+ } from "@/server/services/search-service";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+-import type { OrgId } from "@/types/common";
++import type { OrgId, ProjectId } from "@/types/common";
+ 
+ /** Rows read per page while walking the org's content. */
+ const PAGE_SIZE = 100;
+@@ -26,22 +24,24 @@
+  * document. Scoped to a single org on purpose: a full-fleet reindex is a
+  * sequence of these, so one slow tenant cannot stall the rest.
+  *
+- * Archived rows are read too: the rebuild is what brings a restored project's
+- * content back, so it hands every row to the index writers and leaves the
+- * "is this searchable?" decision to them.
++ * Pages all rows and atomically replaces this tenant's index with exactly the
++ * documents allowed by the live parent chain.
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
++    const documents: { subjectKind: "project" | "issue" | "comment"; subjectId: string; projectId: ProjectId | null; content: string }[] = [];
++    let projectCursor: string | null = null;
++    do {
++    const projectPage = await projectRepo.listProjects({
+       orgId,
+       limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
++      cursor: projectCursor,
+     });
++    projectCursor = projectPage.nextCursor;
+ 
+-    for (const project of projects.items) {
++    for (const project of projectPage.items) {
+       try {
+-        await indexProject(orgId, project);
++        documents.push({ subjectKind: "project", subjectId: project.id, projectId: project.id, content: [project.name, project.description ?? ""].join("\n") });
+         result.processed += 1;
+       } catch (error) {
+         result.failed += 1;
+@@ -51,31 +51,39 @@
+         });
+       }
+     }
++    } while (projectCursor);
+ 
+-    const issues = await issueRepo.listIssues({
++    let issueCursor: string | null = null;
++    do {
++    const issuePage = await issueRepo.listIssues({
+       orgId,
+       limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
++      cursor: issueCursor,
+     });
++    issueCursor = issuePage.nextCursor;
+ 
+-    for (const issue of issues.items) {
++    for (const issue of issuePage.items) {
+       try {
+-        await indexIssue(orgId, issue);
++        const project = await projectRepo.findProjectById(orgId, issue.projectId);
++        if (!project) continue;
++        documents.push({ subjectKind: "issue", subjectId: issue.id, projectId: issue.projectId, content: [issue.title, issue.description ?? ""].join("\n") });
+         result.processed += 1;
+ 
+-        const comments = await commentRepo.listComments({
+-          orgId,
+-          issueId: issue.id,
+-          includeArchived: true,
+-          limit: PAGE_SIZE,
+-          cursor: null,
+-        });
+-
+-        for (const comment of comments.items) {
+-          await indexComment(orgId, comment);
+-          result.processed += 1;
+-        }
++        let commentCursor: string | null = null;
++        do {
++          const comments = await commentRepo.listComments({
++            orgId,
++            issueId: issue.id,
++            includeArchived: false,
++            limit: PAGE_SIZE,
++            cursor: commentCursor,
++          });
++          commentCursor = comments.nextCursor;
++          for (const comment of comments.items) {
++            documents.push({ subjectKind: "comment", subjectId: comment.id, projectId: issue.projectId, content: comment.body });
++            result.processed += 1;
++          }
++        } while (commentCursor);
+       } catch (error) {
+         result.failed += 1;
+         logger.error("failed to index issue", {
+@@ -84,5 +92,8 @@
+         });
+       }
+     }
++    } while (issueCursor);
++
++    await rebuildSearchDocuments(orgId, documents);
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/repositories/search-repository.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/repositories/search-repository.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/repositories/search-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/repositories/search-repository.ts	2026-10-08 12:42:20
+@@ -1,9 +1,9 @@
+ /**
+  * Denormalised search index kept in step by `SearchService`.
+  */
+-import { and, count, desc, eq, inArray, like } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNull, like, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, searchIndex } from "@/server/db";
++import { comments, getDb, issues, projects, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -95,6 +95,25 @@
+     input.projectId === undefined
+       ? undefined
+       : eq(searchIndex.projectId, input.projectId),
++    // The index is denormalized and may be stale between writes or after a
++    // partial rebuild. Enforce the live parent chain at read time as well.
++    sql`(
++      (${searchIndex.subjectKind} = 'project' AND EXISTS (
++        SELECT 1 FROM projects p WHERE p.id = ${searchIndex.subjectId}
++          AND p.org_id = ${input.orgId} AND p.archived_at IS NULL
++      )) OR
++      (${searchIndex.subjectKind} = 'issue' AND EXISTS (
++        SELECT 1 FROM issues i JOIN projects p ON p.id = i.project_id AND p.org_id = i.org_id
++        WHERE i.id = ${searchIndex.subjectId} AND i.org_id = ${input.orgId}
++          AND i.archived_at IS NULL AND p.archived_at IS NULL
++      )) OR
++      (${searchIndex.subjectKind} = 'comment' AND EXISTS (
++        SELECT 1 FROM comments c JOIN issues i ON i.id = c.issue_id AND i.org_id = c.org_id
++          JOIN projects p ON p.id = i.project_id AND p.org_id = i.org_id
++        WHERE c.id = ${searchIndex.subjectId} AND c.org_id = ${input.orgId}
++          AND c.archived_at IS NULL AND i.archived_at IS NULL AND p.archived_at IS NULL
++      ))
++    )`,
+   );
+ 
+   const total = db
+@@ -118,6 +137,52 @@
+     (row) => row,
+     (row) => ({ id: row.id, sortValue: row.indexedAt }),
+   );
++}
++
++/** Replace one tenant's index atomically so readers never see a partial rebuild. */
++export async function rebuildSearchDocuments(
++  orgId: OrgId,
++  documents: readonly { subjectKind: SearchSubjectKind; subjectId: string; projectId: ProjectId | null; content: string }[],
++): Promise<void> {
++  const db = getDb();
++  db.transaction((tx) => {
++    tx.delete(searchIndex).where(orgPredicate(searchIndex.orgId, orgId)).run();
++    for (let offset = 0; offset < documents.length; offset += 200) {
++      const batch = documents.slice(offset, offset + 200);
++      tx.insert(searchIndex).values(batch.map((document) => ({
++        id: newId(), orgId, ...document, indexedAt: toIsoTimestamp(new Date()),
++      }))).run();
++    }
++  });
++}
++
++export async function deleteProjectDocuments(orgId: OrgId, projectId: ProjectId): Promise<void> {
++  const db = getDb();
++  db.delete(searchIndex).where(and(orgPredicate(searchIndex.orgId, orgId), eq(searchIndex.projectId, projectId))).run();
++}
++
++/** Recreate only documents whose complete parent chain is live after restore. */
++export async function restoreLiveProjectDocuments(orgId: OrgId, projectId: ProjectId): Promise<void> {
++  const db = getDb();
++  const project = db.select().from(projects)
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId), isNull(projects.archivedAt))).get();
++  if (!project) return;
++  const liveIssues = db.select().from(issues).where(and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId), isNull(issues.archivedAt))).all();
++  const stamp = toIsoTimestamp(new Date());
++  const projectDoc = db.select({ id: searchIndex.id }).from(searchIndex).where(and(orgPredicate(searchIndex.orgId, orgId), eq(searchIndex.subjectKind, "project"), eq(searchIndex.subjectId, projectId))).get();
++  if (projectDoc) db.update(searchIndex).set({ content: [project.name, project.description ?? ""].join("\n"), projectId, indexedAt: stamp }).where(eq(searchIndex.id, projectDoc.id)).run();
++  else db.insert(searchIndex).values({ id: newId(), orgId, subjectKind: "project", subjectId: projectId, projectId, content: [project.name, project.description ?? ""].join("\n"), indexedAt: stamp }).run();
++  for (const issue of liveIssues) {
++    const issueDoc = db.select({ id: searchIndex.id }).from(searchIndex).where(and(orgPredicate(searchIndex.orgId, orgId), eq(searchIndex.subjectKind, "issue"), eq(searchIndex.subjectId, issue.id))).get();
++    if (issueDoc) db.update(searchIndex).set({ projectId, content: [issue.title, issue.description ?? ""].join("\n"), indexedAt: stamp }).where(eq(searchIndex.id, issueDoc.id)).run();
++    else db.insert(searchIndex).values({ id: newId(), orgId, subjectKind: "issue", subjectId: issue.id, projectId, content: [issue.title, issue.description ?? ""].join("\n"), indexedAt: stamp }).run();
++    const liveComments = db.select().from(comments).where(and(orgPredicate(comments.orgId, orgId), eq(comments.issueId, issue.id), isNull(comments.archivedAt))).all();
++    for (const comment of liveComments) {
++      const commentDoc = db.select({ id: searchIndex.id }).from(searchIndex).where(and(orgPredicate(searchIndex.orgId, orgId), eq(searchIndex.subjectKind, "comment"), eq(searchIndex.subjectId, comment.id))).get();
++      if (commentDoc) db.update(searchIndex).set({ projectId, content: comment.body, indexedAt: stamp }).where(eq(searchIndex.id, commentDoc.id)).run();
++      else db.insert(searchIndex).values({ id: newId(), orgId, subjectKind: "comment", subjectId: comment.id, projectId, content: comment.body, indexedAt: stamp }).run();
++    }
++  }
+ }
+ 
+ /** Drift alarm input: how many documents this org currently has indexed. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/services/comment-service.ts	2026-10-08 12:41:13
+@@ -107,7 +107,13 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const updated = await commentRepo.updateComment(input);
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++  });
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/server/services/search-service.ts	2026-10-08 12:42:56
+@@ -8,16 +8,16 @@
+ import { assertCan } from "@/lib/permissions";
+ import { consumeRateLimit } from "@/lib/rate-limit";
+ import { assertOrgScope } from "@/lib/tenant";
+-import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+ import { orgResource } from "./_support";
+ import type { SearchQueryInput } from "@/schemas/search";
+ import type { SearchSubjectKind } from "@/server/repositories/search-repository";
+ import type { Comment } from "@/types/comment";
+-import type { OrgId, Page } from "@/types/common";
++import type { OrgId, Page, ProjectId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
+ import type { Issue } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -86,6 +86,11 @@
+ }
+ 
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
++  const project = await projectRepo.findProjectById(orgId, issue.projectId);
++  if (issue.archivedAt || !project || project.archivedAt) {
++    await removeFromIndex(orgId, "issue", issue.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "issue",
+@@ -99,19 +104,40 @@
+   orgId: OrgId,
+   comment: Comment,
+ ): Promise<void> {
++  const stored = await commentRepo.findCommentById(orgId, comment.id);
++  const issue = await issueRepo.findIssueById(orgId, comment.issueId);
++  const project = issue
++    ? await projectRepo.findProjectById(orgId, issue.projectId)
++    : null;
++  if (!stored || stored.archivedAt || !issue || issue.archivedAt || !project || project.archivedAt) {
++    await removeFromIndex(orgId, "comment", comment.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    issue.projectId,
+   );
+ }
+ 
++export async function rebuildSearchDocuments(
++  orgId: OrgId,
++  documents: readonly { subjectKind: SearchSubjectKind; subjectId: string; projectId: ProjectId | null; content: string }[],
++): Promise<void> {
++  await searchRepo.rebuildSearchDocuments(orgId, documents);
++}
++
+ export async function indexProject(
+   orgId: OrgId,
+   project: Project,
+ ): Promise<void> {
++  const current = await projectRepo.findProjectById(orgId, project.id);
++  if (!current || current.archivedAt) {
++    await removeFromIndex(orgId, "project", project.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "project",
+@@ -143,9 +169,21 @@
+     subscribe("issue.updated", async (payload) => {
+       const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+       if (issue) await indexIssue(payload.orgId, issue);
++      let cursor: string | null = null;
++      do {
++        const comments = await commentRepo.listComments({ orgId: payload.orgId, issueId: payload.issueId, includeArchived: false, limit: 100, cursor });
++        cursor = comments.nextCursor;
++        for (const comment of comments.items) await indexComment(payload.orgId, comment);
++      } while (cursor);
+     }),
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
++      let cursor: string | null = null;
++      do {
++        const comments = await commentRepo.listComments({ orgId: payload.orgId, issueId: payload.issueId, includeArchived: true, limit: 100, cursor });
++        cursor = comments.nextCursor;
++        for (const comment of comments.items) await removeFromIndex(payload.orgId, "comment", comment.id);
++      } while (cursor);
+     }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+@@ -154,6 +192,10 @@
+       );
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
++    subscribe("comment.updated", async (payload) => {
++      const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++      if (comment) await indexComment(payload.orgId, comment);
++    }),
+     subscribe("comment.deleted", async (payload) => {
+       await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+@@ -166,6 +208,22 @@
+     }),
+     subscribe("project.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
++      await searchRepo.deleteProjectDocuments(payload.orgId, payload.projectId);
++    }),
++    subscribe("project.restored", async (payload) => {
++      const project = await projectRepo.findProjectById(payload.orgId, payload.projectId);
++      if (project) await indexProject(payload.orgId, project);
++      await searchRepo.restoreLiveProjectDocuments(payload.orgId, payload.projectId);
++    }),
++    subscribe("issue.restored", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++      let cursor: string | null = null;
++      do {
++        const comments = await commentRepo.listComments({ orgId: payload.orgId, issueId: payload.issueId, includeArchived: false, limit: 100, cursor });
++        cursor = comments.nextCursor;
++        for (const comment of comments.items) await indexComment(payload.orgId, comment);
++      } while (cursor);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+       if (payload.subjectKind !== "issue") return;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/types/event.ts /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/3a512a21-1906-44cc-94ec-1901eb9eed0a/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/d957d09b-9036-413b-ae92-46c3409acd11/src/types/event.ts	2026-10-08 12:42:01
+@@ -61,6 +61,7 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.restored": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
+@@ -73,6 +74,7 @@
+     mentionedUserIds: readonly UserId[];
+   };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
++  "comment.updated": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };
+   "member.role_changed": EventEnvelope & {

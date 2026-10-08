@@ -1,0 +1,158 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/jobs/trial-expiry-job.ts /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/jobs/trial-expiry-job.ts	2026-10-08 11:58:52
+@@ -38,13 +38,15 @@
+ 
+       if (
+         usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.projectsUsed > freeLimits.projects ||
++        usage.storageMbUsed > freeLimits.storageMb
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+           orgId,
+           seats: usage.seatsUsed,
+           projects: usage.projectsUsed,
++          storageMb: usage.storageMbUsed,
+         });
+         continue;
+       }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/repositories/attachment-repository.ts /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/repositories/attachment-repository.ts
+--- /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/repositories/attachment-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/repositories/attachment-repository.ts	2026-10-08 11:58:38
+@@ -29,6 +29,19 @@
+   return rows.map(toAttachment);
+ }
+ 
++/** Find an attachment by both its id and owning workspace. */
++export async function findAttachmentById(
++  orgId: OrgId,
++  attachmentId: AttachmentId,
++): Promise<IssueAttachment | null> {
++  const row = getDb()
++    .select()
++    .from(attachments)
++    .where(and(orgPredicate(attachments.orgId, orgId), eq(attachments.id, attachmentId)))
++    .get();
++  return row ? toAttachment(row) : null;
++}
++
+ export async function insertAttachment(
+   input: CreateAttachmentInput,
+   uploadedBy: UserId,
+@@ -57,8 +70,8 @@
+ export async function deleteAttachment(
+   orgId: OrgId,
+   attachmentId: AttachmentId,
+-): Promise<void> {
+-  getDb()
++): Promise<boolean> {
++  const deleted = getDb()
+     .delete(attachments)
+     .where(
+       and(
+@@ -66,7 +79,9 @@
+         eq(attachments.id, attachmentId),
+       ),
+     )
+-    .run();
++    .returning({ id: attachments.id })
++    .get();
++  return deleted !== undefined;
+ }
+ 
+ /** Total stored bytes for one tenant; `BillingService` converts to megabytes. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/repositories/usage-repository.ts	2026-10-08 11:58:17
++++ /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/repositories/usage-repository.ts	2026-10-08 11:58:47
+@@ -73,9 +73,10 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  const storage = db
++    .select({ value: sql<number>`coalesce(sum(((${attachments.sizeBytes} + ${BYTES_PER_MB - 1}) / ${BYTES_PER_MB})), 0)` })
+     .from(attachments)
++    .where(eq(attachments.orgId, orgId))
+     .get();
+ 
+   const next = {
+@@ -83,7 +84,7 @@
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed: storage?.value ?? 0,
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/services/attachment-service.ts	2026-10-08 11:58:17
++++ /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/services/attachment-service.ts	2026-10-08 11:58:45
+@@ -94,44 +94,19 @@
+   assertOrgScope(actor, input.orgId);
+ 
+   const attachment = requireFound(
+-    await findAttachment(input.orgId, input.attachmentId),
++    await attachmentRepo.findAttachmentById(input.orgId, input.attachmentId),
+     "Attachment",
+     input.attachmentId,
+   );
+ 
+-  const issue = requireFound(
+-    await issueRepo.findIssueById(input.orgId, attachment.issueId),
+-    "Issue",
+-    attachment.issueId,
+-  );
+-  assertCan(actor, "issue:update", issueResource(issue));
++  const issue = await issueRepo.findIssueById(input.orgId, attachment.issueId);
++  if (issue) assertCan(actor, "issue:update", issueResource(issue));
+ 
+-  await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
++  const deleted = await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
++  if (!deleted) {
++    requireFound(null, "Attachment", input.attachmentId);
++  }
+   await usageRepo.incrementUsage(input.orgId, {
+-    storageMbUsed: -Math.floor(attachment.sizeBytes / BYTES_PER_MB),
++    storageMbUsed: -Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
+   });
+-}
+-
+-/**
+- * The attachment repository only reads by issue, because that is the only way
+- * the UI ever reaches one. A delete arrives with just an id, so the org's
+- * issues are walked until the row turns up.
+- */
+-async function findAttachment(
+-  orgId: OrgId,
+-  attachmentId: string,
+-): Promise<IssueAttachment | null> {
+-  const page = await issueRepo.listIssues({
+-    orgId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  for (const issue of page.items) {
+-    const rows = await attachmentRepo.listAttachments(orgId, issue.id);
+-    const match = rows.find((row) => row.id === attachmentId);
+-    if (match) return match;
+-  }
+-
+-  return null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/services/billing-service.ts /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/services/billing-service.ts
+--- /private/tmp/luna-scratch-20261008/2837ff45-98f5-4821-8e71-23a3cfaa22ae/src/server/services/billing-service.ts	2026-10-08 11:58:17
++++ /private/tmp/luna-scratch-20261008/da87bce1-5160-4db7-b0d6-6df64dfc89d2/src/server/services/billing-service.ts	2026-10-08 11:58:49
+@@ -242,7 +242,7 @@
+     case "issuesPerProject":
+       return usage.issuesUsed;
+     case "storageMb":
+-      return Math.round(
++      return Math.ceil(
+         (await attachmentRepo.sumStorageBytes(orgId)) / BYTES_PER_MB,
+       );
+     case "webhooks":

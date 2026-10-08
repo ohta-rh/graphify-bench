@@ -1,0 +1,181 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/comment-repository.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/comment-repository.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/comment-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/comment-repository.ts	2026-10-08 15:28:26
+@@ -35,6 +35,18 @@
+   return row ? toComment(row) : null;
+ }
+ 
++export async function findLiveCommentById(
++  orgId: OrgId,
++  commentId: CommentId,
++): Promise<Comment | null> {
++  const row = getDb()
++    .select()
++    .from(comments)
++    .where(and(orgPredicate(comments.orgId, orgId), eq(comments.id, commentId), isNull(comments.archivedAt)))
++    .get();
++  return row ? toComment(row) : null;
++}
++
+ export async function listComments(
+   input: ListCommentsInput,
+ ): Promise<Page<CommentWithAuthor>> {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/label-repository.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/label-repository.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/label-repository.ts	2026-10-08 15:28:23
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/member-repository.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/member-repository.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/repositories/member-repository.ts	2026-10-08 15:28:23
+@@ -36,6 +36,7 @@
+       and(
+         orgPredicate(members.orgId, orgId),
+         eq(members.userId, userId),
++        eq(members.status, "active"),
+         liveMemberPredicate(),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/comment-service.ts	2026-10-08 15:27:55
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/comment-service.ts	2026-10-08 15:28:41
+@@ -17,6 +17,7 @@
+   commentResource,
+   issueResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   CreateCommentInput,
+@@ -54,8 +55,13 @@
+     input.issueId,
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
+-  assertNotArchived("Issue", issue.id, issue);
++  if (issue.archivedAt !== null) throw new NotFoundError("Issue", input.issueId);
+ 
++  if (input.parentId !== null) {
++    const parent = requireFound(await commentRepo.findLiveCommentById(input.orgId, input.parentId), "Comment", input.parentId);
++    if (parent.issueId !== issue.id || parent.parentId !== null) throw new NotFoundError("Comment", input.parentId);
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -101,7 +107,7 @@
+     input.commentId,
+   );
+   assertCan(actor, "comment:update", commentResource(comment));
+-  assertNotArchived("Comment", comment.id, comment);
++  if (comment.archivedAt !== null) throw new NotFoundError("Comment", input.commentId);
+ 
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+     throw new Error("The edit window for this comment has closed");
+@@ -186,5 +192,6 @@
+ 
+   const resolved = resolveMentions(body, members.items);
+ 
+-  return [...new Set([...resolved, ...clientProvided])];
++  const activeIds = new Set(members.items.map((member) => member.userId));
++  return [...new Set([...resolved, ...clientProvided])].filter((id) => activeIds.has(id));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/issue-service.ts	2026-10-08 15:28:50
+@@ -13,6 +13,7 @@
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import {
+   actorEnvelope,
+@@ -20,6 +21,7 @@
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   AssignIssueInput,
+@@ -53,6 +55,17 @@
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  if (input.assigneeId !== null && !(await memberRepo.findMember(input.orgId, input.assigneeId))) {
++    throw new NotFoundError("User", input.assigneeId);
++  }
++  if (input.parentId !== null) {
++    const parent = requireFound(await issueRepo.findIssueById(input.orgId, input.parentId), "Issue", input.parentId);
++    if (parent.archivedAt !== null) throw new NotFoundError("Issue", input.parentId);
++    if (parent.projectId !== project.id) throw new NotFoundError("Issue", input.parentId);
++  }
++  const labels = await labelRepo.listLabels(input.orgId);
++  if (input.labelIds.some((id) => !labels.some((label) => label.id === id))) throw new NotFoundError("Label", "unknown");
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -94,6 +107,11 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  if (input.labelIds !== undefined) {
++    const labels = await labelRepo.listLabels(input.orgId);
++    if (input.labelIds.some((id) => !labels.some((label) => label.id === id))) throw new NotFoundError("Label", "unknown");
++  }
++
+   const after = await issueRepo.updateIssue(input);
+ 
+   await emit("issue.updated", {
+@@ -160,6 +178,10 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++
++  if (input.assigneeId !== null && !(await memberRepo.findMember(input.orgId, input.assigneeId))) {
++    throw new NotFoundError("User", input.assigneeId);
++  }
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/a94aac87-c1f8-4459-8e8b-99b817f108ce/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/777b3a1c-b7b5-49a3-ba1b-d9ab0c00e9f8/src/server/services/project-service.ts	2026-10-08 15:28:35
+@@ -12,11 +12,13 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+   orgResource,
+   projectResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
+@@ -39,6 +41,7 @@
+ ): Promise<Project> {
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
++  if (input.leadId !== null && !(await memberRepo.findMember(input.orgId, input.leadId))) throw new NotFoundError("User", input.leadId);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -84,6 +87,8 @@
+   );
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== undefined && input.leadId !== null && !(await memberRepo.findMember(input.orgId, input.leadId))) throw new NotFoundError("User", input.leadId);
+ 
+   return projectRepo.updateProject(input);
+ }

@@ -1,0 +1,432 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/db/migrate.ts	2026-10-08 12:22:49
+@@ -211,6 +211,7 @@
+      body TEXT NOT NULL,
+      href TEXT NOT NULL,
+      actor_id TEXT,
++     project_id TEXT,
+      read_at TEXT,
+      channels TEXT NOT NULL DEFAULT '["in_app"]',
+      created_at TEXT NOT NULL,
+@@ -218,6 +219,13 @@
+    )`,
+   `CREATE INDEX IF NOT EXISTS notifications_org_recipient_idx ON notifications (org_id, recipient_id)`,
+   `CREATE INDEX IF NOT EXISTS notifications_org_read_idx ON notifications (org_id, read_at)`,
++  `CREATE TABLE IF NOT EXISTS project_mutes (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     project_id TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS project_mutes_pk ON project_mutes (org_id, user_id, project_id)`,
++  `CREATE INDEX IF NOT EXISTS project_mutes_org_user_idx ON project_mutes (org_id, user_id)`,
+   `CREATE TABLE IF NOT EXISTS notification_preferences (
+      org_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+@@ -332,6 +340,36 @@
+     for (const statement of readMigrationStatements()) {
+       sqlite.exec(statement);
+     }
++
++    // Existing databases can predate the nullable project association. The
++    // fallback schema creates it directly, while this keeps upgraded installs
++    // compatible when their migration set does not contain the column yet.
++    const notificationColumns = sqlite
++      .prepare("PRAGMA table_info(notifications)")
++      .all() as Array<{ name: string }>;
++    if (!notificationColumns.some((column) => column.name === "project_id")) {
++      sqlite.exec("ALTER TABLE notifications ADD COLUMN project_id TEXT");
++    }
++
++    // Older issue and comment notifications already carry their issue URL,
++    // which lets them participate in mute filtering after an upgrade.
++    sqlite.exec(`
++      UPDATE notifications
++      SET project_id = (
++        SELECT issues.project_id
++        FROM issues
++        WHERE issues.org_id = notifications.org_id
++          AND issues.id = substr(notifications.href, 9)
++      )
++      WHERE project_id IS NULL
++        AND href GLOB '/issues/*'
++        AND EXISTS (
++          SELECT 1
++          FROM issues
++          WHERE issues.org_id = notifications.org_id
++            AND issues.id = substr(notifications.href, 9)
++        )
++    `);
+   } finally {
+     sqlite.close();
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/db/schema/notifications.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/db/schema/notifications.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/db/schema/notifications.ts	2026-10-08 12:21:09
+@@ -26,6 +26,7 @@
+     body: text("body").notNull(),
+     href: text("href").notNull(),
+     actorId: text("actor_id"),
++    projectId: text("project_id"),
+     readAt: text("read_at"),
+     /** JSON array of `NotificationChannel`. */
+     channels: text("channels").notNull().default('["in_app"]'),
+@@ -34,6 +35,24 @@
+   (table) => [
+     index("notifications_org_recipient_idx").on(table.orgId, table.recipientId),
+     index("notifications_org_read_idx").on(table.orgId, table.readAt),
++  ],
++);
++
++/** Per-member project notification mutes. */
++export const projectMutes = sqliteTable(
++  "project_mutes",
++  {
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    projectId: text("project_id").notNull(),
++  },
++  (table) => [
++    uniqueIndex("project_mutes_pk").on(
++      table.orgId,
++      table.userId,
++      table.projectId,
++    ),
++    index("project_mutes_org_user_idx").on(table.orgId, table.userId),
+   ],
+ );
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/_mappers.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/_mappers.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/_mappers.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/_mappers.ts	2026-10-08 12:21:17
+@@ -268,6 +268,8 @@
+     body: row.body,
+     href: row.href,
+     actorId: row.actorId === null ? null : brandId<UserId>(row.actorId),
++    projectId:
++      row.projectId === null ? null : brandId<ProjectId>(row.projectId),
+     readAt: brandStampOrNull(row.readAt),
+     channels: parseJsonArray<NotificationChannel>(row.channels),
+     createdAt: brandStamp(row.createdAt),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/index.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/index.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/index.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/index.ts	2026-10-08 12:22:03
+@@ -17,6 +17,7 @@
+ export * as memberRepository from "./member-repository";
+ export * as notificationPreferenceRepository from "./notification-preference-repository";
+ export * as notificationRepository from "./notification-repository";
++export * as projectMuteRepository from "./project-mute-repository";
+ export * as organizationRepository from "./organization-repository";
+ export * as projectMemberRepository from "./project-member-repository";
+ export * as projectRepository from "./project-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/notification-repository.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/notification-repository.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/notification-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/notification-repository.ts	2026-10-08 12:21:17
+@@ -14,14 +14,15 @@
+   NotificationId,
+   OrgId,
+   Page,
++  ProjectId,
+   UserId,
+ } from "@/types/common";
+ import type { Notification } from "@/types/notification";
+ 
+ type NewNotification = Omit<
+   Notification,
+-  "id" | "createdAt" | "updatedAt" | "readAt"
+->;
++  "id" | "createdAt" | "updatedAt" | "readAt" | "projectId"
++> & { projectId?: ProjectId | null };
+ 
+ export async function listNotifications(
+   input: ListNotificationsInput,
+@@ -107,6 +108,7 @@
+         body: input.body,
+         href: input.href,
+         actorId: input.actorId,
++        projectId: input.projectId ?? null,
+         readAt: null,
+         channels: JSON.stringify(input.channels),
+         createdAt: stamp,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/project-mute-repository.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/project-mute-repository.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/repositories/project-mute-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/repositories/project-mute-repository.ts	2026-10-08 12:21:17
+@@ -0,0 +1,72 @@
++/** Per-member project mute preferences. */
++import { and, eq } from "drizzle-orm";
++import { getDb, projectMutes } from "@/server/db";
++import { orgPredicate } from "./base-repository";
++import { brandId } from "./_mappers";
++import type { OrgId, ProjectId, UserId } from "@/types/common";
++
++export async function muteProject(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<void> {
++  getDb()
++    .insert(projectMutes)
++    .values({ orgId, userId, projectId })
++    .onConflictDoNothing()
++    .run();
++}
++
++export async function unmuteProject(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<void> {
++  getDb()
++    .delete(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .run();
++}
++
++export async function listMutedProjectIds(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<readonly ProjectId[]> {
++  const rows = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++      ),
++    )
++    .all();
++
++  return rows.map((row) => brandId<ProjectId>(row.projectId));
++}
++
++export async function isProjectMuted(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<boolean> {
++  const row = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .get();
++  return row !== undefined;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/services/digest-service.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/services/digest-service.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/services/digest-service.ts	2026-10-08 12:21:43
+@@ -8,6 +8,7 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectMuteRepo from "@/server/repositories/project-mute-repository";
+ import { renderEmail } from "./email-service";
+ import { buildFlagContext } from "./feature-flag-service";
+ import type { RenderedEmail } from "@/server/services/email-service";
+@@ -40,9 +41,17 @@
+     recipientId,
+     windowStart,
+   );
++  const mutedProjects = new Set(
++    await projectMuteRepo.listMutedProjectIds(orgId, recipientId),
++  );
+ 
+   const entries: DigestEntry[] = unread
+-    .filter((notification) => notification.createdAt <= windowEnd)
++    .filter(
++      (notification) =>
++        notification.createdAt <= windowEnd &&
++        (notification.projectId === null ||
++          !mutedProjects.has(notification.projectId)),
++    )
+     .map((notification) => ({
+       notificationId: notification.id,
+       kind: notification.kind,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/server/services/notification-service.ts	2026-10-08 12:21:41
+@@ -11,14 +11,20 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as projectMuteRepo from "@/server/repositories/project-mute-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { notificationResource, requireFound } from "./_support";
++import {
++  notificationResource,
++  projectResource,
++  requireFound,
++} from "./_support";
+ import type {
+   ListNotificationsInput,
+   MarkNotificationReadInput,
+   UpdateNotificationPreferenceInput,
+ } from "@/schemas/notification";
+-import type { OrgId, Page, UserId } from "@/types/common";
++import type { OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { FlagContext } from "@/types/feature-flag";
+ import type { Actor } from "@/types/member";
+ import type {
+@@ -33,10 +39,16 @@
+   body: string;
+   href: string;
+   actorId: UserId | null;
++  projectId?: ProjectId | null;
+ };
+ 
+ /** Channels used when a recipient has never touched their preferences. */
+ const DEFAULT_CHANNELS: readonly NotificationChannel[] = ["in_app", "email"];
++const PERSONAL_NOTIFICATION_KINDS = new Set<NotificationKind>([
++  "issue_assigned",
++  "comment_mention",
++  "issue_overdue",
++]);
+ 
+ /**
+  * Writes one notification row per recipient, each with the channel set that
+@@ -65,12 +77,24 @@
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
+ 
++    const projectMuted =
++      payload.projectId != null &&
++      (await projectMuteRepo.isProjectMuted(
++        orgId,
++        recipientId,
++        payload.projectId,
++      ));
++    if (projectMuted && !PERSONAL_NOTIFICATION_KINDS.has(kind)) continue;
++
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+       recipientId,
+       kind,
+     );
+-    const channels = resolveChannels(preference, flags);
++    const preferredChannels = resolveChannels(preference, flags);
++    const channels = projectMuted
++      ? preferredChannels.filter((channel) => channel !== "email")
++      : preferredChannels;
+     if (channels.length === 0) continue;
+ 
+     rows.push({
+@@ -81,6 +105,7 @@
+       body: payload.body,
+       href: payload.href,
+       actorId: payload.actorId,
++      projectId: payload.projectId ?? null,
+       channels,
+     });
+   }
+@@ -148,6 +173,47 @@
+   return preferenceRepo.upsertPreference(input);
+ }
+ 
++export async function muteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  const project = await getReadableProject(actor, orgId, projectId);
++  await projectMuteRepo.muteProject(orgId, actor.userId, project.id);
++}
++
++export async function unmuteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  const project = await getReadableProject(actor, orgId, projectId);
++  await projectMuteRepo.unmuteProject(orgId, actor.userId, project.id);
++}
++
++export async function listMutedProjectIds(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly ProjectId[]> {
++  assertOrgScope(actor, orgId);
++  return projectMuteRepo.listMutedProjectIds(orgId, actor.userId);
++}
++
++async function getReadableProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++) {
++  assertOrgScope(actor, orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++  return project;
++}
++
+ /**
+  * Turns a stored preference into the channels one notification will use.
+  * `digestOnly` suppresses the immediate email but keeps the in-app row, and
+@@ -187,6 +253,7 @@
+       body: `Issue ${payload.issueId} is now yours`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
++      projectId: payload.projectId,
+     });
+   });
+ 
+@@ -197,6 +264,7 @@
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: null,
++      projectId: payload.projectId,
+     });
+   });
+ 
+@@ -211,6 +279,7 @@
+       body: `A comment was added to issue ${payload.issueId}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
++      projectId: issue?.projectId,
+     });
+ 
+     if (payload.mentionedUserIds.length > 0) {
+@@ -223,6 +292,7 @@
+           body: `You were mentioned on issue ${payload.issueId}`,
+           href: `/issues/${payload.issueId}`,
+           actorId: payload.actorId,
++          projectId: issue?.projectId,
+         },
+       );
+     }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/types/notification.ts /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/types/notification.ts
+--- /private/tmp/luna-scratch-20261008/704c4e5c-aca2-4e8c-b207-e8f612456ff9/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/663bbef5-a376-4396-aa9a-c8c77c8f96ab/src/types/notification.ts	2026-10-08 12:21:17
+@@ -1,6 +1,7 @@
+ import type {
+   IsoTimestamp,
+   NotificationId,
++  ProjectId,
+   TenantScoped,
+   Timestamps,
+   UserId,
+@@ -29,6 +30,7 @@
+   readonly body: string;
+   readonly href: string;
+   readonly actorId: UserId | null;
++  readonly projectId: ProjectId | null;
+   readonly readAt: IsoTimestamp | null;
+   readonly channels: readonly NotificationChannel[];
+ }

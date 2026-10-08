@@ -1,0 +1,416 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/app/(dashboard)/[orgSlug]/activity/page.tsx /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/app/(dashboard)/[orgSlug]/activity/page.tsx
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/app/(dashboard)/[orgSlug]/activity/page.tsx	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/app/(dashboard)/[orgSlug]/activity/page.tsx	2026-10-08 16:04:38
+@@ -19,6 +19,7 @@
+ import { buildFlagContext } from "@/server/services/feature-flag-service";
+ import { listMembers } from "@/server/services/member-service";
+ import { searchParamsPaginationSchema } from "@/schemas/pagination";
++import { projectIdSchema } from "@/schemas/common";
+ import type { User } from "@/types/member";
+ import { loadTenantContext } from "../_lib/tenant-context";
+ 
+@@ -56,10 +57,16 @@
+   }
+ 
+   const pagination = searchParamsPaginationSchema.parse(search);
++  const rawProjectId = search.projectId;
++  const parsedProjectId = typeof rawProjectId === "string"
++    ? projectIdSchema.safeParse(rawProjectId)
++    : null;
++  const projectId = parsedProjectId?.success ? parsedProjectId.data : undefined;
+ 
+   const [page, members] = await Promise.all([
+     listActivity(actor, {
+       orgId: org.id,
++      projectId,
+       limit: pagination.perPage,
+       cursor: pagination.cursor ?? null,
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/app/api/export/activity/route.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/app/api/export/activity/route.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/app/api/export/activity/route.ts	2026-09-02 11:21:08
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/app/api/export/activity/route.ts	2026-10-08 16:04:34
+@@ -31,6 +31,7 @@
+   "subjectId",
+   "projectId",
+   "summary",
++  "metadata",
+ ];
+ 
+ export async function GET(request: Request): Promise<Response> {
+@@ -71,12 +72,25 @@
+       until: parsed.data.until,
+       limit: EXPORT_PAGE_LIMIT,
+     });
++    const items = [...page.items];
++    let cursor = page.nextCursor;
++    while (cursor !== null) {
++      const next = await listActivity(actor, {
++        orgId: parsed.data.orgId,
++        since: parsed.data.since,
++        until: parsed.data.until,
++        limit: EXPORT_PAGE_LIMIT,
++        cursor,
++      });
++      items.push(...next.items);
++      cursor = next.nextCursor;
++    }
+ 
+     if (parsed.data.format === "json") {
+-      return Response.json({ items: page.items, total: page.total });
++      return Response.json({ items, total: page.total });
+     }
+ 
+-    const csv = toCsv(page.items.map(toRow), COLUMNS);
++    const csv = toCsv(items.map(toRow), COLUMNS);
+     return new Response(csv, {
+       headers: csvResponseHeaders(`taskflow-activity-${organization.slug}.csv`),
+     });
+@@ -96,5 +110,6 @@
+     subjectId: event.subjectId,
+     projectId: event.projectId,
+     summary: event.summary,
++    metadata: JSON.stringify(event.metadata),
+   };
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/schemas/activity.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/schemas/activity.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/schemas/activity.ts	2026-10-08 16:04:12
+@@ -57,6 +57,9 @@
+   since: isoTimestampSchema,
+   until: isoTimestampSchema,
+   format: z.enum(["csv", "json"]).default("csv"),
++}).refine((value) => Date.parse(value.until) >= Date.parse(value.since), {
++  message: "until must be at or after since",
++  path: ["until"],
+ });
+ 
+ export type ActivityFilterInput = z.infer<typeof activityFilterSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/repositories/activity-repository.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/repositories/activity-repository.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/repositories/activity-repository.ts	2026-10-08 16:03:10
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/repositories/activity-repository.ts	2026-10-08 16:03:56
+@@ -1,7 +1,7 @@
+ /**
+  * Append-only audit log. Never updated, never deleted before the plan's retention window.
+  */
+-import { and, count, desc, eq, gte, inArray, lt } from "drizzle-orm";
++import { and, count, desc, eq, gte, inArray, lte } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { activityEvents, getDb } from "@/server/db";
+ import { orgPredicate } from "./base-repository";
+@@ -25,9 +25,7 @@
+       subjectId: event.subjectId,
+       projectId: event.projectId,
+       summary: event.summary,
+-      // The summary is the audited fact; the scalar bag is presentation-only
+-      // and is reconstructed by the readers that need it.
+-      metadata: "{}",
++      metadata: JSON.stringify(event.metadata),
+       occurredAt: event.occurredAt,
+     })
+     .returning()
+@@ -62,11 +60,9 @@
+     input.since === undefined
+       ? undefined
+       : gte(activityEvents.occurredAt, input.since),
+-    // Half-open on the right so consecutive windows tile without overlap:
+-    // [since, until) followed by [until, next).
+     input.until === undefined
+       ? undefined
+-      : lt(activityEvents.occurredAt, input.until),
++      : lte(activityEvents.occurredAt, input.until),
+   );
+ 
+   const total = db
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/activity-service.ts	2026-10-08 16:03:10
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/activity-service.ts	2026-10-08 16:04:34
+@@ -30,6 +30,7 @@
+   projectId: ProjectId | null;
+   summary: string;
+   metadata?: Readonly<Record<string, string | number | boolean | null>>;
++  occurredAt?: import("@/types/common").IsoTimestamp;
+ };
+ 
+ /** Columns of the audit-log CSV export, in the order the file lists them. */
+@@ -39,7 +40,9 @@
+   "actorId",
+   "subjectKind",
+   "subjectId",
++  "projectId",
+   "summary",
++  "metadata",
+ ] as const;
+ 
+ /**
+@@ -61,7 +64,7 @@
+     projectId: input.projectId,
+     summary: input.summary,
+     metadata: input.metadata ?? {},
+-    occurredAt: toIsoTimestamp(new Date()),
++    occurredAt: input.occurredAt ?? toIsoTimestamp(new Date()),
+   });
+ }
+ 
+@@ -124,18 +127,34 @@
+     cursor: null,
+   });
+ 
++  const items = [...page.items];
++  let cursor = page.nextCursor;
++  while (cursor !== null) {
++    const next = await activityRepo.listActivity({
++      orgId: input.orgId,
++      since: input.since,
++      until: input.until,
++      limit: 100,
++      cursor,
++    });
++    items.push(...next.items);
++    cursor = next.nextCursor;
++  }
++
+   if (input.format === "json") {
+-    return JSON.stringify(page.items, null, 2);
++    return JSON.stringify(items, null, 2);
+   }
+ 
+   return toCsv(
+-    page.items.map((event) => ({
++    items.map((event) => ({
+       occurredAt: event.occurredAt,
+       action: event.action,
+       actorId: event.actorId,
+       subjectKind: event.subjectKind,
+       subjectId: event.subjectId,
++      projectId: event.projectId,
+       summary: event.summary,
++      metadata: JSON.stringify(event.metadata),
+     })),
+     [...EXPORT_COLUMNS],
+   );
+@@ -155,8 +174,14 @@
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+         summary: `Created project ${payload.name}`,
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("project.updated", (payload) => record(payload.orgId, "project.updated", {
++      actorId: payload.actorId, subjectKind: "project", subjectId: payload.projectId,
++      projectId: payload.projectId, summary: `Updated project (${payload.changedFields.join(", ")})`,
++      metadata: { changedFields: payload.changedFields.join(", ") }, occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
+@@ -164,8 +189,13 @@
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+         summary: `Archived project with ${payload.issuesArchived} issues`,
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("project.restored", (payload) => record(payload.orgId, "project.restored", {
++      actorId: payload.actorId, subjectKind: "project", subjectId: payload.projectId,
++      projectId: payload.projectId, summary: "Restored project", occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("issue.created", (payload) =>
+       record(payload.orgId, "issue.created", {
+         actorId: payload.actorId,
+@@ -174,6 +204,7 @@
+         projectId: payload.projectId,
+         summary: `Created issue "${payload.title}"`,
+         metadata: { priority: payload.priority },
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
+     subscribe("issue.status_changed", (payload) =>
+@@ -181,32 +212,50 @@
+         actorId: payload.actorId,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+-        // A status move is a fact about the issue, not about the project's
+-        // structure; the project column is reserved for structural changes.
+-        projectId: null,
++        projectId: payload.projectId,
+         summary: `Status ${payload.from} → ${payload.to}`,
+         metadata: { from: payload.from, to: payload.to },
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+-        // The row is about the assignee: that is who the feed should name.
+-        actorId: payload.assigneeId,
++        actorId: payload.actorId,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+         projectId: payload.projectId,
+         summary: `Assigned to ${payload.assigneeId}`,
++        metadata: { previousAssigneeId: payload.previousAssigneeId, assigneeId: payload.assigneeId },
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("issue.updated", (payload) => record(payload.orgId, "issue.updated", {
++      actorId: payload.actorId, subjectKind: "issue", subjectId: payload.issueId,
++      projectId: payload.projectId, summary: `Updated issue (${payload.changedFields.join(", ")})`,
++      metadata: { changedFields: payload.changedFields.join(", ") }, occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
++    subscribe("issue.archived", (payload) => record(payload.orgId, "issue.archived", {
++      actorId: payload.actorId, subjectKind: "issue", subjectId: payload.issueId,
++      projectId: payload.projectId, summary: "Archived issue", occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("comment.created", (payload) =>
+       record(payload.orgId, "comment.created", {
+         actorId: payload.actorId,
+         subjectKind: "comment",
+         subjectId: payload.commentId,
+-        projectId: null,
++        projectId: payload.projectId,
+         summary: `Commented on issue ${payload.issueId}`,
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("comment.updated", (payload) => record(payload.orgId, "comment.updated", {
++      actorId: payload.actorId, subjectKind: "comment", subjectId: payload.commentId,
++      projectId: payload.projectId, summary: "Edited comment", occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
++    subscribe("comment.deleted", (payload) => record(payload.orgId, "comment.deleted", {
++      actorId: payload.actorId, subjectKind: "comment", subjectId: payload.commentId,
++      projectId: payload.projectId, summary: "Deleted comment", occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("member.invited", (payload) =>
+       record(payload.orgId, "member.invited", {
+         actorId: payload.actorId,
+@@ -214,8 +263,13 @@
+         subjectId: payload.email,
+         projectId: null,
+         summary: `Invited ${payload.email} as ${payload.role}`,
++        occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("member.joined", (payload) => record(payload.orgId, "member.joined", {
++      actorId: payload.actorId, subjectKind: "member", subjectId: payload.memberId,
++      projectId: null, summary: `Joined as ${payload.role}`, occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("member.role_changed", (payload) =>
+       record(payload.orgId, "member.role_changed", {
+         actorId: payload.actorId,
+@@ -223,8 +277,13 @@
+         subjectId: payload.memberId,
+         projectId: null,
+         summary: `Role ${payload.from} → ${payload.to}`,
++        metadata: { from: payload.from, to: payload.to }, occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("member.removed", (payload) => record(payload.orgId, "member.removed", {
++      actorId: payload.actorId, subjectKind: "member", subjectId: payload.memberId,
++      projectId: null, summary: "Removed member", occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
+@@ -232,8 +291,14 @@
+         subjectId: payload.orgId,
+         projectId: null,
+         summary: `Plan ${payload.from} → ${payload.to}`,
++        metadata: { from: payload.from, to: payload.to }, occurredAt: payload.occurredAt,
+       }).then(() => undefined),
+     ),
++    subscribe("flag.toggled", (payload) => record(payload.orgId, "flag.toggled", {
++      actorId: payload.actorId, subjectKind: "feature_flag", subjectId: payload.flag,
++      projectId: null, summary: `${payload.flag} ${payload.enabled ? "enabled" : "disabled"}`,
++      metadata: { flag: payload.flag, enabled: payload.enabled }, occurredAt: payload.occurredAt,
++    }).then(() => undefined)),
+   ];
+ 
+   return () => {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/comment-service.ts	2026-10-08 16:04:04
+@@ -78,6 +78,7 @@
+     ...actorEnvelope(actor),
+     commentId: comment.id,
+     issueId: comment.issueId,
++    projectId: issue.projectId,
+     mentionedUserIds,
+   });
+ 
+@@ -107,7 +108,19 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const updated = await commentRepo.updateComment(input);
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, updated.issueId),
++    "Issue",
++    updated.issueId,
++  );
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++    projectId: issue.projectId,
++  });
++  return updated;
+ }
+ 
+ /**
+@@ -140,6 +153,11 @@
+     occurredAt: archivedAt,
+     commentId: archived.id,
+     issueId: archived.issueId,
++    projectId: requireFound(
++      await issueRepo.findIssueById(input.orgId, archived.issueId),
++      "Issue",
++      archived.issueId,
++    ).projectId,
+   });
+ 
+   return archived;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/server/services/project-service.ts	2026-10-08 16:04:04
+@@ -85,7 +85,13 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+-  return projectRepo.updateProject(input);
++  const updated = await projectRepo.updateProject(input);
++  await emit("project.updated", {
++    ...actorEnvelope(actor),
++    projectId: updated.id,
++    changedFields: Object.keys(input).filter((key) => key !== "orgId" && key !== "projectId"),
++  });
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/types/event.ts /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/556c902d-adb8-49a6-8bef-8406be4e86f6/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/fc823358-ba28-4dfc-a948-b5aa0be6934a/src/types/event.ts	2026-10-08 16:04:04
+@@ -31,6 +31,10 @@
+     name: string;
+     slug: string;
+   };
++  "project.updated": EventEnvelope & {
++    projectId: ProjectId;
++    changedFields: readonly string[];
++  };
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
+@@ -70,9 +74,11 @@
+   "comment.created": EventEnvelope & {
+     commentId: CommentId;
+     issueId: IssueId;
++    projectId: ProjectId;
+     mentionedUserIds: readonly UserId[];
+   };
+-  "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
++  "comment.updated": EventEnvelope & { commentId: CommentId; issueId: IssueId; projectId: ProjectId };
++  "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId; projectId: ProjectId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };
+   "member.role_changed": EventEnvelope & {

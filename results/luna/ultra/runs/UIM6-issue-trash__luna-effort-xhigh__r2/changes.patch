@@ -1,0 +1,687 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/lib/errors.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/lib/errors.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/lib/errors.ts	2026-10-08 12:08:48
+@@ -2,15 +2,15 @@
+  * Maps thrown domain errors onto `AppErrorShape`.
+  *
+  * The service layer throws (`PermissionDeniedError`, `TenantScopeError`,
+- * `FeatureDisabledError`, `AlreadyArchivedError`, `InvalidSlugError`,
+- * `ZodError`); Server Actions and Route Handlers never propagate those to the
+- * client. Everything funnels through `toAppError()` so one thrown class maps
++ * `FeatureDisabledError`, `AlreadyArchivedError`, `RestoreRefusedError`,
++ * `InvalidSlugError`, `ZodError`); Server Actions and Route Handlers never
++ * propagate those to the client. Everything funnels through `toAppError()` so one thrown class maps
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+-import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { AlreadyArchivedError, RestoreRefusedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+@@ -34,6 +34,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof RestoreRefusedError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -93,6 +94,14 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof RestoreRefusedError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { reason: error.reason },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/lib/soft-delete.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/lib/soft-delete.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/lib/soft-delete.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/lib/soft-delete.ts	2026-10-08 12:06:37
+@@ -4,11 +4,11 @@
+ /**
+  * Soft-delete conventions.
+  *
+- * Issues, projects and comments are never physically removed — they get an
+- * `archived_at` timestamp. Repositories must express "live rows only" through
+- * these helpers so the predicate stays in one place; a raw
+- * `isNull(table.archivedAt)` sprinkled through the data layer is exactly the
+- * drift this module prevents.
++ * Issues, projects and comments get an `archived_at` timestamp when they are
++ * soft deleted. Expired archived issues are later purged by the retention
++ * sweep. Repositories must express "live rows only" through these helpers so
++ * the predicate stays in one place; a raw `isNull(table.archivedAt)` sprinkled
++ * through the data layer is exactly the drift this module prevents.
+  */
+ 
+ export function isArchived(row: SoftDeletable): boolean {
+@@ -55,6 +55,21 @@
+   constructor(readonly entity: string, readonly id: string) {
+     super(`${entity} ${id} is already archived.`);
+     this.name = "AlreadyArchivedError";
++  }
++}
++
++export type RestoreRefusalReason =
++  | "not_archived"
++  | "expired"
++  | "project_archived"
++  | "quota";
++
++export class RestoreRefusedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly reason: RestoreRefusalReason) {
++    super(`Issue restore refused: ${reason}`);
++    this.name = "RestoreRefusedError";
+   }
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/db/migrate.ts	2026-10-08 12:06:37
+@@ -158,6 +158,11 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS project_issue_sequences (
++     project_id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     last_number INTEGER NOT NULL
++   )`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/db/schema/issues.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/db/schema/issues.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/db/schema/issues.ts	2026-10-08 12:06:37
+@@ -44,6 +44,13 @@
+   ],
+ );
+ 
++/** High-water marks survive issue purges so project numbers are never reused. */
++export const projectIssueSequences = sqliteTable("project_issue_sequences", {
++  projectId: text("project_id").primaryKey(),
++  orgId: text("org_id").notNull(),
++  lastNumber: integer("last_number").notNull(),
++});
++
+ export const labels = sqliteTable(
+   "labels",
+   {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/jobs/cleanup-archived-job.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/jobs/cleanup-archived-job.ts	2026-10-08 12:07:49
+@@ -9,7 +9,6 @@
+ import * as activityRepo from "@/server/repositories/activity-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as searchRepo from "@/server/repositories/search-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -26,9 +25,8 @@
+  * promises and no longer: the cut-off comes from `retentionDays`, so an
+  * enterprise tenant keeps years of history where a free one keeps a month.
+  *
+- * Only the search documents are actually dropped here — the issue rows stay,
+- * because the audit log still points at them — while the audit rows past the
+- * window are purged outright.
++ * Expired issues and their dependent rows are purged outright. Audit rows are
++ * retained independently until they cross the same workspace retention cut-off.
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+@@ -43,20 +41,45 @@
+         new Date(now.getTime() - retentionDays * MS_PER_DAY),
+       );
+ 
+-      const archived = await issueRepo.listIssues({
+-        orgId,
+-        limit: PAGE_SIZE,
+-        cursor: null,
+-        includeArchived: true,
+-      });
++      let cursor: string | null = null;
++      do {
++        const archived = await issueRepo.listIssues({
++          orgId,
++          limit: PAGE_SIZE,
++          cursor,
++          includeArchived: true,
++        });
+ 
+-      for (const issue of archived.items) {
+-        if (!isArchived(issue)) continue;
+-        if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
++        for (const issue of archived.items) {
++          if (!isArchived(issue) || issue.archivedAt === null) continue;
++          if (issue.archivedAt > cutoff) continue;
+ 
+-        await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
+-        result.processed += 1;
+-      }
++          try {
++            const purged = await issueRepo.purgeExpiredIssue(
++              orgId,
++              issue.id,
++              cutoff,
++            );
++            if (!purged) continue;
++
++            if (purged.storageMb > 0) {
++              await usageRepo.incrementUsage(orgId, {
++                storageMbUsed: -purged.storageMb,
++              });
++            }
++            result.processed += 1;
++          } catch (error) {
++            result.failed += 1;
++            logger.error("archived issue purge failed", {
++              orgId,
++              issueId: issue.id,
++              reason: error instanceof Error ? error.message : String(error),
++            });
++          }
++        }
++
++        cursor = archived.nextCursor;
++      } while (cursor !== null);
+ 
+       try {
+         const purged = await activityRepo.purgeActivityBefore(orgId, cutoff);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/repositories/issue-repository.ts	2026-10-08 12:06:37
+@@ -11,6 +11,7 @@
+   inArray,
+   isNotNull,
+   isNull,
++  lte,
+   like,
+   lt,
+   or,
+@@ -22,7 +23,15 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issues,
++  projectIssueSequences,
++  searchIndex,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -36,6 +45,7 @@
+ } from "@/schemas/issue";
+ import type {
+   ArchiveScope,
++  CommentId,
+   IsoTimestamp,
+   IssueId,
+   LabelId,
+@@ -54,7 +64,13 @@
+ 
+ /** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+ const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++const BYTES_PER_MB = 1024 * 1024;
+ 
++export type PurgedIssue = {
++  readonly commentIds: readonly CommentId[];
++  readonly storageMb: number;
++};
++
+ export async function findIssueById(
+   orgId: OrgId,
+   issueId: IssueId,
+@@ -293,14 +309,20 @@
+   orgId: OrgId,
+   projectId: ProjectId,
+ ): Promise<number> {
+-  const row = getDb()
++  const db = getDb();
++  const row = db
+     .select({ value: sql<number | null>`max(${issues.number})` })
+     .from(issues)
+     .where(
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const sequence = db
++    .select({ lastNumber: projectIssueSequences.lastNumber })
++    .from(projectIssueSequences)
++    .where(eq(projectIssueSequences.projectId, projectId))
++    .get();
++  return Math.max(row?.value ?? 0, sequence?.lastNumber ?? 0) + 1;
+ }
+ 
+ export async function insertIssue(
+@@ -311,42 +333,60 @@
+   const stamp = toIsoTimestamp(new Date());
+   const db = getDb();
+ 
+-  const row = db
+-    .insert(issues)
+-    .values({
+-      id: newId(),
+-      orgId: input.orgId,
+-      projectId: input.projectId,
+-      number: issueNumber,
+-      title: input.title,
+-      description: input.description,
+-      status: input.status,
+-      priority: input.priority,
+-      authorId,
+-      assigneeId: input.assigneeId,
+-      parentId: input.parentId,
+-      estimate: input.estimate,
+-      dueAt: input.dueAt,
+-      startedAt: null,
+-      completedAt: null,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
++  const row = db.transaction((tx) => {
++    const inserted = tx
++      .insert(issues)
++      .values({
++        id: newId(),
++        orgId: input.orgId,
++        projectId: input.projectId,
++        number: issueNumber,
++        title: input.title,
++        description: input.description,
++        status: input.status,
++        priority: input.priority,
++        authorId,
++        assigneeId: input.assigneeId,
++        parentId: input.parentId,
++        estimate: input.estimate,
++        dueAt: input.dueAt,
++        startedAt: null,
++        completedAt: null,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
+ 
+-  if (input.labelIds.length > 0) {
+-    db.insert(issueLabels)
+-      .values(
+-        input.labelIds.map((labelId) => ({
+-          orgId: input.orgId,
+-          issueId: row.id,
+-          labelId,
+-        })),
+-      )
++    tx.insert(projectIssueSequences)
++      .values({
++        orgId: input.orgId,
++        projectId: input.projectId,
++        lastNumber: issueNumber,
++      })
++      .onConflictDoUpdate({
++        target: projectIssueSequences.projectId,
++        set: {
++          lastNumber: sql`max(${projectIssueSequences.lastNumber}, excluded.last_number)`,
++        },
++      })
+       .run();
+-  }
+ 
++    if (input.labelIds.length > 0) {
++      tx.insert(issueLabels)
++        .values(
++          input.labelIds.map((labelId) => ({
++            orgId: input.orgId,
++            issueId: inserted.id,
++            labelId,
++          })),
++        )
++        .run();
++    }
++
++    return inserted;
++  });
++
+   return toIssue(row, input.labelIds);
+ }
+ 
+@@ -477,7 +517,141 @@
+     .get();
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+-  return toIssue(row);
++  const labels = await listLabelsForIssues(orgId, [issueId]);
++  return toIssue(row, (labels[issueId] ?? []).map((label) => label.id));
++}
++
++/** Permanently deletes one expired issue and all rows/documents owned by it. */
++export async function purgeExpiredIssue(
++  orgId: OrgId,
++  issueId: IssueId,
++  cutoff: IsoTimestamp,
++): Promise<PurgedIssue | null> {
++  return getDb().transaction((tx) => {
++    const issue = tx
++      .select({
++        id: issues.id,
++        projectId: issues.projectId,
++        number: issues.number,
++      })
++      .from(issues)
++      .where(
++        and(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.id, issueId),
++          isNotNull(issues.archivedAt),
++          lte(issues.archivedAt, cutoff),
++        ),
++      )
++      .get();
++    if (!issue) return null;
++
++    const maxNumber = tx
++      .select({ value: sql<number | null>`max(${issues.number})` })
++      .from(issues)
++      .where(
++        and(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.projectId, issue.projectId),
++        ),
++      )
++      .get()?.value ?? issue.number;
++
++    // Upgrade pre-sequence data before deleting its rows, retaining the
++    // greatest number the project has ever issued.
++    tx.insert(projectIssueSequences)
++      .values({
++        orgId,
++        projectId: issue.projectId,
++        lastNumber: maxNumber,
++      })
++      .onConflictDoUpdate({
++        target: projectIssueSequences.projectId,
++        set: {
++          lastNumber: sql`max(${projectIssueSequences.lastNumber}, excluded.last_number)`,
++        },
++      })
++      .run();
++
++    const commentIds = tx
++      .select({ id: comments.id })
++      .from(comments)
++      .where(
++        and(
++          orgPredicate(comments.orgId, orgId),
++          eq(comments.issueId, issueId),
++        ),
++      )
++      .all()
++      .map((row) => row.id as CommentId);
++    const attachmentRows = tx
++      .select({ sizeBytes: attachments.sizeBytes })
++      .from(attachments)
++      .where(
++        and(
++          orgPredicate(attachments.orgId, orgId),
++          eq(attachments.issueId, issueId),
++        ),
++      )
++      .all();
++
++    tx.delete(searchIndex)
++      .where(
++        and(
++          orgPredicate(searchIndex.orgId, orgId),
++          eq(searchIndex.subjectKind, "issue"),
++          eq(searchIndex.subjectId, issueId),
++        ),
++      )
++      .run();
++    if (commentIds.length > 0) {
++      tx.delete(searchIndex)
++        .where(
++          and(
++            orgPredicate(searchIndex.orgId, orgId),
++            eq(searchIndex.subjectKind, "comment"),
++            inArray(searchIndex.subjectId, [...commentIds]),
++          ),
++        )
++        .run();
++    }
++    tx.delete(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, orgId),
++          eq(issueLabels.issueId, issueId),
++        ),
++      )
++      .run();
++    tx.delete(comments)
++      .where(
++        and(
++          orgPredicate(comments.orgId, orgId),
++          eq(comments.issueId, issueId),
++        ),
++      )
++      .run();
++    tx.delete(attachments)
++      .where(
++        and(
++          orgPredicate(attachments.orgId, orgId),
++          eq(attachments.issueId, issueId),
++        ),
++      )
++      .run();
++    tx.delete(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .run();
++
++    return {
++      commentIds,
++      storageMb: attachmentRows.reduce(
++        (total, attachment) =>
++          total + Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
++        0,
++      ),
++    };
++  });
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/repositories/usage-repository.ts	2026-10-08 12:07:49
+@@ -1,7 +1,7 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { and, count, eq, isNull } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+@@ -73,18 +73,22 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  const attachmentSizes = db
++    .select({ sizeBytes: attachments.sizeBytes })
+     .from(attachments)
+     .where(eq(attachments.orgId, orgId))
+-    .get();
++    .all();
+ 
+   const next = {
+     orgId,
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed: attachmentSizes.reduce(
++      (total, attachment) =>
++        total + Math.ceil(attachment.sizeBytes / BYTES_PER_MB),
++      0,
++    ),
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/activity-service.ts	2026-10-08 12:06:51
+@@ -176,6 +176,15 @@
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.restored", (payload) =>
++      record(payload.orgId, "issue.restored", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: "Restored an issue",
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/issue-service.ts	2026-10-08 12:08:38
+@@ -3,10 +3,14 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, assertNotArchived
+  */
+-import { wouldExceedLimit } from "@/config/plan-limits";
++import { getPlanLimits, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import {
++  assertNotArchived,
++  isArchived,
++  RestoreRefusedError,
++} from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -212,6 +216,59 @@
+   });
+ 
+   return archived;
++}
++
++/** Restores an issue while it remains inside the workspace's retention window. */
++export async function restoreIssue(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<Issue> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:archive", issueResource(issue));
++
++  const archivedAt = issue.archivedAt;
++  if (!isArchived(issue) || archivedAt === null) {
++    throw new RestoreRefusedError("not_archived");
++  }
++
++  const org = requireFound(
++    await orgRepo.findOrgById(orgId),
++    "Organization",
++    orgId,
++  );
++  const { retentionDays } = getPlanLimits(org.plan);
++  if (
++    Date.now() - Date.parse(archivedAt) >=
++    retentionDays * 24 * 60 * 60 * 1000
++  ) {
++    throw new RestoreRefusedError("expired");
++  }
++
++  const project = await projectRepo.findProjectById(orgId, issue.projectId);
++  if (!project || isArchived(project)) {
++    throw new RestoreRefusedError("project_archived");
++  }
++
++  const used = await issueRepo.countIssues(orgId, issue.projectId);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new RestoreRefusedError("quota");
++  }
++
++  const restored = await issueRepo.restoreIssue(orgId, issueId);
++  await emit("issue.restored", {
++    ...actorEnvelope(actor),
++    issueId: restored.id,
++    projectId: restored.projectId,
++  });
++
++  return restored;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/search-service.ts	2026-10-08 12:06:51
+@@ -147,6 +147,10 @@
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
++    subscribe("issue.restored", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+         payload.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/usage-service.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/usage-service.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/server/services/usage-service.ts	2026-10-08 12:06:51
+@@ -77,6 +77,9 @@
+     subscribe("issue.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { issuesUsed: -1 });
+     }),
++    subscribe("issue.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { issuesUsed: 1 });
++    }),
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/types/event.ts /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/8fbc2bfa-04a0-4d07-9648-4b1e15a963c3/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/7626591a-fb47-425b-a06f-effcb39d45c7/src/types/event.ts	2026-10-08 12:06:37
+@@ -61,6 +61,7 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.restored": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;

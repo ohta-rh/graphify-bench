@@ -1,0 +1,164 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/lib/permissions.ts /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/lib/permissions.ts
+--- /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/lib/permissions.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/lib/permissions.ts	2026-10-08 11:50:07
+@@ -35,6 +35,7 @@
+   "project:create": "member",
+   "project:read": "viewer",
+   "project:update": "member",
++  "project:change_lead": "admin",
+   "project:archive": "admin",
+   "project:delete": "owner",
+   "issue:create": "member",
+@@ -57,6 +58,7 @@
+ /** Actions an actor may perform on their own content regardless of role rank. */
+ const OWNERSHIP_ESCALATIONS: Readonly<Partial<Record<PermissionAction, true>>> = {
+   "issue:update": true,
++  "project:change_lead": true,
+   "issue:archive": true,
+   "comment:update": true,
+   "comment:delete": true,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/schemas/project.ts /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/schemas/project.ts
+--- /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/schemas/project.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/schemas/project.ts	2026-10-08 11:50:11
+@@ -32,11 +32,16 @@
+   description: z.string().max(2_000).nullable().optional(),
+   visibility: projectVisibilitySchema.optional(),
+   status: projectStatusSchema.optional(),
+-  leadId: userIdSchema.nullable().optional(),
+   color: hexColorSchema.optional(),
+   targetDate: isoTimestampSchema.nullable().optional(),
+ });
+ 
++export const changeProjectLeadSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  leadId: userIdSchema.nullable(),
++});
++
+ export const archiveProjectSchema = z.object({
+   orgId: orgIdSchema,
+   projectId: projectIdSchema,
+@@ -54,5 +59,6 @@
+ 
+ export type CreateProjectInput = z.infer<typeof createProjectSchema>;
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
++export type ChangeProjectLeadInput = z.infer<typeof changeProjectLeadSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/server/repositories/project-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/server/repositories/project-repository.ts	2026-10-08 11:50:13
+@@ -22,7 +22,7 @@
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+-import type { ArchiveScope, OrgId, Page, ProjectId } from "@/types/common";
++import type { ArchiveScope, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Project, ProjectStats } from "@/types/project";
+ 
+ export async function findProjectById(
+@@ -155,7 +155,6 @@
+         ? {}
+         : { visibility: input.visibility }),
+       ...(input.status === undefined ? {} : { status: input.status }),
+-      ...(input.leadId === undefined ? {} : { leadId: input.leadId }),
+       ...(input.color === undefined ? {} : { color: input.color }),
+       ...(input.targetDate === undefined
+         ? {}
+@@ -172,6 +171,22 @@
+     .get();
+ 
+   if (!row) throw new Error(`Project ${input.projectId} not found`);
++  return toProject(row);
++}
++
++export async function updateProjectLead(
++  orgId: OrgId,
++  projectId: ProjectId,
++  leadId: UserId | null,
++): Promise<Project> {
++  const row = getDb()
++    .update(projects)
++    .set({ leadId, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId)))
++    .returning()
++    .get();
++
++  if (!row) throw new Error(`Project ${projectId} not found`);
+   return toProject(row);
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/server/services/project-service.ts	2026-10-08 11:50:11
+@@ -10,16 +10,19 @@
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+   actorEnvelope,
+   orgResource,
++  NotFoundError,
+   projectResource,
+   requireFound,
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
++  ChangeProjectLeadInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+@@ -86,6 +89,39 @@
+   assertNotArchived("Project", project.id, project);
+ 
+   return projectRepo.updateProject(input);
++}
++
++export async function changeProjectLead(
++  actor: Actor,
++  input: ChangeProjectLeadInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:change_lead", projectResource(project));
++  assertNotArchived("Project", project.id, project);
++
++  if (input.leadId !== null) {
++    const member = requireFound(
++      await memberRepo.findMember(input.orgId, input.leadId),
++      "Member",
++      input.leadId,
++    );
++    if (member.status !== "active" || member.joinedAt === null) {
++      throw new NotFoundError("Member", input.leadId);
++    }
++    assertCan(
++      { userId: member.userId, orgId: member.orgId, role: member.role },
++      "project:update",
++      projectResource(project),
++    );
++  }
++
++  return projectRepo.updateProjectLead(input.orgId, input.projectId, input.leadId);
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/types/permission.ts /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/types/permission.ts
+--- /private/tmp/luna-scratch-20261008/9756dbb1-e158-4de8-b530-3dc8394f9ec7/src/types/permission.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/00fa6cb2-4fc2-4dc3-9c16-989bc8d6dd82/src/types/permission.ts	2026-10-08 11:50:07
+@@ -27,6 +27,7 @@
+   | "project:create"
+   | "project:read"
+   | "project:update"
++  | "project:change_lead"
+   | "project:archive"
+   | "project:delete"
+   | "issue:create"

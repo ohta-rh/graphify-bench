@@ -1,0 +1,176 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/repositories/issue-repository.ts	2026-10-08 11:09:54
+@@ -22,7 +22,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issues, projects } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -511,11 +511,13 @@
+   const rows = getDb()
+     .select()
+     .from(issues)
++    .innerJoin(projects, and(eq(projects.id, issues.projectId), eq(projects.orgId, issues.orgId)))
+     .where(
+       and(
+         ...compact(
+           orgPredicate(issues.orgId, orgId),
+           livePredicate(issues.archivedAt, {}),
++          isNull(projects.archivedAt),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
+@@ -525,5 +527,5 @@
+     .orderBy(issues.dueAt)
+     .all();
+ 
+-  return rows.map((row) => toIssue(row));
++  return rows.map((row) => toIssue(row.issues));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/attachment-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/attachment-service.ts	2026-10-08 11:09:40
+@@ -5,10 +5,12 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { issueResource, requireFound } from "./_support";
+ import type {
+@@ -56,6 +58,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertIssueWritable(input.orgId, issue);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -102,6 +105,7 @@
+     attachment.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertIssueWritable(input.orgId, issue);
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+@@ -132,4 +136,10 @@
+   }
+ 
+   return null;
++}
++
++async function assertIssueWritable(orgId: OrgId, issue: import("@/types/issue").Issue): Promise<void> {
++  assertNotArchived("Issue", issue.id, issue);
++  const project = requireFound(await projectRepo.findProjectById(orgId, issue.projectId), "Project", issue.projectId);
++  assertNotArchived("Project", project.id, project);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/comment-service.ts /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/comment-service.ts
+--- /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/comment-service.ts	2026-10-08 11:09:36
+@@ -11,6 +11,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import {
+   actorEnvelope,
+@@ -55,6 +56,7 @@
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectLive(input.orgId, issue.projectId);
+ 
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+@@ -102,6 +104,7 @@
+   );
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++  await assertCommentIssueProjectLive(input.orgId, comment.issueId);
+ 
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+     throw new Error("The edit window for this comment has closed");
+@@ -128,6 +131,7 @@
+   );
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++  await assertCommentIssueProjectLive(input.orgId, comment.issueId);
+ 
+   const { archivedAt } = archivePatch();
+   const archived = await commentRepo.archiveComment(
+@@ -188,4 +192,15 @@
+   return [
+     ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+   ];
++}
++
++async function assertCommentIssueProjectLive(orgId: OrgId, issueId: IssueId): Promise<void> {
++  const issue = requireFound(await issueRepo.findIssueById(orgId, issueId), "Issue", issueId);
++  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueProjectLive(orgId, issue.projectId);
++}
++
++async function assertIssueProjectLive(orgId: OrgId, projectId: import("@/types/common").ProjectId): Promise<void> {
++  const project = requireFound(await projectRepo.findProjectById(orgId, projectId), "Project", projectId);
++  assertNotArchived("Project", project.id, project);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/7982ca73-b598-4de8-bc1f-4bfef0bbc224/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/c8e91c97-c5bd-490f-9465-9aeda3bd1f2b/src/server/services/issue-service.ts	2026-10-08 11:09:32
+@@ -93,6 +93,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectLive(input.orgId, before.projectId);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -122,6 +123,7 @@
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectLive(input.orgId, before.projectId);
+ 
+   if (before.status === input.status) return before;
+ 
+@@ -160,6 +162,7 @@
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
++  await assertProjectLive(input.orgId, before.projectId);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -202,6 +205,7 @@
+   );
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
++  await assertProjectLive(orgId, issue.projectId);
+ 
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
+ 
+@@ -280,4 +284,13 @@
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
++}
++
++async function assertProjectLive(orgId: OrgId, projectId: ProjectId): Promise<void> {
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertNotArchived("Project", project.id, project);
+ }

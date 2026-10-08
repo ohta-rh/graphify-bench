@@ -1,0 +1,262 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/jobs/trial-expiry-job.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/jobs/trial-expiry-job.ts	2026-10-08 12:40:35
+@@ -35,16 +35,19 @@
+     for (const subscription of expiring) {
+       const orgId = subscription.orgId as OrgId;
+       const usage = await usageRepo.getUsage(orgId);
++      const storageMbUsed = await usageRepo.getStorageMbUsed(orgId);
+ 
+       if (
+         usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.projectsUsed > freeLimits.projects ||
++        storageMbUsed > freeLimits.storageMb
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+           orgId,
+           seats: usage.seatsUsed,
+           projects: usage.projectsUsed,
++          storageMb: storageMbUsed,
+         });
+         continue;
+       }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/repositories/attachment-repository.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/repositories/attachment-repository.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/repositories/attachment-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/repositories/attachment-repository.ts	2026-10-08 12:41:19
+@@ -1,5 +1,5 @@
+ /**
+- * Attachment metadata; the byte total feeds the `storageMb` quota check.
++ * Attachment metadata used by issue views and storage accounting.
+  */
+ import { and, asc, eq, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+@@ -29,6 +29,25 @@
+   return rows.map(toAttachment);
+ }
+ 
++/** Finds one attachment without filtering on its issue's archive state. */
++export async function findAttachmentById(
++  orgId: OrgId,
++  attachmentId: AttachmentId,
++): Promise<IssueAttachment | null> {
++  const row = getDb()
++    .select()
++    .from(attachments)
++    .where(
++      and(
++        orgPredicate(attachments.orgId, orgId),
++        eq(attachments.id, attachmentId),
++      ),
++    )
++    .get();
++
++  return row ? toAttachment(row) : null;
++}
++
+ export async function insertAttachment(
+   input: CreateAttachmentInput,
+   uploadedBy: UserId,
+@@ -57,8 +76,8 @@
+ export async function deleteAttachment(
+   orgId: OrgId,
+   attachmentId: AttachmentId,
+-): Promise<void> {
+-  getDb()
++): Promise<IssueAttachment | null> {
++  const row = getDb()
+     .delete(attachments)
+     .where(
+       and(
+@@ -66,7 +85,10 @@
+         eq(attachments.id, attachmentId),
+       ),
+     )
+-    .run();
++    .returning()
++    .get();
++
++  return row ? toAttachment(row) : null;
+ }
+ 
+ /** Total stored bytes for one tenant; `BillingService` converts to megabytes. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/repositories/usage-repository.ts	2026-10-08 12:39:01
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/repositories/usage-repository.ts	2026-10-08 12:40:35
+@@ -11,6 +11,7 @@
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
++import { orgPredicate } from "./base-repository";
+ import { toUsage } from "./_mappers";
+ import { brandId } from "./_mappers";
+ import type { OrgId } from "@/types/common";
+@@ -41,6 +42,23 @@
+ }
+ 
+ /**
++ * Storage is charged per file, so rounding must happen before the total is
++ * summed. The tenant predicate keeps another workspace's files out of the
++ * result.
++ */
++export async function getStorageMbUsed(orgId: OrgId): Promise<number> {
++  const row = getDb()
++    .select({
++      value: sql<number | null>`sum((${attachments.sizeBytes} + ${BYTES_PER_MB - 1}) / ${BYTES_PER_MB})`,
++    })
++    .from(attachments)
++    .where(orgPredicate(attachments.orgId, orgId))
++    .get();
++
++  return row?.value ?? 0;
++}
++
++/**
+  * Recounts every dimension from the source tables and rewrites the cache.
+  * Called by the rollup job and after any bulk change that would drift.
+  */
+@@ -73,17 +91,14 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
+-    .from(attachments)
+-    .get();
++  const storageMbUsed = await getStorageMbUsed(orgId);
+ 
+   const next = {
+     orgId,
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed,
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/attachment-service.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/attachment-service.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/attachment-service.ts	2026-10-08 12:39:01
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/attachment-service.ts	2026-10-08 12:41:19
+@@ -63,11 +63,11 @@
+     input.orgId,
+   );
+ 
+-  const usage = await usageRepo.getUsage(input.orgId);
++  const storageMbUsed = await usageRepo.getStorageMbUsed(input.orgId);
+   const requestedMb = Math.ceil(input.sizeBytes / BYTES_PER_MB);
+ 
+   if (
+-    wouldExceedLimit(org.plan, "storageMb", usage.storageMbUsed, requestedMb)
++    wouldExceedLimit(org.plan, "storageMb", storageMbUsed, requestedMb)
+   ) {
+     throw new Error(
+       `Plan ${org.plan} has no room for another ${requestedMb} MB`,
+@@ -83,10 +83,7 @@
+   return attachment;
+ }
+ 
+-/**
+- * Removing an attachment gives the megabytes back to the quota — only whole
+- * ones, so a removal can never push the counter below what is really stored.
+- */
++/** Removes an attachment and refunds the same rounded charge as its upload. */
+ export async function removeAttachment(
+   actor: Actor,
+   input: DeleteAttachmentInput,
+@@ -94,7 +91,7 @@
+   assertOrgScope(actor, input.orgId);
+ 
+   const attachment = requireFound(
+-    await findAttachment(input.orgId, input.attachmentId),
++    await attachmentRepo.findAttachmentById(input.orgId, input.attachmentId),
+     "Attachment",
+     input.attachmentId,
+   );
+@@ -106,32 +103,12 @@
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+-  await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
++  const deleted = requireFound(
++    await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId),
++    "Attachment",
++    input.attachmentId,
++  );
+   await usageRepo.incrementUsage(input.orgId, {
+-    storageMbUsed: -Math.floor(attachment.sizeBytes / BYTES_PER_MB),
++    storageMbUsed: -Math.ceil(deleted.sizeBytes / BYTES_PER_MB),
+   });
+-}
+-
+-/**
+- * The attachment repository only reads by issue, because that is the only way
+- * the UI ever reaches one. A delete arrives with just an id, so the org's
+- * issues are walked until the row turns up.
+- */
+-async function findAttachment(
+-  orgId: OrgId,
+-  attachmentId: string,
+-): Promise<IssueAttachment | null> {
+-  const page = await issueRepo.listIssues({
+-    orgId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  for (const issue of page.items) {
+-    const rows = await attachmentRepo.listAttachments(orgId, issue.id);
+-    const match = rows.find((row) => row.id === attachmentId);
+-    if (match) return match;
+-  }
+-
+-  return null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/billing-service.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/billing-service.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/billing-service.ts	2026-10-08 12:39:01
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/billing-service.ts	2026-10-08 12:40:35
+@@ -11,7 +11,6 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+-import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as invoiceRepo from "@/server/repositories/invoice-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+@@ -221,8 +220,6 @@
+   return org.plan;
+ }
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+ /**
+  * Maps a quota dimension onto the counter that measures it. Storage is read
+  * from the attachment table itself: the cached counter only moves on the
+@@ -242,9 +239,7 @@
+     case "issuesPerProject":
+       return usage.issuesUsed;
+     case "storageMb":
+-      return Math.round(
+-        (await attachmentRepo.sumStorageBytes(orgId)) / BYTES_PER_MB,
+-      );
++      return usageRepo.getStorageMbUsed(orgId);
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
+     case "apiRequestsPerHour":
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/usage-service.ts /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/usage-service.ts
+--- /private/tmp/luna-scratch-20261008/3231fbd7-98b2-4637-a0bc-63f344748220/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/8a73a06f-79cc-4f4d-93bf-a15975ae4e0e/src/server/services/usage-service.ts	2026-10-08 12:40:35
+@@ -22,7 +22,11 @@
+   orgId: OrgId,
+ ): Promise<OrganizationUsage> {
+   assertOrgScope(actor, orgId);
+-  return usageRepo.getUsage(orgId);
++  const usage = await usageRepo.getUsage(orgId);
++  return {
++    ...usage,
++    storageMbUsed: await usageRepo.getStorageMbUsed(orgId),
++  };
+ }
+ 
+ /**

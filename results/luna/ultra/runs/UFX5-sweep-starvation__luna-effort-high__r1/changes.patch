@@ -1,0 +1,242 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/db/migrate.ts	2026-10-08 12:03:46
+@@ -73,7 +73,8 @@
+      projects_used INTEGER NOT NULL DEFAULT 0,
+      issues_used INTEGER NOT NULL DEFAULT 0,
+      storage_mb_used INTEGER NOT NULL DEFAULT 0,
+-     measured_at TEXT NOT NULL
++     measured_at TEXT NOT NULL,
++     last_recounted_at TEXT NOT NULL DEFAULT '0001-01-01T00:00:00.000Z'
+    )`,
+   `CREATE TABLE IF NOT EXISTS members (
+      id TEXT PRIMARY KEY NOT NULL,
+@@ -331,6 +332,14 @@
+   try {
+     for (const statement of readMigrationStatements()) {
+       sqlite.exec(statement);
++    }
++    const usageColumns = sqlite
++      .prepare("PRAGMA table_info(organization_usage)")
++      .all() as Array<{ name: string }>;
++    if (!usageColumns.some((column) => column.name === "last_recounted_at")) {
++      sqlite.exec(
++        "ALTER TABLE organization_usage ADD COLUMN last_recounted_at TEXT NOT NULL DEFAULT '0001-01-01T00:00:00.000Z'",
++      );
+     }
+   } finally {
+     sqlite.close();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/db/schema/organizations.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/db/schema/organizations.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/db/schema/organizations.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/db/schema/organizations.ts	2026-10-08 12:03:46
+@@ -38,9 +38,12 @@
+   seatsUsed: integer("seats_used").notNull().default(0),
+   projectsUsed: integer("projects_used").notNull().default(0),
+   issuesUsed: integer("issues_used").notNull().default(0),
+-  storageMbUsed: integer("storage_mb_used").notNull().default(0),
+-  measuredAt: text("measured_at").notNull(),
+-});
++    storageMbUsed: integer("storage_mb_used").notNull().default(0),
++    measuredAt: text("measured_at").notNull(),
++    lastRecountedAt: text("last_recounted_at")
++      .notNull()
++      .default("0001-01-01T00:00:00.000Z"),
++  });
+ 
+ export type OrganizationRow = typeof organizations.$inferSelect;
+ export type NewOrganizationRow = typeof organizations.$inferInsert;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/cleanup-archived-job.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/cleanup-archived-job.ts	2026-10-08 12:03:46
+@@ -10,12 +10,10 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-const ORG_BATCH = 25;
+ const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+@@ -32,7 +30,7 @@
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/digest-email-job.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/digest-email-job.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/digest-email-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/digest-email-job.ts	2026-10-08 12:03:46
+@@ -7,7 +7,6 @@
+ import { createLogger } from "@/lib/logger";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+ import { buildDigest, listDigestRecipients, renderDigest } from "@/server/services/digest-service";
+ import { sendEmail } from "@/server/services/email-service";
+@@ -17,7 +16,6 @@
+ import type { JobResult } from "@/server/jobs/types";
+ import type { Organization } from "@/types/organization";
+ 
+-const ORG_BATCH = 50;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("digest-email-job");
+@@ -29,7 +27,7 @@
+  */
+ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
+   return runJob("digest-email", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/overdue-issue-job.ts	2026-10-08 12:03:46
+@@ -7,14 +7,11 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+ 
+@@ -45,7 +42,7 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/usage-rollup-job.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/usage-rollup-job.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/jobs/usage-rollup-job.ts	2026-10-08 12:02:58
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/jobs/usage-rollup-job.ts	2026-10-08 12:04:12
+@@ -9,7 +9,7 @@
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** Organizations recounted per pass; the list puts the busiest tenants first. */
++/** Maximum organizations recounted per pass; the list starts with the oldest recount. */
+ const ORG_BATCH = 25;
+ 
+ const logger = createLogger("usage-rollup-job");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/repositories/organization-repository.ts	2026-10-08 12:04:11
+@@ -9,7 +9,7 @@
+ import { archivePatch } from "@/lib/soft-delete";
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+-import { toOrganization } from "./_mappers";
++import { brandId, toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -24,6 +24,17 @@
+     .where(eq(organizations.id, orgId))
+     .get();
+   return row ? toOrganization(row) : null;
++}
++
++/** IDs for scheduled work that should visit every live organization. */
++export async function listActiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .orderBy(organizations.id)
++    .all();
++  return rows.map((row) => brandId<OrgId>(row.id));
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/repositories/usage-repository.ts /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/repositories/usage-repository.ts
+--- /private/tmp/luna-scratch-20261008/596eb852-b349-48fe-8352-9196843a0ffe/src/server/repositories/usage-repository.ts	2026-10-08 12:02:58
++++ /private/tmp/luna-scratch-20261008/0957fdc1-9f10-45e5-9ebd-087551ede305/src/server/repositories/usage-repository.ts	2026-10-08 12:04:12
+@@ -1,18 +1,18 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
++import { and, asc, count, eq, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+   issues,
+   members,
++  organizations,
+   organizationUsage,
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+-import { toUsage } from "./_mappers";
+-import { brandId } from "./_mappers";
++import { brandId, toUsage } from "./_mappers";
+ import type { OrgId } from "@/types/common";
+ import type { OrganizationUsage } from "@/types/organization";
+ 
+@@ -79,13 +79,15 @@
+     .where(eq(attachments.orgId, orgId))
+     .get();
+ 
++  const recountedAt = toIsoTimestamp(new Date());
+   const next = {
+     orgId,
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+     storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
+-    measuredAt: toIsoTimestamp(new Date()),
++    measuredAt: recountedAt,
++    lastRecountedAt: recountedAt,
+   };
+ 
+   const row = db
+@@ -130,18 +132,22 @@
+ }
+ 
+ /**
+- * The rollup job's work list, most recently measured first: every write nudges
+- * `measured_at`, so the top of this list is where the tenants that are
+- * actually changing — and therefore drifting — are.
++ * The rollup job's work list, oldest full recount first. Counter deltas do not
++ * affect `last_recounted_at`, so each successful recount moves its org back.
+  */
+ export async function listOrgIdsForRollup(
+   limit: number,
+ ): Promise<readonly OrgId[]> {
+   const rows = getDb()
+-    .select({ orgId: organizationUsage.orgId })
+-    .from(organizationUsage)
+-    .orderBy(desc(organizationUsage.measuredAt))
+-    .limit(Math.max(1, limit))
++    .select({ orgId: organizations.id })
++    .from(organizations)
++    .leftJoin(organizationUsage, eq(organizationUsage.orgId, organizations.id))
++    .where(isNull(organizations.archivedAt))
++    .orderBy(
++      asc(sql`coalesce(${organizationUsage.lastRecountedAt}, '0001-01-01T00:00:00.000Z')`),
++      asc(organizations.id),
++    )
++    .limit(Math.min(25, Math.max(1, limit)))
+     .all();
+ 
+   return rows.map((row) => brandId<OrgId>(row.orgId));

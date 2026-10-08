@@ -1,0 +1,225 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/jobs/overdue-issue-job.ts	2026-10-08 12:00:47
+@@ -7,23 +7,19 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+-/** Archived issues are never overdue — an archived issue has no due date. */
++/** The repository's live-row filter keeps archived issues out of the scan. */
+ const LIVE_ONLY = {} as const;
+ 
+ const logger = createLogger("overdue-issue-job");
+ 
+ /**
+- * Issues already announced this process's lifetime. A later sweep still
+- * finds a still-open, still-overdue issue — this is what keeps the job from
+- * re-emitting `issue.overdue` for it on every pass.
++ * Issues announced by the previous completed sweep. Entries are removed when
++ * a later sweep finds the issue closed, archived, or no longer past due.
+  */
+ const reported = new Set<string>();
+ 
+@@ -33,8 +29,9 @@
+ }
+ 
+ /**
+- * Publishes one `issue.overdue` per still-open, past-due issue. The job owns
+- * no notification logic: it announces the fact, and whoever cares (in-app
++ * Publishes `issue.overdue` when an open, past-due issue first appears in a
++ * consecutive run of overdue sweeps. The job owns no notification logic: it
++ * announces the fact, and whoever cares (in-app
+  * alerts, the digest, webhooks) reacts on the bus.
+  */
+ export async function runOverdueIssueJob(now: Date): Promise<JobResult> {
+@@ -45,14 +42,17 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listLiveOrgIds();
++    const overdueThisSweep = new Set<string>();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
+-        if (reported.has(issue.id)) continue;
++        const trackingKey = `${orgId}:${issue.id}`;
++        overdueThisSweep.add(trackingKey);
++        if (reported.has(trackingKey)) continue;
+ 
+         try {
+           await emit("issue.overdue", {
+@@ -64,7 +64,7 @@
+             dueAt: issue.dueAt,
+             assigneeId: issue.assigneeId,
+           });
+-          reported.add(issue.id);
++          reported.add(trackingKey);
+           result.processed += 1;
+         } catch (error) {
+           result.failed += 1;
+@@ -74,6 +74,10 @@
+           });
+         }
+       }
++    }
++
++    for (const trackingKey of reported) {
++      if (!overdueThisSweep.has(trackingKey)) reported.delete(trackingKey);
+     }
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/issue-repository.ts	2026-10-08 11:59:30
++++ /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/issue-repository.ts	2026-10-08 12:00:47
+@@ -13,7 +13,7 @@
+   isNull,
+   like,
+   lt,
+-  ne,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -24,7 +24,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -53,9 +53,6 @@
+ } from "@/types/issue";
+ import type { SQL } from "drizzle-orm";
+ 
+-/** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+-const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
+-
+ export async function findIssueById(
+   orgId: OrgId,
+   issueId: IssueId,
+@@ -425,9 +422,9 @@
+         status === "in_progress" && current.startedAt === null
+           ? stamp
+           : current.startedAt,
+-      completedAt: TERMINAL_STATUSES.includes(status)
++      completedAt: CLOSED_ISSUE_STATUSES.includes(status)
+         ? stamp
+-        : current.completedAt,
++        : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -521,7 +518,7 @@
+           livePredicate(issues.archivedAt, {}),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+-          ne(issues.status, "done"),
++          notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         ),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/organization-repository.ts	2026-10-08 12:00:29
+@@ -9,7 +9,7 @@
+ import { archivePatch } from "@/lib/soft-delete";
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+-import { toOrganization } from "./_mappers";
++import { brandId, toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -24,6 +24,17 @@
+     .where(eq(organizations.id, orgId))
+     .get();
+   return row ? toOrganization(row) : null;
++}
++
++/** Every workspace that has not been deleted, including newly created ones. */
++export async function listLiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .all();
++
++  return rows.map((row) => brandId<OrgId>(row.id));
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/repositories/project-repository.ts	2026-10-08 11:59:30
++++ /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/repositories/project-repository.ts	2026-10-08 12:00:29
+@@ -3,7 +3,18 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import {
++  and,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNotNull,
++  like,
++  lt,
++  notInArray,
++  sql,
++} from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -13,6 +24,7 @@
+ } from "@/lib/soft-delete";
+ import { getDb, issues, projects } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import { toProject } from "./_mappers";
+@@ -231,7 +243,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, [...CLOSED_ISSUE_STATUSES])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -242,6 +254,7 @@
+     .where(
+       and(
+         scope,
++        notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/3b6dcb34-8d87-48f5-879b-b0a7941a7f4b/src/server/services/notification-service.ts	2026-10-08 11:59:30
++++ /private/tmp/luna-scratch-20261008/0f14d8f8-856d-4c70-b5c1-8a07a233a491/src/server/services/notification-service.ts	2026-10-08 12:00:29
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,

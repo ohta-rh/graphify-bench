@@ -1,0 +1,169 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/jobs/overdue-issue-job.ts /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/jobs/overdue-issue-job.ts	2026-10-08 12:11:35
+@@ -7,23 +7,19 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as organizationRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+ 
+ const logger = createLogger("overdue-issue-job");
+ 
+ /**
+- * Issues already announced this process's lifetime. A later sweep still
+- * finds a still-open, still-overdue issue — this is what keeps the job from
+- * re-emitting `issue.overdue` for it on every pass.
++ * Issues that were overdue on the preceding successful sweep. An issue can
++ * be announced again after a sweep finds it closed, archived, or not yet due.
+  */
+ const reported = new Set<string>();
+ 
+@@ -45,14 +41,18 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await organizationRepo.listLiveOrgIds();
++    const overdueOnThisSweep = new Set<string>();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
+-        if (reported.has(issue.id)) continue;
++        if (reported.has(issue.id)) {
++          overdueOnThisSweep.add(issue.id);
++          continue;
++        }
+ 
+         try {
+           await emit("issue.overdue", {
+@@ -64,7 +64,7 @@
+             dueAt: issue.dueAt,
+             assigneeId: issue.assigneeId,
+           });
+-          reported.add(issue.id);
++          overdueOnThisSweep.add(issue.id);
+           result.processed += 1;
+         } catch (error) {
+           result.failed += 1;
+@@ -75,5 +75,8 @@
+         }
+       }
+     }
++
++    reported.clear();
++    for (const issueId of overdueOnThisSweep) reported.add(issueId);
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/issue-repository.ts	2026-10-08 12:10:49
++++ /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/issue-repository.ts	2026-10-08 12:11:56
+@@ -13,7 +13,7 @@
+   isNull,
+   like,
+   lt,
+-  ne,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -427,7 +427,7 @@
+           : current.startedAt,
+       completedAt: TERMINAL_STATUSES.includes(status)
+         ? stamp
+-        : current.completedAt,
++        : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -521,7 +521,7 @@
+           livePredicate(issues.archivedAt, {}),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+-          ne(issues.status, "done"),
++          notInArray(issues.status, TERMINAL_STATUSES),
+         ),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/organization-repository.ts /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/organization-repository.ts
+--- /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/organization-repository.ts	2026-10-08 12:11:52
+@@ -9,7 +9,7 @@
+ import { archivePatch } from "@/lib/soft-delete";
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+-import { toOrganization } from "./_mappers";
++import { brandId, toOrganization } from "./_mappers";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -24,6 +24,16 @@
+     .where(eq(organizations.id, orgId))
+     .get();
+   return row ? toOrganization(row) : null;
++}
++
++/** Every workspace that has not been soft-deleted, including new workspaces. */
++export async function listLiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select({ id: organizations.id })
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .all();
++  return rows.map((row) => brandId<OrgId>(row.id));
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/repositories/project-repository.ts	2026-10-08 12:10:49
++++ /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/repositories/project-repository.ts	2026-10-08 12:11:24
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNotNull, like, lt, notInArray, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -231,7 +231,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, ["done", "canceled"])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -244,6 +244,7 @@
+         scope,
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
++        notInArray(issues.status, ["done", "canceled"]),
+       ),
+     )
+     .get();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/services/notification-service.ts /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/services/notification-service.ts
+--- /private/tmp/luna-scratch-20261008/c22062e5-b78d-4e9a-b1ff-ef585ebe11ff/src/server/services/notification-service.ts	2026-10-08 12:10:49
++++ /private/tmp/luna-scratch-20261008/cf51e703-44b8-4f84-a535-8002add17add/src/server/services/notification-service.ts	2026-10-08 12:11:37
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
