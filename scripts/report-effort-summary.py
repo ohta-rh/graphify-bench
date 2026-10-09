@@ -33,7 +33,30 @@ TASK_JA = json.loads((ROOT / "scripts" / "task-names-ja.json").read_text())
 SETS = [("45問", "code-45", ["results/opus", "results/sol61", "results/luna/code45"]),
         ("難問", "hard", ["results/hard", "results/luna/hard"]),
         ("超難問", "ultra", ["results/ultra", "results/luna/ultra"]),
-        ("極難問", "extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme"])]
+        ("極難問", "extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme"]),
+        ("apex", "apex", ["results/models/apex"]),
+        ("brownfield", "brownfield", ["results/models/brownfield", "results/luna/brownfield", "results/sol61-brownfield"])]
+# One row per set: (size, what the prompt gives, what it measures, outcome in one line).
+SET_NOTES = {
+    "code-45": ("45 問 × 1 回", "短い質問：場所探し・呼び出し元の列挙・処理の説明・影響範囲・小さなバグ修正（各 9 問）",
+                "コードを探す・読む・小さく直す力。採点はファイル一致 F1、LLM 判定、テスト",
+                "どのモデルも 80〜87% で頭打ち。モデル差はほとんど出ない"),
+    "hard": ("16 問 × 2 回", "症状、または関数名を決めた仕様（約 1,300 字）。3 ファイル以上・2 層以上の修正",
+             "仕様どおりに複数の層を直せるか。採点は実行後に差し込む隠しテスト",
+             "上位モデルはほぼ満点"),
+    "ultra": ("12 問 × 2 回", "関数名・モジュールパスまで書いた詳細な仕様書（約 3,300 字）。不具合 3〜4 個が絡む",
+              "長い仕様を漏れなく実装できるか",
+              "仕様が直す場所まで教えるため、安いモデルも追いつく"),
+    "extreme": ("12 問 × 2 回", "症状だけの障害報告か製品仕様。既存のファイル名・関数名は一切出さない。罠 1 つ",
+                "症状から原因の場所を推理する力",
+                "差が最もはっきり出たセット。Opus・Sonnet 5.5 が 90% 台、Haiku・Grok・Luna は大きく落ちる"),
+    "apex": ("6 問 × 2 回", "症状報告か製品仕様に「期待される振る舞い」の一覧つき（3,800〜8,900 字）。9〜36 ファイル、隠しケース 20〜24、罠 3 つ以上",
+             "規模・順序の不変条件、間違った場所での修正、原因が 2 つある症状",
+             "一覧が罠の不変条件まで書いてしまい、上位 3 モデルが 96〜100% で並んだ（狙いは外れた）"),
+    "brownfield": ("6 問 × 2 回", "ルールを省いたチケット＋古い製品メモと新しい ADR の矛盾（優先順位は docs/README.md）＋同じロジックの食い違ったコピー",
+                   "散らばった根拠を全部拾い、どの文書が正しいかを判断し、全コピーを直せるか",
+                   "Sonnet 5.5 が大きく下がり、手数を惜しまない Haiku 5.5 と Opus が並んだ"),
+}
 CATEGORIES = [("locate", "場所を探す"), ("reference", "呼び出し元を挙げる"), ("explain", "流れを説明する"),
               ("impact", "影響範囲を洗い出す"), ("fix", "バグを直す")]
 
@@ -146,6 +169,19 @@ def cell(v, best, text, partial=False):
 
 def done_note(s):
     return "" if s is None or s["n"] == s["total"] else f'<span class="part">{s["n"]}/{s["total"]}</span>'
+
+
+# ---------- set descriptions ----------
+def sets_section():
+    body = []
+    for name, key, _ in SETS:
+        size, prompt, measures, outcome = SET_NOTES[key]
+        body.append(f'<tr><td><b>{esc(name)}</b></td><td>{esc(size)}</td><td class="wrap">{esc(prompt)}</td>'
+                    f'<td class="wrap">{esc(measures)}</td><td class="wrap">{esc(outcome)}</td></tr>')
+    return ('<h2 id="sets">問題セット</h2><p class="muted">題材はすべて架空の課題管理 SaaS「Taskflow」（Next.js + TypeScript）。'
+            '難問以降は、エージェントが終わってから差し込む隠しテストだけで採点し、見えているテストはバグがあっても全部通る。'
+            'hard 以降はすべて模範解答で独立に検証済み。</p>'
+            + table(["セット", "規模", "問題文が渡すもの", "測るもの", "結果"], body, None, "sets"))
 
 
 # ---------- key points ----------
@@ -328,8 +364,8 @@ def scaling_section():
 
 # ---------- 5. per-task matrices ----------
 def task_section():
-    parts = ['<h2 id="tasks">タスク別の正誤（難問・超難問・極難問）</h2>',
-             '<p class="muted">low〜high × 2 回 = 6 本中の正解数。緑が濃いほど多く解け、赤が濃いほど落としている。途中のモデルは終わった本数が分母。</p>']
+    parts = ['<h2 id="tasks">タスク別の正誤（難問〜brownfield）</h2>',
+             '<p class="muted">low〜high × 2 回 = 6 本中の正解数（apex・brownfield も同じ）。緑が濃いほど多く解け、赤が濃いほど落としている。途中のモデルは終わった本数が分母。</p>']
     for name, key, _ in SETS[1:]:
         tasks = sorted({t for (_, t, _) in cells(key, EFFORTS)})
         body = []
@@ -349,7 +385,7 @@ def task_section():
 # ---------- 6. reliability ----------
 def reliability_section():
     parts = ['<h2 id="reliability">打ち切り</h2>',
-             '<p class="muted">ターン上限（Claude: 45問・難問 60、超難問・極難問 120）や Codex の 30 分上限で打ち切られた本数。'
+             '<p class="muted">ターン上限（Claude: 45問・難問 60、超難問・極難問 120、apex・brownfield 160）や Codex の 30 分上限で打ち切られた本数。'
              '打ち切りも結果として残し、隠しテストで採点している。</p>']
     body = []
     for m, p in MODELS:
@@ -392,7 +428,7 @@ def effort_tables():
 
 
 today = datetime.date.today().isoformat()
-body = "\n".join([keypoints_section(), status_section(), overview_section(), paired_section(), category_section(),
+body = "\n".join([keypoints_section(), sets_section(), status_section(), overview_section(), paired_section(), category_section(),
                   scaling_section(), task_section(), reliability_section(), effort_tables()])
 page = f"""<!doctype html>
 <html lang="ja">
@@ -424,6 +460,7 @@ page = f"""<!doctype html>
   td.n{{text-align:right;font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}}
   td b{{color:var(--accent);font-weight:500}}
   th:not(:first-child){{text-align:right}}
+  td.wrap{{white-space:normal;min-width:14em;max-width:26em}}
   td.na,tr.na td{{color:var(--ink-2)}} td.partial{{color:var(--ink-2)}}
   .part{{display:block;font-size:11px;color:var(--ink-2);font-family:"IBM Plex Mono",monospace}}
   td.hit{{background:var(--hit)}} td.low{{background:var(--low)}}
@@ -453,8 +490,8 @@ page = f"""<!doctype html>
 </head>
 <body><div class="wrap">
 <h1 id="top">モデル比較の詳細：Claude・Grok・GPT</h1>
-<p class="muted">{today} 集計。45問・難問・超難問・極難問の4セット。Haiku 5.5 / Sonnet 5.5 / Opus 5.5 / Sonnet 5（Claude Code）、Grok 4.7（Grok CLI）、GPT-6.1 Sol / GPT-6 Luna（Codex）。</p>
-<nav><a href="#top">要点</a><a href="#status">進み具合</a><a href="#overview">総合</a><a href="#paired">ペア比較</a><a href="#category">カテゴリ別</a><a href="#scaling">effort</a><a href="#tasks">タスク別</a><a href="#reliability">打ち切り</a><a href="#low">low</a><a href="#medium">medium</a><a href="#high">high</a><a href="#xhigh">xhigh</a></nav>
+<p class="muted">{today} 集計。45問・難問・超難問・極難問・apex・brownfield の6セット。Haiku 5.5 / Sonnet 5.5 / Opus 5.5 / Sonnet 5（Claude Code）、Grok 4.7（Grok CLI）、GPT-6.1 Sol / GPT-6 Luna（Codex）。</p>
+<nav><a href="#top">要点</a><a href="#sets">問題セット</a><a href="#status">進み具合</a><a href="#overview">総合</a><a href="#paired">ペア比較</a><a href="#category">カテゴリ別</a><a href="#scaling">effort</a><a href="#tasks">タスク別</a><a href="#reliability">打ち切り</a><a href="#low">low</a><a href="#medium">medium</a><a href="#high">high</a><a href="#xhigh">xhigh</a></nav>
 <ul class="muted">
 <li>どの表も、同じタスク・同じ effort・同じ回のセルで比べている（ペア比較）。合計は low〜high のみ（Grok と Sol に xhigh が無いため）。</li>
 <li>途中のモデルは、終わったセル数を小さく添えている（例 36/45）。その数字は揃ったセルだけの値なので、他モデルと完全には比べられない。</li>

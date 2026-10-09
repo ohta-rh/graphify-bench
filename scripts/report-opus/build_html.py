@@ -14,6 +14,8 @@ SETS = [
     ("hard", "難問", "results/hard"),
     ("ultra", "超難問", "results/ultra"),
     ("extreme", "極難問", "results/models/extreme"),
+    ("apex", "apex", "results/models/apex"),
+    ("brownfield", "brownfield", "results/models/brownfield"),
 ]
 D = {k: json.load(open(os.path.join(DATA, f"f-{k}.json"))) for k, _, _ in SETS}
 head = open(os.path.join(HERE, "head.html")).read()
@@ -140,8 +142,10 @@ _xr = [D[k]["arms"]["sonnet55-effort-xhigh"]["cost_med"] / D[k]["arms"]["sonnet5
 xh_ratio_lo, xh_ratio_hi = min(_xr), max(_xr)
 _oc = [D[k]["arms"][f"opus-effort-{e}"]["cost_med"] / D[k]["arms"][f"sonnet55-effort-{e}"]["cost_med"] for k in D for e in ("high", "xhigh")]
 oc_lo, oc_hi = min(_oc), max(_oc)
-all_runs = sum(a["n"] for k in D for a in D[k]["arms"].values())
-all_cost = sum(a["cost_sum"] for k in D for a in D[k]["arms"].values())
+# Count only the Claude arms this report is about (the results dirs also hold Grok arms).
+_claude_arms = {arm(prefix, e) for prefix, _, _ in FAM for e in EFFORTS} | {"effort-low-nosub"}
+all_runs = sum(a["n"] for k in D for name, a in D[k]["arms"].items() if name in _claude_arms)
+all_cost = sum(a["cost_sum"] for k in D for name, a in D[k]["arms"].items() if name in _claude_arms)
 
 
 def famrow(k, lbl):
@@ -164,6 +168,8 @@ sets_overview = """<div class="tbl"><table class="rep"><thead><tr><th>セット<
 <tr><td>難問</td><td>16 × 2 回</td><td>修正 8・実装 8（3 ファイル以上・2 層以上）</td><td>症状、または名前を指定した仕様（約 1,300 字）</td><td>隠しテスト</td><td>Opus</td><td>60 / $4</td></tr>
 <tr><td>超難問</td><td>12 × 2 回</td><td>修正 6・実装 6（5 ファイル以上・3 層以上、欠陥 3〜4 個）</td><td>詳しい仕様。関数名もルールも全部（約 3,300 字、コード名 14 個）</td><td>隠しテスト</td><td>Opus</td><td>120 / $8</td></tr>
 <tr><td>極難問</td><td>12 × 2 回</td><td>修正 6・実装 6（8 ファイル以上・3 層以上、罠 1 つ）</td><td>症状だけの障害報告か PM 仕様。既存のコード名なし</td><td>隠しテスト</td><td>Fable 5.1</td><td>120 / $8</td></tr>
+<tr><td>apex</td><td>6 × 2 回</td><td>修正 3・実装 3（9〜36 ファイル、隠しケース 20〜24、罠 3 つ以上）</td><td>症状報告か製品仕様に「期待される振る舞い」の一覧（3,800〜8,900 字）</td><td>隠しテスト</td><td>Fable 5.1</td><td>160 / $12</td></tr>
+<tr><td>brownfield</td><td>6 × 2 回</td><td>修正 3・実装 3（8〜12 ファイル、隠しケース 15〜18）</td><td>ルールを省いたチケット。古い製品メモと新しい ADR が矛盾し、優先順位は docs/README.md。同じロジックの食い違ったコピーつき</td><td>隠しテスト</td><td>Fable 5.1</td><td>160 / $12</td></tr>
 </tbody></table></div>"""
 
 
@@ -197,9 +203,9 @@ body = f"""
 </style>
 <body>
 <div class="wrap">
-  <p class="eyebrow">graphify-bench · モデル比較 · 2026-09-25〜10-08</p>
+  <p class="eyebrow">graphify-bench · モデル比較 · 2026-09-25〜10-09</p>
   <h1>Sonnet 5.5 は、症状だけの難しい修正で Opus 5.5 とほぼ同じ正答率を、約半分のコストで出した。</h1>
-  <p class="lede col">Opus 5.5・Sonnet 5・Sonnet 5.5、それに 10-08 に追加した Haiku 5.5 を、それぞれ <code>--effort</code> low・medium・high・xhigh の 4 段階で、難しさと問題の書き方が違う 4 つの問題セットに解かせた。どれも素の Claude Code（<code>claude -p</code>）で、変えたのはモデルと effort だけ。{all_runs:,} run、定価換算で ${all_cost:,.0f}。</p>
+  <p class="lede col">Opus 5.5・Sonnet 5・Sonnet 5.5、それに 10-08 に追加した Haiku 5.5 を、それぞれ <code>--effort</code> low・medium・high・xhigh の 4 段階で、難しさと問題の書き方が違う 6 つの問題セット（apex と brownfield は 10-08〜09 に追加）に解かせた。どれも素の Claude Code（<code>claude -p</code>）で、変えたのはモデルと effort だけ。{all_runs:,} run、定価換算で ${all_cost:,.0f}。</p>
 
   <h2 class="col">サマリと見解</h2>
   {summary_table}
@@ -213,6 +219,7 @@ body = f"""
     <li><b>仕様を細かく書いた超難問では、Sonnet 5 と 5.5 のコストと時間に差がない</b>（どの effort でも CI が 0 をまたぐ）。正答率は 5.5 が {tot['ultra']['Sonnet 5.5'][0]}/96、5 が {tot['ultra']['Sonnet 5'][0]}/96 で、5.5 がわずかに低い（CI の上限がちょうど 0）。Opus は同じ effort 同士で {rng(U, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い。</li>
     <li><b>45 問では、今回測った Claude 3 モデルは 78〜89% の範囲に入る。</b>この Claude 比較の中では Sonnet 5.5 の正解が最も多く（{tot['code45']['Sonnet 5.5'][0]}/180。Opus 5.5 は {tot['code45']['Opus 5.5'][0]}/180）、コストも最も低い（同じ effort 同士で Opus が {rng(C, 'opus-effort', 'sonnet55-effort', 'cost', usd)} 高い）。</li>
     <li><b>Haiku 5.5 は、仕様が書いてある問題では Sonnet 5.5 と並び、症状だけの問題で一段落ちる。</b>4 effort の合計で、難問 {tot['hard']['Haiku 5.5'][0]}/128（Sonnet 5.5 は {tot['hard']['Sonnet 5.5'][0]}/128）、超難問 {tot['ultra']['Haiku 5.5'][0]}/96（同 {tot['ultra']['Sonnet 5.5'][0]}/96）、45 問 {tot['code45']['Haiku 5.5'][0]}/180（同 {tot['code45']['Sonnet 5.5'][0]}/180）、極難問 {tot['extreme']['Haiku 5.5'][0]}/96（同 {tot['extreme']['Sonnet 5.5'][0]}/96）。極難問の low では Sonnet 5.5 より {pt(h_ok['low']['mean'])}（CI が 0 をまたがない）。$/正解はどのセットでも最安で、Sonnet 5.5 の {min(h_ratio.values()):.2f}〜{max(h_ratio.values()):.2f} 倍。代わりにターン数が多く（超難問・極難問の中央値 {min(h_turns):g}〜{max(h_turns):g}、Sonnet 5.5 は {min(s55_turns):g}〜{max(s55_turns):g}）、極難問では 1 本あたり {rng(X, 'haiku55-effort', 'sonnet55-effort', 'wall', sec)} 遅い（CI が 0 をまたがない）。一度も委譲していない。</li>
+    <li><b>追加の 2 セットでは結果が分かれた。</b>apex（期待される振る舞いの一覧つき）は Opus 5.5 {tot['apex']['Opus 5.5'][0]}/48・Sonnet 5.5 {tot['apex']['Sonnet 5.5'][0]}/48・Haiku 5.5 {tot['apex']['Haiku 5.5'][0]}/48 で並んだ — 一覧が罠の不変条件まで書いてしまい、探す余地がなかった。brownfield（仕様の穴・文書の矛盾・重複コード）は Sonnet 5.5 が {tot['brownfield']['Sonnet 5.5'][0]}/48 に下がり、Opus 5.5 {tot['brownfield']['Opus 5.5'][0]}/48・Haiku 5.5 {tot['brownfield']['Haiku 5.5'][0]}/48。6 問ずつなので CI は 0 をまたぐが、Sonnet 5.5 に不利な向きの結果はこれが初めて。</li>
     <li><b>Sonnet 5.5 の xhigh は割に合わない。</b>high と比べてコストが {xh_ratio_lo:.1f}〜{xh_ratio_hi:.1f} 倍になるのに、正答率はどのセットでも上がらない（±1 本）。</li>
   </ul>
 
@@ -226,7 +233,7 @@ body = f"""
     <p><b>何が変わったのか（仮説）。</b>前回まで、Opus の強みは「症状から原因の場所を、少ない手数で探し当てる力」だと読んでいた。その証拠が、症状だけの問題で Sonnet 5 に大差をつけていたことよ。Sonnet 5.5 は、まさにその部分が伸びた。症状だけの極難問ではターン数が 1/3〜1/5 になって委譲もなくなり、正答率が上がった。一方、探索の要らない超難問ではほとんど変わっていない。これは測定からの推論で、モデルの中身を確かめたわけじゃないわ。</p>
   </div>
 
-  <h2 class="col">4 つのセット</h2>
+  <h2 class="col">6 つのセット</h2>
   {sets_overview}
   <p class="cap">共通のルール: 隠しテストはエージェントが終わってから差し込む（バグを仕込んだ状態でも見えるテストは全部通る）。全問を模範解答で独立に検証済み。カンニング禁止をプロンプトに明記し、<code>scripts/audit-scope.py</code> で全 run を監査した（違反 0）。成績を見て問題を選んだことはない。</p>
   {''.join(set_section(k, lbl, p) for k, lbl, p in SETS)}
