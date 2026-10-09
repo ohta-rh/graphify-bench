@@ -9,7 +9,7 @@ export LUNA_DEFER_JUDGE=1
 export TZ=Asia/Tokyo
 case "${1:-all}" in
   all) SETS=(code45 hard ultra extreme) ;;
-  code45|hard|ultra|extreme) SETS=("$1") ;;
+  code45|hard|ultra|extreme|brownfield) SETS=("$1") ;;
   *) echo "unknown set: $1" >&2; exit 2 ;;
 esac
 for bench_set in "${SETS[@]}"; do
@@ -21,4 +21,5 @@ done
 if [[ " ${SETS[*]} " == *" code45 "* ]]; then
   BENCH_RESULTS_DIR=results/luna/code45 pnpm exec tsx bench/luna-grade.ts
 fi
-python3 scripts/report-luna.py --publish
+# The published Luna report covers the four original sets; a brownfield-only run leaves it alone.
+[[ " ${SETS[*]} " == " brownfield " ]] || python3 scripts/report-luna.py --publish

@@ -1,4 +1,4 @@
-/** Code-45 or extreme on Codex. Existing Claude measurements remain untouched. */
+/** Code-45, extreme or brownfield on Codex. Existing Claude measurements remain untouched. */
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -15,16 +15,22 @@ import { parseTaskFile, type Task } from "../tasks/tasks.schema.js";
 const write = (file: string, data: unknown) => fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
 const scratch = process.env.BENCH_SCRATCH || path.join(os.tmpdir(), "bench-scratch");
 const concurrency = Number(process.env.BENCH_CONCURRENCY || 3);
+const SETS: Record<string, { files: string[]; tasks: number; reps: number; claudeCaps: string }> = {
+  code45: { files: ["tasks/tasks.json", "tasks/tasks-ext.json"], tasks: 45, reps: 1, claudeCaps: "60-turn/$4" },
+  extreme: { files: ["tasks/tasks-extreme.json"], tasks: 12, reps: 2, claudeCaps: "120-turn/$8" },
+  brownfield: { files: ["tasks/tasks-brownfield.json"], tasks: 6, reps: 2, claudeCaps: "160-turn/$12" },
+};
 const set = process.env.BENCH_SET || "code45";
-if (!["code45", "extreme"].includes(set)) throw new Error("invalid BENCH_SET");
-const taskFiles = set === "extreme" ? ["tasks/tasks-extreme.json"] : ["tasks/tasks.json", "tasks/tasks-ext.json"];
-const reps = set === "extreme" ? 2 : 1;
+const setConfig = SETS[set];
+if (!setConfig) throw new Error("invalid BENCH_SET");
+const taskFiles = setConfig.files;
+const reps = setConfig.reps;
 const tasks = taskFiles.flatMap(f => parseTaskFile(JSON.parse(fs.readFileSync(path.join(REPO_ROOT, f), "utf8"))).tasks);
 const taskMap = new Map(tasks.map(t => [t.id, t]));
 const contract = fs.readFileSync(path.join(REPO_ROOT, "overlays/baseline/CLAUDE.md"), "utf8");
 const corpus = process.env.BENCH_CORPUS_V1;
 if (!corpus || !fs.existsSync(corpus) || fs.existsSync(path.join(corpus, "docs"))) throw new Error("BENCH_CORPUS_V1 must be a code-only snapshot");
-if (tasks.length !== (set === "extreme" ? 12 : 45) || !Number.isInteger(concurrency) || concurrency < 1) throw new Error("invalid task count/concurrency");
+if (tasks.length !== setConfig.tasks || !Number.isInteger(concurrency) || concurrency < 1) throw new Error("invalid task count/concurrency");
 for (const task of tasks) for (const file of task.hidden ?? []) {
   if (fs.existsSync(path.join(corpus, file.to))) throw new Error(`hidden grading file already present in corpus: ${file.to}`);
 }
@@ -47,7 +53,7 @@ const previousExperiment = fs.existsSync(experimentPath) ? JSON.parse(fs.readFil
 write(experimentPath, { ...previousExperiment, model: SOL61_MODEL, set, task_files: taskFiles, efforts, tasks: tasks.map(t => t.id), reps,
   runtime: "codex", versions, concurrency, corpus, contract_sha256: crypto.createHash("sha256").update(contract).digest("hex"),
   caps: { wall_ms: 30 * 60_000, model_turns: null, budget_usd: null }, pricing: SOL61_PRICING,
-  caveats: [`Codex JSONL does not expose per-model-turn usage; Claude's ${set === "extreme" ? "120-turn/$8" : "60-turn/$4"} caps cannot be enforced by this adapter.`,
+  caveats: [`Codex JSONL does not expose per-model-turn usage; Claude's ${setConfig.claudeCaps} caps cannot be enforced by this adapter.`,
     "Cost is standard list-price equivalent, not a subscription charge. Native input tokens include cache reads/writes.",
     "Personal user configuration, web search and multi-agent tools are disabled; workspace-write sandbox, fresh clone per run."] });
 

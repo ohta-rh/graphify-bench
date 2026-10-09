@@ -21,6 +21,7 @@ const sets: Record<string, { files: string[]; tasks: number; reps: number; turns
   hard: { files: ["tasks/tasks-hard.json"], tasks: 16, reps: 2, turns: 60, budget: 4 },
   ultra: { files: ["tasks/tasks-ultra.json"], tasks: 12, reps: 2, turns: 120, budget: 8 },
   extreme: { files: ["tasks/tasks-extreme.json"], tasks: 12, reps: 2, turns: 120, budget: 8 },
+  brownfield: { files: ["tasks/tasks-brownfield.json"], tasks: 6, reps: 2, turns: 160, budget: 12 },
 };
 const config = sets[set];
 if (!config) throw new Error("invalid BENCH_SET");
