@@ -6,6 +6,15 @@ It now also measures a second, structurally different prebuilt index — [MemPal
 
 A third index shape followed on 2026-09-03: [code-graph-rag](https://github.com/vitali87/code-graph-rag) 0.0.845, a Tree-sitter AST graph stored in Memgraph and reached through its MCP server, measured with its LLM-free tools only (`semantic_search`, `get_code_snippet`, `structural_search`, …; the tool's own NL→Cypher path was deliberately left out so the arm measures the graph, not a second model).
 
+**What this measures that public leaderboards do not.** Aggregate indices such as the Artificial Analysis Intelligence Index (AA Index) and coding benchmarks such as CursorBench sum a model up in one score per suite. That score cannot fully show how a model handles the everyday engineering work a team does in its own codebase. Every task here is that kind of work, set in one realistic multi-tenant SaaS the model has never seen:
+
+- find the code behind a feature, and trace what a change would break;
+- fix a bug from an incident report that names only the symptoms;
+- build a feature from a product spec or a terse ticket;
+- reconcile that ticket with ADRs and stale documents that contradict it.
+
+Each task is graded by a key or a hidden test the agent never sees, and every run also records its cost, turns and wall time.
+
 ## Headline
 
 940 runs, 65 tasks, 25 conditions, one repetition each, about $183 of API spend. Every run's `result.json` and full transcript is committed.
