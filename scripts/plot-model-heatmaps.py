@@ -22,14 +22,15 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 EFFORTS = ("low", "medium", "high", "xhigh")
 
 # Models that do not offer xhigh; their xhigh rows always render as "not offered".
-NO_XHIGH_PREFIXES = frozenset({"grok-effort", "sol61-effort"})
+# Grok 4.7 gained an xhigh arm on the extreme set; its other xhigh cells read "not measured".
+NO_XHIGH_PREFIXES = frozenset({"sol61-effort"})
 
 SETS = [
-    ("code-45", ["results/opus", "results/sol61", "results/luna/code45"], 45),
-    ("hard", ["results/hard", "results/luna/hard"], 32),
-    ("ultra", ["results/ultra", "results/luna/ultra"], 24),
+    ("code-45", ["results/opus", "results/sol61", "results/luna/code45", "results/terra61/code45"], 45),
+    ("hard", ["results/hard", "results/luna/hard", "results/terra61/hard"], 32),
+    ("ultra", ["results/ultra", "results/sol61-ultra", "results/luna/ultra"], 24),
     ("extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme"], 24),
-    ("apex", ["results/models/apex"], 12),
+    ("apex", ["results/models/apex", "results/sol61-apex"], 12),
     ("brownfield", ["results/models/brownfield", "results/luna/brownfield", "results/sol61-brownfield"], 12),
 ]
 
@@ -41,6 +42,7 @@ MODELS = [
     ("Grok 4.7", "grok-effort"),
     ("GPT-6.1 Sol", "sol61-effort"),
     ("GPT-6 Luna", "luna-effort"),
+    ("GPT-6.1 Terra", "terra61-effort"),
 ]
 
 BLUE_STEPS = {
@@ -73,7 +75,7 @@ ROW_LABEL_W = MODEL_LABEL_W + LABEL_GAP + EFFORT_LABEL_W
 
 CAPTION = (
     "Data: results/ (graphify-bench). Claude costs from Claude Code; "
-    "Grok from Grok Build; Sol and Luna are list-price estimates."
+    "Grok from Grok Build; Sol, Luna and Terra are list-price estimates."
 )
 
 
