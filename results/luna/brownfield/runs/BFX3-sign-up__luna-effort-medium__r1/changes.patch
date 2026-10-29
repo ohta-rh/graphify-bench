@@ -1,0 +1,118 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/lib/rate-limit.ts /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/lib/rate-limit.ts
+--- /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/lib/rate-limit.ts	2026-10-10 06:14:28
+@@ -21,6 +21,8 @@
+ export type RateLimitConfig = { capacity: number; refillPerMinute: number };
+ 
+ export const RATE_LIMIT_BUCKETS: Readonly<Record<string, RateLimitConfig>> = {
++  "auth:register": { capacity: 5, refillPerMinute: 1 },
++  "auth:login": { capacity: 10, refillPerMinute: 2 },
+   "member:invite": { capacity: 20, refillPerMinute: 2 },
+   "comment:create": { capacity: 60, refillPerMinute: 20 },
+   "issue:create": { capacity: 60, refillPerMinute: 20 },
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/server/repositories/user-repository.ts /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/server/repositories/user-repository.ts
+--- /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/server/repositories/user-repository.ts	2026-10-10 06:14:06
++++ /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/server/repositories/user-repository.ts	2026-10-10 06:14:28
+@@ -17,14 +17,14 @@
+ }
+ 
+ /**
+- * Addresses are matched as stored. The auth schemas lowercase what the forms
+- * submit, so a lookup already arrives in the stored spelling.
++ * Normalize at the repository boundary so every caller uses case-insensitive
++ * address identity, including non-form entry points.
+  */
+ export async function findUserByEmail(email: string): Promise<User | null> {
+   const rows = getDb()
+     .select()
+     .from(users)
+-    .where(eq(users.email, email))
++    .where(eq(users.email, email.trim().toLowerCase()))
+     .all();
+   const row = rows.at(0);
+   return row ? toUser(row) : null;
+@@ -40,8 +40,7 @@
+     .insert(users)
+     .values({
+       id: newId(),
+-      // Stored as typed: the welcome email is addressed with this value.
+-      email: input.email,
++      email: input.email.trim().toLowerCase(),
+       name: input.name,
+       passwordHash: input.passwordHash,
+       avatarUrl: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/server/services/auth-service.ts /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/server/services/auth-service.ts
+--- /private/tmp/luna-scratch-20261008/357aa94f-eed0-470e-9acf-f2276fdb5f13/src/server/services/auth-service.ts	2026-10-10 06:14:06
++++ /private/tmp/luna-scratch-20261008/68bca467-9a49-4412-8d76-ee73310b6d9d/src/server/services/auth-service.ts	2026-10-10 06:14:28
+@@ -16,6 +16,7 @@
+ } from "@/lib/hash";
+ import { consumeRateLimit } from "@/lib/rate-limit";
+ import { slugify } from "@/lib/slug";
++import { RateLimitedError } from "@/actions/_lib/action-errors";
+ import * as resetTokenRepo from "@/server/repositories/_password-reset-repository";
+ import * as sessionRepo from "@/server/repositories/session-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+@@ -35,6 +36,7 @@
+ 
+ /** Buckets guarding the unauthenticated endpoints. */
+ const LOGIN_BUCKET = "auth:login";
++const REGISTER_BUCKET = "auth:register";
+ const RESET_BUCKET = "auth:password-reset";
+ 
+ /**
+@@ -54,9 +56,12 @@
+ export async function register(
+   input: RegisterInput,
+ ): Promise<{ user: User; org: Organization }> {
++  const verdict = await consumeRateLimit(ANONYMOUS_ORG, REGISTER_BUCKET);
++  if (!verdict.allowed) throw new RateLimitedError(REGISTER_BUCKET, verdict.resetAt);
++
+   const existing = await userRepo.findUserByEmail(input.email);
+   if (existing) {
+-    throw new Error("An account with that email already exists");
++    throw new AccountConflictError();
+   }
+ 
+   const user = await userRepo.insertUser({
+@@ -68,9 +73,16 @@
+   // A reserved or awkward name is handled downstream: `createOrganization`
+   // runs the slug through `uniqueSlug()`, which skips reserved words and
+   // suffixes collisions.
++  const orgName = `${input.name}'s workspace`;
++  const maxOrgNameLength = 64;
++  const workspaceName = orgName.length <= maxOrgNameLength
++    ? orgName
++    : `${input.name.slice(0, maxOrgNameLength - "'s workspace".length)}'s workspace`;
++  const derivedSlug = slugify(input.name);
++  const usableSlug = derivedSlug.length >= 2 ? derivedSlug : "workspace";
+   const org = await createOrganization(user.id, {
+-    name: `${input.name}'s workspace`,
+-    slug: slugify(input.name) || "workspace",
++    name: workspaceName,
++    slug: usableSlug,
+     plan: "free",
+   });
+ 
+@@ -91,11 +103,6 @@
+ export async function login(
+   input: LoginInput,
+ ): Promise<{ user: User; token: string }> {
+-  const verdict = await consumeRateLimit(ANONYMOUS_ORG, LOGIN_BUCKET);
+-  if (!verdict.allowed) {
+-    throw new Error("Too many sign-in attempts; try again shortly");
+-  }
+-
+   const user = await userRepo.findUserByEmail(input.email);
+   if (!user) throw new Error("Those credentials did not match");
+ 
+@@ -152,9 +159,7 @@
+   input: PasswordResetConfirmInput,
+ ): Promise<User> {
+   const verdict = await consumeRateLimit(ANONYMOUS_ORG, RESET_BUCKET);
+-  if (!verdict.allowed) {
+-    throw new Error("Too many reset attempts; try again shortly");
+-  }
++  if (!verdict.allowed) throw new RateLimitedError(RESET_BUCKET, verdict.resetAt);
+ 
+   const stored = await resetTokenRepo.findLiveResetToken(
+     hashToken(input.token),

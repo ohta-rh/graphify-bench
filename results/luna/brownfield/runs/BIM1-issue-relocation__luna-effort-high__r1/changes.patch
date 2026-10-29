@@ -1,0 +1,337 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/schemas/activity.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/schemas/activity.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/schemas/activity.ts	2026-10-10 05:07:10
+@@ -15,6 +15,7 @@
+   "project.restored",
+   "issue.created",
+   "issue.updated",
++  "issue.moved",
+   "issue.status_changed",
+   "issue.assigned",
+   "issue.archived",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/schemas/issue.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/schemas/issue.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/schemas/issue.ts	2026-10-10 05:07:10
+@@ -70,6 +70,12 @@
+   issueId: issueIdSchema,
+ });
+ 
++export const moveIssueToProjectSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  toProjectId: projectIdSchema,
++});
++
+ export const issueFilterSchema = z
+   .object({
+     orgId: orgIdSchema,
+@@ -108,3 +114,4 @@
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
++export type MoveIssueToProjectInput = z.infer<typeof moveIssueToProjectSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/db/migrate.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/db/migrate.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/db/migrate.ts	2026-10-10 05:07:10
+@@ -158,6 +158,11 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS issue_number_counters (
++     project_id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     last_number INTEGER NOT NULL
++   )`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/db/schema/issues.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/db/schema/issues.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/db/schema/issues.ts	2026-10-10 05:07:10
+@@ -44,6 +44,13 @@
+   ],
+ );
+ 
++/** Retains the highest issue number ever issued by each project, including moved issues. */
++export const issueNumberCounters = sqliteTable("issue_number_counters", {
++  projectId: text("project_id").primaryKey().notNull(),
++  orgId: text("org_id").notNull(),
++  lastNumber: integer("last_number").notNull(),
++});
++
+ export const labels = sqliteTable(
+   "labels",
+   {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/repositories/issue-repository.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/repositories/issue-repository.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/repositories/issue-repository.ts	2026-10-10 05:05:46
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/repositories/issue-repository.ts	2026-10-10 05:09:06
+@@ -22,7 +22,14 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issueNumberCounters,
++  issues,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -286,21 +293,99 @@
+ }
+ 
+ /**
+- * Next per-project issue number. Archived issues keep their number, so the
+- * max is taken over every row rather than the live ones.
++ * Reserves the next per-project issue number. The counter survives issue
++ * moves; the row maximum also seeds it for projects created before counters.
+  */
+ export async function nextIssueNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+ ): Promise<number> {
+-  const row = getDb()
++  return getDb().transaction((tx) => reserveNextIssueNumber(tx, orgId, projectId));
++}
++
++function reserveNextIssueNumber(
++  tx: Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0],
++  orgId: OrgId,
++  projectId: ProjectId,
++): number {
++  const row = tx
+     .select({ value: sql<number | null>`max(${issues.number})` })
+     .from(issues)
+     .where(
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const counter = tx
++    .select({ lastNumber: issueNumberCounters.lastNumber })
++    .from(issueNumberCounters)
++    .where(eq(issueNumberCounters.projectId, projectId))
++    .get();
++  const next = Math.max(row?.value ?? 0, counter?.lastNumber ?? 0) + 1;
++
++  tx.insert(issueNumberCounters)
++    .values({ projectId, orgId, lastNumber: next })
++    .onConflictDoUpdate({
++      target: issueNumberCounters.projectId,
++      set: { orgId, lastNumber: next },
++    })
++    .run();
++
++  return next;
++}
++
++/** Moves and renumbers an issue while atomically retaining both project high-water marks. */
++export async function moveIssueToProject(
++  orgId: OrgId,
++  issueId: IssueId,
++  toProjectId: ProjectId,
++): Promise<Issue> {
++  await getDb().transaction((tx) => {
++    const before = tx
++      .select()
++      .from(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .get();
++    if (!before) throw new Error(`Issue ${issueId} not found`);
++
++    const sourceCounter = tx
++      .select({ lastNumber: issueNumberCounters.lastNumber })
++      .from(issueNumberCounters)
++      .where(eq(issueNumberCounters.projectId, before.projectId))
++      .get();
++    tx.insert(issueNumberCounters)
++      .values({
++        projectId: before.projectId as ProjectId,
++        orgId,
++        lastNumber: Math.max(sourceCounter?.lastNumber ?? 0, before.number),
++      })
++      .onConflictDoUpdate({
++        target: issueNumberCounters.projectId,
++        set: {
++          orgId,
++          lastNumber: Math.max(sourceCounter?.lastNumber ?? 0, before.number),
++        },
++      })
++      .run();
++
++    const number = reserveNextIssueNumber(tx, orgId, toProjectId);
++    const row = tx
++      .update(issues)
++      .set({
++        projectId: toProjectId,
++        number,
++        updatedAt: toIsoTimestamp(new Date()),
++      })
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .returning()
++      .get();
++
++    if (!row) throw new Error(`Issue ${issueId} not found`);
++    return row;
++  });
++
++  const moved = await findIssueById(orgId, issueId);
++  if (!moved) throw new Error(`Issue ${issueId} not found`);
++  return moved;
+ }
+ 
+ export async function insertIssue(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/activity-service.ts	2026-10-10 05:08:20
+@@ -186,6 +186,21 @@
+         metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.moved", (payload) =>
++      record(payload.orgId, "issue.moved", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.toProjectId,
++        summary: `Moved issue ${payload.fromNumber} → ${payload.toNumber}`,
++        metadata: {
++          fromProjectId: payload.fromProjectId,
++          toProjectId: payload.toProjectId,
++          fromNumber: payload.fromNumber,
++          toNumber: payload.toNumber,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/issue-service.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/issue-service.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/issue-service.ts	2026-10-10 05:05:46
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/issue-service.ts	2026-10-10 05:09:06
+@@ -27,6 +27,7 @@
+   CreateIssueInput,
+   IssueFilterInput,
+   MoveIssueInput,
++  MoveIssueToProjectInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+@@ -108,6 +109,61 @@
+   return after;
+ }
+ 
++/** Moves one live issue to a live project in the same workspace. */
++export async function moveIssueToProject(
++  actor: Actor,
++  input: MoveIssueToProjectInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++
++  const before = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(before));
++  assertNotArchived("Issue", before.id, before);
++
++  if (before.projectId === input.toProjectId) return before;
++
++  const target = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.toProjectId),
++    "Project",
++    input.toProjectId,
++  );
++  assertNotArchived("Project", target.id, target);
++  assertCan(actor, "issue:create", projectResource(target));
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const used = await issueRepo.countIssues(input.orgId, target.id);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in project ${target.key}`,
++    );
++  }
++
++  const after = await issueRepo.moveIssueToProject(
++    input.orgId,
++    before.id,
++    target.id,
++  );
++
++  await emit("issue.moved", {
++    ...actorEnvelope(actor),
++    issueId: after.id,
++    fromProjectId: before.projectId,
++    toProjectId: after.projectId,
++    fromNumber: before.number,
++    toNumber: after.number,
++  });
++
++  return after;
++}
++
+ /** Status transitions are an `issue:update`, not a separate permission. */
+ export async function changeIssueStatus(
+   actor: Actor,
+@@ -217,9 +273,6 @@
+ /**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+  * `updated_at` — so a move is a status change plus a touch.
+- *
+- * TODO(platform): "move" should eventually take a target project as well;
+- * `issueRepo.relocateIssue` is the primitive for that half.
+  */
+ export async function moveIssue(
+   actor: Actor,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/server/services/search-service.ts	2026-10-10 05:08:20
+@@ -144,6 +144,10 @@
+       const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+       if (issue) await indexIssue(payload.orgId, issue);
+     }),
++    subscribe("issue.moved", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/types/activity.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/types/activity.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/types/activity.ts	2026-10-10 05:07:10
+@@ -16,6 +16,7 @@
+   | "project.restored"
+   | "issue.created"
+   | "issue.updated"
++  | "issue.moved"
+   | "issue.status_changed"
+   | "issue.assigned"
+   | "issue.archived"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/types/event.ts /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/f7bef9e1-4bab-446d-81f2-7b6191591fa6/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/99fb5b9f-7245-4f30-b821-a8db8398e935/src/types/event.ts	2026-10-10 05:07:10
+@@ -48,6 +48,13 @@
+     projectId: ProjectId;
+     changedFields: readonly string[];
+   };
++  "issue.moved": EventEnvelope & {
++    issueId: IssueId;
++    fromProjectId: ProjectId;
++    toProjectId: ProjectId;
++    fromNumber: number;
++    toNumber: number;
++  };
+   "issue.status_changed": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;

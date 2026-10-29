@@ -1,0 +1,379 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/components/domain/activity/activity-labels.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/components/domain/activity/activity-labels.ts	2026-10-10 08:49:49
+@@ -11,6 +11,7 @@
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
+   "project.created": "created a project",
++  "project.cloned": "cloned a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+   "project.restored": "restored a project",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/schemas/activity.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/schemas/activity.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/schemas/activity.ts	2026-10-10 08:49:49
+@@ -10,6 +10,7 @@
+ export const activityActionSchema = z.enum([
+   "organization.updated",
+   "project.created",
++  "project.cloned",
+   "project.updated",
+   "project.archived",
+   "project.restored",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/schemas/project.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/schemas/project.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/schemas/project.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/schemas/project.ts	2026-10-10 08:49:49
+@@ -25,6 +25,15 @@
+   targetDate: isoTimestampSchema.nullable().default(null),
+ });
+ 
++export const cloneProjectSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  name: z.string().min(2).max(80),
++  slug: slugSchema,
++  key: projectKeySchema,
++  includeIssues: z.boolean().default(true),
++});
++
+ export const updateProjectSchema = z.object({
+   orgId: orgIdSchema,
+   projectId: projectIdSchema,
+@@ -53,6 +62,7 @@
+   .extend(archiveScopeSchema.shape);
+ 
+ export type CreateProjectInput = z.infer<typeof createProjectSchema>;
++export type CloneProjectInput = z.infer<typeof cloneProjectSchema>;
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/repositories/project-repository.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/repositories/project-repository.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/repositories/project-repository.ts	2026-10-10 08:49:06
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/repositories/project-repository.ts	2026-10-10 08:50:35
+@@ -11,7 +11,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { getDb, issues, projects } from "@/server/db";
++import { getDb, issueLabels, issues, projects } from "@/server/db";
+ import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -22,8 +22,16 @@
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+-import type { ArchiveScope, OrgId, Page, ProjectId } from "@/types/common";
++import type {
++  ArchiveScope,
++  OrgId,
++  Page,
++  ProjectId,
++  UserId,
++} from "@/types/common";
+ import type { Project, ProjectStats } from "@/types/project";
++import type { CloneProjectInput } from "@/schemas/project";
++import type { Issue, IssueStatus } from "@/types/issue";
+ 
+ export async function findProjectById(
+   orgId: OrgId,
+@@ -139,6 +147,83 @@
+     .get();
+ 
+   return toProject(row);
++}
++
++/** Atomically creates a fresh project and its reset issue copies. */
++export async function cloneProjectWithIssues(
++  input: CloneProjectInput,
++  source: Project,
++  sourceIssues: readonly Issue[],
++  authorId: UserId,
++  defaultStatus: IssueStatus,
++): Promise<Project> {
++  const db = getDb();
++  const taken = await listTakenProjectSlugs(input.orgId);
++  const slug = uniqueSlug(input.slug, taken);
++
++  return db.transaction((tx) => {
++    const stamp = toIsoTimestamp(new Date());
++    const projectRow = tx
++      .insert(projects)
++      .values({
++        id: newId(),
++        orgId: input.orgId,
++        name: input.name,
++        slug,
++        key: input.key,
++        description: source.description,
++        visibility: source.visibility,
++        status: "active",
++        leadId: source.leadId,
++        color: source.color,
++        startsAt: null,
++        targetDate: null,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
++
++    const orderedIssues = [...sourceIssues].sort((a, b) => a.number - b.number);
++    for (const [index, issue] of orderedIssues.entries()) {
++      const issueId = newId();
++      tx.insert(issues)
++        .values({
++          id: issueId,
++          orgId: input.orgId,
++          projectId: projectRow.id,
++          number: index + 1,
++          title: issue.title,
++          description: issue.description,
++          status: defaultStatus,
++          priority: issue.priority,
++          authorId,
++          assigneeId: null,
++          parentId: null,
++          estimate: issue.estimate,
++          dueAt: issue.dueAt,
++          startedAt: null,
++          completedAt: null,
++          createdAt: stamp,
++          updatedAt: stamp,
++        })
++        .run();
++
++      if (issue.labelIds.length > 0) {
++        tx.insert(issueLabels)
++          .values(
++            issue.labelIds.map((labelId) => ({
++              orgId: input.orgId,
++              issueId,
++              labelId,
++            })),
++          )
++          .run();
++      }
++    }
++
++    return toProject(projectRow);
++  });
+ }
+ 
+ export async function updateProject(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/activity-service.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/activity-service.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/activity-service.ts	2026-10-10 08:50:12
+@@ -157,6 +157,19 @@
+         summary: `Created project ${payload.name}`,
+       }).then(() => undefined),
+     ),
++    subscribe("project.cloned", (payload) =>
++      record(payload.orgId, "project.cloned", {
++        actorId: payload.actorId,
++        subjectKind: "project",
++        subjectId: payload.projectId,
++        projectId: payload.projectId,
++        summary: `Cloned project with ${payload.issuesCopied} issues`,
++        metadata: {
++          sourceProjectId: payload.sourceProjectId,
++          issuesCopied: payload.issuesCopied,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/project-service.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/project-service.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/project-service.ts	2026-10-10 08:49:06
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/project-service.ts	2026-10-10 08:50:35
+@@ -20,11 +20,13 @@
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
++  CloneProjectInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
++import type { Issue, IssueStatus } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ import type { Project, ProjectWithStats } from "@/types/project";
+ 
+@@ -32,9 +34,6 @@
+  * Creates a project once the plan still has room for one. The key is derived
+  * from the name when the caller left it blank, so the issue numbering scheme
+  * (`TF-12`) is never invented at the call site.
+- *
+- * The ops console duplicates a project with `projectRepo.duplicateProject`
+- * plus `issueRepo.copyIssuesToProject`; those bypass the gates below.
+  */
+ export async function createProject(
+   actor: Actor,
+@@ -74,6 +73,68 @@
+   return project;
+ }
+ 
++/** Creates a fresh project and, when requested, a reset copy of its live issues. */
++export async function cloneProject(
++  actor: Actor,
++  input: CloneProjectInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const source = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertNotArchived("Project", source.id, source);
++  assertCan(actor, "project:read", projectResource(source));
++  assertCan(actor, "project:create", orgResource(input.orgId));
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const usedProjects = await projectRepo.countProjects(input.orgId);
++  if (wouldExceedLimit(org.plan, "projects", usedProjects)) {
++    throw new Error(
++      `Plan ${org.plan} allows ${usedProjects} projects; upgrade to add another`,
++    );
++  }
++
++  const sourceIssues = input.includeIssues
++    ? await listAllLiveIssues(input.orgId, input.projectId)
++    : [];
++  if (
++    wouldExceedLimit(
++      org.plan,
++      "issuesPerProject",
++      0,
++      sourceIssues.length,
++    )
++  ) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in the cloned project`,
++    );
++  }
++
++  const project = await projectRepo.cloneProjectWithIssues(
++    input,
++    source,
++    sourceIssues,
++    actor.userId,
++    org.settings.defaultIssueStatus as IssueStatus,
++  );
++
++  await emit("project.cloned", {
++    ...actorEnvelope(actor),
++    projectId: project.id,
++    sourceProjectId: source.id,
++    issuesCopied: sourceIssues.length,
++  });
++
++  return project;
++}
++
+ export async function updateProject(
+   actor: Actor,
+   input: UpdateProjectInput,
+@@ -201,4 +262,23 @@
+ ): Promise<string> {
+   const taken = await projectRepo.listTakenProjectSlugs(orgId);
+   return uniqueSlug(name, taken);
++}
++
++async function listAllLiveIssues(
++  orgId: OrgId,
++  projectId: ProjectId,
++) {
++  const issues: Issue[] = [];
++  let cursor: string | null = null;
++  do {
++    const page = await issueRepo.listIssues({
++      orgId,
++      projectId,
++      limit: 100,
++      cursor,
++    });
++    issues.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  return issues;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/search-service.ts	2026-10-10 08:50:12
+@@ -164,6 +164,27 @@
+       );
+       if (project) await indexProject(payload.orgId, project);
+     }),
++    subscribe("project.cloned", async (payload) => {
++      const project = await projectRepo.findProjectById(
++        payload.orgId,
++        payload.projectId,
++      );
++      if (project) await indexProject(payload.orgId, project);
++
++      let cursor: string | null = null;
++      do {
++        const page = await issueRepo.listIssues({
++          orgId: payload.orgId,
++          projectId: payload.projectId,
++          limit: 100,
++          cursor,
++        });
++        await Promise.all(
++          page.items.map((issue) => indexIssue(payload.orgId, issue)),
++        );
++        cursor = page.nextCursor;
++      } while (cursor !== null);
++    }),
+     subscribe("project.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/usage-service.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/usage-service.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/server/services/usage-service.ts	2026-10-10 08:50:12
+@@ -80,6 +80,12 @@
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
++    subscribe("project.cloned", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, {
++        projectsUsed: 1,
++        issuesUsed: payload.issuesCopied,
++      });
++    }),
+     subscribe("project.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, {
+         projectsUsed: -1,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/types/activity.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/types/activity.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/types/activity.ts	2026-10-10 08:49:49
+@@ -11,6 +11,7 @@
+ export type ActivityAction =
+   | "organization.updated"
+   | "project.created"
++  | "project.cloned"
+   | "project.updated"
+   | "project.archived"
+   | "project.restored"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/types/event.ts /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/types/event.ts
+--- /private/tmp/luna-scratch-20261008/649a2d62-feae-4e45-8d30-965c567330a9/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/luna-scratch-20261008/0dfcd33a-26aa-4b99-a67f-fb66ca664af8/src/types/event.ts	2026-10-10 08:49:49
+@@ -31,6 +31,11 @@
+     name: string;
+     slug: string;
+   };
++  "project.cloned": EventEnvelope & {
++    projectId: ProjectId;
++    sourceProjectId: ProjectId;
++    issuesCopied: number;
++  };
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;

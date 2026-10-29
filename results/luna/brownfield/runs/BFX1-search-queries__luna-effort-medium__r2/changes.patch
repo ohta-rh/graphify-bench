@@ -1,0 +1,137 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/03a6f940-04f7-42af-ad48-0b8fb453ba81/src/server/repositories/search-repository.ts /private/tmp/luna-scratch-20261008/79c9b127-0c39-4238-b697-db20d7bf5e8a/src/server/repositories/search-repository.ts
+--- /private/tmp/luna-scratch-20261008/03a6f940-04f7-42af-ad48-0b8fb453ba81/src/server/repositories/search-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/luna-scratch-20261008/79c9b127-0c39-4238-b697-db20d7bf5e8a/src/server/repositories/search-repository.ts	2026-10-10 08:48:45
+@@ -1,7 +1,7 @@
+ /**
+  * Denormalised search index kept in step by `SearchService`.
+  */
+-import { and, count, desc, eq, inArray, like } from "drizzle-orm";
++import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -88,7 +88,7 @@
+ 
+   const filters = compact(
+     orgPredicate(searchIndex.orgId, input.orgId),
+-    like(searchIndex.content, `%${input.q}%`),
++    sql`instr(lower(${searchIndex.content}), lower(${input.q})) > 0`,
+     input.kinds.length === 0
+       ? undefined
+       : inArray(searchIndex.subjectKind, [...input.kinds]),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/luna-scratch-20261008/03a6f940-04f7-42af-ad48-0b8fb453ba81/src/server/services/search-service.ts /private/tmp/luna-scratch-20261008/79c9b127-0c39-4238-b697-db20d7bf5e8a/src/server/services/search-service.ts
+--- /private/tmp/luna-scratch-20261008/03a6f940-04f7-42af-ad48-0b8fb453ba81/src/server/services/search-service.ts	2026-10-10 08:48:18
++++ /private/tmp/luna-scratch-20261008/79c9b127-0c39-4238-b697-db20d7bf5e8a/src/server/services/search-service.ts	2026-10-10 08:48:49
+@@ -22,6 +22,7 @@
+ import type { Issue } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ import type { Project } from "@/types/project";
++import { parseSearchQuery } from "@/components/domain/search/query-syntax";
+ 
+ export type SearchHit = {
+   kind: SearchSubjectKind;
+@@ -39,9 +40,7 @@
+ 
+ /**
+  * Runs a query against the denormalised index. Field-scoped syntax
+- * (`status:done`) is an `advanced_search` feature, so a query containing a
+- * colon is rejected for plans that do not include it rather than silently
+- * being treated as literal text.
++ * Field tokens are interpreted by the same parser used by the dialog.
+  */
+ export async function search(
+   actor: Actor,
+@@ -66,13 +65,16 @@
+     overrides: org?.settings.enabledFlagOverrides,
+   });
+ 
+-  if (input.q.includes(":") && !advanced) {
+-    throw new Error("Field-scoped search is not included in this plan");
+-  }
++  const parsed = parseSearchQuery(input.q, advanced);
++  const text = normaliseQuery(parsed.text);
++  const kinds = advanced
++    ? parsed.kinds.length > 0 && /(?:^|\s)(?:kind|in):/i.test(input.q)
++      ? parsed.kinds
++      : input.kinds
++    : ["issue"] as const;
++  const projectId = advanced ? parsed.projectId ?? input.projectId : input.projectId;
++  const page = await searchRepo.searchDocuments({ ...input, q: text, kinds: [...kinds], ...(projectId ? { projectId } : {}) });
+ 
+-  const text = normaliseQuery(input.q);
+-  const page = await searchRepo.searchDocuments({ ...input, q: text });
+-
+   return {
+     items: page.items.map((row) => ({
+       kind: row.subjectKind,
+@@ -97,6 +99,10 @@
+ }
+ 
+ export async function indexIssue(orgId: OrgId, issue: Issue): Promise<void> {
++  if (issue.archivedAt !== null) {
++    await removeFromIndex(orgId, "issue", issue.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "issue",
+@@ -110,12 +116,21 @@
+   orgId: OrgId,
+   comment: Comment,
+ ): Promise<void> {
++  if (comment.archivedAt !== null) {
++    await removeFromIndex(orgId, "comment", comment.id);
++    return;
++  }
++  const issue = await issueRepo.findIssueById(orgId, comment.issueId);
++  if (!issue || issue.archivedAt !== null) {
++    await removeFromIndex(orgId, "comment", comment.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    issue.projectId,
+   );
+ }
+ 
+@@ -123,6 +138,10 @@
+   orgId: OrgId,
+   project: Project,
+ ): Promise<void> {
++  if (project.archivedAt !== null) {
++    await removeFromIndex(orgId, "project", project.id);
++    return;
++  }
+   await searchRepo.upsertSearchDocument(
+     orgId,
+     "project",
+@@ -179,12 +198,19 @@
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+-      if (payload.subjectKind !== "issue") return;
+-      const issue = await issueRepo.findIssueById(
+-        payload.orgId,
+-        payload.subjectId as Issue["id"],
+-      );
+-      if (issue) await indexIssue(payload.orgId, issue);
++      if (payload.subjectKind === "issue") {
++        const issue = await issueRepo.findIssueById(payload.orgId, payload.subjectId as Issue["id"]);
++        if (issue && issue.archivedAt === null) await indexIssue(payload.orgId, issue);
++        else await removeFromIndex(payload.orgId, "issue", payload.subjectId);
++      } else if (payload.subjectKind === "comment") {
++        const comment = await commentRepo.findCommentById(payload.orgId, payload.subjectId as Comment["id"]);
++        if (comment && comment.archivedAt === null) await indexComment(payload.orgId, comment);
++        else await removeFromIndex(payload.orgId, "comment", payload.subjectId);
++      } else {
++        const project = await projectRepo.findProjectById(payload.orgId, payload.subjectId as Project["id"]);
++        if (project && project.archivedAt === null) await indexProject(payload.orgId, project);
++        else await removeFromIndex(payload.orgId, "project", payload.subjectId);
++      }
+     }),
+   ];
+ 
