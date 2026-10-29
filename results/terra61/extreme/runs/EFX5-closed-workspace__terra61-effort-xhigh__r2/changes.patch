@@ -1,0 +1,508 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/actions/_lib/with-action.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/actions/_lib/with-action.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/actions/_lib/with-action.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/actions/_lib/with-action.ts	2026-10-28 11:15:05
+@@ -10,7 +10,7 @@
+  * Must call (do not reimplement): getActor, toActionResult, revalidateTagged
+  */
+ 
+-import { getActor, requireActorFor } from "@/lib/actor";
++import { getActor, requireActorFor, requireActorForClosure } from "@/lib/actor";
+ import { CACHE_PROFILES, revalidateTagged } from "@/lib/cache";
+ import { toActionResult } from "@/lib/errors";
+ import { getSessionPrincipal } from "@/lib/session";
+@@ -30,6 +30,8 @@
+    * name an organization and the session's active org is used instead.
+    */
+   requireOrg?: boolean;
++  /** Used only by the closure action to report an already closed org. */
++  allowArchivedForClosure?: boolean;
+   /** Static cache tags invalidated once the handler resolves. */
+   revalidate?: readonly string[];
+   /** cacheLife profile handed to `revalidateTag` — required in Next 16. */
+@@ -83,7 +85,10 @@
+     }
+ 
+     try {
+-      const actor = await resolveActorFor(parsed.data, options.requireOrg !== false);
++      const orgId = (parsed.data as OrgBearingInput).orgId;
++      const actor = options.allowArchivedForClosure && typeof orgId === "string"
++        ? await requireActorForClosure(orgId as OrgId)
++        : await resolveActorFor(parsed.data, options.requireOrg !== false);
+       const data = (await handler(parsed.data, actor)) as TData;
+ 
+       const tags = options.revalidate ?? [];
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/actions/organizations/delete-organization.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/actions/organizations/delete-organization.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/actions/organizations/delete-organization.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/actions/organizations/delete-organization.ts	2026-10-28 11:15:05
+@@ -38,7 +38,7 @@
+     revalidatePath("/orgs");
+     return organization;
+   },
+-  { revalidate: ["organization"], cacheProfile: "minutes" },
++  { revalidate: ["organization"], cacheProfile: "minutes", allowArchivedForClosure: true },
+ );
+ 
+ export async function deleteOrganizationAction(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/lib/actor.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/lib/actor.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/lib/actor.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/lib/actor.ts	2026-10-28 11:15:05
+@@ -8,6 +8,7 @@
+  */
+ import { getSessionPrincipal } from "@/lib/session";
+ import { assertOrgScope } from "@/lib/tenant";
++import { findMember } from "@/server/repositories/member-repository";
+ import { findOrgById } from "@/server/repositories/organization-repository";
+ import { resolveActorForOrg } from "@/server/services/session-service";
+ import type { OrgId } from "@/types/common";
+@@ -78,4 +79,16 @@
+ 
+   assertOrgScope(actor, orgId);
+   return actor;
++}
++
++/** Resolve an existing membership solely to report a repeated closure as a conflict. */
++export async function requireActorForClosure(orgId: OrgId): Promise<Actor> {
++  const principal = await getSessionPrincipal();
++  if (principal === null) throw new UnauthorizedError();
++  const org = await findOrgById(orgId);
++  if (!org) throw new NoMembershipError(orgId);
++  if (org.archivedAt === null) return requireActorFor(orgId);
++  const member = await findMember(orgId, principal.userId);
++  if (!member || member.status !== "active") throw new NoMembershipError(org.slug);
++  return { userId: principal.userId, orgId, role: member.role };
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/cleanup-archived-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/cleanup-archived-job.ts	2026-10-28 11:15:05
+@@ -36,7 +36,7 @@
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+-      if (!org) continue;
++      if (!org || org.archivedAt !== null) continue;
+ 
+       const { retentionDays } = getPlanLimits(org.plan);
+       const cutoff = toIsoTimestamp(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/digest-email-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/digest-email-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/digest-email-job.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/digest-email-job.ts	2026-10-28 11:15:40
+@@ -54,6 +54,8 @@
+           if (!recipient) continue;
+ 
+           const rendered = await renderDigest(bundle, recipient);
++          const currentOrg = await orgRepo.findOrgById(orgId);
++          if (!currentOrg || currentOrg.archivedAt !== null) continue;
+           await sendEmail({ to: recipient.email, ...rendered });
+ 
+           // Once digested, these notifications are no longer "unread" — this
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/overdue-issue-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/overdue-issue-job.ts	2026-10-28 11:15:05
+@@ -7,6 +7,7 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+@@ -48,6 +49,8 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+ 
+       for (const issue of overdue) {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/queue.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/queue.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/queue.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/queue.ts	2026-10-28 11:15:40
+@@ -119,6 +119,13 @@
+  * enqueue follow-up work.
+  */
+ async function runHandler(job: QueuedJob): Promise<void> {
++  const orgId = job.payload.orgId;
++  if (typeof orgId === "string") {
++    const { findOrgById } = await import("@/server/repositories/organization-repository");
++    const org = await findOrgById(orgId as import("@/types/common").OrgId);
++    if (!org || org.archivedAt !== null) return;
++  }
++
+   const now = new Date();
+ 
+   switch (job.kind) {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/search-reindex-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/search-reindex-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/search-reindex-job.ts	2026-10-28 11:14:47
+@@ -6,6 +6,7 @@
+ import { createLogger } from "@/lib/logger";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+   indexComment,
+@@ -28,6 +29,9 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
++    const org = await orgRepo.findOrgById(orgId);
++    if (!org || org.archivedAt !== null) return;
++
+     const projects = await projectRepo.listProjects({
+       orgId,
+       limit: PAGE_SIZE,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/trial-expiry-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/trial-expiry-job.ts	2026-10-28 11:15:05
+@@ -6,6 +6,7 @@
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -34,6 +35,8 @@
+ 
+     for (const subscription of expiring) {
+       const orgId = subscription.orgId as OrgId;
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
+       const usage = await usageRepo.getUsage(orgId);
+ 
+       if (
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/usage-rollup-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/usage-rollup-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/usage-rollup-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/usage-rollup-job.ts	2026-10-28 11:15:05
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): recomputeUsage
+  */
+ import { createLogger } from "@/lib/logger";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { recomputeUsage } from "@/server/services/usage-service";
+ import { runJob } from "./types";
+@@ -25,6 +26,8 @@
+     const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
+ 
+     for (const orgId of orgIds) {
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
+       try {
+         const usage = await recomputeUsage(orgId);
+         result.processed += 1;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/webhook-delivery-job.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/webhook-delivery-job.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/jobs/webhook-delivery-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/jobs/webhook-delivery-job.ts	2026-10-28 11:15:40
+@@ -36,6 +36,9 @@
+     for (const delivery of claimed) {
+       const orgId = delivery.orgId as OrgId;
+ 
++      const org = await orgRepo.findOrgById(orgId);
++      if (!org || org.archivedAt !== null) continue;
++
+       if (!(await orgAllowsWebhooks(orgId))) {
+         await webhookRepo.markDeliveryFailed(
+           orgId,
+@@ -70,6 +73,9 @@
+         continue;
+       }
+ 
++      const currentOrg = await orgRepo.findOrgById(orgId);
++      if (!currentOrg || currentOrg.archivedAt !== null) continue;
++
+       const signature = signPayload(endpoint.secret, delivery.payload);
+ 
+       logger.info("webhook delivered", {
+@@ -94,7 +100,7 @@
+ 
+ async function orgAllowsWebhooks(orgId: OrgId): Promise<boolean> {
+   const org = await orgRepo.findOrgById(orgId);
+-  if (!org) return false;
++  if (!org || org.archivedAt !== null) return false;
+ 
+   if (getPlanLimits(org.plan).webhooks <= 0) return false;
+   return isEnabled("webhooks", buildFlagContext(null, org));
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/organization-repository.ts	2026-10-28 11:14:03
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/organization-repository.ts	2026-10-28 11:15:40
+@@ -3,11 +3,11 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+-import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { AlreadyArchivedError, archivePatch } from "@/lib/soft-delete";
++import { getDb, members, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+@@ -28,14 +28,13 @@
+ 
+ /**
+  * Slug lookup for the `[orgSlug]` routes. A closed workspace keeps its slug
+- * and is returned like any other row; the caller sees `archivedAt` and
+- * decides what to render.
++ * and remains reserved even though it cannot be opened.
+  */
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+     .from(organizations)
+-    .where(eq(organizations.slug, slug))
++    .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+   return row ? toOrganization(row) : null;
+ }
+@@ -48,7 +47,7 @@
+     .select({ org: organizations })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
+-    .where(and(eq(members.userId, userId), isNull(members.archivedAt)))
++    .where(and(eq(members.userId, userId), isNull(members.archivedAt), isNull(organizations.archivedAt)))
+     .all();
+ 
+   return rows.map((row) => toOrganization(row.org));
+@@ -56,7 +55,7 @@
+ 
+ /**
+  * Creates the org row. The slug is de-duplicated here rather than in the
+- * service so a race on the unique index still resolves to a usable slug.
++ * service to account for slugs reserved since the service lookup.
+  */
+ export async function insertOrg(
+   input: CreateOrganizationInput,
+@@ -114,25 +113,34 @@
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+-  const row = getDb()
+-    .update(organizations)
+-    .set(archivePatch())
+-    .where(eq(organizations.id, orgId))
+-    .returning()
+-    .get();
++  return getDb().transaction((tx) => {
++    const patch = archivePatch();
++    const row = tx.update(organizations)
++      .set(patch)
++      .where(and(eq(organizations.id, orgId), isNull(organizations.archivedAt)))
++      .returning().get();
+ 
+-  if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++    if (!row) {
++      const existing = tx.select().from(organizations)
++        .where(eq(organizations.id, orgId)).get();
++      if (existing) throw new AlreadyArchivedError("Organization", orgId);
++      throw new Error(`Organization ${orgId} not found`);
++    }
++
++    tx.update(subscriptions).set({
++      status: "canceled", cancelAt: patch.archivedAt, updatedAt: patch.updatedAt,
++    }).where(eq(subscriptions.orgId, orgId)).run();
++    return toOrganization(row);
++  });
+ }
+ 
+-/** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
++/** Includes closed organizations because their addresses remain reserved. */
+ export async function listTakenOrgSlugs(
+-  prefix: string,
++  _prefix: string,
+ ): Promise<readonly string[]> {
+   const rows = getDb()
+     .select({ slug: organizations.slug })
+     .from(organizations)
+-    .where(like(organizations.slug, `${prefix}%`))
+     .all();
+   return rows.map((row) => row.slug);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/subscription-repository.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/subscription-repository.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/subscription-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/subscription-repository.ts	2026-10-28 11:14:47
+@@ -1,9 +1,9 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, isNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, subscriptions } from "@/server/db";
++import { getDb, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { toSubscription } from "./_mappers";
+@@ -115,10 +115,12 @@
+   before: IsoTimestamp,
+ ): Promise<readonly Subscription[]> {
+   const rows = getDb()
+-    .select()
++    .select({ subscription: subscriptions })
+     .from(subscriptions)
++    .innerJoin(organizations, eq(organizations.id, subscriptions.orgId))
+     .where(
+       and(
++        isNull(organizations.archivedAt),
+         eq(subscriptions.status, "trialing"),
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+@@ -127,5 +129,5 @@
+     )
+     .all();
+ 
+-  return rows.map(toSubscription);
++  return rows.map((row) => toSubscription(row.subscription));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/usage-repository.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/usage-repository.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/usage-repository.ts	2026-10-28 11:14:47
+@@ -8,6 +8,7 @@
+   issues,
+   members,
+   organizationUsage,
++  organizations,
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -136,6 +137,8 @@
+   const rows = getDb()
+     .select({ orgId: organizationUsage.orgId })
+     .from(organizationUsage)
++    .innerJoin(organizations, eq(organizations.id, organizationUsage.orgId))
++    .where(isNull(organizations.archivedAt))
+     .orderBy(organizationUsage.measuredAt)
+     .limit(Math.max(1, limit))
+     .all();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/webhook-repository.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/webhook-repository.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/repositories/webhook-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/repositories/webhook-repository.ts	2026-10-28 11:14:47
+@@ -1,9 +1,9 @@
+ /**
+  * Webhook endpoints and their delivery attempts.
+  */
+-import { and, asc, count, eq } from "drizzle-orm";
++import { and, asc, count, eq, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, webhookDeliveries, webhookEndpoints } from "@/server/db";
++import { getDb, organizations, webhookDeliveries, webhookEndpoints } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import type { CreateWebhookInput, UpdateWebhookInput } from "@/schemas/webhook";
+@@ -140,14 +140,15 @@
+ ): Promise<readonly WebhookDeliveryRow[]> {
+   const db = getDb();
+   const pending = db
+-    .select()
++    .select({ delivery: webhookDeliveries })
+     .from(webhookDeliveries)
+-    .where(eq(webhookDeliveries.status, "pending"))
++    .innerJoin(organizations, eq(organizations.id, webhookDeliveries.orgId))
++    .where(and(eq(webhookDeliveries.status, "pending"), isNull(organizations.archivedAt)))
+     .orderBy(asc(webhookDeliveries.createdAt))
+     .limit(Math.max(1, limit))
+     .all();
+ 
+-  return pending.map((row) =>
++  return pending.map(({ delivery: row }) =>
+     db
+       .update(webhookDeliveries)
+       .set({
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/digest-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/digest-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/digest-service.ts	2026-10-28 11:14:47
+@@ -31,7 +31,7 @@
+   windowEnd: IsoTimestamp,
+ ): Promise<DigestBundle | null> {
+   const org = await orgRepo.findOrgById(orgId);
+-  if (!org) return null;
++  if (!org || org.archivedAt !== null) return null;
+ 
+   if (!isEnabled("digest_email", buildFlagContext(null, org))) return null;
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/invitation-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/invitation-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/invitation-service.ts	2026-10-28 11:14:47
+@@ -124,6 +124,11 @@
+     "token",
+   );
+ 
++  const org = await orgRepo.findOrgById(invitation.orgId);
++  if (!org || org.archivedAt !== null) {
++    throw new Error("That invitation is no longer valid");
++  }
++
+   if (invitation.revokedAt !== null) {
+     throw new Error("That invitation has been revoked");
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/notification-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/notification-service.ts	2026-10-28 11:15:40
+@@ -52,6 +52,7 @@
+   if (recipients.length === 0) return [];
+ 
+   const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return [];
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+@@ -85,6 +86,8 @@
+     });
+   }
+ 
++  const currentOrg = await orgRepo.findOrgById(orgId);
++  if (!currentOrg || currentOrg.archivedAt !== null) return [];
+   return notificationRepo.insertNotifications(orgId, rows);
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/organization-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/organization-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/organization-service.ts	2026-10-28 11:14:47
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
++import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -92,6 +93,8 @@
+     "Organization",
+     input.orgId,
+   );
++
++  assertNotArchived("Organization", org.id, org);
+ 
+   if (org.slug !== input.confirmSlug) {
+     throw new Error("The confirmation does not match this organization's slug");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/session-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/session-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/session-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/session-service.ts	2026-10-28 11:14:47
+@@ -57,7 +57,7 @@
+   orgSlug: string,
+ ): Promise<Actor | null> {
+   const org = await orgRepo.findOrgBySlug(orgSlug);
+-  if (!org) return null;
++  if (!org || org.archivedAt !== null) return null;
+ 
+   const member = await memberRepo.findMember(org.id, principal.userId);
+   if (!member || member.status !== "active") return null;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/webhook-service.ts /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/webhook-service.ts
+--- /private/tmp/bench-scratch/24b48667-808d-4a85-b3ad-44edc729a0f5/src/server/services/webhook-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b018a26-be85-4ec0-a18f-60612d0eb107/src/server/services/webhook-service.ts	2026-10-28 11:14:47
+@@ -143,6 +143,9 @@
+   eventType: string,
+   payload: string,
+ ): Promise<void> {
++  const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return;
++
+   const endpoints = await webhookRepo.listEndpoints(orgId);
+ 
+   for (const endpoint of endpoints) {

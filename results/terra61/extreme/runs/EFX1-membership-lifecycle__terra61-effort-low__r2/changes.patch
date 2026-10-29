@@ -1,0 +1,344 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/invitation-repository.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/invitation-repository.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/invitation-repository.ts	2026-10-28 11:21:31
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/invitation-repository.ts	2026-10-28 11:22:26
+@@ -1,7 +1,7 @@
+ /**
+  * Pending invitations, keyed by token hash for the unauthenticated accept flow.
+  */
+-import { and, count, desc, eq, isNull } from "drizzle-orm";
++import { and, count, desc, eq, gt, isNull } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, invitations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -11,11 +11,8 @@
+ import type { InvitationId, IsoTimestamp, OrgId, UserId } from "@/types/common";
+ import type { Invitation } from "@/types/member";
+ 
+-/**
+- * Unit behind `expiresInDays`. Invite links are short-lived credentials, so
+- * the schema's whole-number validity is applied per hour rather than per day.
+- */
+-const EXPIRY_UNIT_MS = 60 * 60 * 1000;
++/** Milliseconds per day for invitation validity. */
++const EXPIRY_UNIT_MS = 24 * 60 * 60 * 1000;
+ 
+ export async function insertInvitation(
+   orgId: OrgId,
+@@ -76,6 +73,7 @@
+         orgPredicate(invitations.orgId, orgId),
+         isNull(invitations.acceptedAt),
+         isNull(invitations.revokedAt),
++        gt(invitations.expiresAt, toIsoTimestamp(new Date())),
+       ),
+     )
+     .orderBy(desc(invitations.createdAt))
+@@ -126,11 +124,7 @@
+   return toInvitation(row);
+ }
+ 
+-/**
+- * Pending invites hold a seat, so the seat quota counts them. An unaccepted
+- * row keeps its seat whether or not it was withdrawn — a revoke-and-reinvite
+- * loop must not be a way of queueing more people than the plan allows.
+- */
++/** Pending invitations hold a seat until accepted, revoked, or expired. */
+ export async function countPendingInvitations(orgId: OrgId): Promise<number> {
+   const row = getDb()
+     .select({ value: count() })
+@@ -139,8 +133,15 @@
+       and(
+         orgPredicate(invitations.orgId, orgId),
+         isNull(invitations.acceptedAt),
++        isNull(invitations.revokedAt),
++        gt(invitations.expiresAt, toIsoTimestamp(new Date())),
+       ),
+     )
+     .get();
+   return row?.value ?? 0;
++}
++
++export async function findInvitationById(orgId: OrgId, invitationId: InvitationId): Promise<Invitation | null> {
++  const row = getDb().select().from(invitations).where(and(eq(invitations.orgId, orgId), eq(invitations.id, invitationId))).get();
++  return row ? toInvitation(row) : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/member-repository.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/member-repository.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/member-repository.ts	2026-10-28 11:21:31
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/member-repository.ts	2026-10-28 11:22:26
+@@ -130,9 +130,7 @@
+       orgId,
+       userId,
+       role,
+-      // A membership created on someone else's behalf starts in the
+-      // `invited` state; the first sign-in through the org promotes it.
+-      status: invitedBy === null ? "active" : "invited",
++      status: "active",
+       invitedBy,
+       joinedAt: stamp,
+       lastSeenAt: null,
+@@ -187,4 +185,14 @@
+     .set({ lastSeenAt: at })
+     .where(and(orgPredicate(members.orgId, orgId), eq(members.userId, userId)))
+     .run();
++}
++
++export async function restoreMember(orgId: OrgId, userId: UserId, role: Role, invitedBy: UserId, at: IsoTimestamp): Promise<Member | null> {
++  const row = getDb().update(members).set({ archivedAt: null, status: "active", role, invitedBy, joinedAt: at, updatedAt: at }).where(and(eq(members.orgId, orgId), eq(members.userId, userId))).returning().get();
++  return row ? toMember(row) : null;
++}
++
++export async function hasMemberEmail(orgId: OrgId, email: string): Promise<boolean> {
++  const rows = getDb().select({ email: users.email }).from(members).innerJoin(users, eq(users.id, members.userId)).where(and(eq(members.orgId, orgId), isNull(members.archivedAt))).all();
++  return rows.some((row) => row.email.toLowerCase() === email.toLowerCase());
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/session-repository.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/session-repository.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/session-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/session-repository.ts	2026-10-28 11:22:18
+@@ -1,7 +1,7 @@
+ /**
+  * Session rows for the cookie-based auth: create, look up by token hash, revoke.
+  */
+-import { eq, lt } from "drizzle-orm";
++import { and, eq, lt } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, sessions, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -99,4 +99,8 @@
+     .returning({ id: sessions.id })
+     .all();
+   return rows.length;
++}
++
++export async function clearActiveOrg(orgId: OrgId, userId?: UserId): Promise<void> {
++  getDb().update(sessions).set({ activeOrgId: null, updatedAt: toIsoTimestamp(new Date()) }).where(and(eq(sessions.activeOrgId, orgId), userId === undefined ? undefined : eq(sessions.userId, userId))).run();
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/usage-repository.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/usage-repository.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/repositories/usage-repository.ts	2026-10-28 11:22:26
+@@ -10,6 +10,8 @@
+   organizationUsage,
+   projects,
+ } from "@/server/db";
++import * as invitationRepo from "./invitation-repository";
++import * as memberRepo from "./member-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toUsage } from "./_mappers";
+ import { brandId } from "./_mappers";
+@@ -29,7 +31,7 @@
+     .where(eq(organizationUsage.orgId, orgId))
+     .get();
+ 
+-  if (row) return toUsage(row);
++  if (row) return { ...toUsage(row), seatsUsed: await memberRepo.countActiveMembers(orgId) + await invitationRepo.countPendingInvitations(orgId) };
+ 
+   const created = getDb()
+     .insert(organizationUsage)
+@@ -37,7 +39,7 @@
+     .returning()
+     .get();
+ 
+-  return toUsage(created);
++  return { ...toUsage(created), seatsUsed: await memberRepo.countActiveMembers(orgId) + await invitationRepo.countPendingInvitations(orgId) };
+ }
+ 
+ /**
+@@ -81,7 +83,7 @@
+ 
+   const next = {
+     orgId,
+-    seatsUsed: seats?.value ?? 0,
++    seatsUsed: (seats?.value ?? 0) + await invitationRepo.countPendingInvitations(orgId),
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+     storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
+@@ -116,7 +118,7 @@
+   const row = getDb()
+     .update(organizationUsage)
+     .set({
+-      seatsUsed: current.seatsUsed + (patch.seatsUsed ?? 0),
++      seatsUsed: current.seatsUsed,
+       projectsUsed: current.projectsUsed + (patch.projectsUsed ?? 0),
+       issuesUsed: current.issuesUsed + (patch.issuesUsed ?? 0),
+       storageMbUsed: current.storageMbUsed + (patch.storageMbUsed ?? 0),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/digest-service.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/digest-service.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/digest-service.ts	2026-10-28 11:22:18
+@@ -5,6 +5,7 @@
+  */
+ import { isEnabled } from "@/lib/feature-flags";
+ import { DIGEST_MAX_ENTRIES } from "@/config/constants";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -31,7 +32,9 @@
+   windowEnd: IsoTimestamp,
+ ): Promise<DigestBundle | null> {
+   const org = await orgRepo.findOrgById(orgId);
+-  if (!org) return null;
++  if (!org || org.archivedAt !== null) return null;
++  const member = await memberRepo.findMember(orgId, recipientId);
++  if (!member || member.status !== "active") return null;
+ 
+   if (!isEnabled("digest_email", buildFlagContext(null, org))) return null;
+ 
+@@ -65,7 +68,9 @@
+ export async function listDigestRecipients(
+   orgId: OrgId,
+ ): Promise<readonly UserId[]> {
+-  return preferenceRepo.listDigestSubscribers(orgId);
++  const subscribers = await preferenceRepo.listDigestSubscribers(orgId);
++  const members = await Promise.all(subscribers.map((userId) => memberRepo.findMember(orgId, userId)));
++  return subscribers.filter((_, index) => members[index]?.status === "active");
+ }
+ 
+ /** Renders one bundle through the shared email pipeline. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/invitation-service.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/invitation-service.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/invitation-service.ts	2026-10-28 11:21:31
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/invitation-service.ts	2026-10-28 11:22:26
+@@ -11,6 +11,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import * as userRepo from "@/server/repositories/user-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { envelope, orgResource, requireFound } from "./_support";
+@@ -67,6 +68,16 @@
+     input.orgId,
+   );
+ 
++  if (org.archivedAt !== null) throw new Error("Organization has been deleted");
++  const addresses = input.invites.map((invite) => invite.email.toLowerCase());
++  if (new Set(addresses).size !== addresses.length) throw new Error("Duplicate invitation address");
++  const pending = await invitationRepo.listPendingInvitations(input.orgId);
++  for (const email of addresses) {
++    if (pending.some((invitation) => invitation.email.toLowerCase() === email) || await memberRepo.hasMemberEmail(input.orgId, email)) {
++      throw new Error("Address is already a member or has a pending invitation");
++    }
++  }
++
+   const seatsUsed =
+     (await memberRepo.countActiveMembers(input.orgId)) +
+     (await invitationRepo.countPendingInvitations(input.orgId));
+@@ -134,16 +145,18 @@
+     throw new Error("That invitation has expired");
+   }
+ 
++  const org = await orgRepo.findOrgById(invitation.orgId);
++  if (!org || org.archivedAt !== null) throw new Error("Organization has been deleted");
++  const user = await userRepo.findUserById(userId);
++  if (!user || user.email.toLowerCase() !== invitation.email.toLowerCase()) {
++    throw new Error("Invitation belongs to a different email address");
++  }
+   const existing = await memberRepo.findMember(invitation.orgId, userId);
+-  if (existing) return existing;
++  if (existing) throw new Error("Already a member");
++  const now = toIsoTimestamp(new Date());
++  const member = await memberRepo.restoreMember(invitation.orgId, userId, invitation.role, invitation.invitedBy, now)
++    ?? await memberRepo.insertMember(invitation.orgId, userId, invitation.role, invitation.invitedBy);
+ 
+-  const member = await memberRepo.insertMember(
+-    invitation.orgId,
+-    userId,
+-    invitation.role,
+-    invitation.invitedBy,
+-  );
+-
+   await invitationRepo.markInvitationAccepted(
+     invitation.orgId,
+     invitation.id,
+@@ -180,20 +193,18 @@
+   assertCan(actor, "member:invite", orgResource(actor.orgId));
+ 
+   const previous = requireFound(
+-    await invitationRepo
+-      .listPendingInvitations(actor.orgId)
+-      .then((rows) => rows.find((row) => row.id === invitationId) ?? null),
++    await invitationRepo.findInvitationById(actor.orgId, invitationId),
+     "Invitation",
+     invitationId,
+   );
+ 
++  if (previous.role === "owner") throw new Error("Cannot invite an owner");
++  if (previous.acceptedAt !== null || previous.revokedAt !== null) throw new Error("Invitation is no longer available");
+   await invitationRepo.revokeInvitation(actor.orgId, invitationId);
+ 
+-  // A re-issued link starts at the lowest invitable role; whoever resends it
+-  // can promote the person once they have joined.
+   return inviteMember(actor, {
+     orgId: actor.orgId,
+     email: previous.email,
+-    role: "member",
++    role: previous.role,
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/member-service.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/member-service.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/member-service.ts	2026-10-28 11:22:18
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as sessionRepo from "@/server/repositories/session-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+@@ -94,6 +95,8 @@
+   await assertLastOwnerRetained(input.orgId, input.memberId, "member");
+ 
+   const removed = await memberRepo.archiveMember(input.orgId, input.memberId);
++
++  await sessionRepo.clearActiveOrg(input.orgId, removed.userId);
+ 
+   await emit("member.removed", {
+     ...actorEnvelope(actor),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/notification-service.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/notification-service.ts	2026-10-28 11:22:18
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -52,6 +53,7 @@
+   if (recipients.length === 0) return [];
+ 
+   const org = await orgRepo.findOrgById(orgId);
++  if (!org || org.archivedAt !== null) return [];
+   const flags: FlagContext = {
+     orgId,
+     userId: payload.actorId,
+@@ -64,6 +66,8 @@
+ 
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
++    const member = await memberRepo.findMember(orgId, recipientId);
++    if (!member || member.status !== "active") continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/organization-service.ts /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/organization-service.ts
+--- /private/tmp/bench-scratch/aa4eee34-e7d1-4289-beff-f49f45109231/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/1ab83c6a-8bbf-4237-a785-c11697870ad9/src/server/services/organization-service.ts	2026-10-28 11:22:18
+@@ -7,6 +7,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertValidSlug, uniqueSlug } from "@/lib/slug";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as sessionRepo from "@/server/repositories/session-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+@@ -97,7 +98,9 @@
+     throw new Error("The confirmation does not match this organization's slug");
+   }
+ 
+-  return orgRepo.archiveOrg(input.orgId);
++  const archived = await orgRepo.archiveOrg(input.orgId);
++  await sessionRepo.clearActiveOrg(input.orgId);
++  return archived;
+ }
+ 
+ /** The header/shell payload: the org plus the counters the sidebar shows. */

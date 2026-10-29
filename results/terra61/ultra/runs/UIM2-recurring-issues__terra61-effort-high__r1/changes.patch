@@ -1,0 +1,381 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/components/domain/billing/usage-panel.tsx /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/components/domain/billing/usage-panel.tsx
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/components/domain/billing/usage-panel.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/components/domain/billing/usage-panel.tsx	2026-10-28 09:16:27
+@@ -20,6 +20,7 @@
+   storageMb: "Storage (MB)",
+   apiRequestsPerHour: "API requests / hour",
+   webhooks: "Webhooks",
++  recurringIssues: "Recurring issues",
+ };
+ 
+ const RESOURCE_ORDER: readonly LimitedResource[] = [
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/config/plan-limits.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/config/plan-limits.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/config/plan-limits.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/config/plan-limits.ts	2026-10-28 09:16:18
+@@ -18,6 +18,7 @@
+   readonly storageMb: number;
+   readonly apiRequestsPerHour: number;
+   readonly webhooks: number;
++  readonly recurringIssues: number;
+   readonly retentionDays: number;
+   readonly includedFlags: readonly FeatureFlagKey[];
+   readonly priceCentsPerSeatMonthly: number;
+@@ -35,6 +36,7 @@
+     storageMb: 100,
+     apiRequestsPerHour: 100,
+     webhooks: 0,
++    recurringIssues: 0,
+     retentionDays: 30,
+     includedFlags: ["command_palette"],
+     priceCentsPerSeatMonthly: 0,
+@@ -47,6 +49,7 @@
+     storageMb: 2_000,
+     apiRequestsPerHour: 1_000,
+     webhooks: 2,
++    recurringIssues: 3,
+     retentionDays: 90,
+     includedFlags: ["command_palette", "kanban_board", "csv_export"],
+     priceCentsPerSeatMonthly: 900,
+@@ -59,6 +62,7 @@
+     storageMb: 20_000,
+     apiRequestsPerHour: 10_000,
+     webhooks: 10,
++    recurringIssues: 25,
+     retentionDays: 365,
+     includedFlags: [
+       "command_palette",
+@@ -79,6 +83,7 @@
+     storageMb: 500_000,
+     apiRequestsPerHour: 100_000,
+     webhooks: UNLIMITED,
++    recurringIssues: UNLIMITED,
+     retentionDays: 2_555,
+     includedFlags: [
+       "command_palette",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/schemas/recurring-issue.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/schemas/recurring-issue.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/schemas/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/schemas/recurring-issue.ts	2026-10-28 09:16:03
+@@ -0,0 +1,22 @@
++import { z } from "zod";
++import { orgIdSchema, projectIdSchema, userIdSchema } from "./common";
++import { issuePrioritySchema } from "./issue";
++
++export const createRecurringIssueSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  title: z.string().min(3).max(180),
++  priority: issuePrioritySchema.default("none"),
++  assigneeId: userIdSchema.nullable().default(null),
++  cadence: z.enum(["daily", "weekly"]),
++  weekday: z.number().int().min(1).max(7).nullable().default(null),
++  timezone: z.string().refine((zone) => {
++    try { new Intl.DateTimeFormat("en", { timeZone: zone }); return true; }
++    catch { return false; }
++  }, "Invalid time zone"),
++  startsOn: z.iso.date(),
++}).refine((value) => value.cadence === "weekly" ? value.weekday !== null : value.weekday === null, {
++  path: ["weekday"], message: "Weekday must be set only for weekly recurrence",
++});
++
++export type CreateRecurringIssueInput = z.input<typeof createRecurringIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/migrate.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/migrate.ts	2026-10-28 09:16:18
+@@ -16,6 +16,16 @@
+  * offline from a clean clone — so this is the fallback "push" path, equivalent
+  * to `drizzle-kit push` and kept in step with `src/server/db/schema/**`.
+  */
++const RECURRING_STATEMENTS: readonly string[] = [
++  `CREATE TABLE IF NOT EXISTS recurring_issues (
++     id TEXT PRIMARY KEY NOT NULL, org_id TEXT NOT NULL, project_id TEXT NOT NULL,
++     title TEXT NOT NULL, priority TEXT NOT NULL, assignee_id TEXT, cadence TEXT NOT NULL,
++     weekday INTEGER, timezone TEXT NOT NULL, starts_on TEXT NOT NULL, last_occurrence_on TEXT,
++     paused INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS recurring_issues_org_idx ON recurring_issues (org_id)`,
++];
++
+ const SCHEMA_STATEMENTS: readonly string[] = [
+   `CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY NOT NULL,
+@@ -329,7 +339,7 @@
+   sqlite.pragma("journal_mode = WAL");
+ 
+   try {
+-    for (const statement of readMigrationStatements()) {
++    for (const statement of [...readMigrationStatements(), ...RECURRING_STATEMENTS]) {
+       sqlite.exec(statement);
+     }
+   } finally {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/schema/index.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/schema/index.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/schema/index.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/schema/index.ts	2026-10-28 09:16:03
+@@ -14,3 +14,4 @@
+ export * from "./activity";
+ export * from "./billing";
+ export * from "./webhooks";
++export * from "./recurring-issues";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/schema/recurring-issues.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/schema/recurring-issues.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/db/schema/recurring-issues.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/db/schema/recurring-issues.ts	2026-10-28 09:16:03
+@@ -0,0 +1,19 @@
++import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const recurringIssues = sqliteTable("recurring_issues", {
++  id: idColumn(),
++  ...tenantColumns,
++  projectId: text("project_id").notNull(),
++  title: text("title").notNull(),
++  priority: text("priority", { enum: ["none", "low", "medium", "high", "urgent"] }).notNull(),
++  assigneeId: text("assignee_id"),
++  cadence: text("cadence", { enum: ["daily", "weekly"] }).notNull(),
++  weekday: integer("weekday"),
++  timezone: text("timezone").notNull(),
++  startsOn: text("starts_on").notNull(),
++  lastOccurrenceOn: text("last_occurrence_on"),
++  paused: integer("paused", { mode: "boolean" }).notNull().default(false),
++  createdBy: text("created_by").notNull(),
++  ...timestampColumns,
++}, (table) => [index("recurring_issues_org_idx").on(table.orgId)]);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/index.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/index.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/index.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/index.ts	2026-10-28 09:16:18
+@@ -31,3 +31,5 @@
+ export { runTrialExpiryJob } from "./trial-expiry-job";
+ export { runUsageRollupJob } from "./usage-rollup-job";
+ export { backoffMs, runWebhookDeliveryJob } from "./webhook-delivery-job";
++
++export { runRecurringIssueJob } from "./recurring-issue-job";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/queue.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/queue.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/queue.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/queue.ts	2026-10-28 09:16:18
+@@ -20,7 +20,8 @@
+   | "usage-rollup"
+   | "search-reindex"
+   | "cleanup-archived"
+-  | "trial-expiry";
++  | "trial-expiry"
++  | "recurring-issues";
+ 
+ /** Attempts after which a job is dropped rather than retried again. */
+ const MAX_ATTEMPTS = 5;
+@@ -152,6 +153,11 @@
+     case "cleanup-archived": {
+       const { runCleanupArchivedJob } = await import("./cleanup-archived-job");
+       await runCleanupArchivedJob(now);
++      return;
++    }
++    case "recurring-issues": {
++      const { runRecurringIssueJob } = await import("./recurring-issue-job");
++      await runRecurringIssueJob(now);
+       return;
+     }
+     case "trial-expiry": {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/recurring-issue-job.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/recurring-issue-job.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/recurring-issue-job.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/recurring-issue-job.ts	2026-10-28 09:16:18
+@@ -0,0 +1,50 @@
++import { can } from "@/lib/permissions";
++import { createIssueSchema } from "@/schemas/issue";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { projectResource } from "@/server/services/_support";
++import { createIssue } from "@/server/services/issue-service";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import { runJob } from "./types";
++import type { JobResult } from "./types";
++
++function latestOccurrence(rule: RecurringIssue, now: Date): string | null {
++  const parts = new Intl.DateTimeFormat("en-US", { timeZone: rule.timezone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
++  const part = (type: string) => parts.find((p) => p.type === type)!.value;
++  const day = `${part("year").padStart(4, "0")}-${part("month")}-${part("day")}`;
++  if (day < rule.startsOn) return null;
++  if (rule.cadence === "daily") return day;
++  const date = new Date(`${day}T00:00:00.000Z`);
++  const weekday = date.getUTCDay() || 7;
++  date.setUTCDate(date.getUTCDate() - ((weekday - rule.weekday! + 7) % 7));
++  const occurrence = date.toISOString().slice(0, 10);
++  return occurrence >= rule.startsOn ? occurrence : null;
++}
++export async function runRecurringIssueJob(now: Date): Promise<JobResult> {
++  return runJob("recurring-issues", async (result) => {
++    const rules = await recurringRepo.listActiveRecurringIssues();
++    for (const rule of rules) {
++      try {
++        const occurrence = latestOccurrence(rule, now);
++        if (!occurrence || (rule.lastOccurrenceOn !== null && occurrence <= rule.lastOccurrenceOn)) continue;
++        const project = await projectRepo.findProjectById(rule.orgId, rule.projectId);
++        if (!project || project.archivedAt !== null) continue;
++        const creator = await memberRepo.findMember(rule.orgId, rule.createdBy);
++        if (!creator || creator.status !== "active" || !can({ userId: rule.createdBy, orgId: rule.orgId, role: creator.role }, "issue:create", projectResource(project))) {
++          await recurringRepo.updateRecurringIssue(rule.orgId, rule.id, { paused: true });
++          continue;
++        }
++        const assignee = rule.assigneeId === null ? null : await memberRepo.findMember(rule.orgId, rule.assigneeId);
++        await createIssue({ userId: rule.createdBy, orgId: rule.orgId, role: creator.role }, createIssueSchema.parse({
++          orgId: rule.orgId, projectId: rule.projectId, title: `${rule.title} (${occurrence})`,
++          priority: rule.priority, assigneeId: assignee?.status === "active" ? rule.assigneeId : null,
++        }));
++        await recurringRepo.updateRecurringIssue(rule.orgId, rule.id, { lastOccurrenceOn: occurrence });
++        result.processed += 1;
++      } catch {
++        result.failed += 1;
++      }
++    }
++  });
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/scheduler.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/scheduler.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/jobs/scheduler.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/jobs/scheduler.ts	2026-10-28 09:16:18
+@@ -18,6 +18,7 @@
+   "search-reindex": 1_440,
+   "cleanup-archived": 1_440,
+   "trial-expiry": 360,
++  "recurring-issues": 15,
+ };
+ 
+ const logger = createLogger("job-scheduler");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/repositories/recurring-issue-repository.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/repositories/recurring-issue-repository.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/repositories/recurring-issue-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/repositories/recurring-issue-repository.ts	2026-10-28 09:16:03
+@@ -0,0 +1,38 @@
++import { and, asc, count, eq, sql } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, recurringIssues } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import type { OrgId, ProjectId, UserId } from "@/types/common";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import type { createRecurringIssueSchema } from "@/schemas/recurring-issue";
++import type { z } from "zod";
++import { orgPredicate } from "./base-repository";
++
++type Row = typeof recurringIssues.$inferSelect;
++function map(row: Row): RecurringIssue {
++  return { ...row, orgId: row.orgId as OrgId, projectId: row.projectId as ProjectId,
++    assigneeId: row.assigneeId as UserId | null, createdBy: row.createdBy as UserId,
++    createdAt: toIsoTimestamp(row.createdAt), updatedAt: toIsoTimestamp(row.updatedAt) };
++}
++export async function insertRecurringIssue(input: z.output<typeof createRecurringIssueSchema>, createdBy: UserId): Promise<RecurringIssue> {
++  const stamp = toIsoTimestamp(new Date());
++  return map(getDb().insert(recurringIssues).values({ ...input, id: newId(), createdBy, lastOccurrenceOn: null, paused: false, createdAt: stamp, updatedAt: stamp }).returning().get());
++}
++export async function findRecurringIssue(orgId: OrgId, id: string): Promise<RecurringIssue | null> {
++  const row = getDb().select().from(recurringIssues).where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id))).get();
++  return row ? map(row) : null;
++}
++export async function listRecurringIssues(orgId: OrgId): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues).where(orgPredicate(recurringIssues.orgId, orgId)).orderBy(asc(recurringIssues.createdAt), sql`rowid`).all().map(map);
++}
++export async function listActiveRecurringIssues(): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues).where(eq(recurringIssues.paused, false)).all().map(map);
++}
++export async function countRecurringIssues(orgId: OrgId): Promise<number> {
++  return getDb().select({ value: count() }).from(recurringIssues).where(orgPredicate(recurringIssues.orgId, orgId)).get()?.value ?? 0;
++}
++export async function updateRecurringIssue(orgId: OrgId, id: string, patch: { paused?: boolean; lastOccurrenceOn?: string }): Promise<RecurringIssue> {
++  const row = getDb().update(recurringIssues).set({ ...patch, updatedAt: toIsoTimestamp(new Date()) }).where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id))).returning().get();
++  if (!row) throw new Error(`Recurring issue ${id} not found`);
++  return map(row);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/services/billing-service.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/services/billing-service.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/services/billing-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/services/billing-service.ts	2026-10-28 09:16:18
+@@ -1,3 +1,4 @@
++import * as recurringIssueRepo from "@/server/repositories/recurring-issue-repository";
+ /**
+  * Plan changes and quota arithmetic. The single reader of `PLAN_LIMITS` on the server; every other layer asks this service.
+  *
+@@ -236,6 +237,8 @@
+       return usage.issuesUsed;
+     case "storageMb":
+       return usage.storageMbUsed;
++    case "recurringIssues":
++      return recurringIssueRepo.countRecurringIssues(orgId);
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
+     case "apiRequestsPerHour":
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/services/recurring-issue-service.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/services/recurring-issue-service.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/server/services/recurring-issue-service.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/server/services/recurring-issue-service.ts	2026-10-28 09:16:18
+@@ -0,0 +1,41 @@
++import { wouldExceedLimit } from "@/config/plan-limits";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import { createRecurringIssueSchema } from "@/schemas/recurring-issue";
++import type { CreateRecurringIssueInput } from "@/schemas/recurring-issue";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { orgResource, projectResource, requireFound } from "./_support";
++import type { OrgId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { RecurringIssue } from "@/types/recurring-issue";
++
++export async function createRecurringIssue(actor: Actor, input: CreateRecurringIssueInput): Promise<RecurringIssue> {
++  const data = createRecurringIssueSchema.parse(input);
++  assertOrgScope(actor, data.orgId);
++  const project = requireFound(await projectRepo.findProjectById(data.orgId, data.projectId), "Project", data.projectId);
++  assertNotArchived("Project", project.id, project);
++  assertCan(actor, "issue:create", projectResource(project));
++  if (data.assigneeId !== null) {
++    const member = await memberRepo.findMember(data.orgId, data.assigneeId);
++    if (!member || member.status !== "active") throw new Error("Assignee must be an active member");
++  }
++  const org = requireFound(await orgRepo.findOrgById(data.orgId), "Organization", data.orgId);
++  if (wouldExceedLimit(org.plan, "recurringIssues", await recurringRepo.countRecurringIssues(data.orgId))) throw new Error("Recurring issue quota exceeded");
++  return recurringRepo.insertRecurringIssue(data, actor.userId);
++}
++export async function setRecurringIssuePaused(actor: Actor, input: { orgId: OrgId; recurringIssueId: string; paused: boolean }): Promise<RecurringIssue> {
++  assertOrgScope(actor, input.orgId);
++  const rule = requireFound(await recurringRepo.findRecurringIssue(input.orgId, input.recurringIssueId), "Recurring issue", input.recurringIssueId);
++  const project = requireFound(await projectRepo.findProjectById(input.orgId, rule.projectId), "Project", rule.projectId);
++  assertCan(actor, "issue:create", projectResource(project));
++  return recurringRepo.updateRecurringIssue(input.orgId, rule.id, { paused: input.paused });
++}
++export async function listRecurringIssues(actor: Actor, orgId: OrgId): Promise<readonly RecurringIssue[]> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "issue:read", orgResource(orgId));
++  return recurringRepo.listRecurringIssues(orgId);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/types/billing.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/types/billing.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/types/billing.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/types/billing.ts	2026-10-28 09:16:18
+@@ -42,7 +42,8 @@
+   | "issuesPerProject"
+   | "storageMb"
+   | "apiRequestsPerHour"
+-  | "webhooks";
++  | "webhooks"
++  | "recurringIssues";
+ 
+ /** Result of a single quota check, returned by `BillingService.checkLimit`. */
+ export interface LimitCheck {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/types/recurring-issue.ts /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/types/recurring-issue.ts
+--- /private/tmp/bench-scratch/a4bcd713-4a17-4b06-8b0e-30cd6b396f00/src/types/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d6c1b870-000b-4c83-8b0c-304d10303966/src/types/recurring-issue.ts	2026-10-28 09:16:03
+@@ -0,0 +1,21 @@
++import type { IsoTimestamp, OrgId, ProjectId, UserId } from "./common";
++import type { IssuePriority } from "./issue";
++
++export type RecurrenceCadence = "daily" | "weekly";
++export interface RecurringIssue {
++  id: string;
++  orgId: OrgId;
++  projectId: ProjectId;
++  title: string;
++  priority: IssuePriority;
++  assigneeId: UserId | null;
++  cadence: RecurrenceCadence;
++  weekday: number | null;
++  timezone: string;
++  startsOn: string;
++  lastOccurrenceOn: string | null;
++  paused: boolean;
++  createdBy: UserId;
++  createdAt: IsoTimestamp;
++  updatedAt: IsoTimestamp;
++}

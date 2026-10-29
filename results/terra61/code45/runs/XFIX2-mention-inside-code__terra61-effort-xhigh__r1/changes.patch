@@ -1,0 +1,127 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/src/lib/mentions.ts /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/src/lib/mentions.ts
+--- /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/src/lib/mentions.ts	2026-10-27 08:45:18
++++ /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/src/lib/mentions.ts	2026-10-27 08:45:40
+@@ -14,7 +14,25 @@
+ const MENTION_PATTERN = /(^|[\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi;
+ 
+ function withoutCode(body: string): string {
+-  return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ");
++  let fence: { marker: string; length: number } | null = null;
++  const prose = body.split(/\r?\n/).map((line) => {
++    if (fence !== null) {
++      const closing = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
++      if (closing && closing[1]![0] === fence.marker && closing[1]!.length >= fence.length) {
++        fence = null;
++      }
++      return " ";
++    }
++
++    const opening = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
++    if (opening && (opening[1]![0] !== "`" || !opening[2]!.includes("`"))) {
++      fence = { marker: opening[1]![0]!, length: opening[1]!.length };
++      return " ";
++    }
++    return line;
++  }).join("\n");
++
++  return prose.replace(/`[^`]*`/g, " ");
+ }
+ 
+ /** The handle Taskflow addresses a member by, derived from their email. */
+@@ -27,7 +45,7 @@
+   const seen = new Set<string>();
+   const handles: string[] = [];
+ 
+-  for (const match of body.matchAll(MENTION_PATTERN)) {
++  for (const match of withoutCode(body).matchAll(MENTION_PATTERN)) {
+     const handle = (match[2] ?? "").toLowerCase();
+     if (handle === "" || seen.has(handle)) continue;
+     seen.add(handle);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/src/server/services/comment-service.ts /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/src/server/services/comment-service.ts	2026-10-27 08:45:40
+@@ -66,7 +66,6 @@
+   const mentionedUserIds = await resolveMentionedUsers(
+     input.orgId,
+     input.body,
+-    input.mentionedUserIds,
+   );
+ 
+   const comment = await commentRepo.insertComment(
+@@ -167,14 +166,10 @@
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+-/**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The server list wins on disagreement.
+- */
++/** Resolve mentions from the submitted body on the server. */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+-  clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+   const members = await memberRepo.listMembers({
+     orgId,
+@@ -182,10 +177,5 @@
+     cursor: null,
+   });
+ 
+-  const resolved = resolveMentions(body, members.items);
+-  const known = new Set(members.items.map((member) => member.userId));
+-
+-  return [
+-    ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+-  ];
++  return resolveMentions(body, members.items);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/tests/lib/mentions.test.ts /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/tests/lib/mentions.test.ts
+--- /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/tests/lib/mentions.test.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/tests/lib/mentions.test.ts	2026-10-27 08:45:40
+@@ -38,6 +38,14 @@
+     ]);
+   });
+ 
++  it("recognizes fenced blocks with languages, longer fences and unclosed fences", () => {
++    expect(extractMentions("@alice\n````sh\n@bob.smith\n```\n@bob.smith\n````\n@bob.smith")).toEqual([
++      "alice", "bob.smith",
++    ]);
++    expect(extractMentions("~~~shell\n@alice\n~~~\n@bob.smith")).toEqual(["bob.smith"]);
++    expect(extractMentions("@alice\n```sh\n@bob.smith")).toEqual(["alice"]);
++  });
++
+   it("returns an empty list for a body with no mentions", () => {
+     expect(extractMentions("no mentions at all")).toEqual([]);
+   });
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/tests/services/comment-service.test.ts /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/tests/services/comment-service.test.ts
+--- /private/tmp/bench-scratch/1ff660f4-835b-4674-ba6a-a2e1b9247c21/tests/services/comment-service.test.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/20bed3f3-5100-4ea2-9ea2-e460f15437d7/tests/services/comment-service.test.ts	2026-10-27 08:45:47
+@@ -80,6 +80,27 @@
+     }
+   });
+ 
++  it("does not notify client-provided mentions that occur only in fenced code", async () => {
++    const received: unknown[] = [];
++    const off = subscribe("comment.created", (payload) => {
++      received.push(payload);
++    });
++    try {
++      const comment = await commentService.createComment(tenant.actors.member, {
++        orgId: tenant.org.id,
++        issueId: issue.id,
++        body: "```sh\necho @admin\n```\ncc @owner",
++        parentId: null,
++        mentionedUserIds: [tenant.userIds.admin],
++      });
++
++      expect(comment.mentionedUserIds).toEqual([tenant.userIds.owner]);
++      expect(received[0]).toMatchObject({ mentionedUserIds: [tenant.userIds.owner] });
++    } finally {
++      off();
++    }
++  });
++
+   it("allows the author to edit inside the edit window", async () => {
+     vi.useFakeTimers({ toFake: ["Date"] });
+     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));

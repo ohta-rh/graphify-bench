@@ -1,0 +1,415 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/components/domain/notification/notification-preferences-form.tsx /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/components/domain/notification/notification-preferences-form.tsx
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/components/domain/notification/notification-preferences-form.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/components/domain/notification/notification-preferences-form.tsx	2026-10-28 09:17:46
+@@ -43,6 +43,7 @@
+   issue_status_changed: "Issue status changed",
+   issue_due_soon: "Issue due soon",
+   issue_overdue: "Issue overdue",
++  issue_unblocked: "Issue unblocked",
+   comment_created: "New comment",
+   comment_mention: "I was mentioned",
+   member_invited: "Member invited",
+@@ -57,6 +58,10 @@
+ ): ReactElement | null {
+   const { orgId, userId, preferences, flags, onSubmit } = props;
+   const { submit, pending } = useFormAction(onSubmit);
++  const preferencesByKind = new Map(preferences.map((preference) => [preference.kind, preference]));
++  const allPreferences = (Object.keys(KIND_LABELS) as NotificationKind[]).map((kind) =>
++    preferencesByKind.get(kind) ?? { orgId, userId, kind, inApp: true, email: true, digestOnly: false },
++  );
+ 
+   const digestOn =
+     flags.digest_email === true ||
+@@ -90,7 +95,7 @@
+       </TableHead>
+ 
+       <TableBody>
+-        {preferences.map((preference) => (
++        {allPreferences.map((preference) => (
+           <TableRow key={preference.kind}>
+             <TableCell>{KIND_LABELS[preference.kind]}</TableCell>
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/schemas/notification.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/schemas/notification.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/schemas/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/schemas/notification.ts	2026-10-28 09:17:46
+@@ -12,6 +12,7 @@
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
++  "issue_unblocked",
+   "comment_created",
+   "comment_mention",
+   "member_invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/migrate.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/migrate.ts	2026-10-28 09:18:19
+@@ -158,6 +158,15 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS issue_dependencies (
++     org_id TEXT NOT NULL,
++     issue_id TEXT NOT NULL,
++     blocker_id TEXT NOT NULL,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS issue_dependencies_pk ON issue_dependencies (org_id, issue_id, blocker_id)`,
++  `CREATE INDEX IF NOT EXISTS issue_dependencies_blocker_idx ON issue_dependencies (org_id, blocker_id)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+@@ -352,10 +361,20 @@
+ 
+   if (files.length === 0) return SCHEMA_STATEMENTS;
+ 
+-  return files.flatMap((name) =>
++  const generated = files.flatMap((name) =>
+     readFileSync(join(dir, name), "utf8")
+       .split("--> statement-breakpoint")
+       .map((chunk) => chunk.trim())
+       .filter(Boolean),
+   );
++  // Older generated migrations may predate issue dependencies. Keep the
++  // additive table available for those installations too.
++  return [
++    ...generated,
++    ...SCHEMA_STATEMENTS.filter((statement) =>
++      statement.startsWith("CREATE TABLE IF NOT EXISTS issue_dependencies ") ||
++      statement.startsWith("CREATE UNIQUE INDEX IF NOT EXISTS issue_dependencies_pk ") ||
++      statement.startsWith("CREATE INDEX IF NOT EXISTS issue_dependencies_blocker_idx "),
++    ),
++  ];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/schema/issues.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/schema/issues.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/schema/issues.ts	2026-10-28 09:17:46
+@@ -44,6 +44,21 @@
+   ],
+ );
+ 
++export const issueDependencies = sqliteTable(
++  "issue_dependencies",
++  {
++    ...tenantColumns,
++    issueId: text("issue_id").notNull(),
++    blockerId: text("blocker_id").notNull(),
++    createdBy: text("created_by").notNull(),
++    createdAt: text("created_at").notNull(),
++  },
++  (table) => [
++    uniqueIndex("issue_dependencies_pk").on(table.orgId, table.issueId, table.blockerId),
++    index("issue_dependencies_blocker_idx").on(table.orgId, table.blockerId),
++  ],
++);
++
+ export const labels = sqliteTable(
+   "labels",
+   {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/schema/notifications.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/schema/notifications.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/db/schema/notifications.ts	2026-10-28 09:17:46
+@@ -6,6 +6,7 @@
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
++  "issue_unblocked",
+   "comment_created",
+   "comment_mention",
+   "member_invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/repositories/issue-dependency-repository.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/repositories/issue-dependency-repository.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/repositories/issue-dependency-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/repositories/issue-dependency-repository.ts	2026-10-28 09:17:58
+@@ -0,0 +1,69 @@
++import { and, eq } from "drizzle-orm";
++import { getDb, issueDependencies } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
++import * as issueRepo from "./issue-repository";
++import type { IsoTimestamp, IssueId, OrgId, UserId } from "@/types/common";
++import type { Issue, IssueDependency } from "@/types/issue";
++
++function mapDependency(row: typeof issueDependencies.$inferSelect): IssueDependency {
++  return {
++    orgId: row.orgId as OrgId,
++    issueId: row.issueId as IssueId,
++    blockerId: row.blockerId as IssueId,
++    createdBy: row.createdBy as UserId,
++    createdAt: row.createdAt as IsoTimestamp,
++  };
++}
++
++/** Check the graph and insert together so concurrent additions cannot form a cycle. */
++export async function insertDependency(
++  orgId: OrgId, issueId: IssueId, blockerId: IssueId, createdBy: UserId,
++): Promise<IssueDependency> {
++  const db = getDb();
++  return db.transaction((tx) => {
++    const rows = tx.select().from(issueDependencies)
++      .where(eq(issueDependencies.orgId, orgId)).all();
++    const existing = rows.find((row) => row.issueId === issueId && row.blockerId === blockerId);
++    if (existing) return mapDependency(existing);
++    const pending: string[] = [blockerId];
++    const seen = new Set<string>();
++    while (pending.length) {
++      const current = pending.pop()!;
++      if (current === issueId) throw new Error("Issue dependency would create a cycle");
++      if (seen.has(current)) continue;
++      seen.add(current);
++      for (const row of rows) if (row.issueId === current) pending.push(row.blockerId);
++    }
++    return mapDependency(tx.insert(issueDependencies).values({
++      orgId, issueId, blockerId, createdBy, createdAt: toIsoTimestamp(new Date()),
++    }).returning().get());
++  });
++}
++
++export async function deleteDependency(orgId: OrgId, issueId: IssueId, blockerId: IssueId): Promise<boolean> {
++  return getDb().delete(issueDependencies).where(and(
++    eq(issueDependencies.orgId, orgId), eq(issueDependencies.issueId, issueId),
++    eq(issueDependencies.blockerId, blockerId),
++  )).run().changes > 0;
++}
++
++export async function listBlockerIssues(orgId: OrgId, issueId: IssueId): Promise<readonly Issue[]> {
++  const links = getDb().select().from(issueDependencies).where(and(
++    eq(issueDependencies.orgId, orgId), eq(issueDependencies.issueId, issueId),
++  )).all();
++  const blockers = await Promise.all(links.map((link) => issueRepo.findIssueById(orgId, link.blockerId as IssueId)));
++  return blockers.filter((issue): issue is Issue => issue !== null && issue.archivedAt === null)
++    .sort((a, b) => a.number - b.number || a.id.localeCompare(b.id));
++}
++
++export async function listOpenBlockers(orgId: OrgId, issueId: IssueId): Promise<readonly Issue[]> {
++  return (await listBlockerIssues(orgId, issueId)).filter((issue) => !CLOSED_ISSUE_STATUSES.includes(issue.status));
++}
++
++export async function listBlockedIssueIds(orgId: OrgId, blockerIds: readonly IssueId[]): Promise<readonly IssueId[]> {
++  if (blockerIds.length === 0) return [];
++  const links = getDb().select().from(issueDependencies).where(eq(issueDependencies.orgId, orgId)).all();
++  const ids = new Set<string>(blockerIds);
++  return [...new Set(links.filter((link) => ids.has(link.blockerId)).map((link) => link.issueId as IssueId))];
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/repositories/issue-repository.ts	2026-10-28 09:18:09
+@@ -480,6 +480,14 @@
+   return toIssue(row);
+ }
+ 
++/** Open issues that a project archive is about to close. */
++export async function listOpenIssueIdsForProject(orgId: OrgId, projectId: ProjectId): Promise<readonly IssueId[]> {
++  return getDb().select({ id: issues.id }).from(issues).where(and(
++    eq(issues.orgId, orgId), eq(issues.projectId, projectId), isNull(issues.archivedAt),
++    inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
++  )).all().map((row) => row.id as IssueId);
++}
++
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+ export async function archiveIssuesForProject(
+   orgId: OrgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/event-registry.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/event-registry.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/event-registry.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/event-registry.ts	2026-10-28 09:18:09
+@@ -10,6 +10,7 @@
+ import { registerActivityListeners } from "./activity-service";
+ import { registerSearchListeners } from "./search-service";
+ import { registerUsageListeners } from "./usage-service";
++import { registerDependencyListeners } from "./issue-dependency-listeners";
+ import { registerWebhookListeners } from "./webhook-service";
+ import type { Unsubscribe } from "@/types/event";
+ 
+@@ -35,6 +36,7 @@
+ 
+   const offs: Unsubscribe[] = [
+     registerActivityListeners(),
++    registerDependencyListeners(),
+     registerSearchListeners(),
+     registerUsageListeners(),
+     registerWebhookListeners(),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-dependency-listeners.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-dependency-listeners.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-dependency-listeners.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-dependency-listeners.ts	2026-10-28 09:18:09
+@@ -0,0 +1,42 @@
++import { subscribe } from "@/lib/event-bus";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
++import { notify } from "./notification-service";
++import type { IssueId, OrgId, UserId } from "@/types/common";
++import type { Unsubscribe } from "@/types/event";
++
++async function notifyUnblocked(orgId: OrgId, blockerIds: readonly IssueId[], actorId: UserId | null): Promise<void> {
++  const issueIds = await dependencyRepo.listBlockedIssueIds(orgId, blockerIds);
++  for (const issueId of issueIds) {
++    const issue = await issueRepo.findIssueById(orgId, issueId);
++    if (!issue || issue.archivedAt !== null || CLOSED_ISSUE_STATUSES.includes(issue.status) || issue.assigneeId === null) continue;
++    if ((await dependencyRepo.listOpenBlockers(orgId, issueId)).length > 0) continue;
++    await notify(orgId, "issue_unblocked", [issue.assigneeId], {
++      title: "Issue unblocked",
++      body: `Issue ${issue.title} is no longer blocked`,
++      href: `/issues/${issue.id}`,
++      actorId,
++    });
++  }
++}
++
++export function registerDependencyListeners(): Unsubscribe {
++  const offs = [
++    subscribe("issue.status_changed", async (event) => {
++      if (!CLOSED_ISSUE_STATUSES.includes(event.from) && CLOSED_ISSUE_STATUSES.includes(event.to)) {
++        await notifyUnblocked(event.orgId, [event.issueId], event.actorId);
++      }
++    }),
++    subscribe("issue.archived", async (event) => {
++      const issue = await issueRepo.findIssueById(event.orgId, event.issueId);
++      if (issue && !CLOSED_ISSUE_STATUSES.includes(issue.status)) {
++        await notifyUnblocked(event.orgId, [event.issueId], event.actorId);
++      }
++    }),
++    subscribe("project.archived", async (event) => {
++      await notifyUnblocked(event.orgId, event.closedIssueIds ?? [], event.actorId);
++    }),
++  ];
++  return () => { for (const off of offs) off(); };
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-dependency-service.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-dependency-service.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-dependency-service.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-dependency-service.ts	2026-10-28 09:17:58
+@@ -0,0 +1,43 @@
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import { issueResource, requireFound } from "./_support";
++import type { IssueId, OrgId } from "@/types/common";
++import type { Issue, IssueDependency } from "@/types/issue";
++import type { Actor } from "@/types/member";
++
++export class IssueBlockedError extends Error {
++  readonly code = "conflict" as const;
++  constructor(readonly blockerIds: readonly IssueId[]) {
++    super("Issue has open blockers");
++    this.name = "IssueBlockedError";
++  }
++}
++
++type DependencyInput = { orgId: OrgId; issueId: IssueId; blockerId: IssueId };
++
++export async function addBlocker(actor: Actor, input: DependencyInput): Promise<IssueDependency> {
++  assertOrgScope(actor, input.orgId);
++  const issue = requireFound(await issueRepo.findIssueById(input.orgId, input.issueId), "Issue", input.issueId);
++  assertCan(actor, "issue:update", issueResource(issue));
++  const blocker = requireFound(await issueRepo.findIssueById(input.orgId, input.blockerId), "Issue", input.blockerId);
++  assertNotArchived("Issue", issue.id, issue);
++  assertNotArchived("Issue", blocker.id, blocker);
++  return dependencyRepo.insertDependency(input.orgId, input.issueId, input.blockerId, actor.userId);
++}
++
++export async function removeBlocker(actor: Actor, input: DependencyInput): Promise<boolean> {
++  assertOrgScope(actor, input.orgId);
++  const issue = requireFound(await issueRepo.findIssueById(input.orgId, input.issueId), "Issue", input.issueId);
++  assertCan(actor, "issue:update", issueResource(issue));
++  return dependencyRepo.deleteDependency(input.orgId, input.issueId, input.blockerId);
++}
++
++export async function listBlockers(actor: Actor, orgId: OrgId, issueId: IssueId): Promise<readonly Issue[]> {
++  assertOrgScope(actor, orgId);
++  const issue = requireFound(await issueRepo.findIssueById(orgId, issueId), "Issue", issueId);
++  assertCan(actor, "issue:read", issueResource(issue));
++  return dependencyRepo.listBlockerIssues(orgId, issueId);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-service.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/issue-service.ts	2026-10-28 09:18:09
+@@ -9,6 +9,8 @@
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as dependencyRepo from "@/server/repositories/issue-dependency-repository";
++import { IssueBlockedError } from "./issue-dependency-service";
+ import * as labelRepo from "@/server/repositories/label-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+@@ -124,6 +126,11 @@
+   assertNotArchived("Issue", before.id, before);
+ 
+   if (before.status === input.status) return before;
++
++  if (input.status === "done") {
++    const blockers = await dependencyRepo.listOpenBlockers(input.orgId, input.issueId);
++    if (blockers.length > 0) throw new IssueBlockedError(blockers.map((blocker) => blocker.id));
++  }
+ 
+   const after = await issueRepo.setIssueStatus(
+     input.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/project-service.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/server/services/project-service.ts	2026-10-28 09:18:09
+@@ -106,6 +106,9 @@
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  const closedIssueIds = input.archiveIssues
++    ? await issueRepo.listOpenIssueIdsForProject(input.orgId, input.projectId)
++    : [];
+   const issuesArchived = input.archiveIssues
+     ? await issueRepo.archiveIssuesForProject(input.orgId, input.projectId)
+     : 0;
+@@ -119,6 +122,7 @@
+     ...actorEnvelope(actor),
+     projectId: archived.id,
+     issuesArchived,
++    closedIssueIds,
+   });
+ 
+   return archived;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/event.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/event.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/event.ts	2026-10-28 09:18:09
+@@ -34,6 +34,7 @@
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
++    closedIssueIds?: readonly IssueId[];
+   };
+   "project.restored": EventEnvelope & { projectId: ProjectId };
+   "issue.created": EventEnvelope & {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/issue.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/issue.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/issue.ts	2026-10-28 09:17:46
+@@ -2,6 +2,7 @@
+   AttachmentId,
+   IsoTimestamp,
+   IssueId,
++  OrgId,
+   LabelId,
+   ProjectId,
+   SoftDeletable,
+@@ -56,6 +57,14 @@
+   readonly startedAt: IsoTimestamp | null;
+   readonly completedAt: IsoTimestamp | null;
+   readonly labelIds: readonly LabelId[];
++}
++
++export interface IssueDependency {
++  orgId: OrgId;
++  issueId: IssueId;
++  blockerId: IssueId;
++  createdBy: UserId;
++  createdAt: IsoTimestamp;
+ }
+ 
+ export interface IssueLabel extends TenantScoped {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/notification.ts /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/notification.ts
+--- /private/tmp/bench-scratch/fd0680c6-e4e0-42df-9b07-1193d2be2323/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e68939f3-f243-4cdf-be79-e734c3cd21db/src/types/notification.ts	2026-10-28 09:17:46
+@@ -11,6 +11,7 @@
+   | "issue_status_changed"
+   | "issue_due_soon"
+   | "issue_overdue"
++  | "issue_unblocked"
+   | "comment_created"
+   | "comment_mention"
+   | "member_invited"

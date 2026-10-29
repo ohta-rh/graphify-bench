@@ -1,0 +1,204 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/repositories/issue-repository.ts	2026-10-28 11:15:23
+@@ -22,7 +22,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issues, labels } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -129,9 +129,11 @@
+           getDb()
+             .select({ id: issueLabels.issueId })
+             .from(issueLabels)
++            .innerJoin(labels, eq(labels.id, issueLabels.labelId))
+             .where(
+               and(
+                 orgPredicate(issueLabels.orgId, input.orgId),
++                orgPredicate(labels.orgId, input.orgId),
+                 inArray(issueLabels.labelId, [...input.labelIds]),
+               ),
+             ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/repositories/label-repository.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/repositories/label-repository.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/repositories/label-repository.ts	2026-10-28 11:15:02
+@@ -123,6 +123,7 @@
+     .where(
+       and(
+         orgPredicate(issueLabels.orgId, orgId),
++        orgPredicate(labels.orgId, orgId),
+         inArray(issueLabels.issueId, [...issueIds]),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/_support.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/_support.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/_support.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/_support.ts	2026-10-28 11:15:02
+@@ -6,9 +6,11 @@
+  * Neither re-implements a cross-cutting concern — they are adapters onto
+  * `@/lib/permissions` and `@/lib/event-bus`.
+  */
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as labelRepo from "@/server/repositories/label-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import type { Comment } from "@/types/comment";
+-import type { OrgId, UserId } from "@/types/common";
++import type { LabelId, OrgId, UserId } from "@/types/common";
+ import type { EventEnvelope } from "@/types/event";
+ import type { Issue } from "@/types/issue";
+ import type { Actor, Member } from "@/types/member";
+@@ -127,4 +129,18 @@
+       JSON.stringify(before[key as keyof T]) !==
+       JSON.stringify(after[key as keyof T]),
+   );
++}
++
++/** Validate references before any mutation or event is produced. */
++export async function requireActiveMember(orgId: OrgId, userId: UserId | null | undefined): Promise<void> {
++  if (userId == null) return;
++  const member = await memberRepo.findMember(orgId, userId);
++  if (!member || member.status !== "active") throw new NotFoundError("Member", userId);
++}
++
++export async function requireLabels(orgId: OrgId, ids: readonly LabelId[] | undefined): Promise<void> {
++  if (!ids || ids.length === 0) return;
++  const labels = await labelRepo.listLabels(orgId);
++  const available = new Set(labels.map((label) => label.id));
++  for (const id of ids) if (!available.has(id)) throw new NotFoundError("Label", id);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/comment-service.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/comment-service.ts	2026-10-28 11:14:31
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/comment-service.ts	2026-10-28 11:15:23
+@@ -17,6 +17,7 @@
+   commentResource,
+   issueResource,
+   requireFound,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   CreateCommentInput,
+@@ -56,6 +57,13 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
++  if (input.parentId !== null) {
++    const parent = requireFound(await commentRepo.findCommentById(input.orgId, input.parentId), "Comment", input.parentId);
++    if (parent.archivedAt !== null || parent.issueId !== input.issueId || parent.parentId !== null) {
++      throw new NotFoundError("Comment", input.parentId);
++    }
++  }
++
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+     throw new Error(
+@@ -167,24 +175,21 @@
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+-/**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The composer resolves its ids from the
+- * same member list the server reads here, so they are taken as they come;
+- * the body scan only adds handles the composer did not catch.
+- */
++/** Resolve handles and composer-supplied ids against current members. */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+   clientProvided: readonly UserId[],
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const members: import("@/types/member").MemberWithUser[] = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({ orgId, limit: MENTION_LOOKUP_LIMIT, cursor, status: "active" });
++    members.push(...page.items.filter((member) => member.status === "active" && member.archivedAt === null));
++    cursor = page.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
+-
+-  return [...new Set([...resolved, ...clientProvided])];
++  const resolved = resolveMentions(body, members);
++  const activeIds = new Set(members.map((member) => member.userId));
++  return [...new Set([...resolved, ...clientProvided.filter((id) => activeIds.has(id))])];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/issue-service.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/issue-service.ts	2026-10-28 11:15:02
+@@ -20,6 +20,9 @@
+   orgResource,
+   projectResource,
+   requireFound,
++  requireActiveMember,
++  requireLabels,
++  NotFoundError,
+ } from "./_support";
+ import type {
+   AssignIssueInput,
+@@ -53,6 +56,15 @@
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
++  await requireActiveMember(input.orgId, input.assigneeId);
++  await requireLabels(input.orgId, input.labelIds);
++  if (input.parentId !== null) {
++    const parent = requireFound(await issueRepo.findIssueById(input.orgId, input.parentId), "Issue", input.parentId);
++    if (parent.archivedAt !== null || parent.projectId !== input.projectId) {
++      throw new NotFoundError("Issue", input.parentId);
++    }
++  }
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -94,6 +106,7 @@
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await requireLabels(input.orgId, input.labelIds);
+   const after = await issueRepo.updateIssue(input);
+ 
+   await emit("issue.updated", {
+@@ -161,6 +174,7 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  await requireActiveMember(input.orgId, input.assigneeId);
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/project-service.ts /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/aea18d26-d3d0-4322-b42f-5069268293bd/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/55a527c4-ae5a-4212-9456-58ce9c9991e8/src/server/services/project-service.ts	2026-10-28 11:15:02
+@@ -17,6 +17,7 @@
+   orgResource,
+   projectResource,
+   requireFound,
++  requireActiveMember,
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
+@@ -40,6 +41,8 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
+ 
++  await requireActiveMember(input.orgId, input.leadId);
++
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+     "Organization",
+@@ -85,6 +88,7 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  await requireActiveMember(input.orgId, input.leadId);
+   return projectRepo.updateProject(input);
+ }
+ 

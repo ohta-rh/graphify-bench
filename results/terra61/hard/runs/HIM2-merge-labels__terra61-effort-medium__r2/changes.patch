@@ -1,0 +1,105 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/schemas/label.ts /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/schemas/label.ts
+--- /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/schemas/label.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/schemas/label.ts	2026-10-27 13:44:35
+@@ -21,5 +21,15 @@
+   labelId: labelIdSchema,
+ });
+ 
++export const mergeLabelsSchema = z.object({
++  orgId: orgIdSchema,
++  sourceLabelId: labelIdSchema,
++  targetLabelId: labelIdSchema,
++}).refine((input) => input.sourceLabelId !== input.targetLabelId, {
++  message: "Source and target labels must be different",
++  path: ["targetLabelId"],
++});
++
+ export type CreateLabelInput = z.infer<typeof createLabelSchema>;
+ export type UpdateLabelInput = z.infer<typeof updateLabelSchema>;
++export type MergeLabelsInput = z.infer<typeof mergeLabelsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/server/repositories/label-repository.ts /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/server/repositories/label-repository.ts
+--- /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/server/repositories/label-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/server/repositories/label-repository.ts	2026-10-27 13:44:35
+@@ -7,7 +7,7 @@
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { toLabel } from "./_mappers";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import type { CreateLabelInput, MergeLabelsInput, UpdateLabelInput } from "@/schemas/label";
+ import type { IssueId, LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ 
+@@ -84,6 +84,39 @@
+   db.delete(labels)
+     .where(and(orgPredicate(labels.orgId, orgId), eq(labels.id, labelId)))
+     .run();
++}
++
++export async function mergeLabels(
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number } | { missingId: LabelId }> {
++  const db = getDb();
++  return db.transaction((tx) => {
++    const findLabel = (id: LabelId) => tx.select().from(labels)
++      .where(and(orgPredicate(labels.orgId, input.orgId), eq(labels.id, id)))
++      .get();
++    const source = findLabel(input.sourceLabelId);
++    if (!source) return { missingId: input.sourceLabelId };
++    const target = findLabel(input.targetLabelId);
++    if (!target) return { missingId: input.targetLabelId };
++
++    const assignments = tx.select({ issueId: issueLabels.issueId }).from(issueLabels)
++      .where(and(orgPredicate(issueLabels.orgId, input.orgId), eq(issueLabels.labelId, input.sourceLabelId)))
++      .all();
++    for (const assignment of assignments) {
++      tx.insert(issueLabels).values({
++        orgId: input.orgId,
++        issueId: assignment.issueId,
++        labelId: input.targetLabelId,
++      }).onConflictDoNothing().run();
++    }
++    tx.delete(issueLabels)
++      .where(and(orgPredicate(issueLabels.orgId, input.orgId), eq(issueLabels.labelId, input.sourceLabelId)))
++      .run();
++    tx.delete(labels)
++      .where(and(orgPredicate(labels.orgId, input.orgId), eq(labels.id, input.sourceLabelId)))
++      .run();
++    return { label: toLabel(target), issuesRelabelled: assignments.length };
++  });
+ }
+ 
+ /** Replaces the whole label set of one issue in a single round trip. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/server/services/label-service.ts /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/server/services/label-service.ts
+--- /private/tmp/bench-scratch/575a5374-dcc1-4112-b926-0c302548f43f/src/server/services/label-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/a5d1bc48-9c73-4793-bf48-eb52f50c4a5b/src/server/services/label-service.ts	2026-10-27 13:44:35
+@@ -6,8 +6,8 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as labelRepo from "@/server/repositories/label-repository";
+-import { orgResource } from "./_support";
+-import type { CreateLabelInput, UpdateLabelInput } from "@/schemas/label";
++import { NotFoundError, orgResource } from "./_support";
++import type { CreateLabelInput, MergeLabelsInput, UpdateLabelInput } from "@/schemas/label";
+ import type { LabelId, OrgId } from "@/types/common";
+ import type { IssueLabel } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+@@ -58,4 +58,19 @@
+   assertOrgScope(actor, orgId);
+   assertCan(actor, "project:archive", orgResource(orgId));
+   await labelRepo.deleteLabel(orgId, labelId);
++}
++
++export async function mergeLabels(
++  actor: Actor,
++  input: MergeLabelsInput,
++): Promise<{ label: IssueLabel; issuesRelabelled: number }> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "project:archive", orgResource(input.orgId));
++  if (input.sourceLabelId === input.targetLabelId) {
++    throw new Error("Source and target labels must be different");
++  }
++
++  const result = await labelRepo.mergeLabels(input);
++  if ("missingId" in result) throw new NotFoundError("Label", result.missingId);
++  return result;
+ }

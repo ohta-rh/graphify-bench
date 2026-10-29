@@ -1,0 +1,118 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1c91d52c-a75b-418d-a7e9-b800fd1bd9fe/src/server/repositories/_paging.ts /private/tmp/bench-scratch/dba508f8-29fc-403e-a553-53a211c915fd/src/server/repositories/_paging.ts
+--- /private/tmp/bench-scratch/1c91d52c-a75b-418d-a7e9-b800fd1bd9fe/src/server/repositories/_paging.ts	2026-10-27 13:23:51
++++ /private/tmp/bench-scratch/dba508f8-29fc-403e-a553-53a211c915fd/src/server/repositories/_paging.ts	2026-10-27 13:24:14
+@@ -2,10 +2,9 @@
+  * Private paging helpers shared by the repositories in this directory.
+  *
+  * Not part of the public data-access surface — repositories re-export nothing
+- * from here. Keyset (cursor) pagination is expressed as a range on the sort
+- * column, which lets SQLite serve every page from the `(org_id, <sort>)` index.
++ * from here. Keyset (cursor) pagination follows the sort column and ID.
+  */
+-import { lt } from "drizzle-orm";
++import { and, eq, lt, or } from "drizzle-orm";
+ import { decodeCursor, encodeCursor } from "./base-repository";
+ import { makePage } from "@/types/common";
+ import type { Page } from "@/types/common";
+@@ -30,9 +29,11 @@
+   const decoded = decodeCursor(cursor);
+   if (!decoded) return undefined;
+ 
+-  // Listings are newest first, so the next page is everything older than the
+-  // last row the caller was shown.
+-  return lt(sort.sortColumn, decoded.sortValue);
++  // Both columns are descending, so equal sort values resume at the next ID.
++  return or(
++    lt(sort.sortColumn, decoded.sortValue),
++    and(eq(sort.sortColumn, decoded.sortValue), lt(sort.idColumn, decoded.id)),
++  );
+ }
+ 
+ /** SQLite tolerates a `LIMIT` of `n + 1`; that extra row is the has-more probe. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/1c91d52c-a75b-418d-a7e9-b800fd1bd9fe/tests/repositories/pagination-ties.test.ts /private/tmp/bench-scratch/dba508f8-29fc-403e-a553-53a211c915fd/tests/repositories/pagination-ties.test.ts
+--- /private/tmp/bench-scratch/1c91d52c-a75b-418d-a7e9-b800fd1bd9fe/tests/repositories/pagination-ties.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/dba508f8-29fc-403e-a553-53a211c915fd/tests/repositories/pagination-ties.test.ts	2026-10-27 13:24:38
+@@ -0,0 +1,83 @@
++import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import * as issues from "@/server/repositories/issue-repository";
++import * as notifications from "@/server/repositories/notification-repository";
++import * as activity from "@/server/repositories/activity-repository";
++import { toIsoTimestamp } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Page } from "@/types/common";
++
++let cleanup: () => void;
++beforeAll(async () => { cleanup = await useTemporaryDatabase(); });
++afterAll(() => { cleanup(); });
++
++async function checkPages<T extends { id: string; orgId: string }>(
++  list: (limit: number, cursor: string | null) => Promise<Page<T>>,
++  orgId: string,
++) {
++  const full = await list(100, null);
++  expect(full.total).toBe(7);
++  expect(full.items).toHaveLength(7);
++  expect(full.items.every((item) => item.orgId === orgId)).toBe(true);
++  for (const limit of [1, 2, 3, 7, 10]) {
++    const seen: string[] = [];
++    let cursor: string | null = null;
++    do {
++      const page = await list(limit, cursor);
++      expect(page.total).toBe(7);
++      expect(page.items.every((item) => item.orgId === orgId)).toBe(true);
++      seen.push(...page.items.map((item) => item.id));
++      expect(seen.length).toBeLessThanOrEqual(7);
++      cursor = page.nextCursor;
++    } while (cursor);
++    expect(seen).toEqual(full.items.map((item) => item.id));
++    expect(new Set(seen).size).toBe(7);
++  }
++}
++
++describe("pagination with tied timestamps", () => {
++  it("keeps issues, notifications and activity ordered and tenant scoped", async () => {
++    const tenant = await createTenant("ties-main");
++    const other = await createTenant("ties-other");
++    vi.useFakeTimers({ toFake: ["Date"] });
++    try {
++      for (let i = 0; i < 8; i++) {
++        const current = i === 7 ? other : tenant;
++        // Two timestamp groups exercise both branches of the cursor predicate.
++        const date = new Date(i < 4 ? "2026-01-02T00:00:00.000Z" : "2026-01-01T00:00:00.000Z");
++        vi.setSystemTime(date);
++        const number = await issues.nextIssueNumber(current.org.id, current.project.id);
++        await issues.insertIssue(issueInput(current.org.id, current.project.id), current.userIds.owner, number);
++        await notifications.insertNotification(current.org.id, {
++          orgId: current.org.id,
++          recipientId: tenant.userIds.owner,
++          kind: "issue_assigned",
++          title: "Assigned",
++          body: "Issue assigned",
++          href: "/issues",
++          actorId: null,
++          channels: ["in_app"],
++        });
++        await activity.insertActivity({
++          orgId: current.org.id,
++          action: "issue.created",
++          actorId: current.userIds.owner,
++          subjectKind: "project",
++          subjectId: current.project.id,
++          projectId: current.project.id,
++          summary: "Created",
++          metadata: {},
++          occurredAt: toIsoTimestamp(date),
++        });
++      }
++    } finally {
++      vi.useRealTimers();
++    }
++    await checkPages((limit, cursor) => issues.listIssues({ orgId: tenant.org.id, projectId: tenant.project.id, limit, cursor }), tenant.org.id);
++    await checkPages((limit, cursor) => notifications.listNotifications({ orgId: tenant.org.id, recipientId: tenant.userIds.owner, unreadOnly: false, limit, cursor }), tenant.org.id);
++    await checkPages((limit, cursor) => activity.listActivity({ orgId: tenant.org.id, limit, cursor }), tenant.org.id);
++  });
++});

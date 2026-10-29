@@ -1,0 +1,229 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/cleanup-archived-job.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/cleanup-archived-job.ts	2026-10-28 09:13:33
+@@ -10,12 +10,10 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as searchRepo from "@/server/repositories/search-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-const ORG_BATCH = 25;
+ const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+@@ -32,7 +30,7 @@
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+@@ -43,20 +41,24 @@
+         new Date(now.getTime() - retentionDays * MS_PER_DAY),
+       );
+ 
+-      const archived = await issueRepo.listIssues({
+-        orgId,
+-        limit: PAGE_SIZE,
+-        cursor: null,
+-        includeArchived: true,
+-      });
++      let cursor: string | null = null;
++      do {
++        const archived = await issueRepo.listIssues({
++          orgId,
++          limit: PAGE_SIZE,
++          cursor,
++          includeArchived: true,
++        });
+ 
+-      for (const issue of archived.items) {
+-        if (!isArchived(issue)) continue;
+-        if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
++        for (const issue of archived.items) {
++          if (!isArchived(issue)) continue;
++          if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
+ 
+-        await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
+-        result.processed += 1;
+-      }
++          await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
++          result.processed += 1;
++        }
++        cursor = archived.nextCursor;
++      } while (cursor !== null);
+ 
+       try {
+         const purged = await activityRepo.purgeActivityBefore(orgId, cutoff);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/digest-email-job.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/digest-email-job.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/digest-email-job.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/digest-email-job.ts	2026-10-28 09:13:24
+@@ -7,7 +7,6 @@
+ import { createLogger } from "@/lib/logger";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
+ import * as userRepo from "@/server/repositories/user-repository";
+ import { buildDigest, listDigestRecipients, renderDigest } from "@/server/services/digest-service";
+ import { sendEmail } from "@/server/services/email-service";
+@@ -17,7 +16,6 @@
+ import type { JobResult } from "@/server/jobs/types";
+ import type { Organization } from "@/types/organization";
+ 
+-const ORG_BATCH = 50;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("digest-email-job");
+@@ -29,7 +27,7 @@
+  */
+ export async function runDigestEmailJob(now: Date): Promise<JobResult> {
+   return runJob("digest-email", async (result) => {
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const org = await orgRepo.findOrgById(orgId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/overdue-issue-job.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/overdue-issue-job.ts	2026-10-28 09:13:24
+@@ -7,14 +7,11 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+ 
+@@ -45,7 +42,7 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listActiveOrgIds();
+ 
+     for (const orgId of orgIds) {
+       const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/usage-rollup-job.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/usage-rollup-job.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/jobs/usage-rollup-job.ts	2026-10-28 09:12:57
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/jobs/usage-rollup-job.ts	2026-10-28 09:13:24
+@@ -9,7 +9,7 @@
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** Organizations recounted per pass; the list puts the busiest tenants first. */
++/** Organizations recounted per pass; oldest recounts first. */
+ const ORG_BATCH = 25;
+ 
+ const logger = createLogger("usage-rollup-job");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/repositories/organization-repository.ts	2026-10-28 09:13:24
+@@ -35,6 +35,13 @@
+   return row ? toOrganization(row) : null;
+ }
+ 
++/** All organizations eligible for background work. */
++export async function listActiveOrgIds(): Promise<readonly OrgId[]> {
++  return getDb().select({ id: organizations.id }).from(organizations)
++    .where(isNull(organizations.archivedAt)).orderBy(organizations.id).all()
++    .map((row) => row.id as OrgId);
++}
++
+ /** Every org the user still holds a live membership in. */
+ export async function listOrgsForUser(
+   userId: UserId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/repositories/usage-repository.ts /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/repositories/usage-repository.ts
+--- /private/tmp/bench-scratch/29ab6970-587c-49b9-ada9-2a882b313425/src/server/repositories/usage-repository.ts	2026-10-28 09:12:57
++++ /private/tmp/bench-scratch/f5fe39e5-67f3-4be4-957e-45b1ca73633e/src/server/repositories/usage-repository.ts	2026-10-28 09:13:24
+@@ -1,13 +1,14 @@
+ /**
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+-import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
++import { and, asc, count, eq, isNull, sql } from "drizzle-orm";
+ import {
+   attachments,
+   getDb,
+   issues,
+   members,
+   organizationUsage,
++  organizations,
+   projects,
+ } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -33,7 +34,7 @@
+ 
+   const created = getDb()
+     .insert(organizationUsage)
+-    .values({ orgId, measuredAt: toIsoTimestamp(new Date()) })
++    .values({ orgId, measuredAt: toIsoTimestamp(new Date(0)) })
+     .returning()
+     .get();
+ 
+@@ -79,13 +80,17 @@
+     .where(eq(attachments.orgId, orgId))
+     .get();
+ 
++  const latest = db.select({ value: sql<string | null>`max(${organizationUsage.measuredAt})` })
++    .from(organizationUsage).get()?.value;
++  const measuredTime = Math.max(Date.now(), latest ? Date.parse(latest) + 1 : 0);
++
+   const next = {
+     orgId,
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+     storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
+-    measuredAt: toIsoTimestamp(new Date()),
++    measuredAt: toIsoTimestamp(new Date(measuredTime)),
+   };
+ 
+   const row = db
+@@ -120,7 +125,6 @@
+       projectsUsed: current.projectsUsed + (patch.projectsUsed ?? 0),
+       issuesUsed: current.issuesUsed + (patch.issuesUsed ?? 0),
+       storageMbUsed: current.storageMbUsed + (patch.storageMbUsed ?? 0),
+-      measuredAt: toIsoTimestamp(new Date()),
+     })
+     .where(eq(organizationUsage.orgId, orgId))
+     .returning()
+@@ -129,19 +133,17 @@
+   return toUsage(row);
+ }
+ 
+-/**
+- * The rollup job's work list, most recently measured first: every write nudges
+- * `measured_at`, so the top of this list is where the tenants that are
+- * actually changing — and therefore drifting — are.
+- */
++/** Oldest recounts first; organizations without a usage row are first. */
+ export async function listOrgIdsForRollup(
+   limit: number,
+ ): Promise<readonly OrgId[]> {
+   const rows = getDb()
+-    .select({ orgId: organizationUsage.orgId })
+-    .from(organizationUsage)
+-    .orderBy(desc(organizationUsage.measuredAt))
+-    .limit(Math.max(1, limit))
++    .select({ orgId: organizations.id })
++    .from(organizations)
++    .leftJoin(organizationUsage, eq(organizationUsage.orgId, organizations.id))
++    .where(isNull(organizations.archivedAt))
++    .orderBy(asc(organizationUsage.measuredAt), asc(organizations.id))
++    .limit(Math.max(0, limit))
+     .all();
+ 
+   return rows.map((row) => brandId<OrgId>(row.orgId));
