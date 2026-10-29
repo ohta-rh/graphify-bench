@@ -163,6 +163,76 @@ Paired comparisons average repeats per task and bootstrap all 12 tasks. Claude r
 | 極難問 | xhigh | 24/24 | 16 | 302.0 s | $0.0457 |
 <!-- LUNA-README-END -->
 
+<!-- SOL61-ULTRA-README-START -->
+**GPT-6.1 Sol, ultra addition** (2026-10-09〜2026-10-10, Asia/Tokyo): the 12 original ultra tasks, 2 repetitions at low/medium/high/xhigh, 96 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price total: $21.2704.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 20/24 (83.3%) | $0.1109 | $0.1245 | 59.5 s | 76.9 s |
+| medium | 21/24 (87.5%) | $0.1546 | $0.1932 | 84.8 s | 100.1 s |
+| high | 23/24 (95.8%) | $0.2244 | $0.2677 | 137.0 s | 197.1 s |
+| xhigh | 23/24 (95.8%) | $0.3733 | $0.3725 | 247.8 s | 290.8 s |
+
+Paired comparisons average repeats per task and bootstrap all 12 tasks. Reference model totals use the same 96 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 120-turn/$8 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-ultra`](results/sol61-ultra/REPORT.md), [`analysis.json`](results/sol61-ultra/analysis.json), [`runs.csv`](results/sol61-ultra/runs.csv). Japanese HTML: [`report-sol61-ultra-ja.html`](docs/report-sol61-ultra-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-ultra.sh`.
+<!-- SOL61-ULTRA-README-END -->
+
+<!-- SOL61-APEX-README-START -->
+**GPT-6.1 Sol, apex addition** (2026-10-14〜2026-10-15, Asia/Tokyo): the 6 original apex tasks, 2 repetitions at low/medium/high/xhigh, 48 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price amount: $15.4701.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 10/12 (83.3%) | $0.1438 | $0.2088 | 108.7 s | 129.6 s |
+| medium | 10/12 (83.3%) | $0.2064 | $0.2782 | 191.7 s | 199.2 s |
+| high | 10/12 (83.3%) | $0.3900 | $0.4452 | 347.4 s | 317.1 s |
+| xhigh | 12/12 (100.0%) | $0.5532 | $0.5123 | 547.7 s | 538.5 s |
+
+Paired comparisons average repeats per task and bootstrap all 6 tasks. Reference model totals use the same 48 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 160-turn/$12 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-apex`](results/sol61-apex/REPORT.md), [`analysis.json`](results/sol61-apex/analysis.json), [`runs.csv`](results/sol61-apex/runs.csv). Japanese HTML: [`report-sol61-apex-ja.html`](docs/report-sol61-apex-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-additional.sh`.
+<!-- SOL61-APEX-README-END -->
+
+<!-- SOL61-BROWNFIELD-README-START -->
+**GPT-6.1 Sol, brownfield addition** (2026-10-10〜2026-10-14, Asia/Tokyo): the 6 original brownfield tasks, 2 repetitions at low/medium/high/xhigh, 48 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price amount: $11.0096（使用量不明の実行を除いた小計）.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 8/12 (66.7%) | $0.1491 | N/A | 102.1 s | 1003.6 s |
+| medium | 6/12 (50.0%) | $0.2038 | N/A | 127.7 s | 1111.7 s |
+| high | 6/12 (50.0%) | $0.3062 | N/A | 261.0 s | 1244.0 s |
+| xhigh | 8/12 (66.7%) | $0.4072 | $0.6184 | 492.8 s | 488.2 s |
+
+Paired comparisons average repeats per task and bootstrap all 6 tasks. Reference model totals use the same 48 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 160-turn/$12 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-brownfield`](results/sol61-brownfield/REPORT.md), [`analysis.json`](results/sol61-brownfield/analysis.json), [`runs.csv`](results/sol61-brownfield/runs.csv). Japanese HTML: [`report-sol61-brownfield-ja.html`](docs/report-sol61-brownfield-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-additional.sh`.
+<!-- SOL61-BROWNFIELD-README-END -->
+
+<!-- TERRA61-README-START -->
+**GPT-6.1 Terra, all six sets:** 596 solver and graded runs at low/medium/high/xhigh. Independent Codex runtime; Claude turn/budget caps cannot be enforced identically. Runtime, host load and date differences apply. Base Standard solver cost subtotal $30.1743, not an invoice. [Data and paired task CIs](results/terra61/REPORT.md), [JSON](results/terra61/analysis.json), [CSV](results/terra61/runs.csv), [Japanese HTML](docs/report-terra61-ja.html).
+
+| セット | effort | 採点済み/予定 | 正解 | 時間中央値 | 推定費用中央値 |
+|---|---|---|---|---|---|
+| 通常45問 | low | 45/45 | 39 | 23.9 s | $0.0179 |
+| 通常45問 | medium | 45/45 | 39 | 24.1 s | $0.0184 |
+| 通常45問 | high | 45/45 | 38 | 27.8 s | $0.0198 |
+| 通常45問 | xhigh | 45/45 | 38 | 22.1 s | $0.0222 |
+| 難問 | low | 32/32 | 29 | 37.7 s | $0.0314（費用不明1件） |
+| 難問 | medium | 32/32 | 32 | 38.4 s | $0.0293 |
+| 難問 | high | 32/32 | 32 | 37.8 s | $0.0309 |
+| 難問 | xhigh | 32/32 | 32 | 44.8 s | $0.0393 |
+| 超難問 | low | 24/24 | 15 | 59.2 s | $0.0513（費用不明6件） |
+| 超難問 | medium | 24/24 | 14 | 60.9 s | $0.0683（費用不明8件） |
+| 超難問 | high | 24/24 | 19 | 58.8 s | $0.0718（費用不明1件） |
+| 超難問 | xhigh | 24/24 | 16 | 90.6 s | $0.1008（費用不明4件） |
+| 極難問 | low | 24/24 | 16 | 48.8 s | $0.0656 |
+| 極難問 | medium | 24/24 | 18 | 51.9 s | $0.0722 |
+| 極難問 | high | 24/24 | 17 | 71.0 s | $0.0880 |
+| 極難問 | xhigh | 24/24 | 18 | 105.4 s | $0.1312 |
+| apex | low | 12/12 | 6 | 73.0 s | $0.0705（費用不明3件） |
+| apex | medium | 12/12 | 4 | 1034.9 s | $0.0739（費用不明6件） |
+| apex | high | 12/12 | 6 | 97.2 s | $0.0747（費用不明4件） |
+| apex | xhigh | 12/12 | 5 | 2094.4 s | $0.1238（費用不明7件） |
+| brownfield | low | 12/12 | 9 | 43.5 s | $0.0592 |
+| brownfield | medium | 12/12 | 7 | 55.6 s | $0.0638 |
+| brownfield | high | 12/12 | 7 | 60.2 s | $0.0766 |
+| brownfield | xhigh | 12/12 | 6 | 94.9 s | $0.1204 |
+<!-- TERRA61-README-END -->
+
 Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
 
 Three findings behind the table:
