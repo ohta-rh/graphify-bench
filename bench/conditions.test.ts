@@ -597,6 +597,7 @@ describe("runtime lever arms", () => {
     ["grok-effort-low", "effort-low"],
     ["grok-effort-medium", "effort-medium"],
     ["grok-effort-high", "effort-high"],
+    ["grok-effort-xhigh", "effort-xhigh"],
   ])("%s is %s with only the model swapped", (grok, sonnet) => {
     const o = getCondition(grok);
     const s = getCondition(sonnet);
@@ -612,6 +613,7 @@ describe("runtime lever arms", () => {
       "grok-effort-low",
       "grok-effort-medium",
       "grok-effort-high",
+      "grok-effort-xhigh",
     ]);
   });
 

@@ -21,10 +21,10 @@ export { GROK_MODEL };
  *   stay; they are part of the product, as Claude Code's built-ins are.
  *
  * Grok has no `--max-budget-usd`. The turn cap is the one the set already uses.
- * There is no xhigh arm: that effort was declined for this comparison.
+ * xhigh is measured on the extreme set only.
  */
 export const GROK_BIN = process.env.BENCH_GROK_BIN || "grok";
-export const GROK_EFFORTS = ["low", "medium", "high"] as const;
+export const GROK_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
 export type GrokEffort = (typeof GROK_EFFORTS)[number];
 
 /** Skill names `grok inspect` reported as bundled on grok 1.0.46. Anything else is a leak. */

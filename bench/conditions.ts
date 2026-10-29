@@ -130,7 +130,7 @@ export const HAIKU55_MODEL = "claude-haiku-5-5";
 /**
  * Grok 4.7 as passed to `grok -p --model`. On grok 1.0.46 a probe's `modelUsage`
  * key was `grok-4.7-build`; the report reads that key from the run, not this constant.
- * No xhigh arm — that effort was left out of this comparison.
+ * xhigh is registered for the extreme set. The other three sets were measured without it.
  */
 export const GROK_MODEL = "grok-4.7";
 
@@ -690,7 +690,15 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     corpus: "v1",
     model: GROK_MODEL,
     effort: "high",
-    note: "As `grok-effort-low`, at `--effort high`. No xhigh arm.",
+    note: "As `grok-effort-low`, at `--effort high`.",
+  },
+  {
+    name: "grok-effort-xhigh",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: GROK_MODEL,
+    effort: "xhigh",
+    note: "As `grok-effort-low`, at `--effort xhigh`. Measured on the extreme set.",
   },
 ] as const;
 
