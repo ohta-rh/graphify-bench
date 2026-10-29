@@ -28,10 +28,10 @@ NO_XHIGH_PREFIXES = frozenset({"sol61-effort"})
 SETS = [
     ("code-45", ["results/opus", "results/sol61", "results/luna/code45", "results/terra61/code45"], 45),
     ("hard", ["results/hard", "results/luna/hard", "results/terra61/hard"], 32),
-    ("ultra", ["results/ultra", "results/sol61-ultra", "results/luna/ultra"], 24),
-    ("extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme"], 24),
-    ("apex", ["results/models/apex", "results/sol61-apex"], 12),
-    ("brownfield", ["results/models/brownfield", "results/luna/brownfield", "results/sol61-brownfield"], 12),
+    ("ultra", ["results/ultra", "results/sol61-ultra", "results/luna/ultra", "results/terra61/ultra"], 24),
+    ("extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme", "results/terra61/extreme"], 24),
+    ("apex", ["results/models/apex", "results/sol61-apex", "results/terra61/apex"], 12),
+    ("brownfield", ["results/models/brownfield", "results/luna/brownfield", "results/sol61-brownfield", "results/terra61/brownfield"], 12),
 ]
 
 MODELS = [
