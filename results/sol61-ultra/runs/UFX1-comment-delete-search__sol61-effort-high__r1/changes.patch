@@ -1,0 +1,230 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/jobs/search-reindex-job.ts /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/jobs/search-reindex-job.ts	2026-10-09 13:58:15
++++ /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/jobs/search-reindex-job.ts	2026-10-09 13:59:20
+@@ -7,6 +7,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
+ import {
+   indexComment,
+   indexIssue,
+@@ -28,57 +29,73 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-    });
++    await searchRepo.clearSearchDocuments(orgId);
+ 
+-    for (const project of projects.items) {
+-      try {
+-        await indexProject(orgId, project);
+-        result.processed += 1;
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index project", {
+-          projectId: project.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
++    let projectCursor: string | null = null;
++    do {
++      const projects = await projectRepo.listProjects({
++        orgId,
++        limit: PAGE_SIZE,
++        cursor: projectCursor,
++        includeArchived: false,
++      });
++
++      for (const project of projects.items) {
++        try {
++          await indexProject(orgId, project);
++          result.processed += 1;
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index project", {
++            projectId: project.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
++        }
+       }
+-    }
++      projectCursor = projects.nextCursor;
++    } while (projectCursor !== null);
+ 
+-    // Archived issues are still readable from their permalink, so the
+-    // rebuild covers them as well; the thread walk below picks up every
+-    // comment in reading order, replies included, in a single query.
+-    const issues = await issueRepo.listIssues({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
++    let issueCursor: string | null = null;
++    do {
++      const issues = await issueRepo.listIssues({
++        orgId,
++        limit: PAGE_SIZE,
++        cursor: issueCursor,
++        includeArchived: false,
++      });
+ 
+-    for (const issue of issues.items) {
+-      try {
+-        await indexIssue(orgId, issue);
+-        result.processed += 1;
++      for (const issue of issues.items) {
++        try {
++          await indexIssue(orgId, issue);
++          result.processed += 1;
+ 
+-        const thread = await commentRepo.listThread(orgId, issue.id);
+-        const comments = thread.flatMap((node) => [
+-          node.comment,
+-          ...node.replies,
+-        ]);
++          // List rows independently of the thread so live replies survive
++          // even when their parent comment has been deleted.
++          let commentCursor: string | null = null;
++          do {
++            const comments = await commentRepo.listComments({
++              orgId,
++              issueId: issue.id,
++              limit: PAGE_SIZE,
++              cursor: commentCursor,
++              includeArchived: false,
++            });
+ 
+-        for (const comment of comments) {
+-          await indexComment(orgId, comment);
+-          result.processed += 1;
++            for (const comment of comments.items) {
++              await indexComment(orgId, comment);
++              result.processed += 1;
++            }
++            commentCursor = comments.nextCursor;
++          } while (commentCursor !== null);
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index issue", {
++            issueId: issue.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
+         }
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index issue", {
+-          issueId: issue.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
+       }
+-    }
++      issueCursor = issues.nextCursor;
++    } while (issueCursor !== null);
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/repositories/comment-repository.ts /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/repositories/comment-repository.ts
+--- /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/repositories/comment-repository.ts	2026-10-09 13:58:15
++++ /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/repositories/comment-repository.ts	2026-10-09 13:59:20
+@@ -8,7 +8,7 @@
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+ import { comments, getDb, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+-import { orgPredicate } from "./base-repository";
++import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import { toComment, toUser } from "./_mappers";
+ import type {
+@@ -125,6 +125,7 @@
+       and(
+         orgPredicate(comments.orgId, orgId),
+         eq(comments.issueId, issueId),
++        livePredicate(comments.archivedAt, {}),
+       ),
+     )
+     .get();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/repositories/search-repository.ts /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/repositories/search-repository.ts
+--- /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/repositories/search-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/repositories/search-repository.ts	2026-10-09 13:59:20
+@@ -3,13 +3,13 @@
+  */
+ import { and, count, desc, eq, inArray, like } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { getDb, searchIndex } from "@/server/db";
++import { comments, getDb, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import type { SearchQueryInput } from "@/schemas/search";
+ import type { SearchIndexRow } from "@/server/db/schema/webhooks";
+-import type { OrgId, Page, ProjectId } from "@/types/common";
++import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+ 
+ /**
+  * Upsert by (org, kind, subject) rather than by row id: the indexer is called
+@@ -72,6 +72,41 @@
+         eq(searchIndex.subjectId, subjectId),
+       ),
+     )
++    .run();
++}
++
++/** Removes every comment document belonging to this issue, including replies. */
++export async function deleteIssueCommentDocuments(
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<void> {
++  const db = getDb();
++  db.delete(searchIndex)
++    .where(
++      and(
++        orgPredicate(searchIndex.orgId, orgId),
++        eq(searchIndex.subjectKind, "comment"),
++        inArray(
++          searchIndex.subjectId,
++          db.select({ id: comments.id })
++            .from(comments)
++            .where(
++              and(
++                orgPredicate(comments.orgId, orgId),
++                eq(comments.issueId, issueId),
++              ),
++            ),
++        ),
++      ),
++    )
++    .run();
++}
++
++/** Clears stale documents before rebuilding a single tenant's index. */
++export async function clearSearchDocuments(orgId: OrgId): Promise<void> {
++  getDb()
++    .delete(searchIndex)
++    .where(orgPredicate(searchIndex.orgId, orgId))
+     .run();
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/services/search-service.ts /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/93b44f98-2ddc-4582-a102-f54e247afec1/src/server/services/search-service.ts	2026-10-09 13:58:15
++++ /private/tmp/bench-scratch/b9b5fe91-6bec-4a38-8fef-9e7efef3740f/src/server/services/search-service.ts	2026-10-09 13:59:20
+@@ -146,6 +146,7 @@
+     }),
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
++      await searchRepo.deleteIssueCommentDocuments(payload.orgId, payload.issueId);
+     }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+@@ -155,7 +156,7 @@
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
+     subscribe("comment.deleted", async (payload) => {
+-      await removeFromIndex(payload.orgId, "issue", payload.commentId);
++      await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+     subscribe("project.created", async (payload) => {
+       const project = await projectRepo.findProjectById(

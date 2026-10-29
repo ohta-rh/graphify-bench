@@ -1,0 +1,1237 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/components/domain/notification/notification-preferences-form.tsx /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/components/domain/notification/notification-preferences-form.tsx
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/components/domain/notification/notification-preferences-form.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/components/domain/notification/notification-preferences-form.tsx	2026-10-14 22:36:44
+@@ -43,6 +43,7 @@
+   issue_status_changed: "Issue status changed",
+   issue_due_soon: "Issue due soon",
+   issue_overdue: "Issue overdue",
++  sub_issues_completed: "All sub-issues completed",
+   comment_created: "New comment",
+   comment_mention: "I was mentioned",
+   member_invited: "Member invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/config/constants.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/config/constants.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/config/constants.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/config/constants.ts	2026-10-14 22:36:43
+@@ -13,6 +13,9 @@
+ /** Upper bound the pagination schemas clamp `limit` to. */
+ export const MAX_PAGE_SIZE: number = 100;
+ 
++/** Root issues are level zero; sub-issues may extend through this level. */
++export const MAX_SUB_ISSUE_DEPTH: number = 3;
++
+ /** How long after posting a comment its author may still edit it. */
+ export const COMMENT_EDIT_WINDOW_MINUTES: number = 15;
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/lib/errors.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/lib/errors.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/lib/errors.ts	2026-10-14 22:36:44
+@@ -8,6 +8,7 @@
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
++import { IssueHierarchyError } from "@/lib/issue-hierarchy";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof IssueHierarchyError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -93,6 +95,14 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof IssueHierarchyError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { issueId: error.issueId, reason: error.reason },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/lib/issue-hierarchy.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/lib/issue-hierarchy.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/lib/issue-hierarchy.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/lib/issue-hierarchy.ts	2026-10-14 22:36:43
+@@ -0,0 +1,15 @@
++export class IssueHierarchyError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(
++    readonly issueId: string,
++    readonly reason: "cycle" | "too_deep",
++  ) {
++    super(
++      reason === "cycle"
++        ? `Issue ${issueId} cannot be placed under itself or a descendant.`
++        : `Issue ${issueId} would exceed the maximum sub-issue depth.`,
++    );
++    this.name = "IssueHierarchyError";
++  }
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/schemas/issue.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/schemas/issue.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/schemas/issue.ts	2026-10-14 22:36:44
+@@ -65,6 +65,12 @@
+   assigneeId: userIdSchema.nullable(),
+ });
+ 
++export const setIssueParentSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  parentId: issueIdSchema.nullable(),
++});
++
+ export const archiveIssueSchema = z.object({
+   orgId: orgIdSchema,
+   issueId: issueIdSchema,
+@@ -106,5 +112,6 @@
+ export type UpdateIssueInput = z.infer<typeof updateIssueSchema>;
+ export type ChangeIssueStatusInput = z.infer<typeof changeIssueStatusSchema>;
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
++export type SetIssueParentInput = z.infer<typeof setIssueParentSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/schemas/notification.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/schemas/notification.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/schemas/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/schemas/notification.ts	2026-10-14 22:36:44
+@@ -12,6 +12,7 @@
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
++  "sub_issues_completed",
+   "comment_created",
+   "comment_mention",
+   "member_invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/db/schema/notifications.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/db/schema/notifications.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/db/schema/notifications.ts	2026-10-14 22:36:44
+@@ -6,6 +6,7 @@
+   "issue_status_changed",
+   "issue_due_soon",
+   "issue_overdue",
++  "sub_issues_completed",
+   "comment_created",
+   "comment_mention",
+   "member_invited",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/repositories/issue-repository.ts	2026-10-14 22:46:44
+@@ -5,6 +5,7 @@
+  */
+ import {
+   and,
++  asc,
+   count,
+   desc,
+   eq,
+@@ -13,6 +14,7 @@
+   isNull,
+   like,
+   lt,
++  ne,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -23,7 +25,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -32,6 +34,7 @@
+ import type {
+   CreateIssueInput,
+   IssueFilterInput,
++  SetIssueParentInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type {
+@@ -47,14 +50,152 @@
+ import type {
+   Issue,
+   IssueBoardColumn,
++  IssueRollup,
+   IssueStatus,
+   IssueWithRelations,
+ } from "@/types/issue";
+ import type { SQL } from "drizzle-orm";
++import type { IssueRow } from "@/server/db/schema/issues";
+ 
+-/** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+-const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++type IssueLookup = (issueId: IssueId) => Issue | null;
+ 
++/** Synchronous reads let a service validate a hierarchy inside a write transaction. */
++function scopedIssueLookup(orgId: OrgId): IssueLookup {
++  return (issueId) => {
++    const row = getDb()
++      .select()
++      .from(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .get();
++    return row ? toIssue(row) : null;
++  };
++}
++
++/** Include archived links while walking; filtering happens at the leaves. */
++function subtreeIds(orgId: OrgId, projectId: ProjectId, issueId: IssueId): SQL {
++  return sql`(
++    with recursive issue_tree(id) as (
++      select ${issues.id} from ${issues}
++      where ${orgPredicate(issues.orgId, orgId)}
++        and ${eq(issues.projectId, projectId)} and ${eq(issues.id, issueId)}
++      union
++      select ${issues.id} from ${issues}
++      inner join issue_tree on ${issues.parentId} = issue_tree.id
++      where ${orgPredicate(issues.orgId, orgId)}
++        and ${eq(issues.projectId, projectId)}
++    ) select id from issue_tree
++  )`;
++}
++
++function readIssueRollup(
++  orgId: OrgId,
++  projectId: ProjectId,
++  issueId: IssueId,
++): IssueRollup {
++  const row = getDb()
++    .select({
++      total: count(),
++      closed: sql<number>`coalesce(sum(case
++        when ${inArray(issues.status, [...CLOSED_ISSUE_STATUSES])} then 1
++        else 0 end), 0)`,
++    })
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        eq(issues.projectId, projectId),
++        ne(issues.id, issueId),
++        inArray(issues.id, subtreeIds(orgId, projectId, issueId)),
++        livePredicate(issues.archivedAt, {}),
++      ),
++    )
++    .get();
++  const total = row?.total ?? 0;
++  const closed = row?.closed ?? 0;
++  return { total, open: total - closed, closed };
++}
++
++export async function getIssueRollup(
++  orgId: OrgId,
++  projectId: ProjectId,
++  issueId: IssueId,
++): Promise<IssueRollup> {
++  return readIssueRollup(orgId, projectId, issueId);
++}
++
++export async function listSubIssues(
++  orgId: OrgId,
++  projectId: ProjectId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  const rows = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        eq(issues.projectId, projectId),
++        eq(issues.parentId, issueId),
++        livePredicate(issues.archivedAt, {}),
++      ),
++    )
++    .orderBy(asc(issues.createdAt), asc(issues.number))
++    .all();
++  const labels = await listLabelsForIssues(
++    orgId,
++    rows.map((row) => row.id as IssueId),
++  );
++  return rows.map((row) =>
++    toIssue(row, (labels[row.id] ?? []).map((label) => label.id)),
++  );
++}
++
++/** Unpaginated and including archived descendants, for structural checks. */
++function readIssueDescendants(
++  orgId: OrgId,
++  projectId: ProjectId,
++  issueId: IssueId,
++): readonly Issue[] {
++  return getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, orgId),
++        eq(issues.projectId, projectId),
++        ne(issues.id, issueId),
++        inArray(issues.id, subtreeIds(orgId, projectId, issueId)),
++      ),
++    )
++    .all()
++    .map((row) => toIssue(row));
++}
++
++/** Called only after a live, open child closes, in the mutation transaction. */
++function completedParentFor(child: IssueRow): Issue | null {
++  if (child.parentId === null) return null;
++  const parent = getDb()
++    .select()
++    .from(issues)
++    .where(
++      and(
++        orgPredicate(issues.orgId, child.orgId as OrgId),
++        eq(issues.projectId, child.projectId),
++        eq(issues.id, child.parentId),
++        livePredicate(issues.archivedAt, {}),
++        isNotNull(issues.assigneeId),
++      ),
++    )
++    .get();
++  if (!parent) return null;
++  const rollup = readIssueRollup(
++    parent.orgId as OrgId,
++    parent.projectId as ProjectId,
++    parent.id as IssueId,
++  );
++  return rollup.open === 0 ? toIssue(parent) : null;
++}
++
+ export async function findIssueById(
+   orgId: OrgId,
+   issueId: IssueId,
+@@ -307,47 +448,50 @@
+   input: CreateIssueInput,
+   authorId: UserId,
+   issueNumber: number,
++  validateParent?: (findIssue: IssueLookup) => void,
+ ): Promise<Issue> {
+-  const stamp = toIsoTimestamp(new Date());
+-  const db = getDb();
++  return getDb().transaction((db) => {
++    validateParent?.(scopedIssueLookup(input.orgId));
++    const stamp = toIsoTimestamp(new Date());
+ 
+-  const row = db
+-    .insert(issues)
+-    .values({
+-      id: newId(),
+-      orgId: input.orgId,
+-      projectId: input.projectId,
+-      number: issueNumber,
+-      title: input.title,
+-      description: input.description,
+-      status: input.status,
+-      priority: input.priority,
+-      authorId,
+-      assigneeId: input.assigneeId,
+-      parentId: input.parentId,
+-      estimate: input.estimate,
+-      dueAt: input.dueAt,
+-      startedAt: null,
+-      completedAt: null,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
++    const row = db
++      .insert(issues)
++      .values({
++        id: newId(),
++        orgId: input.orgId,
++        projectId: input.projectId,
++        number: issueNumber,
++        title: input.title,
++        description: input.description,
++        status: input.status,
++        priority: input.priority,
++        authorId,
++        assigneeId: input.assigneeId,
++        parentId: input.parentId,
++        estimate: input.estimate,
++        dueAt: input.dueAt,
++        startedAt: null,
++        completedAt: null,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
+ 
+-  if (input.labelIds.length > 0) {
+-    db.insert(issueLabels)
+-      .values(
+-        input.labelIds.map((labelId) => ({
+-          orgId: input.orgId,
+-          issueId: row.id,
+-          labelId,
+-        })),
+-      )
+-      .run();
+-  }
++    if (input.labelIds.length > 0) {
++      db.insert(issueLabels)
++        .values(
++          input.labelIds.map((labelId) => ({
++            orgId: input.orgId,
++            issueId: row.id,
++            labelId,
++          })),
++        )
++        .run();
++    }
+ 
+-  return toIssue(row, input.labelIds);
++    return toIssue(row, input.labelIds);
++  });
+ }
+ 
+ export async function updateIssue(input: UpdateIssueInput): Promise<Issue> {
+@@ -407,33 +551,91 @@
+   issueId: IssueId,
+   status: IssueStatus,
+ ): Promise<Issue> {
+-  const stamp = toIsoTimestamp(new Date());
+-  const current = getDb()
+-    .select()
+-    .from(issues)
+-    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+-    .get();
++  return (await setIssueStatusWithCompletion(orgId, issueId, status)).issue;
++}
+ 
+-  if (!current) throw new Error(`Issue ${issueId} not found`);
++/** Observe completion with the write, so simultaneous closes notify once. */
++export async function setIssueStatusWithCompletion(
++  orgId: OrgId,
++  issueId: IssueId,
++  status: IssueStatus,
++): Promise<{ issue: Issue; completedParent: Issue | null }> {
++  return getDb().transaction((db) => {
++    const stamp = toIsoTimestamp(new Date());
++    const current = db
++      .select()
++      .from(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .get();
++    if (!current) throw new Error(`Issue ${issueId} not found`);
+ 
+-  const row = getDb()
+-    .update(issues)
+-    .set({
+-      status,
+-      startedAt:
+-        status === "in_progress" && current.startedAt === null
+-          ? stamp
+-          : current.startedAt,
+-      completedAt: TERMINAL_STATUSES.includes(status) ? stamp : null,
+-      updatedAt: stamp,
+-    })
+-    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+-    .returning()
+-    .get();
++    const row = db
++      .update(issues)
++      .set({
++        status,
++        startedAt:
++          status === "in_progress" && current.startedAt === null
++            ? stamp
++            : current.startedAt,
++        completedAt: CLOSED_ISSUE_STATUSES.includes(status) ? stamp : null,
++        updatedAt: stamp,
++      })
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .returning()
++      .get();
+ 
+-  return toIssue(row);
++    const closing =
++      current.archivedAt === null &&
++      !CLOSED_ISSUE_STATUSES.includes(current.status) &&
++      CLOSED_ISSUE_STATUSES.includes(status);
++    return {
++      issue: toIssue(row),
++      completedParent: closing ? completedParentFor(current) : null,
++    };
++  });
+ }
+ 
++export async function setIssueParent(
++  input: SetIssueParentInput,
++  validate?: (
++    current: Issue | null,
++    findIssue: IssueLookup,
++    descendants: readonly Issue[],
++  ) => void,
++): Promise<Issue> {
++  const row = getDb().transaction((db) => {
++    const current = db
++      .select()
++      .from(issues)
++      .where(
++        and(orgPredicate(issues.orgId, input.orgId), eq(issues.id, input.issueId)),
++      )
++      .get();
++    validate?.(
++      current ? toIssue(current) : null,
++      scopedIssueLookup(input.orgId),
++      current
++        ? readIssueDescendants(input.orgId, current.projectId as ProjectId, input.issueId)
++        : [],
++    );
++    if (!current) throw new Error(`Issue ${input.issueId} not found`);
++    if (current.parentId === input.parentId) return current;
++    return db
++      .update(issues)
++      .set({ parentId: input.parentId, updatedAt: toIsoTimestamp(new Date()) })
++      .where(
++        and(
++          orgPredicate(issues.orgId, input.orgId),
++          eq(issues.id, input.issueId),
++        ),
++      )
++      .returning()
++      .get();
++  });
++  const labels = await listLabelsForIssues(input.orgId, [input.issueId]);
++  return toIssue(row, (labels[row.id] ?? []).map((label) => label.id));
++}
++
+ export async function setIssueAssignee(
+   orgId: OrgId,
+   issueId: IssueId,
+@@ -463,6 +665,37 @@
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+   return toIssue(row);
++}
++
++/** Archive the complete live subtree before publishing any archive events. */
++export async function archiveIssueTree(
++  orgId: OrgId,
++  projectId: ProjectId,
++  issueId: IssueId,
++): Promise<{ archivedIssues: readonly Issue[]; completedParent: Issue | null }> {
++  return getDb().transaction((db) => {
++    const rows = db
++      .update(issues)
++      .set(archivePatch())
++      .where(
++        and(
++          orgPredicate(issues.orgId, orgId),
++          eq(issues.projectId, projectId),
++          inArray(issues.id, subtreeIds(orgId, projectId, issueId)),
++          livePredicate(issues.archivedAt, {}),
++        ),
++      )
++      .returning()
++      .all();
++    const root = rows.find((row) => row.id === issueId);
++    return {
++      archivedIssues: rows.map((row) => toIssue(row)),
++      completedParent:
++        root && !CLOSED_ISSUE_STATUSES.includes(root.status)
++          ? completedParentFor(root)
++          : null,
++    };
++  });
+ }
+ 
+ export async function restoreIssue(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/services/issue-service.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/services/issue-service.ts	2026-10-14 22:47:22
+@@ -3,8 +3,10 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, assertNotArchived
+  */
++import { MAX_SUB_ISSUE_DEPTH } from "@/config/constants";
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
++import { IssueHierarchyError } from "@/lib/issue-hierarchy";
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+@@ -27,16 +29,86 @@
+   CreateIssueInput,
+   IssueFilterInput,
+   MoveIssueInput,
++  SetIssueParentInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+-import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
++import type {
++  Issue,
++  IssueBoardColumn,
++  IssueRollup,
++  IssueWithRelations,
++} from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
++/** Count the proposed ancestors, checking the entire chain for a cycle. */
++function parentDepth(
++  projectId: ProjectId,
++  parentId: IssueId,
++  findIssue: (issueId: IssueId) => Issue | null,
++  issueId?: IssueId,
++): number {
++  const seen = new Set<IssueId>();
++  let nextId: IssueId | null = parentId;
++  let depth = 0;
++
++  while (nextId !== null) {
++    const found = findIssue(nextId);
++    const parent: Issue = requireFound(
++      found?.projectId === projectId ? found : null,
++      "Issue",
++      nextId,
++    );
++    if (depth === 0) assertNotArchived("Issue", parent.id, parent);
++    if (parent.id === issueId || seen.has(parent.id)) {
++      throw new IssueHierarchyError(issueId ?? parentId, "cycle");
++    }
++    seen.add(parent.id);
++    depth += 1;
++    nextId = parent.parentId;
++  }
++
++  return depth;
++}
++
++/** Archived descendants still move with their parent and occupy a level. */
++function subtreeHeight(issueId: IssueId, descendants: readonly Issue[]): number {
++  const children = new Map<IssueId, IssueId[]>();
++  for (const issue of descendants) {
++    if (issue.parentId === null) continue;
++    const siblings = children.get(issue.parentId) ?? [];
++    siblings.push(issue.id);
++    children.set(issue.parentId, siblings);
++  }
++  const queue = [{ id: issueId, depth: 0 }];
++  let height = 0;
++  for (let i = 0; i < queue.length; i += 1) {
++    const current = queue[i];
++    height = Math.max(height, current.depth);
++    for (const id of children.get(current.id) ?? []) {
++      queue.push({ id, depth: current.depth + 1 });
++    }
++  }
++  return height;
++}
++
++async function announceSubIssuesCompleted(
++  actor: Actor,
++  parent: Issue | null,
++): Promise<void> {
++  if (parent?.assigneeId == null) return;
++  await emit("issue.sub_issues_completed", {
++    ...actorEnvelope(actor),
++    issueId: parent.id,
++    projectId: parent.projectId,
++    assigneeId: parent.assigneeId,
++  });
++}
++
+ /**
+- * Creates an issue after four gates: tenant scope, the `issue:create`
+- * permission, a live parent project and the plan's per-project issue quota.
+- * Only then is a number allocated and `issue.created` published — everything
++ * Creates an issue after checking tenant scope, the `issue:create`
++ * permission, a live project, the quota and the proposed parent hierarchy.
++ * Successful insertion publishes `issue.created` — everything
+  * reactive (notifications, search, webhooks, the audit log) hangs off that.
+  */
+ export async function createIssue(
+@@ -66,7 +138,18 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const issue = await issueRepo.insertIssue(
++    input,
++    actor.userId,
++    number,
++    (findIssue) => {
++      if (input.parentId === null) return;
++      const depth = parentDepth(input.projectId, input.parentId, findIssue);
++      if (depth > MAX_SUB_ISSUE_DEPTH) {
++        throw new IssueHierarchyError(input.parentId, "too_deep");
++      }
++    },
++  );
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -108,6 +191,67 @@
+   return after;
+ }
+ 
++export async function setIssueParent(
++  actor: Actor,
++  input: SetIssueParentInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++  let changed = false;
++  const after = await issueRepo.setIssueParent(
++    input,
++    (current, findIssue, descendants) => {
++      const before = requireFound(current, "Issue", input.issueId);
++      assertCan(actor, "issue:update", issueResource(before));
++      assertNotArchived("Issue", before.id, before);
++      const depth = input.parentId === null
++        ? 0
++        : parentDepth(before.projectId, input.parentId, findIssue, before.id);
++      if (depth + subtreeHeight(before.id, descendants) > MAX_SUB_ISSUE_DEPTH) {
++        throw new IssueHierarchyError(before.id, "too_deep");
++      }
++      changed = before.parentId !== input.parentId;
++    },
++  );
++  if (!changed) return after;
++  await emit("issue.updated", {
++    ...actorEnvelope(actor),
++    issueId: after.id,
++    projectId: after.projectId,
++    changedFields: ["parentId"],
++  });
++  return after;
++}
++
++export async function listSubIssues(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<readonly Issue[]> {
++  assertOrgScope(actor, orgId);
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++  return issueRepo.listSubIssues(orgId, issue.projectId, issueId);
++}
++
++export async function getIssueRollup(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<IssueRollup> {
++  assertOrgScope(actor, orgId);
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:read", issueResource(issue));
++  return issueRepo.getIssueRollup(orgId, issue.projectId, issueId);
++}
++
+ /** Status transitions are an `issue:update`, not a separate permission. */
+ export async function changeIssueStatus(
+   actor: Actor,
+@@ -125,11 +269,12 @@
+ 
+   if (before.status === input.status) return before;
+ 
+-  const after = await issueRepo.setIssueStatus(
+-    input.orgId,
+-    input.issueId,
+-    input.status,
+-  );
++  const { issue: after, completedParent } =
++    await issueRepo.setIssueStatusWithCompletion(
++      input.orgId,
++      input.issueId,
++      input.status,
++    );
+ 
+   await emit("issue.status_changed", {
+     ...actorEnvelope(actor),
+@@ -139,6 +284,8 @@
+     to: after.status,
+   });
+ 
++  await announceSubIssuesCompleted(actor, completedParent);
++
+   return after;
+ }
+ 
+@@ -203,13 +350,24 @@
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+-  const archived = await issueRepo.archiveIssue(orgId, issueId);
+-
+-  await emit("issue.archived", {
+-    ...actorEnvelope(actor),
+-    issueId: archived.id,
+-    projectId: archived.projectId,
+-  });
++  const { archivedIssues, completedParent } = await issueRepo.archiveIssueTree(
++    orgId,
++    issue.projectId,
++    issueId,
++  );
++  const archived = requireFound(
++    archivedIssues.find((row) => row.id === issueId),
++    "Issue",
++    issueId,
++  );
++  for (const row of archivedIssues) {
++    await emit("issue.archived", {
++      ...actorEnvelope(actor),
++      issueId: row.id,
++      projectId: row.projectId,
++    });
++  }
++  await announceSubIssuesCompleted(actor, completedParent);
+ 
+   return archived;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/services/notification-service.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/server/services/notification-service.ts	2026-10-14 22:36:44
+@@ -200,6 +200,15 @@
+     });
+   });
+ 
++  subscribe("issue.sub_issues_completed", async (payload) => {
++    await notify(payload.orgId, "sub_issues_completed", [payload.assigneeId], {
++      title: "All sub-issues completed",
++      body: `All sub-issues of issue ${payload.issueId} are closed`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    });
++  });
++
+   subscribe("comment.created", async (payload) => {
+     const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+     const watchers = issue
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/event.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/event.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/event.ts	2026-10-14 22:36:44
+@@ -61,6 +61,11 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.sub_issues_completed": EventEnvelope & {
++    issueId: IssueId;
++    projectId: ProjectId;
++    assigneeId: UserId;
++  };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/issue.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/issue.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/issue.ts	2026-10-14 22:36:44
+@@ -94,6 +94,12 @@
+   readonly attachmentCount: number;
+ }
+ 
++export interface IssueRollup {
++  readonly total: number;
++  readonly open: number;
++  readonly closed: number;
++}
++
+ /** One column of the kanban board; the board is an ordered list of these. */
+ export interface IssueBoardColumn {
+   readonly status: IssueStatus;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/notification.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/notification.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/src/types/notification.ts	2026-10-14 22:36:44
+@@ -11,6 +11,7 @@
+   | "issue_status_changed"
+   | "issue_due_soon"
+   | "issue_overdue"
++  | "sub_issues_completed"
+   | "comment_created"
+   | "comment_mention"
+   | "member_invited"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/tests/services/issue-hierarchy.test.ts /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/tests/services/issue-hierarchy.test.ts
+--- /private/tmp/bench-scratch/b6f67075-4ac2-4344-b910-08a9af2d5441/tests/services/issue-hierarchy.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c00aefcd-7e98-49af-9dde-ef9dedb70fb8/tests/services/issue-hierarchy.test.ts	2026-10-14 22:47:22
+@@ -0,0 +1,367 @@
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++import { eq } from "drizzle-orm";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { MAX_SUB_ISSUE_DEPTH } from "@/config/constants";
++import { subscribe } from "@/lib/event-bus";
++import { isDomainError, toAppError } from "@/lib/errors";
++import { IssueHierarchyError } from "@/lib/issue-hierarchy";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { getDb, issues } from "@/server/db";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { NotFoundError } from "@/server/services/_support";
++import * as service from "@/server/services/issue-service";
++import { listNotifications, updatePreference } from "@/server/services/notification-service";
++import { updateNotificationPreferenceSchema } from "@/schemas/notification";
++import { setIssueParentSchema } from "@/schemas/issue";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++import type { CreateIssueInput } from "@/schemas/issue";
++import type { IssueId } from "@/types/common";
++import type { IssueStatus } from "@/types/issue";
++import type { TaskflowEventMap, TaskflowEventType, Unsubscribe } from "@/types/event";
++
++let cleanup: () => void;
++let tenant: Tenant;
++let otherTenant: Tenant;
++let otherProject: Awaited<ReturnType<typeof projectRepo.insertProject>>;
++const detachers: Unsubscribe[] = [];
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  tenant = await createTenant("hierarchy");
++  otherTenant = await createTenant("hierarchy-other");
++  otherProject = await projectRepo.insertProject({
++    orgId: tenant.org.id,
++    name: "Other project",
++    slug: "other",
++    key: "OTHER",
++    description: null,
++    visibility: "org",
++    leadId: null,
++    color: "#6366f1",
++    targetDate: null,
++  });
++});
++
++afterEach(() => {
++  while (detachers.length > 0) detachers.pop()?.();
++});
++
++afterAll(() => cleanup());
++
++function create(overrides: Partial<CreateIssueInput> = {}) {
++  return service.createIssue(tenant.actors.member, {
++    ...issueInput(tenant.org.id, tenant.project.id),
++    ...overrides,
++  });
++}
++
++function move(issueId: IssueId, parentId: IssueId | null) {
++  return service.setIssueParent(tenant.actors.member, { orgId: tenant.org.id, issueId, parentId });
++}
++
++function status(issueId: IssueId, status: IssueStatus) {
++  return service.changeIssueStatus(tenant.actors.member, { orgId: tenant.org.id, issueId, status });
++}
++
++function archive(issueId: IssueId) {
++  return service.archiveIssue(tenant.actors.member, tenant.org.id, issueId);
++}
++
++function rollup(issueId: IssueId) {
++  return service.getIssueRollup(tenant.actors.viewer, tenant.org.id, issueId);
++}
++
++function notices(recipientId = tenant.userIds.admin) {
++  return listNotifications(tenant.actors.owner, {
++    orgId: tenant.org.id, recipientId, kind: ["sub_issues_completed"],
++    unreadOnly: false, limit: 100, cursor: null,
++  });
++}
++
++function capture<K extends TaskflowEventType>(type: K): TaskflowEventMap[K][] {
++  const seen: TaskflowEventMap[K][] = [];
++  detachers.push(subscribe(type, (payload) => { seen.push(payload); }));
++  return seen;
++}
++
++describe("issue hierarchy", () => {
++  it("validates the parent schema and maps hierarchy conflicts", async () => {
++    const issue = await create();
++    expect(setIssueParentSchema.parse({ orgId: tenant.org.id, issueId: issue.id, parentId: null }).parentId).toBeNull();
++    expect(setIssueParentSchema.safeParse({ orgId: tenant.org.id, issueId: issue.id }).success).toBe(false);
++    for (const reason of ["cycle", "too_deep"] as const) {
++      const error = new IssueHierarchyError(issue.id, reason);
++      expect(error.code).toBe("conflict");
++      expect(isDomainError(error)).toBe(true);
++      expect(toAppError(error)).toMatchObject({ code: "conflict", meta: { issueId: issue.id, reason } });
++    }
++  });
++
++  it("moves whole subtrees and removes parents, announcing only parentId", async () => {
++    const first = await create();
++    const second = await create();
++    const child = await create({ parentId: first.id });
++    const grandchild = await create({ parentId: child.id });
++    const seen = capture("issue.updated");
++
++    expect((await move(child.id, second.id)).parentId).toBe(second.id);
++    expect(await rollup(first.id)).toEqual({ total: 0, open: 0, closed: 0 });
++    expect(await rollup(second.id)).toEqual({ total: 2, open: 2, closed: 0 });
++    expect((await issueRepo.findIssueById(tenant.org.id, grandchild.id))?.parentId).toBe(child.id);
++    expect((await move(child.id, null)).parentId).toBeNull();
++    expect(seen.map((event) => event.changedFields)).toEqual([["parentId"], ["parentId"]]);
++  });
++
++  it("checks tenant scope and scoped existence on every hierarchy operation", async () => {
++    const foreign = await service.createIssue(otherTenant.actors.member, issueInput(otherTenant.org.id, otherTenant.project.id));
++    const reads = [service.listSubIssues, service.getIssueRollup];
++    for (const read of reads) {
++      await expect(read(tenant.actors.owner, otherTenant.org.id, foreign.id)).rejects.toBeInstanceOf(TenantScopeError);
++      await expect(read(tenant.actors.owner, tenant.org.id, foreign.id)).rejects.toBeInstanceOf(NotFoundError);
++    }
++    await expect(service.setIssueParent(tenant.actors.owner, {
++      orgId: otherTenant.org.id, issueId: foreign.id, parentId: null,
++    })).rejects.toBeInstanceOf(TenantScopeError);
++    await expect(move(foreign.id, null)).rejects.toBeInstanceOf(NotFoundError);
++    const local = await create();
++    await expect(move(local.id, foreign.id)).rejects.toBeInstanceOf(NotFoundError);
++  });
++
++  it("uses issue:update, including ownership escalation, and rejects archived moves", async () => {
++    const parent = await create();
++    const child = await create();
++    await expect(service.setIssueParent(tenant.actors.viewer, {
++      orgId: tenant.org.id, issueId: child.id, parentId: parent.id,
++    })).rejects.toBeInstanceOf(PermissionDeniedError);
++    const own = await create({ assigneeId: tenant.userIds.viewer });
++    expect((await service.setIssueParent(tenant.actors.viewer, {
++      orgId: tenant.org.id, issueId: own.id, parentId: parent.id,
++    })).parentId).toBe(parent.id);
++    await archive(child.id);
++    await expect(move(child.id, parent.id)).rejects.toBeInstanceOf(AlreadyArchivedError);
++  });
++
++  it("rejects foreign, wrong-project and archived parents without creating or announcing", async () => {
++    const foreign = await service.createIssue(otherTenant.actors.member, issueInput(otherTenant.org.id, otherTenant.project.id));
++    const wrongProject = await create({ projectId: otherProject.id });
++    const archived = await create();
++    await archive(archived.id);
++    const child = await create();
++    const seen = capture("issue.created");
++    const updates = capture("issue.updated");
++    const count = await issueRepo.countIssues(tenant.org.id, tenant.project.id, { includeArchived: true });
++    for (const parent of [foreign, wrongProject, archived]) {
++      const error = parent.id === archived.id ? AlreadyArchivedError : NotFoundError;
++      await expect(create({ parentId: parent.id })).rejects.toBeInstanceOf(error);
++      await expect(move(child.id, parent.id)).rejects.toBeInstanceOf(error);
++    }
++    expect(await issueRepo.countIssues(tenant.org.id, tenant.project.id, { includeArchived: true })).toBe(count);
++    expect(await issueRepo.findIssueById(tenant.org.id, child.id)).toEqual(child);
++    expect(seen).toHaveLength(0);
++    expect(updates).toHaveLength(0);
++  });
++
++  it("rejects self-parenting and indirect cycles without any mutation", async () => {
++    const root = await create();
++    const child = await create({ parentId: root.id });
++    const grandchild = await create({ parentId: child.id });
++    const seen = capture("issue.updated");
++    for (const parentId of [root.id, child.id, grandchild.id]) {
++      await expect(move(root.id, parentId)).rejects.toMatchObject({ issueId: root.id, reason: "cycle" });
++      expect(await issueRepo.findIssueById(tenant.org.id, root.id)).toEqual(root);
++    }
++    expect(seen).toHaveLength(0);
++  });
++
++  it("prevents a cycle when two parent changes happen simultaneously", async () => {
++    const first = await create();
++    const second = await create();
++    const results = await Promise.allSettled([
++      move(first.id, second.id),
++      move(second.id, first.id),
++    ]);
++    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
++    const rejected = results.find((result) => result.status === "rejected");
++    expect(rejected?.reason).toMatchObject({ reason: "cycle" });
++    expect((await rollup(second.id)).total).toBe(1);
++  });
++
++  it("enforces the maximum depth at creation and uses the deepest moved descendant", async () => {
++    expect(MAX_SUB_ISSUE_DEPTH).toBe(3);
++    const root = await create();
++    const level1 = await create({ parentId: root.id });
++    const level2 = await create({ parentId: level1.id });
++    const level3 = await create({ parentId: level2.id });
++    const created = capture("issue.created");
++    await expect(create({ parentId: level3.id })).rejects.toMatchObject({ reason: "too_deep" });
++    expect(created).toHaveLength(0);
++
++    const subtree = await create();
++    const child = await create({ parentId: subtree.id });
++    const leaf = await create({ parentId: child.id });
++    const updated = capture("issue.updated");
++    await expect(move(subtree.id, level1.id)).rejects.toMatchObject({ issueId: subtree.id, reason: "too_deep" });
++    expect(await issueRepo.findIssueById(tenant.org.id, subtree.id)).toEqual(subtree);
++    expect(updated).toHaveLength(0);
++    await move(subtree.id, root.id);
++    expect((await issueRepo.findIssueById(tenant.org.id, leaf.id))?.parentId).toBe(child.id);
++    await move(subtree.id, null);
++  });
++
++  it("includes archived descendants when checking the depth of a move", async () => {
++    const parent = await create();
++    const destination = await create({ parentId: parent.id });
++    const subtree = await create();
++    const child = await create({ parentId: subtree.id });
++    const leaf = await create({ parentId: child.id });
++    await archive(leaf.id);
++    await expect(move(subtree.id, destination.id)).rejects.toMatchObject({ reason: "too_deep" });
++    expect(await issueRepo.findIssueById(tenant.org.id, subtree.id)).toEqual(subtree);
++  });
++
++  it("lists direct live children by creation time, then number", async () => {
++    const root = await create();
++    const latest = await create({ parentId: root.id });
++    const oldest = await create({ parentId: root.id });
++    const tied = await create({ parentId: root.id, status: "done" });
++    await create({ parentId: oldest.id });
++    const archived = await create({ parentId: root.id });
++    await archive(archived.id);
++    for (const [issue, stamp] of [
++      [latest, "2026-01-02T00:00:00.000Z"],
++      [oldest, "2026-01-01T00:00:00.000Z"],
++      [tied, "2026-01-01T00:00:00.000Z"],
++    ] as const) {
++      getDb().update(issues).set({ createdAt: stamp }).where(eq(issues.id, issue.id)).run();
++    }
++    const children = await service.listSubIssues(tenant.actors.viewer, tenant.org.id, root.id);
++    expect(children.map((issue) => issue.id)).toEqual([oldest.id, tied.id, latest.id]);
++  });
++
++  it("counts all descendants beyond a page, including live work below archived links", async () => {
++    const root = await create();
++    const child = await create({ parentId: root.id, status: "done" });
++    const grandchild = await create({ parentId: child.id, status: "canceled" });
++    await create({ parentId: grandchild.id });
++    for (let i = 0; i < 125; i += 1) await create({ parentId: root.id });
++    await issueRepo.archiveIssue(tenant.org.id, child.id);
++    expect(await rollup(root.id)).toEqual({ total: 127, open: 126, closed: 1 });
++    expect(await rollup(grandchild.id)).toEqual({ total: 1, open: 1, closed: 0 });
++  });
++
++  it("archives every live descendant once, preserves archived rows and leaves ancestors live", async () => {
++    const parent = await create();
++    const root = await create({ parentId: parent.id });
++    const child = await create({ parentId: root.id });
++    const leaf = await create({ parentId: child.id, status: "done" });
++    const sibling = await create({ parentId: root.id, status: "canceled" });
++    const previouslyArchived = await issueRepo.archiveIssue(tenant.org.id, child.id);
++    const seen = capture("issue.archived");
++    await archive(root.id);
++    expect(seen.map((event) => event.issueId).sort()).toEqual([root.id, leaf.id, sibling.id].sort());
++    expect(await issueRepo.findIssueById(tenant.org.id, child.id)).toEqual(previouslyArchived);
++    expect((await issueRepo.findIssueById(tenant.org.id, parent.id))?.archivedAt).toBeNull();
++    for (const id of [root.id, leaf.id, sibling.id]) {
++      expect((await issueRepo.findIssueById(tenant.org.id, id))?.archivedAt).not.toBeNull();
++    }
++    expect(await rollup(root.id)).toEqual({ total: 0, open: 0, closed: 0 });
++    await expect(archive(root.id)).rejects.toBeInstanceOf(AlreadyArchivedError);
++    expect(seen).toHaveLength(3);
++  });
++});
++
++describe("sub-issue completion notifications", () => {
++  it("notifies only on the last open descendant's close, and again after reopening", async () => {
++    const root = await create({ assigneeId: tenant.userIds.admin });
++    const child = await create({ parentId: root.id });
++    const grandchild = await create({ parentId: child.id });
++    const second = await create({ parentId: root.id });
++    const initial = (await notices()).total;
++    await status(child.id, "done");
++    expect((await notices()).total).toBe(initial);
++    // Only the direct parent of this closing is considered; it has no assignee.
++    await status(grandchild.id, "canceled");
++    expect((await notices()).total).toBe(initial);
++    await status(second.id, "canceled");
++    const first = await notices();
++    expect(first.total).toBe(initial + 1);
++    expect(first.items[0]).toMatchObject({ recipientId: tenant.userIds.admin, actorId: tenant.userIds.member, href: `/issues/${root.id}` });
++    await status(second.id, "done");
++    await status(second.id, "done");
++    expect((await notices()).total).toBe(initial + 1);
++    await status(second.id, "todo");
++    expect((await notices()).total).toBe(initial + 1);
++    await status(second.id, "done");
++    expect((await notices()).total).toBe(initial + 2);
++  });
++
++  it("notifies once for simultaneous sibling closes", async () => {
++    const parent = await create({ assigneeId: tenant.userIds.admin });
++    const first = await create({ parentId: parent.id });
++    const second = await create({ parentId: parent.id });
++    const initial = (await notices()).total;
++    await Promise.all([status(first.id, "done"), status(second.id, "canceled")]);
++    expect((await notices()).total).toBe(initial + 1);
++  });
++
++  it("counts an open subtree archive as a close and skips parents in the archive", async () => {
++    const parent = await create({ assigneeId: tenant.userIds.admin });
++    const child = await create({ parentId: parent.id, assigneeId: tenant.userIds.admin });
++    await create({ parentId: child.id });
++    await create({ parentId: child.id });
++    const initial = (await notices()).total;
++    await archive(child.id);
++    const result = await notices();
++    expect(result.total).toBe(initial + 1);
++    expect(result.items[0]?.href).toBe(`/issues/${parent.id}`);
++    expect((await issueRepo.findIssueById(tenant.org.id, parent.id))?.archivedAt).toBeNull();
++  });
++
++  it("sends nothing for moves, closed archives, unassigned or archived parents, or the actor", async () => {
++    const initial = (await notices()).total;
++    const parent = await create({ assigneeId: tenant.userIds.admin });
++    const child = await create({ parentId: parent.id });
++    await move(child.id, null);
++    const closed = await create({ parentId: parent.id, status: "done" });
++    await create({ parentId: closed.id });
++    await archive(closed.id);
++    await status(parent.id, "done");
++    const unassigned = await create();
++    await status((await create({ parentId: unassigned.id })).id, "done");
++    const archivedParent = await create({ assigneeId: tenant.userIds.admin });
++    const orphan = await create({ parentId: archivedParent.id });
++    await issueRepo.archiveIssue(tenant.org.id, archivedParent.id);
++    await status(orphan.id, "done");
++    expect((await notices()).total).toBe(initial);
++    const actorInitial = (await notices(tenant.userIds.member)).total;
++    const self = await create({ assigneeId: tenant.userIds.member });
++    await status((await create({ parentId: self.id })).id, "done");
++    expect((await notices(tenant.userIds.member)).total).toBe(actorInitial);
++  });
++
++  it("accepts preferences for the new kind and applies channel choices and muting", async () => {
++    const input = updateNotificationPreferenceSchema.parse({
++      orgId: tenant.org.id, userId: tenant.userIds.admin, kind: "sub_issues_completed",
++      inApp: true, email: false, digestOnly: false,
++    });
++    await updatePreference(tenant.actors.admin, input);
++    const initial = (await notices()).total;
++    const parent = await create({ assigneeId: tenant.userIds.admin });
++    const child = await create({ parentId: parent.id });
++    await status(child.id, "done");
++    const first = await notices();
++    expect(first.total).toBe(initial + 1);
++    expect(first.items[0]?.channels).toEqual(["in_app"]);
++    await updatePreference(tenant.actors.admin, { ...input, inApp: false });
++    await status(child.id, "backlog");
++    await status(child.id, "canceled");
++    expect((await notices()).total).toBe(initial + 1);
++  });
++});

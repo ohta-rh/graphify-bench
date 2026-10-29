@@ -1,0 +1,315 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/jobs/search-reindex-job.ts /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/jobs/search-reindex-job.ts
+--- /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/jobs/search-reindex-job.ts	2026-10-10 00:10:00
++++ /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/jobs/search-reindex-job.ts	2026-10-10 00:11:11
+@@ -4,11 +4,11 @@
+  * Must call (do not reimplement): indexIssue, indexComment, indexProject
+  */
+ import { createLogger } from "@/lib/logger";
+-import * as commentRepo from "@/server/repositories/comment-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import {
+-  indexComment,
++  indexIssueComments,
+   indexIssue,
+   indexProject,
+ } from "@/server/services/search-service";
+@@ -32,57 +32,56 @@
+  */
+ export async function runSearchReindexJob(orgId: OrgId): Promise<JobResult> {
+   return runJob("search-reindex", async (result) => {
+-    const projects = await projectRepo.listProjects({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
++    await searchRepo.clearSearchIndex(orgId);
++    let projectCursor: string | null = null;
++    do {
++      const projects = await projectRepo.listProjects({
++        orgId,
++        limit: PAGE_SIZE,
++        cursor: projectCursor,
++        includeArchived: true,
++      });
+ 
+-    for (const project of projects.items) {
+-      try {
+-        await indexProject(orgId, project);
+-        result.processed += 1;
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index project", {
+-          projectId: project.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
++      for (const project of projects.items) {
++        try {
++          await indexProject(orgId, project);
++          result.processed += 1;
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index project", {
++            projectId: project.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
++        }
+       }
+-    }
+ 
+-    const issues = await issueRepo.listIssues({
+-      orgId,
+-      limit: PAGE_SIZE,
+-      cursor: null,
+-      includeArchived: true,
+-    });
++      projectCursor = projects.nextCursor;
++    } while (projectCursor);
+ 
+-    for (const issue of issues.items) {
+-      try {
+-        await indexIssue(orgId, issue);
+-        result.processed += 1;
++    let issueCursor: string | null = null;
++    do {
++      const issues = await issueRepo.listIssues({
++        orgId,
++        limit: PAGE_SIZE,
++        cursor: issueCursor,
++        includeArchived: true,
++      });
+ 
+-        const comments = await commentRepo.listComments({
+-          orgId,
+-          issueId: issue.id,
+-          includeArchived: true,
+-          limit: PAGE_SIZE,
+-          cursor: null,
+-        });
+-
+-        for (const comment of comments.items) {
+-          await indexComment(orgId, comment);
++      for (const issue of issues.items) {
++        try {
++          await indexIssue(orgId, issue);
+           result.processed += 1;
++
++          result.processed += await indexIssueComments(orgId, issue);
++        } catch (error) {
++          result.failed += 1;
++          logger.error("failed to index issue", {
++            issueId: issue.id,
++            reason: error instanceof Error ? error.message : String(error),
++          });
+         }
+-      } catch (error) {
+-        result.failed += 1;
+-        logger.error("failed to index issue", {
+-          issueId: issue.id,
+-          reason: error instanceof Error ? error.message : String(error),
+-        });
+       }
+-    }
++      issueCursor = issues.nextCursor;
++    } while (issueCursor);
+   });
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/repositories/search-repository.ts /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/repositories/search-repository.ts
+--- /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/repositories/search-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/repositories/search-repository.ts	2026-10-10 00:10:54
+@@ -1,7 +1,7 @@
+ /**
+  * Denormalised search index kept in step by `SearchService`.
+  */
+-import { and, count, desc, eq, inArray, like } from "drizzle-orm";
++import { and, count, desc, eq, inArray, like, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, searchIndex } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -11,6 +11,37 @@
+ import type { SearchIndexRow } from "@/server/db/schema/webhooks";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
+ 
++/** Check the source hierarchy, including tenant ownership at every level. */
++function searchable(orgId: OrgId, kind: SearchSubjectKind | typeof searchIndex.subjectKind,
++  subjectId: string | typeof searchIndex.subjectId) {
++  return sql`(
++    (${kind} = 'project' AND EXISTS (
++      SELECT 1 FROM projects p WHERE p.id = ${subjectId}
++      AND p.org_id = ${orgId} AND p.archived_at IS NULL
++    )) OR (${kind} = 'issue' AND EXISTS (
++      SELECT 1 FROM issues i JOIN projects p ON p.id = i.project_id AND p.org_id = i.org_id
++      WHERE i.id = ${subjectId} AND i.org_id = ${orgId}
++      AND i.archived_at IS NULL AND p.archived_at IS NULL
++    )) OR (${kind} = 'comment' AND EXISTS (
++      SELECT 1 FROM comments c JOIN issues i ON i.id = c.issue_id AND i.org_id = c.org_id
++      JOIN projects p ON p.id = i.project_id AND p.org_id = i.org_id
++      WHERE c.id = ${subjectId} AND c.org_id = ${orgId}
++      AND c.archived_at IS NULL AND i.archived_at IS NULL AND p.archived_at IS NULL
++    ))
++  )`;
++}
++
++export async function clearSearchIndex(orgId: OrgId): Promise<void> {
++  getDb().delete(searchIndex).where(orgPredicate(searchIndex.orgId, orgId)).run();
++}
++
++export async function pruneSearchIndex(orgId: OrgId): Promise<void> {
++  getDb().delete(searchIndex).where(and(
++    orgPredicate(searchIndex.orgId, orgId),
++    sql`NOT ${searchable(orgId, searchIndex.subjectKind, searchIndex.subjectId)}`,
++  )).run();
++}
++
+ /**
+  * Upsert by (org, kind, subject) rather than by row id: the indexer is called
+  * on every write and must be idempotent.
+@@ -23,6 +54,11 @@
+   projectId: ProjectId | null,
+ ): Promise<void> {
+   const db = getDb();
++  const visible = db.get<{ visible: number }>(sql`SELECT ${searchable(orgId, subjectKind, subjectId)} AS visible`);
++  if (!visible?.visible) {
++    await deleteSearchDocument(orgId, subjectKind, subjectId);
++    return;
++  }
+   const indexedAt = toIsoTimestamp(new Date());
+ 
+   const existing = db
+@@ -88,6 +124,7 @@
+ 
+   const filters = compact(
+     orgPredicate(searchIndex.orgId, input.orgId),
++    searchable(input.orgId, searchIndex.subjectKind, searchIndex.subjectId),
+     like(searchIndex.content, `%${input.q}%`),
+     input.kinds.length === 0
+       ? undefined
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/comment-service.ts /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/comment-service.ts	2026-10-10 00:11:11
+@@ -3,6 +3,7 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, archivePatch, consumeRateLimit
+  */
++import { indexComment } from "./search-service";
+ import { emit } from "@/lib/event-bus";
+ import { resolveMentions } from "@/lib/mentions";
+ import { assertCan } from "@/lib/permissions";
+@@ -107,7 +108,9 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const updated = await commentRepo.updateComment(input);
++  await indexComment(input.orgId, updated);
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/project-service.ts /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/project-service.ts	2026-10-10 00:11:11
+@@ -4,6 +4,7 @@
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, uniqueSlug, projectKeyFromName
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
++import { indexProject } from "./search-service";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { projectKeyFromName, uniqueSlug } from "@/lib/slug";
+@@ -85,7 +86,9 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+-  return projectRepo.updateProject(input);
++  const updated = await projectRepo.updateProject(input);
++  await indexProject(input.orgId, updated);
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/search-service.ts /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/454e2de2-dfb7-40c2-bc21-c5b9376aa36e/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/fde24950-1ef5-47a9-8857-da0aab9af10b/src/server/services/search-service.ts	2026-10-10 00:11:11
+@@ -104,7 +104,7 @@
+     "comment",
+     comment.id,
+     comment.body,
+-    null,
++    (await issueRepo.findIssueById(orgId, comment.issueId))?.projectId ?? null,
+   );
+ }
+ 
+@@ -121,6 +121,21 @@
+   );
+ }
+ 
++export async function indexIssueComments(orgId: OrgId, issue: Issue): Promise<number> {
++  let cursor: string | null = null;
++  let processed = 0;
++  do {
++    const page = await commentRepo.listComments({ orgId, issueId: issue.id,
++      includeArchived: true, limit: 100, cursor });
++    for (const comment of page.items) {
++      await indexComment(orgId, comment);
++      processed += 1;
++    }
++    cursor = page.nextCursor;
++  } while (cursor);
++  return processed;
++}
++
+ export async function removeFromIndex(
+   orgId: OrgId,
+   subjectKind: SearchSubjectKind,
+@@ -145,7 +160,7 @@
+       if (issue) await indexIssue(payload.orgId, issue);
+     }),
+     subscribe("issue.archived", async (payload) => {
+-      await removeFromIndex(payload.orgId, "issue", payload.issueId);
++      await searchRepo.pruneSearchIndex(payload.orgId);
+     }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+@@ -164,11 +179,37 @@
+       );
+       if (project) await indexProject(payload.orgId, project);
+     }),
++    subscribe("project.restored", async (payload) => {
++      const project = await projectRepo.findProjectById(payload.orgId, payload.projectId);
++      if (!project) return;
++      await indexProject(payload.orgId, project);
++      let cursor: string | null = null;
++      do {
++        const page = await issueRepo.listIssues({ orgId: payload.orgId,
++          projectId: project.id, limit: 100, cursor, includeArchived: false });
++        for (const issue of page.items) {
++          await indexIssue(payload.orgId, issue);
++          await indexIssueComments(payload.orgId, issue);
++        }
++        cursor = page.nextCursor;
++      } while (cursor);
++    }),
+     subscribe("project.archived", async (payload) => {
+-      await removeFromIndex(payload.orgId, "project", payload.projectId);
++      await searchRepo.pruneSearchIndex(payload.orgId);
+     }),
+     subscribe("search.reindex_requested", async (payload) => {
+-      if (payload.subjectKind !== "issue") return;
++      if (payload.subjectKind === "project") {
++        const project = await projectRepo.findProjectById(payload.orgId, payload.subjectId as Project["id"]);
++        if (project) await indexProject(payload.orgId, project);
++        else await removeFromIndex(payload.orgId, "project", payload.subjectId);
++        return;
++      }
++      if (payload.subjectKind === "comment") {
++        const comment = await commentRepo.findCommentById(payload.orgId, payload.subjectId as Comment["id"]);
++        if (comment) await indexComment(payload.orgId, comment);
++        else await removeFromIndex(payload.orgId, "comment", payload.subjectId);
++        return;
++      }
+       const issue = await issueRepo.findIssueById(
+         payload.orgId,
+         payload.subjectId as Issue["id"],

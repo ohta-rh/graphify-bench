@@ -1,0 +1,665 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/components/domain/activity/activity-labels.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/components/domain/activity/activity-labels.ts	2026-10-14 17:36:23
+@@ -11,6 +11,7 @@
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
+   "project.created": "created a project",
++  "project.cloned": "cloned a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+   "project.restored": "restored a project",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/schemas/activity.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/schemas/activity.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/schemas/activity.ts	2026-10-14 17:36:23
+@@ -10,6 +10,7 @@
+ export const activityActionSchema = z.enum([
+   "organization.updated",
+   "project.created",
++  "project.cloned",
+   "project.updated",
+   "project.archived",
+   "project.restored",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/schemas/project.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/schemas/project.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/schemas/project.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/schemas/project.ts	2026-10-14 17:36:23
+@@ -25,6 +25,15 @@
+   targetDate: isoTimestampSchema.nullable().default(null),
+ });
+ 
++export const cloneProjectSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  name: z.string().min(2).max(80),
++  slug: slugSchema,
++  key: projectKeySchema,
++  includeIssues: z.boolean().default(true),
++});
++
+ export const updateProjectSchema = z.object({
+   orgId: orgIdSchema,
+   projectId: projectIdSchema,
+@@ -53,6 +62,7 @@
+   .extend(archiveScopeSchema.shape);
+ 
+ export type CreateProjectInput = z.infer<typeof createProjectSchema>;
++export type CloneProjectInput = z.infer<typeof cloneProjectSchema>;
+ export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+ export type ArchiveProjectInput = z.infer<typeof archiveProjectSchema>;
+ export type ListProjectsInput = z.infer<typeof listProjectsSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/repositories/project-repository.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/repositories/project-repository.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/repositories/project-repository.ts	2026-10-14 17:33:32
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/repositories/project-repository.ts	2026-10-14 17:36:47
+@@ -11,7 +11,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { getDb, issues, projects } from "@/server/db";
++import { getDb, issueLabels, issues, projects } from "@/server/db";
+ import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -22,7 +22,8 @@
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+-import type { ArchiveScope, OrgId, Page, ProjectId } from "@/types/common";
++import type { ArchiveScope, OrgId, Page, ProjectId, UserId } from "@/types/common";
++import type { Issue, IssueStatus } from "@/types/issue";
+ import type { Project, ProjectStats } from "@/types/project";
+ 
+ export async function findProjectById(
+@@ -112,31 +113,80 @@
+ 
+ export async function insertProject(
+   input: CreateProjectInput,
++  issueCopies?: {
++    issues: readonly Issue[];
++    authorId: UserId;
++    status: IssueStatus;
++  },
+ ): Promise<Project> {
+   const taken = await listTakenProjectSlugs(input.orgId);
+   const slug = uniqueSlug(input.slug, taken);
+   const stamp = toIsoTimestamp(new Date());
+ 
+-  const row = getDb()
+-    .insert(projects)
+-    .values({
+-      id: newId(),
+-      orgId: input.orgId,
+-      name: input.name,
+-      slug,
+-      key: input.key,
+-      description: input.description,
+-      visibility: input.visibility,
+-      status: "active",
+-      leadId: input.leadId,
+-      color: input.color,
+-      startsAt: null,
+-      targetDate: input.targetDate,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
++  // A clone's project, issues and label links commit together.
++  const row = getDb().transaction((tx) => {
++    const project = tx
++      .insert(projects)
++      .values({
++        id: newId(),
++        orgId: input.orgId,
++        name: input.name,
++        slug,
++        key: input.key,
++        description: input.description,
++        visibility: input.visibility,
++        status: "active",
++        leadId: input.leadId,
++        color: input.color,
++        startsAt: null,
++        targetDate: input.targetDate,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
++
++    if (issueCopies) {
++      for (const [index, issue] of issueCopies.issues.entries()) {
++        const id = newId();
++        tx.insert(issues)
++          .values({
++            id,
++            orgId: input.orgId,
++            projectId: project.id,
++            number: index + 1,
++            title: issue.title,
++            description: issue.description,
++            status: issueCopies.status,
++            priority: issue.priority,
++            authorId: issueCopies.authorId,
++            assigneeId: null,
++            parentId: null,
++            estimate: issue.estimate,
++            dueAt: issue.dueAt,
++            startedAt: null,
++            completedAt: null,
++            createdAt: stamp,
++            updatedAt: stamp,
++          })
++          .run();
++
++        if (issue.labelIds.length > 0) {
++          tx.insert(issueLabels)
++            .values(
++              issue.labelIds.map((labelId) => ({
++                orgId: input.orgId,
++                issueId: id,
++                labelId,
++              })),
++            )
++            .run();
++        }
++      }
++    }
++
++    return project;
++  });
+ 
+   return toProject(row);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/activity-service.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/activity-service.ts	2026-10-14 17:36:23
+@@ -157,6 +157,19 @@
+         summary: `Created project ${payload.name}`,
+       }).then(() => undefined),
+     ),
++    subscribe("project.cloned", (payload) =>
++      record(payload.orgId, "project.cloned", {
++        actorId: payload.actorId,
++        subjectKind: "project",
++        subjectId: payload.projectId,
++        projectId: payload.projectId,
++        summary: `Cloned project with ${payload.issuesCopied} issues`,
++        metadata: {
++          sourceProjectId: payload.sourceProjectId,
++          issuesCopied: payload.issuesCopied,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/project-service.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/project-service.ts	2026-10-14 17:33:32
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/project-service.ts	2026-10-14 17:39:53
+@@ -9,6 +9,7 @@
+ import { projectKeyFromName, uniqueSlug } from "@/lib/slug";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import { issueStatusSchema } from "@/schemas/issue";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+@@ -20,12 +21,14 @@
+ } from "./_support";
+ import type {
+   ArchiveProjectInput,
++  CloneProjectInput,
+   CreateProjectInput,
+   ListProjectsInput,
+   UpdateProjectInput,
+ } from "@/schemas/project";
+ import type { OrgId, Page, ProjectId } from "@/types/common";
+ import type { Actor } from "@/types/member";
++import type { Issue } from "@/types/issue";
+ import type { Project, ProjectWithStats } from "@/types/project";
+ 
+ /**
+@@ -69,6 +72,88 @@
+     projectId: project.id,
+     name: project.name,
+     slug: project.slug,
++  });
++
++  return project;
++}
++
++/** Clones a live project and preflights the entire issue batch before writing. */
++export async function cloneProject(
++  actor: Actor,
++  input: CloneProjectInput,
++): Promise<Project> {
++  assertOrgScope(actor, input.orgId);
++
++  const source = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.projectId),
++    "Project",
++    input.projectId,
++  );
++  assertCan(actor, "project:read", projectResource(source));
++  assertCan(actor, "project:create", orgResource(input.orgId));
++  assertNotArchived("Project", source.id, source);
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const used = await projectRepo.countProjects(input.orgId);
++  if (wouldExceedLimit(org.plan, "projects", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows ${used} projects; upgrade to add another`,
++    );
++  }
++
++  const issues: Issue[] = [];
++  if (input.includeIssues) {
++    let cursor: string | null = null;
++    do {
++      const page = await issueRepo.listIssues({
++        orgId: input.orgId,
++        projectId: source.id,
++        limit: 100,
++        cursor,
++      });
++      issues.push(...page.items);
++      cursor = page.nextCursor;
++    } while (cursor !== null);
++    issues.sort((a, b) => a.number - b.number);
++  }
++
++  if (wouldExceedLimit(org.plan, "issuesPerProject", 0, issues.length)) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in project ${input.key}`,
++    );
++  }
++
++  const defaultStatus = issueStatusSchema.safeParse(
++    org.settings.defaultIssueStatus,
++  );
++  const project = await projectRepo.insertProject(
++    {
++      orgId: input.orgId,
++      name: input.name,
++      slug: input.slug,
++      key: input.key,
++      description: source.description,
++      visibility: source.visibility,
++      leadId: source.leadId,
++      color: source.color,
++      targetDate: null,
++    },
++    {
++      issues,
++      authorId: actor.userId,
++      status: defaultStatus.success ? defaultStatus.data : "backlog",
++    },
++  );
++
++  await emit("project.cloned", {
++    ...actorEnvelope(actor),
++    projectId: project.id,
++    sourceProjectId: source.id,
++    issuesCopied: issues.length,
+   });
+ 
+   return project;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/search-service.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/search-service.ts	2026-10-14 17:36:23
+@@ -164,6 +164,25 @@
+       );
+       if (project) await indexProject(payload.orgId, project);
+     }),
++    subscribe("project.cloned", async (payload) => {
++      const project = await projectRepo.findProjectById(
++        payload.orgId,
++        payload.projectId,
++      );
++      if (project) await indexProject(payload.orgId, project);
++
++      let cursor: string | null = null;
++      do {
++        const page = await issueRepo.listIssues({
++          orgId: payload.orgId,
++          projectId: payload.projectId,
++          limit: 100,
++          cursor,
++        });
++        for (const issue of page.items) await indexIssue(payload.orgId, issue);
++        cursor = page.nextCursor;
++      } while (cursor !== null);
++    }),
+     subscribe("project.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "project", payload.projectId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/usage-service.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/usage-service.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/server/services/usage-service.ts	2026-10-14 17:36:23
+@@ -80,6 +80,12 @@
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
++    subscribe("project.cloned", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, {
++        projectsUsed: 1,
++        issuesUsed: payload.issuesCopied,
++      });
++    }),
+     subscribe("project.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, {
+         projectsUsed: -1,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/types/activity.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/types/activity.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/types/activity.ts	2026-10-14 17:36:23
+@@ -11,6 +11,7 @@
+ export type ActivityAction =
+   | "organization.updated"
+   | "project.created"
++  | "project.cloned"
+   | "project.updated"
+   | "project.archived"
+   | "project.restored"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/types/event.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/types/event.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/src/types/event.ts	2026-10-14 17:36:23
+@@ -31,6 +31,11 @@
+     name: string;
+     slug: string;
+   };
++  "project.cloned": EventEnvelope & {
++    projectId: ProjectId;
++    sourceProjectId: ProjectId;
++    issuesCopied: number;
++  };
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/components/activity-grouping.test.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/components/activity-grouping.test.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/components/activity-grouping.test.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/components/activity-grouping.test.ts	2026-10-14 17:39:01
+@@ -48,6 +48,7 @@
+ 
+   it("has a label for every action it renders", () => {
+     expect(activityLabel("member.role_changed")).toBe("changed a role");
++    expect(activityLabel("project.cloned")).toBe("cloned a project");
+   });
+ });
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/schemas/project.schema.test.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/schemas/project.schema.test.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/schemas/project.schema.test.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/schemas/project.schema.test.ts	2026-10-14 17:39:01
+@@ -2,6 +2,7 @@
+ import { describe, expect, it } from "vitest";
+ import {
+   archiveProjectSchema,
++  cloneProjectSchema,
+   createProjectSchema,
+   listProjectsSchema,
+   projectStatusSchema,
+@@ -115,6 +116,23 @@
+         archiveIssues: false,
+       }).archiveIssues,
+     ).toBe(false);
++  });
++
++  it("validates clone choices and includes issues by default", () => {
++    const input = { ...createInput(), projectId: PROJECT };
++    expect(cloneProjectSchema.parse(input).includeIssues).toBe(true);
++    expect(cloneProjectSchema.parse({ ...input, includeIssues: false }).includeIssues).toBe(false);
++    for (const patch of [
++      { projectId: "invalid" },
++      { orgId: "invalid" },
++      { name: "x" },
++      { name: "x".repeat(81) },
++      { slug: "Invalid Slug" },
++      { key: "lowercase" },
++      { includeIssues: "true" },
++    ]) {
++      expect(cloneProjectSchema.safeParse({ ...input, ...patch }).success).toBe(false);
++    }
+   });
+ 
+   it("extends the list schema with pagination and archive scope", () => {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/services/project-clone.test.ts /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/services/project-clone.test.ts
+--- /private/tmp/bench-scratch/32c324a9-d2df-4275-94cf-14ccbd017da1/tests/services/project-clone.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/01e9ecb1-3393-47c5-9706-6d0937964154/tests/services/project-clone.test.ts	2026-10-14 17:39:53
+@@ -0,0 +1,234 @@
++import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { eq } from "drizzle-orm";
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { activityFilterSchema } from "@/schemas/activity";
++import { getDb, projects } from "@/server/db";
++import * as activityRepo from "@/server/repositories/activity-repository";
++import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as commentRepo from "@/server/repositories/comment-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as labelRepo from "@/server/repositories/label-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
++import * as usageRepo from "@/server/repositories/usage-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { registerActivityListeners } from "@/server/services/activity-service";
++import { createIssue } from "@/server/services/issue-service";
++import { cloneProject } from "@/server/services/project-service";
++import { registerSearchListeners } from "@/server/services/search-service";
++import { registerUsageListeners } from "@/server/services/usage-service";
++import { toIsoTimestamp } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { CloneProjectInput } from "@/schemas/project";
++import type { TaskflowEventMap } from "@/types/event";
++import type { Tenant } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++let detach: (() => void)[];
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  detach = [registerActivityListeners(), registerSearchListeners(), registerUsageListeners()];
++});
++
++afterAll(() => {
++  for (const off of detach) off();
++  cleanup();
++});
++
++function cloneInput(tenant: Tenant, overrides: Partial<CloneProjectInput> = {}): CloneProjectInput {
++  return {
++    orgId: tenant.org.id,
++    projectId: tenant.project.id,
++    name: "Next release",
++    slug: "next-release",
++    key: "NEXT",
++    includeIssues: true,
++    ...overrides,
++  };
++}
++
++describe("services/project-service cloneProject", () => {
++  it("copies project settings and live issue content, resetting progress and relationships", async () => {
++    const tenant = await createTenant("clone-content");
++    const date = toIsoTimestamp("2026-09-01T00:00:00.000Z");
++    await orgRepo.updateOrg(tenant.org.id, {
++      orgId: tenant.org.id,
++      settings: { defaultIssueStatus: "todo" },
++    });
++    await projectRepo.updateProject({
++      orgId: tenant.org.id,
++      projectId: tenant.project.id,
++      description: "Repeatable checklist",
++      visibility: "private",
++      color: "#112233",
++      status: "completed",
++      targetDate: date,
++    });
++    getDb().update(projects).set({ startsAt: date }).where(eq(projects.id, tenant.project.id)).run();
++    const sourceProject = await projectRepo.findProjectById(tenant.org.id, tenant.project.id);
++    const label = await labelRepo.insertLabel({ orgId: tenant.org.id, name: "Release", color: "#112233", description: null });
++    const parent = await issueRepo.insertIssue(
++      issueInput(tenant.org.id, tenant.project.id, { title: "Archived parent" }),
++      tenant.userIds.owner,
++      2,
++    );
++    await issueRepo.archiveIssue(tenant.org.id, parent.id);
++    const source = await issueRepo.insertIssue(
++      {
++        ...issueInput(tenant.org.id, tenant.project.id),
++        title: "Ship release",
++        description: "Keep these instructions",
++        priority: "high",
++        assigneeId: tenant.userIds.admin,
++        parentId: parent.id,
++        estimate: 5,
++        dueAt: date,
++        labelIds: [label.id],
++      },
++      tenant.userIds.owner,
++      9,
++    );
++    await issueRepo.setIssueStatus(tenant.org.id, source.id, "in_progress");
++    await issueRepo.setIssueStatus(tenant.org.id, source.id, "done");
++    const before = await issueRepo.findIssueById(tenant.org.id, source.id);
++    await commentRepo.insertComment({ orgId: tenant.org.id, issueId: source.id, body: "Conversation", parentId: null, mentionedUserIds: [] }, tenant.userIds.owner);
++    await attachmentRepo.insertAttachment({ orgId: tenant.org.id, issueId: source.id, filename: "notes.txt", contentType: "text/plain", sizeBytes: 10 }, tenant.userIds.owner);
++
++    const project = await cloneProject(tenant.actors.member, cloneInput(tenant, { slug: "platform" }));
++    expect(project.id).not.toBe(tenant.project.id);
++    expect(project).toMatchObject({
++      orgId: tenant.org.id,
++      name: "Next release",
++      slug: "platform-2",
++      key: "NEXT",
++      description: "Repeatable checklist",
++      visibility: "private",
++      leadId: tenant.userIds.owner,
++      color: "#112233",
++      status: "active",
++      startsAt: null,
++      targetDate: null,
++      archivedAt: null,
++    });
++    expect(await projectRepo.findProjectById(tenant.org.id, project.id)).toEqual(project);
++    const page = await issueRepo.listIssuesWithRelations({ orgId: tenant.org.id, projectId: project.id, limit: 100, cursor: null, includeArchived: true });
++    expect(page.items).toHaveLength(1);
++    const copy = page.items[0];
++    expect(copy.issue.id).not.toBe(source.id);
++    expect(copy.issue).toMatchObject({
++      projectId: project.id,
++      number: 1,
++      title: source.title,
++      description: source.description,
++      priority: source.priority,
++      estimate: source.estimate,
++      dueAt: source.dueAt,
++      labelIds: [label.id],
++      status: "todo",
++      authorId: tenant.userIds.member,
++      assigneeId: null,
++      parentId: null,
++      startedAt: null,
++      completedAt: null,
++      archivedAt: null,
++    });
++    expect(copy.commentCount).toBe(0);
++    expect(copy.attachmentCount).toBe(0);
++    expect(await issueRepo.findIssueById(tenant.org.id, source.id)).toEqual(before);
++    expect(await projectRepo.findProjectById(tenant.org.id, tenant.project.id)).toEqual(sourceProject);
++    const next = await createIssue(tenant.actors.member, issueInput(tenant.org.id, project.id));
++    expect(next.number).toBe(2);
++  });
++
++  it("walks every issue page, renumbers by source number, and updates search, audit and meters with one event", async () => {
++    const tenant = await createTenant("clone-batch");
++    for (let number = 105; number >= 1; number--) {
++      await issueRepo.insertIssue(
++        issueInput(tenant.org.id, tenant.project.id, { title: `Batch issue ${number}` }),
++        tenant.userIds.owner,
++        number * 3,
++      );
++    }
++    const before = await usageRepo.recomputeUsage(tenant.org.id);
++    const cloned: TaskflowEventMap["project.cloned"][] = [];
++    const created: unknown[] = [];
++    const off = [
++      subscribe("project.cloned", (payload) => { cloned.push(payload); }),
++      subscribe("project.created", (payload) => { created.push(payload); }),
++      subscribe("issue.created", (payload) => { created.push(payload); }),
++    ];
++    try {
++      const project = await cloneProject(tenant.actors.member, cloneInput(tenant));
++      expect(created).toHaveLength(0);
++      expect(cloned).toHaveLength(1);
++      expect(cloned[0]).toMatchObject({ orgId: tenant.org.id, actorId: tenant.userIds.member, projectId: project.id, sourceProjectId: tenant.project.id, issuesCopied: 105 });
++      expect(cloned[0].occurredAt).toEqual(expect.any(String));
++      expect(await issueRepo.countIssues(tenant.org.id, project.id)).toBe(105);
++      expect(await issueRepo.nextIssueNumber(tenant.org.id, project.id)).toBe(106);
++      for (let number = 1; number <= 105; number++) {
++        expect(await issueRepo.findIssueByNumber(tenant.org.id, project.id, number)).toMatchObject({ title: `Batch issue ${number}` });
++      }
++      expect(await searchRepo.searchDocuments({ orgId: tenant.org.id, projectId: project.id, q: "Batch issue", kinds: ["issue"], limit: 100, cursor: null })).toMatchObject({ total: 105 });
++      expect(await searchRepo.searchDocuments({ orgId: tenant.org.id, projectId: project.id, q: project.name, kinds: ["project"], limit: 100, cursor: null })).toMatchObject({ total: 1 });
++      expect(await usageRepo.getUsage(tenant.org.id)).toMatchObject({ projectsUsed: before.projectsUsed + 1, issuesUsed: before.issuesUsed + 105 });
++      const audit = await activityRepo.listActivity(activityFilterSchema.parse({ orgId: tenant.org.id, projectId: project.id, action: ["project.cloned"] }));
++      expect(audit.items).toHaveLength(1);
++      expect(audit.items[0]).toMatchObject({ action: "project.cloned", actorId: tenant.userIds.member, subjectKind: "project", subjectId: project.id, projectId: project.id, metadata: { sourceProjectId: tenant.project.id, issuesCopied: 105 } });
++      expect((await activityRepo.listActivity({ orgId: tenant.org.id, projectId: project.id, limit: 100, cursor: null })).total).toBe(1);
++    } finally {
++      for (const detach of off) detach();
++    }
++  });
++
++  it("refuses an oversized issue batch before writing, but allows a project-only clone", async () => {
++    const tenant = await createTenant("clone-issue-quota", "free");
++    for (let number = 1; number <= 101; number++) {
++      await issueRepo.insertIssue(issueInput(tenant.org.id, tenant.project.id), tenant.userIds.owner, number);
++    }
++    const before = await usageRepo.recomputeUsage(tenant.org.id);
++    await expect(cloneProject(tenant.actors.member, cloneInput(tenant))).rejects.toThrow(/allows no more issues/);
++    expect(await projectRepo.countProjects(tenant.org.id, { includeArchived: true })).toBe(1);
++    expect(await usageRepo.getUsage(tenant.org.id)).toEqual(before);
++    expect((await activityRepo.listActivity({ orgId: tenant.org.id, limit: 100, cursor: null })).total).toBe(0);
++    expect(await searchRepo.countIndexed(tenant.org.id)).toBe(0);
++
++    const project = await cloneProject(tenant.actors.member, cloneInput(tenant, { includeIssues: false }));
++    expect(await issueRepo.countIssues(tenant.org.id, project.id, { includeArchived: true })).toBe(0);
++    expect(await usageRepo.getUsage(tenant.org.id)).toMatchObject({ projectsUsed: 2, issuesUsed: 101 });
++    const audit = await activityRepo.listActivity({ orgId: tenant.org.id, projectId: project.id, limit: 100, cursor: null });
++    expect(audit.items[0].metadata).toEqual({ sourceProjectId: tenant.project.id, issuesCopied: 0 });
++    await expect(cloneProject(tenant.actors.member, cloneInput(tenant, { key: "MORE", slug: "more" }))).rejects.toThrow(/allows 2 projects/);
++    expect(await projectRepo.countProjects(tenant.org.id)).toBe(2);
++  });
++
++  it("allows exactly the issue quota, excluding archived issues from the batch", async () => {
++    const tenant = await createTenant("clone-exact-quota", "free");
++    for (let number = 1; number <= 101; number++) {
++      const issue = await issueRepo.insertIssue(issueInput(tenant.org.id, tenant.project.id), tenant.userIds.owner, number);
++      if (number === 1) await issueRepo.archiveIssue(tenant.org.id, issue.id);
++    }
++    const project = await cloneProject(tenant.actors.member, cloneInput(tenant));
++    expect(await issueRepo.countIssues(tenant.org.id, project.id)).toBe(100);
++    expect(await issueRepo.nextIssueNumber(tenant.org.id, project.id)).toBe(101);
++  });
++
++  it("requires an authorized actor and a live source in the same workspace", async () => {
++    const tenant = await createTenant("clone-gates");
++    const other = await createTenant("clone-other");
++    await expect(cloneProject(tenant.actors.viewer, cloneInput(tenant))).rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(cloneProject(other.actors.owner, cloneInput(tenant))).rejects.toBeInstanceOf(TenantScopeError);
++    await expect(cloneProject(tenant.actors.member, cloneInput(tenant, { projectId: other.project.id }))).rejects.toBeInstanceOf(NotFoundError);
++    await projectRepo.archiveProject(tenant.org.id, tenant.project.id);
++    await expect(cloneProject(tenant.actors.member, cloneInput(tenant))).rejects.toBeInstanceOf(AlreadyArchivedError);
++    expect(await projectRepo.countProjects(tenant.org.id, { includeArchived: true })).toBe(1);
++  });
++});

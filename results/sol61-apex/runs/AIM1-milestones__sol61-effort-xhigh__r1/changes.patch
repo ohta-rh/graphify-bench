@@ -1,0 +1,1421 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/components/domain/activity/activity-labels.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/components/domain/activity/activity-labels.ts	2026-10-14 22:25:06
+@@ -14,6 +14,9 @@
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+   "project.restored": "restored a project",
++  "milestone.created": "created a milestone",
++  "milestone.closed": "closed a milestone",
++  "milestone.reopened": "reopened a milestone",
+   "issue.created": "created an issue",
+   "issue.updated": "updated an issue",
+   "issue.status_changed": "changed status",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/components/domain/notification/notification-preferences-form.tsx /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/components/domain/notification/notification-preferences-form.tsx
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/components/domain/notification/notification-preferences-form.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/components/domain/notification/notification-preferences-form.tsx	2026-10-14 22:25:06
+@@ -41,6 +41,7 @@
+ const KIND_LABELS: Readonly<Record<NotificationKind, string>> = {
+   issue_assigned: "Issue assigned to me",
+   issue_status_changed: "Issue status changed",
++  issue_milestone_changed: "Issue milestone changed",
+   issue_due_soon: "Issue due soon",
+   issue_overdue: "Issue overdue",
+   comment_created: "New comment",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/config/constants.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/config/constants.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/config/constants.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/config/constants.ts	2026-10-14 22:24:24
+@@ -24,3 +24,6 @@
+ 
+ /** How far ahead the overdue job looks when collecting due issues. */
+ export const OVERDUE_LOOKAHEAD_HOURS: number = 24;
++
++/** Maximum number of open milestones in one project. */
++export const MAX_OPEN_MILESTONES_PER_PROJECT: number = 10;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/lib/errors.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/lib/errors.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/lib/errors.ts	2026-10-14 22:24:24
+@@ -8,6 +8,7 @@
+  * to exactly one `ErrorCode` and one HTTP status, app-wide.
+  */
+ import { FeatureDisabledError } from "@/lib/feature-flags";
++import { MilestoneStateError } from "@/lib/milestones";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+ import { AlreadyArchivedError } from "@/lib/soft-delete";
+@@ -34,6 +35,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof MilestoneStateError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -93,6 +95,14 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof MilestoneStateError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { reason: error.reason },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/lib/milestones.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/lib/milestones.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/lib/milestones.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/lib/milestones.ts	2026-10-14 22:24:24
+@@ -0,0 +1,16 @@
++export class MilestoneStateError extends Error {
++  readonly code = "conflict";
++
++  constructor(
++    readonly reason: "closed" | "already_open" | "too_many_open" | "name_taken",
++  ) {
++    const messages = {
++      closed: "This milestone is closed.",
++      already_open: "This milestone is already open.",
++      too_many_open: "This project has too many open milestones.",
++      name_taken: "This project already has a milestone with that name.",
++    };
++    super(messages[reason]);
++    this.name = "MilestoneStateError";
++  }
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/activity.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/activity.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/activity.ts	2026-10-14 22:25:06
+@@ -13,6 +13,9 @@
+   "project.updated",
+   "project.archived",
+   "project.restored",
++  "milestone.created",
++  "milestone.closed",
++  "milestone.reopened",
+   "issue.created",
+   "issue.updated",
+   "issue.status_changed",
+@@ -33,6 +36,7 @@
+ export const activitySubjectKindSchema = z.enum([
+   "organization",
+   "project",
++  "milestone",
+   "issue",
+   "comment",
+   "member",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/common.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/common.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/common.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/common.ts	2026-10-14 22:24:24
+@@ -8,6 +8,7 @@
+   IssueId,
+   LabelId,
+   MemberId,
++  MilestoneId,
+   NotificationId,
+   OrgId,
+   ProjectId,
+@@ -37,6 +38,7 @@
+ export const userIdSchema = brandedId<UserId>("userId");
+ export const orgIdSchema = brandedId<OrgId>("orgId");
+ export const projectIdSchema = brandedId<ProjectId>("projectId");
++export const milestoneIdSchema = brandedId<MilestoneId>("milestoneId");
+ export const issueIdSchema = brandedId<IssueId>("issueId");
+ export const commentIdSchema = brandedId<CommentId>("commentId");
+ export const memberIdSchema = brandedId<MemberId>("memberId");
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/index.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/index.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/index.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/index.ts	2026-10-14 22:24:24
+@@ -12,6 +12,7 @@
+ export * from "./member";
+ export * from "./invitation";
+ export * from "./project";
++export * from "./milestone";
+ export * from "./issue";
+ export * from "./comment";
+ export * from "./label";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/issue.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/issue.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/issue.ts	2026-10-14 22:24:24
+@@ -5,6 +5,7 @@
+   isoTimestampSchema,
+   issueIdSchema,
+   labelIdSchema,
++  milestoneIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+   projectIdSchema,
+@@ -31,6 +32,7 @@
+ export const createIssueSchema = z.object({
+   orgId: orgIdSchema,
+   projectId: projectIdSchema,
++  milestoneId: milestoneIdSchema.nullable().default(null),
+   title: z.string().min(3, "give the issue a title").max(200),
+   description: z.string().max(20_000).nullable().default(null),
+   status: issueStatusSchema.default("backlog"),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/milestone.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/milestone.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/milestone.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/milestone.ts	2026-10-14 22:24:24
+@@ -0,0 +1,39 @@
++import { z } from "zod";
++import {
++  isoTimestampSchema,
++  issueIdSchema,
++  milestoneIdSchema,
++  orgIdSchema,
++  projectIdSchema,
++} from "./common";
++
++export const createMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  name: z.string().min(1).max(80),
++  targetDate: isoTimestampSchema.nullable().default(null),
++});
++
++export const updateMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  milestoneId: milestoneIdSchema,
++  name: z.string().min(1).max(80).optional(),
++  targetDate: isoTimestampSchema.nullable().optional(),
++});
++
++export const closeMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  milestoneId: milestoneIdSchema,
++  moveOpenIssuesTo: milestoneIdSchema.nullable().default(null),
++});
++
++export const setIssueMilestoneSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  milestoneId: milestoneIdSchema.nullable(),
++});
++
++export type CreateMilestoneInput = z.infer<typeof createMilestoneSchema>;
++export type UpdateMilestoneInput = z.infer<typeof updateMilestoneSchema>;
++export type CloseMilestoneInput = z.infer<typeof closeMilestoneSchema>;
++export type SetIssueMilestoneInput = z.infer<typeof setIssueMilestoneSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/notification.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/notification.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/schemas/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/schemas/notification.ts	2026-10-14 22:25:06
+@@ -10,6 +10,7 @@
+ export const notificationKindSchema = z.enum([
+   "issue_assigned",
+   "issue_status_changed",
++  "issue_milestone_changed",
+   "issue_due_soon",
+   "issue_overdue",
+   "comment_created",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/migrate.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/migrate.ts	2026-10-14 22:25:06
+@@ -133,10 +133,24 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS project_members_pk ON project_members (project_id, user_id)`,
+   `CREATE INDEX IF NOT EXISTS project_members_org_idx ON project_members (org_id)`,
++  `CREATE TABLE IF NOT EXISTS milestones (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     name TEXT NOT NULL,
++     normalized_name TEXT NOT NULL,
++     target_date TEXT,
++     closed_at TEXT,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS milestones_project_name_idx ON milestones (org_id, project_id, normalized_name)`,
++  `CREATE INDEX IF NOT EXISTS milestones_org_project_idx ON milestones (org_id, project_id)`,
+   `CREATE TABLE IF NOT EXISTS issues (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
++     milestone_id TEXT,
+      number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+@@ -332,6 +346,13 @@
+     for (const statement of readMigrationStatements()) {
+       sqlite.exec(statement);
+     }
++    // Existing databases retain their issue rows when the embedded schema is
++    // pushed again; CREATE TABLE IF NOT EXISTS cannot add a new column.
++    const issueColumns = sqlite.pragma("table_info(issues)") as { name: string }[];
++    if (!issueColumns.some((column) => column.name === "milestone_id")) {
++      sqlite.exec("ALTER TABLE issues ADD COLUMN milestone_id TEXT");
++    }
++    sqlite.exec("CREATE INDEX IF NOT EXISTS issues_org_milestone_idx ON issues (org_id, milestone_id)");
+   } finally {
+     sqlite.close();
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/activity.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/activity.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/activity.ts	2026-10-14 22:25:06
+@@ -12,6 +12,7 @@
+       enum: [
+         "organization",
+         "project",
++        "milestone",
+         "issue",
+         "comment",
+         "member",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/index.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/index.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/index.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/index.ts	2026-10-14 22:24:24
+@@ -8,6 +8,7 @@
+ export * from "./organizations";
+ export * from "./members";
+ export * from "./projects";
++export * from "./milestones";
+ export * from "./issues";
+ export * from "./comments";
+ export * from "./notifications";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/issues.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/issues.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/issues.ts	2026-10-14 22:24:24
+@@ -12,6 +12,7 @@
+     id: idColumn(),
+     ...tenantColumns,
+     projectId: text("project_id").notNull(),
++    milestoneId: text("milestone_id"),
+     number: integer("number").notNull(),
+     title: text("title").notNull(),
+     description: text("description"),
+@@ -41,6 +42,7 @@
+     index("issues_org_assignee_idx").on(table.orgId, table.assigneeId),
+     index("issues_org_archived_idx").on(table.orgId, table.archivedAt),
+     index("issues_org_due_idx").on(table.orgId, table.dueAt),
++    index("issues_org_milestone_idx").on(table.orgId, table.milestoneId),
+   ],
+ );
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/milestones.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/milestones.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/milestones.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/milestones.ts	2026-10-14 22:24:24
+@@ -0,0 +1,26 @@
++import { index, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const milestones = sqliteTable(
++  "milestones",
++  {
++    id: idColumn(),
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    name: text("name").notNull(),
++    normalizedName: text("normalized_name").notNull(),
++    targetDate: text("target_date"),
++    closedAt: text("closed_at"),
++    ...timestampColumns,
++  },
++  (table) => [
++    uniqueIndex("milestones_project_name_idx").on(
++      table.orgId,
++      table.projectId,
++      table.normalizedName,
++    ),
++    index("milestones_org_project_idx").on(table.orgId, table.projectId),
++  ],
++);
++
++export type MilestoneRow = typeof milestones.$inferSelect;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/notifications.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/notifications.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/db/schema/notifications.ts	2026-10-14 22:25:06
+@@ -4,6 +4,7 @@
+ const NOTIFICATION_KINDS = [
+   "issue_assigned",
+   "issue_status_changed",
++  "issue_milestone_changed",
+   "issue_due_soon",
+   "issue_overdue",
+   "comment_created",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/_mappers.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/_mappers.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/_mappers.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/_mappers.ts	2026-10-14 22:24:24
+@@ -14,6 +14,7 @@
+   IssueRow,
+   LabelRow,
+   MemberRow,
++  MilestoneRow,
+   NotificationPreferenceRow,
+   NotificationRow,
+   OrganizationRow,
+@@ -37,6 +38,7 @@
+   IssueId,
+   LabelId,
+   MemberId,
++  MilestoneId,
+   NotificationId,
+   OrgId,
+   ProjectId,
+@@ -55,6 +57,7 @@
+   OrganizationUsage,
+ } from "@/types/organization";
+ import type { Project } from "@/types/project";
++import type { Milestone } from "@/types/milestone";
+ 
+ /** Every id column is text in SQLite; the brand is re-applied on the way out. */
+ export function brandId<T extends string>(value: string): T {
+@@ -191,6 +194,19 @@
+   };
+ }
+ 
++export function toMilestone(row: MilestoneRow): Milestone {
++  return {
++    id: brandId<MilestoneId>(row.id),
++    orgId: brandId<OrgId>(row.orgId),
++    projectId: brandId<ProjectId>(row.projectId),
++    name: row.name,
++    targetDate: brandStampOrNull(row.targetDate),
++    closedAt: brandStampOrNull(row.closedAt),
++    createdAt: brandStamp(row.createdAt),
++    updatedAt: brandStamp(row.updatedAt),
++  };
++}
++
+ export function toIssue(
+   row: IssueRow,
+   labelIds: readonly LabelId[] = [],
+@@ -200,6 +216,7 @@
+     orgId: brandId<OrgId>(row.orgId),
+     projectId: brandId<ProjectId>(row.projectId),
+     number: row.number,
++    milestoneId: row.milestoneId === null ? null : brandId<MilestoneId>(row.milestoneId),
+     title: row.title,
+     description: row.description,
+     status: row.status,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/index.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/index.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/index.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/index.ts	2026-10-14 22:26:44
+@@ -15,6 +15,7 @@
+ export * as issueRepository from "./issue-repository";
+ export * as labelRepository from "./label-repository";
+ export * as memberRepository from "./member-repository";
++export * as milestoneRepository from "./milestone-repository";
+ export * as notificationPreferenceRepository from "./notification-preference-repository";
+ export * as notificationRepository from "./notification-repository";
+ export * as organizationRepository from "./organization-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/issue-repository.ts	2026-10-14 22:27:21
+@@ -29,6 +29,7 @@
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import { toIssue } from "./_mappers";
+ import { listLabelsForIssues } from "./label-repository";
++import { requireOpenMilestone } from "./milestone-repository";
+ import type {
+   CreateIssueInput,
+   IssueFilterInput,
+@@ -39,6 +40,7 @@
+   IsoTimestamp,
+   IssueId,
+   LabelId,
++  MilestoneId,
+   OrgId,
+   Page,
+   ProjectId,
+@@ -311,12 +313,17 @@
+   const stamp = toIsoTimestamp(new Date());
+   const db = getDb();
+ 
++  if (input.milestoneId != null) {
++    requireOpenMilestone(input.orgId, input.projectId, input.milestoneId);
++  }
++
+   const row = db
+     .insert(issues)
+     .values({
+       id: newId(),
+       orgId: input.orgId,
+       projectId: input.projectId,
++      milestoneId: input.milestoneId ?? null,
+       number: issueNumber,
+       title: input.title,
+       description: input.description,
+@@ -448,6 +455,21 @@
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+   return toIssue(row);
++}
++
++export async function setIssueMilestone(
++  orgId: OrgId,
++  issueId: IssueId,
++  milestoneId: MilestoneId | null,
++  now: IsoTimestamp,
++): Promise<Issue> {
++  const row = getDb().update(issues)
++    .set({ milestoneId, updatedAt: now })
++    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++    .returning().get();
++  if (!row) throw new Error(`Issue ${issueId} not found`);
++  const labels = await listLabelsForIssues(orgId, [issueId]);
++  return toIssue(row, (labels[issueId] ?? []).map((label) => label.id));
+ }
+ 
+ export async function archiveIssue(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/milestone-repository.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/milestone-repository.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/repositories/milestone-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/repositories/milestone-repository.ts	2026-10-14 22:33:02
+@@ -0,0 +1,165 @@
++import { and, asc, count, eq, isNotNull, isNull, ne, notInArray, sql } from "drizzle-orm";
++import { MAX_OPEN_MILESTONES_PER_PROJECT } from "@/config/constants";
++import { newId } from "@/lib/id";
++import { MilestoneStateError } from "@/lib/milestones";
++import { getDb, issues, milestones } from "@/server/db";
++import { NotFoundError, requireFound } from "@/server/services/_support";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
++import { toMilestone } from "./_mappers";
++import { livePredicate, orgPredicate } from "./base-repository";
++import type { CloseMilestoneInput, CreateMilestoneInput, UpdateMilestoneInput } from "@/schemas/milestone";
++import type { IsoTimestamp, IssueId, MilestoneId, OrgId, ProjectId } from "@/types/common";
++import type { Milestone, MilestoneProgress } from "@/types/milestone";
++
++export function findMilestoneById(orgId: OrgId, milestoneId: MilestoneId): Milestone | null {
++  const row = getDb().select().from(milestones).where(and(
++    orgPredicate(milestones.orgId, orgId),
++    eq(milestones.id, milestoneId),
++  )).get();
++  return row ? toMilestone(row) : null;
++}
++
++/** A cross-project id is deliberately indistinguishable from a missing id. */
++export function requireOpenMilestone(
++  orgId: OrgId,
++  projectId: ProjectId,
++  milestoneId: MilestoneId,
++): Milestone {
++  const milestone = findMilestoneById(orgId, milestoneId);
++  if (!milestone || milestone.projectId !== projectId) {
++    throw new NotFoundError("Milestone", milestoneId);
++  }
++  if (milestone.closedAt !== null) throw new MilestoneStateError("closed");
++  return milestone;
++}
++
++function assertNameAvailable(orgId: OrgId, projectId: ProjectId, name: string, exceptId?: MilestoneId): void {
++  const taken = getDb().select({ id: milestones.id }).from(milestones).where(and(
++    orgPredicate(milestones.orgId, orgId),
++    eq(milestones.projectId, projectId),
++    eq(milestones.normalizedName, name.trim().toLowerCase()),
++    exceptId === undefined ? undefined : ne(milestones.id, exceptId),
++  )).get();
++  if (taken) throw new MilestoneStateError("name_taken");
++}
++
++function assertOpenCapacity(orgId: OrgId, projectId: ProjectId): void {
++  const row = getDb().select({ value: count() }).from(milestones).where(and(
++    orgPredicate(milestones.orgId, orgId),
++    eq(milestones.projectId, projectId),
++    isNull(milestones.closedAt),
++  )).get();
++  if ((row?.value ?? 0) >= MAX_OPEN_MILESTONES_PER_PROJECT) {
++    throw new MilestoneStateError("too_many_open");
++  }
++}
++
++export function insertMilestone(input: CreateMilestoneInput, now: IsoTimestamp): Milestone {
++  return getDb().transaction((tx) => {
++    assertNameAvailable(input.orgId, input.projectId, input.name);
++    assertOpenCapacity(input.orgId, input.projectId);
++    const row = tx.insert(milestones).values({
++      id: newId(),
++      orgId: input.orgId,
++      projectId: input.projectId,
++      name: input.name,
++      normalizedName: input.name.trim().toLowerCase(),
++      targetDate: input.targetDate,
++      closedAt: null,
++      createdAt: now,
++      updatedAt: now,
++    }).returning().get();
++    return toMilestone(row);
++  });
++}
++
++export function updateMilestone(input: UpdateMilestoneInput, now: IsoTimestamp): Milestone {
++  return getDb().transaction((tx) => {
++    const milestone = requireFound(findMilestoneById(input.orgId, input.milestoneId), "Milestone", input.milestoneId);
++    if (input.name !== undefined) {
++      assertNameAvailable(input.orgId, milestone.projectId, input.name, milestone.id);
++    }
++    const row = tx.update(milestones).set({
++      ...(input.name === undefined ? {} : {
++        name: input.name,
++        normalizedName: input.name.trim().toLowerCase(),
++      }),
++      ...(input.targetDate === undefined ? {} : {
++        targetDate: input.targetDate,
++      }),
++      updatedAt: now,
++    }).where(and(orgPredicate(milestones.orgId, input.orgId), eq(milestones.id, input.milestoneId))).returning().get();
++    return toMilestone(row);
++  });
++}
++
++export function reopenMilestone(orgId: OrgId, milestoneId: MilestoneId, now: IsoTimestamp): Milestone {
++  return getDb().transaction((tx) => {
++    const milestone = requireFound(findMilestoneById(orgId, milestoneId), "Milestone", milestoneId);
++    if (milestone.closedAt === null) throw new MilestoneStateError("already_open");
++    assertOpenCapacity(orgId, milestone.projectId);
++    return toMilestone(tx.update(milestones).set({ closedAt: null, updatedAt: now })
++      .where(and(orgPredicate(milestones.orgId, orgId), eq(milestones.id, milestoneId)))
++      .returning().get());
++  });
++}
++
++/** Validation, issue movement and closing commit together before any events. */
++export function closeMilestone(input: CloseMilestoneInput, now: IsoTimestamp): {
++  milestone: Milestone;
++  movedIssueIds: readonly IssueId[];
++} {
++  return getDb().transaction((tx) => {
++    const milestone = requireFound(findMilestoneById(input.orgId, input.milestoneId), "Milestone", input.milestoneId);
++    if (milestone.closedAt !== null) throw new MilestoneStateError("closed");
++    if (input.moveOpenIssuesTo !== null) {
++      if (input.moveOpenIssuesTo === milestone.id) {
++        throw new NotFoundError("Milestone", input.moveOpenIssuesTo);
++      }
++      requireOpenMilestone(input.orgId, milestone.projectId, input.moveOpenIssuesTo);
++    }
++
++    const moved = tx.update(issues).set({
++      milestoneId: input.moveOpenIssuesTo,
++      updatedAt: now,
++    }).where(and(
++      orgPredicate(issues.orgId, input.orgId),
++      eq(issues.projectId, milestone.projectId),
++      eq(issues.milestoneId, milestone.id),
++      livePredicate(issues.archivedAt, {}),
++      notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
++    )).returning({ id: issues.id }).all();
++
++    const closed = tx.update(milestones).set({ closedAt: now, updatedAt: now })
++      .where(and(orgPredicate(milestones.orgId, input.orgId), eq(milestones.id, milestone.id)))
++      .returning().get();
++    return {
++      milestone: toMilestone(closed),
++      movedIssueIds: moved.map((row) => row.id as IssueId),
++    };
++  });
++}
++
++export function listMilestones(orgId: OrgId, projectId: ProjectId): readonly Milestone[] {
++  return getDb().select().from(milestones).where(and(
++    orgPredicate(milestones.orgId, orgId), eq(milestones.projectId, projectId),
++  )).orderBy(
++    asc(isNotNull(milestones.closedAt)),
++    asc(isNull(milestones.targetDate)),
++    asc(sql`julianday(${milestones.targetDate})`),
++    asc(milestones.createdAt),
++    asc(milestones.id),
++  ).all().map(toMilestone);
++}
++
++/** Aggregate every live issue; progress is independent of list pagination. */
++export function getMilestoneProgress(orgId: OrgId, milestoneId: MilestoneId): MilestoneProgress {
++  const counts = getDb().select({ status: issues.status, value: count() }).from(issues).where(and(
++    orgPredicate(issues.orgId, orgId),
++    eq(issues.milestoneId, milestoneId),
++    livePredicate(issues.archivedAt, {}),
++  )).groupBy(issues.status).all();
++  const total = counts.reduce((sum, row) => sum + row.value, 0);
++  const closed = counts.reduce((sum, row) => sum + (CLOSED_ISSUE_STATUSES.includes(row.status) ? row.value : 0), 0);
++  return { total, open: total - closed, closed };
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/activity-service.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/activity-service.ts	2026-10-14 22:25:06
+@@ -148,6 +148,17 @@
+  */
+ export function registerActivityListeners(): Unsubscribe {
+   const offs: Unsubscribe[] = [
++    ...(["milestone.created", "milestone.closed", "milestone.reopened"] as const).map(
++      (action) => subscribe(action, (payload) =>
++        record(payload.orgId, action, {
++          actorId: payload.actorId,
++          subjectKind: "milestone",
++          subjectId: payload.milestoneId,
++          projectId: payload.projectId,
++          summary: `${action === "milestone.created" ? "Created" : action === "milestone.closed" ? "Closed" : "Reopened"} milestone ${payload.milestoneId}`,
++        }).then(() => undefined),
++      ),
++    ),
+     subscribe("project.created", (payload) =>
+       record(payload.orgId, "project.created", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/index.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/index.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/index.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/index.ts	2026-10-14 22:26:44
+@@ -17,6 +17,7 @@
+ export * as issueService from "./issue-service";
+ export * as labelService from "./label-service";
+ export * as memberService from "./member-service";
++export * as milestoneService from "./milestone-service";
+ export * as notificationService from "./notification-service";
+ export * as organizationService from "./organization-service";
+ export * as projectService from "./project-service";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/issue-service.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/issue-service.ts	2026-10-14 22:27:21
+@@ -10,6 +10,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
++import * as milestoneRepo from "@/server/repositories/milestone-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+@@ -30,6 +31,8 @@
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
++import { toIsoTimestamp } from "@/types/common";
++import type { SetIssueMilestoneInput } from "@/schemas/milestone";
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+@@ -78,6 +81,39 @@
+   });
+ 
+   return issue;
++}
++
++export async function setIssueMilestone(
++  actor: Actor,
++  input: SetIssueMilestoneInput,
++): Promise<Issue> {
++  const now = toIsoTimestamp(new Date());
++  assertOrgScope(actor, input.orgId);
++  const before = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(before));
++  assertNotArchived("Issue", before.id, before);
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, before.projectId),
++    "Project",
++    before.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++  if (input.milestoneId !== null) {
++    milestoneRepo.requireOpenMilestone(input.orgId, before.projectId, input.milestoneId);
++  }
++  if (before.milestoneId === input.milestoneId) return before;
++  const after = await issueRepo.setIssueMilestone(input.orgId, before.id, input.milestoneId, now);
++  await emit("issue.updated", {
++    ...actorEnvelope(actor), occurredAt: now,
++    issueId: after.id,
++    projectId: after.projectId,
++    changedFields: ["milestoneId"],
++  });
++  return after;
+ }
+ 
+ export async function updateIssue(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/milestone-service.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/milestone-service.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/milestone-service.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/milestone-service.ts	2026-10-14 22:26:44
+@@ -0,0 +1,98 @@
++import { emit } from "@/lib/event-bus";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import * as milestoneRepo from "@/server/repositories/milestone-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { toIsoTimestamp } from "@/types/common";
++import { actorEnvelope, projectResource, requireFound } from "./_support";
++import type { CloseMilestoneInput, CreateMilestoneInput, UpdateMilestoneInput } from "@/schemas/milestone";
++import type { IssueId, MilestoneId, OrgId, ProjectId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { Milestone, MilestoneWithProgress } from "@/types/milestone";
++
++async function authorizeProject(actor: Actor, orgId: OrgId, projectId: ProjectId, write: boolean): Promise<void> {
++  const project = requireFound(await projectRepo.findProjectById(orgId, projectId), "Project", projectId);
++  assertCan(actor, write ? "project:update" : "project:read", projectResource(project));
++  if (write) assertNotArchived("Project", project.id, project);
++}
++
++function loadMilestone(orgId: OrgId, milestoneId: MilestoneId): Milestone {
++  return requireFound(milestoneRepo.findMilestoneById(orgId, milestoneId), "Milestone", milestoneId);
++}
++
++export async function createMilestone(actor: Actor, input: CreateMilestoneInput): Promise<Milestone> {
++  const now = toIsoTimestamp(new Date());
++  assertOrgScope(actor, input.orgId);
++  await authorizeProject(actor, input.orgId, input.projectId, true);
++  const milestone = milestoneRepo.insertMilestone(input, now);
++  await emit("milestone.created", {
++    ...actorEnvelope(actor), occurredAt: now,
++    milestoneId: milestone.id, projectId: milestone.projectId,
++  });
++  return milestone;
++}
++
++export async function updateMilestone(actor: Actor, input: UpdateMilestoneInput): Promise<Milestone> {
++  const now = toIsoTimestamp(new Date());
++  assertOrgScope(actor, input.orgId);
++  const milestone = loadMilestone(input.orgId, input.milestoneId);
++  await authorizeProject(actor, input.orgId, milestone.projectId, true);
++  return milestoneRepo.updateMilestone(input, now);
++}
++
++export async function closeMilestone(actor: Actor, input: CloseMilestoneInput): Promise<{
++  milestone: Milestone;
++  movedIssueIds: readonly IssueId[];
++}> {
++  const now = toIsoTimestamp(new Date());
++  assertOrgScope(actor, input.orgId);
++  const milestone = loadMilestone(input.orgId, input.milestoneId);
++  await authorizeProject(actor, input.orgId, milestone.projectId, true);
++  const result = milestoneRepo.closeMilestone(input, now);
++  await emit("milestone.closed", {
++    ...actorEnvelope(actor), occurredAt: now,
++    milestoneId: milestone.id, projectId: milestone.projectId,
++    movedToMilestoneId: input.moveOpenIssuesTo,
++    movedIssueIds: result.movedIssueIds,
++  });
++  return result;
++}
++
++export async function reopenMilestone(actor: Actor, orgId: OrgId, milestoneId: MilestoneId): Promise<Milestone> {
++  const now = toIsoTimestamp(new Date());
++  assertOrgScope(actor, orgId);
++  const before = loadMilestone(orgId, milestoneId);
++  await authorizeProject(actor, orgId, before.projectId, true);
++  const milestone = milestoneRepo.reopenMilestone(orgId, milestoneId, now);
++  await emit("milestone.reopened", {
++    ...actorEnvelope(actor), occurredAt: now,
++    milestoneId: milestone.id, projectId: milestone.projectId,
++  });
++  return milestone;
++}
++
++function withProgress(milestone: Milestone, now: number): MilestoneWithProgress {
++  const progress = milestoneRepo.getMilestoneProgress(milestone.orgId, milestone.id);
++  return {
++    milestone,
++    progress,
++    overdue: milestone.closedAt === null && milestone.targetDate !== null
++      && new Date(milestone.targetDate).getTime() < now && progress.open > 0,
++  };
++}
++
++export async function listMilestones(actor: Actor, orgId: OrgId, projectId: ProjectId): Promise<readonly MilestoneWithProgress[]> {
++  const now = Date.now();
++  assertOrgScope(actor, orgId);
++  await authorizeProject(actor, orgId, projectId, false);
++  return milestoneRepo.listMilestones(orgId, projectId).map((milestone) => withProgress(milestone, now));
++}
++
++export async function getMilestone(actor: Actor, orgId: OrgId, milestoneId: MilestoneId): Promise<MilestoneWithProgress> {
++  const now = Date.now();
++  assertOrgScope(actor, orgId);
++  const milestone = loadMilestone(orgId, milestoneId);
++  await authorizeProject(actor, orgId, milestone.projectId, false);
++  return withProgress(milestone, now);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/notification-service.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/server/services/notification-service.ts	2026-10-14 22:25:06
+@@ -181,6 +181,21 @@
+   if (registered) return;
+   registered = true;
+ 
++  subscribe("milestone.closed", async (payload) => {
++    for (const issueId of new Set(payload.movedIssueIds)) {
++      const issue = await issueRepo.findIssueById(payload.orgId, issueId);
++      if (!issue?.assigneeId) continue;
++      await notify(payload.orgId, "issue_milestone_changed", [issue.assigneeId], {
++        title: "An issue's milestone changed",
++        body: payload.movedToMilestoneId === null
++          ? `Issue ${issueId} was removed from its closed milestone`
++          : `Issue ${issueId} was moved to milestone ${payload.movedToMilestoneId}`,
++        href: `/issues/${issueId}`,
++        actorId: payload.actorId,
++      });
++    }
++  });
++
+   subscribe("issue.assigned", async (payload) => {
+     await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
+       title: "You were assigned an issue",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/activity.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/activity.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/activity.ts	2026-10-14 22:25:06
+@@ -14,6 +14,9 @@
+   | "project.updated"
+   | "project.archived"
+   | "project.restored"
++  | "milestone.created"
++  | "milestone.closed"
++  | "milestone.reopened"
+   | "issue.created"
+   | "issue.updated"
+   | "issue.status_changed"
+@@ -33,6 +36,7 @@
+ export type ActivitySubjectKind =
+   | "organization"
+   | "project"
++  | "milestone"
+   | "issue"
+   | "comment"
+   | "member"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/common.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/common.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/common.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/common.ts	2026-10-14 22:24:24
+@@ -14,6 +14,7 @@
+ export type UserId = Branded<string, "UserId">;
+ export type OrgId = Branded<string, "OrgId">;
+ export type ProjectId = Branded<string, "ProjectId">;
++export type MilestoneId = Branded<string, "MilestoneId">;
+ export type IssueId = Branded<string, "IssueId">;
+ export type CommentId = Branded<string, "CommentId">;
+ export type MemberId = Branded<string, "MemberId">;
+@@ -31,6 +32,7 @@
+   | UserId
+   | OrgId
+   | ProjectId
++  | MilestoneId
+   | IssueId
+   | CommentId
+   | MemberId
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/event.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/event.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/event.ts	2026-10-14 22:25:06
+@@ -2,6 +2,7 @@
+   CommentId,
+   IssueId,
+   MemberId,
++  MilestoneId,
+   OrgId,
+   ProjectId,
+   UserId,
+@@ -36,6 +37,20 @@
+     issuesArchived: number;
+   };
+   "project.restored": EventEnvelope & { projectId: ProjectId };
++  "milestone.created": EventEnvelope & {
++    milestoneId: MilestoneId;
++    projectId: ProjectId;
++  };
++  "milestone.reopened": EventEnvelope & {
++    milestoneId: MilestoneId;
++    projectId: ProjectId;
++  };
++  "milestone.closed": EventEnvelope & {
++    milestoneId: MilestoneId;
++    projectId: ProjectId;
++    movedToMilestoneId: MilestoneId | null;
++    movedIssueIds: readonly IssueId[];
++  };
+   "issue.created": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/index.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/index.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/index.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/index.ts	2026-10-14 22:24:24
+@@ -5,6 +5,7 @@
+ export * from "./member";
+ export * from "./organization";
+ export * from "./project";
++export * from "./milestone";
+ export * from "./issue";
+ export * from "./comment";
+ export * from "./notification";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/issue.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/issue.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/issue.ts	2026-10-14 22:24:24
+@@ -3,6 +3,7 @@
+   IsoTimestamp,
+   IssueId,
+   LabelId,
++  MilestoneId,
+   ProjectId,
+   SoftDeletable,
+   TenantScoped,
+@@ -43,6 +44,7 @@
+ export interface Issue extends Timestamps, TenantScoped, SoftDeletable {
+   readonly id: IssueId;
+   readonly projectId: ProjectId;
++  readonly milestoneId: MilestoneId | null;
+   readonly number: number;
+   readonly title: string;
+   readonly description: string | null;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/milestone.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/milestone.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/milestone.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/milestone.ts	2026-10-14 22:24:24
+@@ -0,0 +1,27 @@
++import type {
++  IsoTimestamp,
++  MilestoneId,
++  ProjectId,
++  TenantScoped,
++  Timestamps,
++} from "./common";
++
++export interface Milestone extends Timestamps, TenantScoped {
++  readonly id: MilestoneId;
++  readonly projectId: ProjectId;
++  readonly name: string;
++  readonly targetDate: IsoTimestamp | null;
++  readonly closedAt: IsoTimestamp | null;
++}
++
++export interface MilestoneProgress {
++  readonly total: number;
++  readonly open: number;
++  readonly closed: number;
++}
++
++export interface MilestoneWithProgress {
++  readonly milestone: Milestone;
++  readonly progress: MilestoneProgress;
++  readonly overdue: boolean;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/notification.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/notification.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/src/types/notification.ts	2026-10-14 22:25:06
+@@ -9,6 +9,7 @@
+ export type NotificationKind =
+   | "issue_assigned"
+   | "issue_status_changed"
++  | "issue_milestone_changed"
+   | "issue_due_soon"
+   | "issue_overdue"
+   | "comment_created"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/components/board-model.test.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/components/board-model.test.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/components/board-model.test.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/components/board-model.test.ts	2026-10-14 22:27:34
+@@ -24,6 +24,7 @@
+     id: id as IssueId,
+     orgId: ORG_ID,
+     projectId: PROJECT_ID,
++    milestoneId: null,
+     number: Number(id.replace(/\D/g, "")) || 1,
+     title: `Issue ${id}`,
+     description: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/components/optimistic-issues.test.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/components/optimistic-issues.test.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/components/optimistic-issues.test.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/components/optimistic-issues.test.ts	2026-10-14 22:27:34
+@@ -15,6 +15,7 @@
+   id: "iss_1" as IssueId,
+   orgId: "org_1" as OrgId,
+   projectId: "prj_1" as ProjectId,
++  milestoneId: null,
+   number: 12,
+   title: "Fix the thing",
+   description: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/helpers/factories.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/helpers/factories.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/helpers/factories.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/helpers/factories.ts	2026-10-14 22:27:34
+@@ -104,6 +104,7 @@
+     id: nextId() as IssueId,
+     orgId: ORG_A,
+     projectId: "01HZZZPPPPPPPPPPPPPPPPPPPP" as ProjectId,
++    milestoneId: null,
+     number: 1,
+     title: "Fix the broken sign-up link",
+     description: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/schemas/issue.schema.test.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/schemas/issue.schema.test.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/schemas/issue.schema.test.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/schemas/issue.schema.test.ts	2026-10-14 22:27:35
+@@ -26,6 +26,7 @@
+       status: "backlog",
+       priority: "none",
+       assigneeId: null,
++      milestoneId: null,
+       parentId: null,
+       estimate: null,
+       dueAt: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/server/_support/fixtures.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/server/_support/fixtures.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/server/_support/fixtures.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/server/_support/fixtures.ts	2026-10-14 22:27:34
+@@ -123,6 +123,7 @@
+     orgId,
+     projectId,
+     title: overrides.title ?? "Ship the thing",
++    milestoneId: null,
+     description: null,
+     status: "backlog" as const,
+     priority: "none" as const,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/services/milestone-service.test.ts /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/services/milestone-service.test.ts
+--- /private/tmp/bench-scratch/58ebbf47-5335-4dd1-b0b0-9dd7a2ea2b71/tests/services/milestone-service.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/f38b3fa6-8c96-4f76-972a-6ed5785612f5/tests/services/milestone-service.test.ts	2026-10-14 22:31:52
+@@ -0,0 +1,369 @@
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { MAX_OPEN_MILESTONES_PER_PROJECT } from "@/config/constants";
++import { subscribe } from "@/lib/event-bus";
++import { isDomainError, toAppError } from "@/lib/errors";
++import { MilestoneStateError } from "@/lib/milestones";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { activityFilterSchema } from "@/schemas/activity";
++import { createIssueSchema } from "@/schemas/issue";
++import { closeMilestoneSchema, createMilestoneSchema, setIssueMilestoneSchema, updateMilestoneSchema } from "@/schemas/milestone";
++import { updateNotificationPreferenceSchema } from "@/schemas/notification";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { listActivity, registerActivityListeners } from "@/server/services/activity-service";
++import * as issueService from "@/server/services/issue-service";
++import * as milestoneService from "@/server/services/milestone-service";
++import { listNotifications } from "@/server/services/notification-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { MilestoneId, UserId } from "@/types/common";
++import type { TaskflowEventMap, TaskflowEventType, Unsubscribe } from "@/types/event";
++import type { IssueStatus } from "@/types/issue";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++let detachActivity: Unsubscribe;
++let tenant: Tenant;
++let sequence = 0;
++const detachers: Unsubscribe[] = [];
++const missing = "00000000000000000000000000" as MilestoneId;
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  detachActivity = registerActivityListeners();
++});
++
++beforeEach(async () => {
++  tenant = await createTenant(`milestones-${++sequence}`);
++});
++
++afterEach(() => {
++  for (const off of detachers.splice(0)) off();
++  vi.useRealTimers();
++});
++
++afterAll(() => {
++  detachActivity();
++  cleanup();
++});
++
++function capture<K extends TaskflowEventType>(type: K): TaskflowEventMap[K][] {
++  const seen: TaskflowEventMap[K][] = [];
++  detachers.push(subscribe(type, (payload) => { seen.push(payload); }));
++  return seen;
++}
++
++function milestone(name: string, targetDate: string | null = null, projectId = tenant.project.id) {
++  return milestoneService.createMilestone(tenant.actors.member, createMilestoneSchema.parse({
++    orgId: tenant.org.id, projectId, name, targetDate,
++  }));
++}
++
++function issue(milestoneId: MilestoneId | null, status: IssueStatus = "backlog", assigneeId: UserId | null = null) {
++  return issueService.createIssue(tenant.actors.member, {
++    ...issueInput(tenant.org.id, tenant.project.id), milestoneId, status, assigneeId,
++  });
++}
++
++function close(milestoneId: MilestoneId, moveOpenIssuesTo: MilestoneId | null = null) {
++  return milestoneService.closeMilestone(tenant.actors.member, {
++    orgId: tenant.org.id, milestoneId, moveOpenIssuesTo,
++  });
++}
++
++describe("milestones", () => {
++  it("parses defaults and maps state conflicts", () => {
++    const input = { orgId: tenant.org.id, projectId: tenant.project.id, name: "Launch" };
++    expect(createMilestoneSchema.parse(input).targetDate).toBeNull();
++    expect(closeMilestoneSchema.parse({ orgId: tenant.org.id, milestoneId: missing }).moveOpenIssuesTo).toBeNull();
++    expect(createIssueSchema.parse({ ...issueInput(tenant.org.id, tenant.project.id), milestoneId: undefined }).milestoneId).toBeNull();
++    expect(updateMilestoneSchema.safeParse({ orgId: tenant.org.id, milestoneId: missing, name: "" }).success).toBe(false);
++    expect(setIssueMilestoneSchema.safeParse({ orgId: tenant.org.id, issueId: missing }).success).toBe(false);
++    for (const reason of ["closed", "already_open", "too_many_open", "name_taken"] as const) {
++      const error = new MilestoneStateError(reason);
++      expect(isDomainError(error)).toBe(true);
++      expect(toAppError(error)).toMatchObject({ code: "conflict", meta: { reason } });
++    }
++  });
++
++  it("persists names and dates, including clearing the date and editing closed milestones", async () => {
++    const created = await milestone("Launch", "2026-06-01T00:00:00.000Z");
++    expect(created.closedAt).toBeNull();
++    expect(created).toMatchObject({ orgId: tenant.org.id, projectId: tenant.project.id, name: "Launch" });
++    await close(created.id);
++    const updated = await milestoneService.updateMilestone(tenant.actors.member, {
++      orgId: tenant.org.id, milestoneId: created.id, name: "Release", targetDate: null,
++    });
++    expect(updated).toMatchObject({ name: "Release", targetDate: null });
++    expect(updated.closedAt).not.toBeNull();
++    expect((await milestoneService.getMilestone(tenant.actors.viewer, tenant.org.id, created.id)).milestone).toEqual(updated);
++  });
++
++  it("reserves normalized names across open and closed milestones but allows them in another project", async () => {
++    const first = await milestone("  Launch  ");
++    const second = await milestone("Beta");
++    await close(first.id);
++    await expect(milestone("LAUNCH")).rejects.toMatchObject({ reason: "name_taken" });
++    await expect(milestoneService.updateMilestone(tenant.actors.member, {
++      orgId: tenant.org.id, milestoneId: second.id, name: " launch ",
++    })).rejects.toMatchObject({ reason: "name_taken" });
++    expect((await milestoneService.getMilestone(tenant.actors.viewer, tenant.org.id, second.id)).milestone.name).toBe("Beta");
++    const otherProject = await projectRepo.insertProject({ ...tenant.project, slug: "other", key: "OTH" });
++    await expect(milestone("launch", null, otherProject.id)).resolves.toMatchObject({ name: "launch" });
++    await expect(milestoneService.updateMilestone(tenant.actors.member, {
++      orgId: tenant.org.id, milestoneId: first.id, name: "LAUNCH",
++    })).resolves.toMatchObject({ name: "LAUNCH" });
++  });
++
++  it("enforces the open cap for creates and reopens, including concurrent creates", async () => {
++    const closed = await milestone("Previous");
++    await close(closed.id);
++    const results = await Promise.allSettled(Array.from({ length: MAX_OPEN_MILESTONES_PER_PROJECT + 1 }, (_, index) => milestone(`M${index}`)));
++    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(MAX_OPEN_MILESTONES_PER_PROJECT);
++    expect(results.filter((result) => result.status === "rejected")).toMatchObject([{ reason: { reason: "too_many_open" } }]);
++    await expect(milestoneService.reopenMilestone(tenant.actors.member, tenant.org.id, closed.id)).rejects.toMatchObject({ reason: "too_many_open" });
++    const open = await milestoneService.listMilestones(tenant.actors.viewer, tenant.org.id, tenant.project.id);
++    await close(open[0].milestone.id);
++    await expect(milestoneService.reopenMilestone(tenant.actors.member, tenant.org.id, closed.id)).resolves.toMatchObject({ closedAt: null });
++  });
++
++  it("allows viewers to read while requiring project:update for every milestone write", async () => {
++    const created = await milestone("Launch");
++    const actor = tenant.actors.viewer;
++    const orgId = tenant.org.id;
++    const milestoneId = created.id;
++    for (const operation of [
++      () => milestoneService.createMilestone(actor, { orgId, projectId: tenant.project.id, name: "Other", targetDate: null }),
++      () => milestoneService.updateMilestone(actor, { orgId, milestoneId, name: "Renamed" }),
++      () => milestoneService.closeMilestone(actor, { orgId, milestoneId, moveOpenIssuesTo: null }),
++      () => milestoneService.reopenMilestone(actor, orgId, milestoneId),
++    ]) await expect(operation()).rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(milestoneService.listMilestones(actor, orgId, tenant.project.id)).resolves.toHaveLength(1);
++    await expect(milestoneService.getMilestone(actor, orgId, milestoneId)).resolves.toMatchObject({ progress: { total: 0, open: 0, closed: 0 }, overdue: false });
++  });
++
++  it("checks tenant scope first for every operation and hides foreign project and milestone ids", async () => {
++    const other = await createTenant(`foreign-${sequence}`);
++    const foreign = await milestoneService.createMilestone(other.actors.member, {
++      orgId: other.org.id, projectId: other.project.id, name: "Foreign", targetDate: null,
++    });
++    const own = await milestone("Own");
++    const ownIssue = await issue(own.id);
++    const actor = tenant.actors.member;
++    for (const operation of [
++      () => milestoneService.createMilestone(actor, { orgId: other.org.id, projectId: tenant.project.id, name: "Scope", targetDate: null }),
++      () => milestoneService.updateMilestone(actor, { orgId: other.org.id, milestoneId: own.id }),
++      () => milestoneService.closeMilestone(actor, { orgId: other.org.id, milestoneId: own.id, moveOpenIssuesTo: null }),
++      () => milestoneService.reopenMilestone(actor, other.org.id, own.id),
++      () => milestoneService.getMilestone(actor, other.org.id, own.id),
++      () => milestoneService.listMilestones(actor, other.org.id, tenant.project.id),
++      () => issueService.setIssueMilestone(actor, { orgId: other.org.id, issueId: ownIssue.id, milestoneId: null }),
++    ]) await expect(operation()).rejects.toBeInstanceOf(TenantScopeError);
++    for (const milestoneId of [foreign.id, missing]) {
++      const orgId = tenant.org.id;
++      for (const operation of [
++        () => milestoneService.updateMilestone(actor, { orgId, milestoneId }),
++        () => milestoneService.closeMilestone(actor, { orgId, milestoneId, moveOpenIssuesTo: null }),
++        () => milestoneService.reopenMilestone(actor, orgId, milestoneId),
++        () => milestoneService.getMilestone(actor, orgId, milestoneId),
++        () => issueService.setIssueMilestone(actor, { orgId, issueId: ownIssue.id, milestoneId }),
++      ]) await expect(operation()).rejects.toBeInstanceOf(NotFoundError);
++    }
++    await expect(milestone("Foreign project", null, other.project.id)).rejects.toBeInstanceOf(NotFoundError);
++    await expect(milestoneService.listMilestones(actor, tenant.org.id, other.project.id)).rejects.toBeInstanceOf(NotFoundError);
++  });
++
++  it("assigns and removes milestones at creation and later, retaining labels and issue ownership permissions", async () => {
++    const first = await milestone("First");
++    const second = await milestone("Second");
++    const created = await issue(first.id);
++    expect(created.milestoneId).toBe(first.id);
++    await expect(issueService.setIssueMilestone(tenant.actors.viewer, {
++      orgId: tenant.org.id, issueId: created.id, milestoneId: second.id,
++    })).rejects.toBeInstanceOf(PermissionDeniedError);
++    const ownerAsViewer = { ...tenant.actors.member, role: "viewer" as const };
++    expect((await issueService.setIssueMilestone(ownerAsViewer, {
++      orgId: tenant.org.id, issueId: created.id, milestoneId: second.id,
++    })).milestoneId).toBe(second.id);
++    expect((await issueService.setIssueMilestone(ownerAsViewer, {
++      orgId: tenant.org.id, issueId: created.id, milestoneId: null,
++    })).milestoneId).toBeNull();
++    expect((await issueRepo.findIssueById(tenant.org.id, created.id))?.milestoneId).toBeNull();
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, created.id);
++    await expect(issueService.setIssueMilestone(ownerAsViewer, {
++      orgId: tenant.org.id, issueId: created.id, milestoneId: second.id,
++    })).rejects.toBeInstanceOf(AlreadyArchivedError);
++  });
++
++  it("refuses invalid issue milestones without creating issues or announcing anything", async () => {
++    const closed = await milestone("Closed");
++    await close(closed.id);
++    const otherProject = await projectRepo.insertProject({ ...tenant.project, slug: "other", key: "OTH" });
++    const foreign = await milestone("Other project", null, otherProject.id);
++    const ownIssue = await issue(null);
++    const created = capture("issue.created");
++    const updated = capture("issue.updated");
++    for (const [milestoneId, error] of [[closed.id, MilestoneStateError], [foreign.id, NotFoundError], [missing, NotFoundError]] as const) {
++      await expect(issue(milestoneId)).rejects.toBeInstanceOf(error);
++      await expect(issueService.setIssueMilestone(tenant.actors.member, {
++        orgId: tenant.org.id, issueId: ownIssue.id, milestoneId,
++      })).rejects.toBeInstanceOf(error);
++    }
++    expect(await issueRepo.countIssues(tenant.org.id, tenant.project.id)).toBe(1);
++    expect((await issueRepo.findIssueById(tenant.org.id, ownIssue.id))?.milestoneId).toBeNull();
++    expect(created).toEqual([]);
++    expect(updated).toEqual([]);
++  });
++
++  it("counts every live issue beyond a page and uses strictly past target dates for overdue", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-06-01T00:00:00.000Z"));
++    const created = await milestone("Launch", "2026-06-01T00:00:00.000Z");
++    for (let number = 1; number <= 151; number++) {
++      await issueRepo.insertIssue({
++        ...issueInput(tenant.org.id, tenant.project.id), milestoneId: created.id,
++        status: number <= 101 ? "todo" : number <= 126 ? "done" : "canceled",
++      }, tenant.userIds.member, number);
++    }
++    const archived = await issue(created.id);
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, archived.id);
++    const read = () => milestoneService.getMilestone(tenant.actors.viewer, tenant.org.id, created.id);
++    expect(await read()).toMatchObject({ progress: { total: 151, open: 101, closed: 50 }, overdue: false });
++    vi.setSystemTime(new Date("2026-06-01T00:00:00.001Z"));
++    expect((await read()).overdue).toBe(true);
++    await milestoneService.updateMilestone(tenant.actors.member, { orgId: tenant.org.id, milestoneId: created.id, targetDate: null });
++    expect((await read()).overdue).toBe(false);
++    await milestoneService.updateMilestone(tenant.actors.member, { orgId: tenant.org.id, milestoneId: created.id, targetDate: toIsoTimestamp("2026-05-01") });
++    await close(created.id);
++    expect(await read()).toMatchObject({ progress: { total: 50, open: 0, closed: 50 }, overdue: false });
++  });
++
++  it("orders by state, target date with null last, and creation age", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-01-01"));
++    const undated = await milestone("Undated");
++    const oldest = await milestone("Oldest", "2026-06-01T00:00:00.000Z");
++    vi.setSystemTime(new Date("2026-01-02"));
++    const newest = await milestone("Newest", "2026-06-01T00:00:00.000Z");
++    const early = await milestone("Early", "2026-05-01T00:00:00.000Z");
++    const closedUndated = await milestone("Closed undated");
++    const closedDated = await milestone("Closed dated", "2026-01-01T00:00:00.000Z");
++    await close(closedUndated.id);
++    await close(closedDated.id);
++    const listed = await milestoneService.listMilestones(tenant.actors.viewer, tenant.org.id, tenant.project.id);
++    expect(listed.map((item) => item.milestone.id)).toEqual([early.id, oldest.id, newest.id, undated.id, closedDated.id, closedUndated.id]);
++  });
++
++  it("moves only open live issues on close, preserving closed and archived memberships", async () => {
++    const source = await milestone("Source");
++    const target = await milestone("Target");
++    const open = [await issue(source.id, "todo"), await issue(source.id, "in_review")];
++    const done = await issue(source.id, "done");
++    const canceled = await issue(source.id, "canceled");
++    const archived = await issue(source.id);
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, archived.id);
++    const closed = capture("milestone.closed");
++    const result = await close(source.id, target.id);
++    expect([...result.movedIssueIds].sort()).toEqual(open.map((item) => item.id).sort());
++    expect(closed).toHaveLength(1);
++    expect(closed[0]).toMatchObject({ milestoneId: source.id, movedToMilestoneId: target.id, movedIssueIds: result.movedIssueIds });
++    for (const item of open) expect((await issueRepo.findIssueById(tenant.org.id, item.id))?.milestoneId).toBe(target.id);
++    for (const item of [done, canceled, archived]) expect((await issueRepo.findIssueById(tenant.org.id, item.id))?.milestoneId).toBe(source.id);
++    const removed = await close(target.id);
++    expect(removed.movedIssueIds).toHaveLength(2);
++    for (const item of open) expect((await issueRepo.findIssueById(tenant.org.id, item.id))?.milestoneId).toBeNull();
++  });
++
++  it("refuses invalid close targets atomically and refuses duplicate lifecycle transitions", async () => {
++    const source = await milestone("Source");
++    const closedTarget = await milestone("Closed target");
++    await close(closedTarget.id);
++    const otherProject = await projectRepo.insertProject({ ...tenant.project, slug: "other", key: "OTH" });
++    const foreign = await milestone("Foreign", null, otherProject.id);
++    const openIssue = await issue(source.id);
++    const closedEvents = capture("milestone.closed");
++    const reopened = capture("milestone.reopened");
++    for (const [target, error] of [[source.id, NotFoundError], [missing, NotFoundError], [foreign.id, NotFoundError], [closedTarget.id, MilestoneStateError]] as const) {
++      await expect(close(source.id, target)).rejects.toBeInstanceOf(error);
++    }
++    expect((await milestoneService.getMilestone(tenant.actors.viewer, tenant.org.id, source.id)).milestone).toEqual(source);
++    expect((await issueRepo.findIssueById(tenant.org.id, openIssue.id))?.milestoneId).toBe(source.id);
++    expect(closedEvents).toEqual([]);
++    await expect(milestoneService.reopenMilestone(tenant.actors.member, tenant.org.id, source.id)).rejects.toMatchObject({ reason: "already_open" });
++    expect(reopened).toEqual([]);
++    await close(source.id);
++    await expect(close(source.id)).rejects.toMatchObject({ reason: "closed" });
++    expect(closedEvents).toHaveLength(1);
++  });
++
++  it("audits lifecycle events exactly once and alerts each moved assignee through their preferences", async () => {
++    const createdEvents = capture("milestone.created");
++    const source = await milestone("Source");
++    const target = await milestone("Target");
++    const assigned = [await issue(source.id, "todo", tenant.userIds.admin), await issue(source.id, "todo", tenant.userIds.admin)];
++    await issue(source.id, "todo", tenant.userIds.member);
++    await issue(source.id, "todo", tenant.userIds.viewer);
++    await issue(source.id);
++    await issue(source.id, "done", tenant.userIds.admin);
++    await preferenceRepo.upsertPreference(updateNotificationPreferenceSchema.parse({
++      orgId: tenant.org.id, userId: tenant.userIds.admin, kind: "issue_milestone_changed",
++      inApp: true, email: false, digestOnly: false,
++    }));
++    await preferenceRepo.upsertPreference({
++      orgId: tenant.org.id, userId: tenant.userIds.viewer, kind: "issue_milestone_changed",
++      inApp: false, email: false, digestOnly: false,
++    });
++    await close(source.id, target.id);
++    const reopenedEvents = capture("milestone.reopened");
++    await milestoneService.reopenMilestone(tenant.actors.member, tenant.org.id, source.id);
++    expect(createdEvents).toHaveLength(2);
++    expect(reopenedEvents).toHaveLength(1);
++    const audit = await listActivity(tenant.actors.member, activityFilterSchema.parse({
++      orgId: tenant.org.id, subjectKind: "milestone", projectId: tenant.project.id,
++      action: ["milestone.created", "milestone.closed", "milestone.reopened"],
++    }));
++    expect(audit.items).toHaveLength(4);
++    expect(audit.items.every((entry) => entry.actorId === tenant.userIds.member && entry.projectId === tenant.project.id && entry.subjectKind === "milestone")).toBe(true);
++    for (const action of ["milestone.created", "milestone.closed", "milestone.reopened"]) {
++      expect(audit.items.filter((entry) => entry.subjectId === source.id && entry.action === action)).toHaveLength(1);
++    }
++    for (const recipientId of [tenant.userIds.admin, tenant.userIds.member, tenant.userIds.viewer]) {
++      const alerts = await listNotifications(tenant.actors.owner, {
++        orgId: tenant.org.id, recipientId, kind: ["issue_milestone_changed"], unreadOnly: false, limit: 100,
++      });
++      expect(alerts.items).toHaveLength(recipientId === tenant.userIds.admin ? 2 : 0);
++      if (recipientId === tenant.userIds.admin) {
++        expect(alerts.items.map((entry) => entry.href).sort()).toEqual(assigned.map((entry) => `/issues/${entry.id}`).sort());
++        expect(alerts.items.every((entry) => entry.channels.join() === "in_app")).toBe(true);
++      }
++    }
++  });
++
++  it("blocks every milestone write and issue movement for archived projects, while reads still work", async () => {
++    const source = await milestone("Source");
++    const closed = await milestone("Closed");
++    await close(closed.id);
++    const openIssue = await issue(source.id);
++    await projectRepo.archiveProject(tenant.org.id, tenant.project.id);
++    const actor = tenant.actors.member;
++    const orgId = tenant.org.id;
++    for (const operation of [
++      () => milestoneService.createMilestone(actor, { orgId, projectId: tenant.project.id, name: "New", targetDate: null }),
++      () => milestoneService.updateMilestone(actor, { orgId, milestoneId: source.id, name: "Rename" }),
++      () => close(source.id),
++      () => milestoneService.reopenMilestone(actor, orgId, closed.id),
++      () => issueService.setIssueMilestone(actor, { orgId, issueId: openIssue.id, milestoneId: null }),
++      () => issue(source.id),
++    ]) await expect(operation()).rejects.toBeInstanceOf(AlreadyArchivedError);
++    expect(await milestoneService.listMilestones(tenant.actors.viewer, orgId, tenant.project.id)).toHaveLength(2);
++    expect((await milestoneService.getMilestone(tenant.actors.viewer, orgId, source.id)).progress.open).toBe(1);
++  });
++});

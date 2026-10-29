@@ -1,0 +1,119 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/607f1a59-8f0e-4bd0-a9b5-b2e10f10919f/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/25b30e38-7e06-4497-898d-bf2a94253254/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/607f1a59-8f0e-4bd0-a9b5-b2e10f10919f/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/25b30e38-7e06-4497-898d-bf2a94253254/src/server/repositories/organization-repository.ts	2026-10-09 14:11:51
+@@ -1,5 +1,6 @@
+ /**
+- * Organization rows plus slug uniqueness lookups.
++ * Organization rows plus slug uniqueness lookups. Returned plans come from
++ * the subscription when present; the stored organization plan is a fallback.
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+@@ -10,6 +11,8 @@
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
++import { findSubscription } from "./subscription-repository";
++import type { OrganizationRow } from "@/server/db/schema/organizations";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -23,7 +26,7 @@
+     .from(organizations)
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(row) : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+@@ -32,7 +35,7 @@
+     .from(organizations)
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(row) : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -52,7 +55,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return Promise.all(rows.map((row) => withCurrentPlan(row.org)));
+ }
+ 
+ /**
+@@ -83,7 +86,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ export async function updateOrg(
+@@ -111,7 +114,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+@@ -123,7 +126,7 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+@@ -136,4 +139,13 @@
+     .where(like(organizations.slug, `${prefix}%`))
+     .all();
+   return rows.map((row) => row.slug);
++}
++
++/** Resolve on every read so existing mismatches and plan changes take effect. */
++async function withCurrentPlan(row: OrganizationRow): Promise<Organization> {
++  const organization = toOrganization(row);
++  const subscription = await findSubscription(organization.id);
++  return subscription
++    ? { ...organization, plan: subscription.plan }
++    : organization;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/607f1a59-8f0e-4bd0-a9b5-b2e10f10919f/src/server/repositories/subscription-repository.ts /private/tmp/bench-scratch/25b30e38-7e06-4497-898d-bf2a94253254/src/server/repositories/subscription-repository.ts
+--- /private/tmp/bench-scratch/607f1a59-8f0e-4bd0-a9b5-b2e10f10919f/src/server/repositories/subscription-repository.ts	2026-10-09 14:11:24
++++ /private/tmp/bench-scratch/25b30e38-7e06-4497-898d-bf2a94253254/src/server/repositories/subscription-repository.ts	2026-10-09 14:11:51
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -112,8 +112,8 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Only subscriptions still trialing can expire; choosing a plan ends the trial
++ * even when its original period end remains in the past.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -123,6 +123,7 @@
+     .from(subscriptions)
+     .where(
+       and(
++        eq(subscriptions.status, "trialing"),
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+         ne(subscriptions.plan, "free"),

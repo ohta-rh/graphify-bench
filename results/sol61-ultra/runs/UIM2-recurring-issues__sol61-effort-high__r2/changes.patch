@@ -1,0 +1,685 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/components/domain/billing/usage-panel.tsx /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/components/domain/billing/usage-panel.tsx
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/components/domain/billing/usage-panel.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/components/domain/billing/usage-panel.tsx	2026-10-09 19:21:54
+@@ -17,6 +17,7 @@
+   seats: "Seats",
+   projects: "Projects",
+   issuesPerProject: "Issues per project",
++  recurringIssues: "Recurring issues",
+   storageMb: "Storage (MB)",
+   apiRequestsPerHour: "API requests / hour",
+   webhooks: "Webhooks",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/config/plan-limits.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/config/plan-limits.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/config/plan-limits.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/config/plan-limits.ts	2026-10-09 19:21:54
+@@ -15,6 +15,7 @@
+   readonly seats: number;
+   readonly projects: number;
+   readonly issuesPerProject: number;
++  readonly recurringIssues: number;
+   readonly storageMb: number;
+   readonly apiRequestsPerHour: number;
+   readonly webhooks: number;
+@@ -32,6 +33,7 @@
+     seats: 3,
+     projects: 2,
+     issuesPerProject: 100,
++    recurringIssues: 0,
+     storageMb: 100,
+     apiRequestsPerHour: 100,
+     webhooks: 0,
+@@ -44,6 +46,7 @@
+     seats: 10,
+     projects: 10,
+     issuesPerProject: 1_000,
++    recurringIssues: 3,
+     storageMb: 2_000,
+     apiRequestsPerHour: 1_000,
+     webhooks: 2,
+@@ -56,6 +59,7 @@
+     seats: 50,
+     projects: 100,
+     issuesPerProject: 10_000,
++    recurringIssues: 25,
+     storageMb: 20_000,
+     apiRequestsPerHour: 10_000,
+     webhooks: 10,
+@@ -76,6 +80,7 @@
+     seats: UNLIMITED,
+     projects: UNLIMITED,
+     issuesPerProject: UNLIMITED,
++    recurringIssues: UNLIMITED,
+     storageMb: 500_000,
+     apiRequestsPerHour: 100_000,
+     webhooks: UNLIMITED,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/schemas/recurring-issue.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/schemas/recurring-issue.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/schemas/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/schemas/recurring-issue.ts	2026-10-09 19:21:54
+@@ -0,0 +1,38 @@
++import { z } from "zod";
++import { orgIdSchema, projectIdSchema, userIdSchema } from "./common";
++import { issuePrioritySchema } from "./issue";
++
++export const createRecurringIssueSchema = z.object({
++  orgId: orgIdSchema,
++  projectId: projectIdSchema,
++  title: z.string().min(3).max(180),
++  priority: issuePrioritySchema.default("none"),
++  assigneeId: userIdSchema.nullable().default(null),
++  cadence: z.enum(["daily", "weekly"]),
++  weekday: z.number().int().min(1).max(7).nullable().default(null),
++  timezone: z.string().refine((value) => {
++    if (!value || /^[+-]/.test(value)) return false;
++    try {
++      new Intl.DateTimeFormat("en", { timeZone: value });
++      return true;
++    } catch {
++      return false;
++    }
++  }, "Unknown IANA time zone"),
++  startsOn: z.string().refine((value) => {
++    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
++    const date = new Date(`${value}T00:00:00.000Z`);
++    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
++  }, "Expected a real YYYY-MM-DD calendar date"),
++}).superRefine((input, ctx) => {
++  if ((input.cadence === "weekly" && input.weekday === null) ||
++      (input.cadence === "daily" && input.weekday !== null)) {
++    ctx.addIssue({
++      code: "custom",
++      path: ["weekday"],
++      message: "Weekly rules require a weekday; daily rules must have no weekday",
++    });
++  }
++});
++
++export type CreateRecurringIssueInput = z.input<typeof createRecurringIssueSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/migrate.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/migrate.ts	2026-10-09 19:21:54
+@@ -158,6 +158,25 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS recurring_issues (
++     id TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     title TEXT NOT NULL,
++     priority TEXT NOT NULL DEFAULT 'none',
++     assignee_id TEXT,
++     cadence TEXT NOT NULL,
++     weekday INTEGER,
++     timezone TEXT NOT NULL,
++     starts_on TEXT NOT NULL,
++     last_occurrence_on TEXT,
++     paused INTEGER NOT NULL DEFAULT 0,
++     created_by TEXT NOT NULL,
++     created_at TEXT NOT NULL,
++     updated_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS recurring_issues_org_created_idx ON recurring_issues (org_id, created_at)`,
++  `CREATE INDEX IF NOT EXISTS recurring_issues_paused_idx ON recurring_issues (paused)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/schema/index.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/schema/index.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/schema/index.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/schema/index.ts	2026-10-09 19:21:54
+@@ -9,6 +9,7 @@
+ export * from "./members";
+ export * from "./projects";
+ export * from "./issues";
++export * from "./recurring-issues";
+ export * from "./comments";
+ export * from "./notifications";
+ export * from "./activity";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/schema/recurring-issues.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/schema/recurring-issues.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/db/schema/recurring-issues.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/db/schema/recurring-issues.ts	2026-10-09 19:21:54
+@@ -0,0 +1,23 @@
++import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
++import { idColumn, tenantColumns, timestampColumns } from "./_shared";
++
++export const recurringIssues = sqliteTable("recurring_issues", {
++  id: idColumn(),
++  ...tenantColumns,
++  projectId: text("project_id").notNull(),
++  title: text("title").notNull(),
++  priority: text("priority", { enum: ["none", "low", "medium", "high", "urgent"] })
++    .notNull().default("none"),
++  assigneeId: text("assignee_id"),
++  cadence: text("cadence", { enum: ["daily", "weekly"] }).notNull(),
++  weekday: integer("weekday"),
++  timezone: text("timezone").notNull(),
++  startsOn: text("starts_on").notNull(),
++  lastOccurrenceOn: text("last_occurrence_on"),
++  paused: integer("paused", { mode: "boolean" }).notNull().default(false),
++  createdBy: text("created_by").notNull(),
++  ...timestampColumns,
++}, (table) => [
++  index("recurring_issues_org_created_idx").on(table.orgId, table.createdAt),
++  index("recurring_issues_paused_idx").on(table.paused),
++]);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/index.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/index.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/index.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/index.ts	2026-10-09 19:23:11
+@@ -27,6 +27,7 @@
+ export { runCleanupArchivedJob } from "./cleanup-archived-job";
+ export { runDigestEmailJob, shouldRunForOrg } from "./digest-email-job";
+ export { runOverdueIssueJob } from "./overdue-issue-job";
++export { runRecurringIssueJob } from "./recurring-issue-job";
+ export { runSearchReindexJob } from "./search-reindex-job";
+ export { runTrialExpiryJob } from "./trial-expiry-job";
+ export { runUsageRollupJob } from "./usage-rollup-job";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/queue.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/queue.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/queue.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/queue.ts	2026-10-09 19:23:11
+@@ -16,6 +16,7 @@
+ export type JobKind =
+   | "digest-email"
+   | "overdue-issues"
++  | "recurring-issues"
+   | "webhook-delivery"
+   | "usage-rollup"
+   | "search-reindex"
+@@ -130,6 +131,11 @@
+     case "overdue-issues": {
+       const { runOverdueIssueJob } = await import("./overdue-issue-job");
+       await runOverdueIssueJob(now);
++      return;
++    }
++    case "recurring-issues": {
++      const { runRecurringIssueJob } = await import("./recurring-issue-job");
++      await runRecurringIssueJob(now);
+       return;
+     }
+     case "webhook-delivery": {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/recurring-issue-job.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/recurring-issue-job.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/recurring-issue-job.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/recurring-issue-job.ts	2026-10-09 19:23:11
+@@ -0,0 +1,85 @@
++import { createLogger } from "@/lib/logger";
++import { can } from "@/lib/permissions";
++import { createIssueSchema } from "@/schemas/issue";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { projectResource } from "@/server/services/_support";
++import { createIssue } from "@/server/services/issue-service";
++import type { Actor } from "@/types/member";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import { runJob } from "./types";
++import type { JobResult } from "./types";
++
++const logger = createLogger("recurring-issue-job");
++
++function latestOccurrence(rule: RecurringIssue, now: Date): string | null {
++  const parts = new Intl.DateTimeFormat("en-US", {
++    timeZone: rule.timezone,
++    calendar: "iso8601",
++    numberingSystem: "latn",
++    year: "numeric", month: "2-digit", day: "2-digit",
++  }).formatToParts(now);
++  const part = (type: string) => parts.find((p) => p.type === type)!.value;
++  const today = `${part("year").padStart(4, "0")}-${part("month")}-${part("day")}`;
++  let occurrence = today;
++  if (rule.cadence === "weekly") {
++    // UTC is used only for arithmetic on calendar dates, never for zone boundaries.
++    const date = new Date(`${today}T00:00:00.000Z`);
++    const weekday = date.getUTCDay() || 7;
++    date.setUTCDate(date.getUTCDate() - (weekday - rule.weekday! + 7) % 7);
++    occurrence = date.toISOString().slice(0, 10);
++  }
++  return occurrence >= rule.startsOn ? occurrence : null;
++}
++
++// The app has one writer process. Serialize sweeps so overlapping runs cannot
++// both create an issue before the first advances lastOccurrenceOn.
++let previousRun: Promise<unknown> = Promise.resolve();
++
++export async function runRecurringIssueJob(now: Date): Promise<JobResult> {
++  const clock = new Date(now.getTime());
++  const run = previousRun.then(() => runJob("recurring-issues", async (result) => {
++    const rules = await recurringRepo.listUnpausedRecurringIssues();
++    for (const rule of rules) {
++      try {
++        const occurrence = latestOccurrence(rule, clock);
++        if (occurrence === null ||
++            (rule.lastOccurrenceOn !== null && occurrence <= rule.lastOccurrenceOn)) continue;
++
++        const project = await projectRepo.findProjectById(rule.orgId, rule.projectId);
++        if (!project || project.archivedAt !== null) continue;
++
++        const creator = await memberRepo.findMember(rule.orgId, rule.createdBy);
++        const actor: Actor | null = creator?.status === "active"
++          ? { orgId: rule.orgId, userId: creator.userId, role: creator.role }
++          : null;
++        if (!actor || !can(actor, "issue:create", projectResource(project))) {
++          await recurringRepo.updateRecurringIssue(rule.orgId, rule.id, { paused: true });
++          continue;
++        }
++
++        const assignee = rule.assigneeId === null ? null
++          : await memberRepo.findMember(rule.orgId, rule.assigneeId);
++        await createIssue(actor, createIssueSchema.parse({
++          orgId: rule.orgId,
++          projectId: rule.projectId,
++          title: `${rule.title} (${occurrence})`,
++          status: "backlog",
++          priority: rule.priority,
++          assigneeId: assignee?.status === "active" ? assignee.userId : null,
++        }));
++        result.processed += 1;
++        await recurringRepo.updateRecurringIssue(rule.orgId, rule.id, { lastOccurrenceOn: occurrence });
++      } catch (error) {
++        result.failed += 1;
++        logger.error("failed to file recurring issue", {
++          recurringIssueId: rule.id,
++          reason: error instanceof Error ? error.message : String(error),
++        });
++      }
++    }
++  }));
++  previousRun = run.catch(() => undefined);
++  return run;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/scheduler.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/scheduler.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/jobs/scheduler.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/jobs/scheduler.ts	2026-10-09 19:23:11
+@@ -13,6 +13,7 @@
+ const CADENCE_MINUTES: Readonly<Record<JobKind, number>> = {
+   "digest-email": 60,
+   "overdue-issues": 60,
++  "recurring-issues": 15,
+   "webhook-delivery": 1,
+   "usage-rollup": 15,
+   "search-reindex": 1_440,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/repositories/recurring-issue-repository.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/repositories/recurring-issue-repository.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/repositories/recurring-issue-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/repositories/recurring-issue-repository.ts	2026-10-09 19:23:11
+@@ -0,0 +1,85 @@
++import { and, count, eq, sql } from "drizzle-orm";
++import { newId } from "@/lib/id";
++import { getDb, recurringIssues } from "@/server/db";
++import { toIsoTimestamp } from "@/types/common";
++import type { OrgId, ProjectId, UserId } from "@/types/common";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import { orgPredicate } from "./base-repository";
++
++function toRecurringIssue(row: typeof recurringIssues.$inferSelect): RecurringIssue {
++  return {
++    ...row,
++    orgId: row.orgId as OrgId,
++    projectId: row.projectId as ProjectId,
++    assigneeId: row.assigneeId as UserId | null,
++    createdBy: row.createdBy as UserId,
++    createdAt: toIsoTimestamp(row.createdAt),
++    updatedAt: toIsoTimestamp(row.updatedAt),
++  };
++}
++
++export async function findRecurringIssueById(
++  orgId: OrgId,
++  id: string,
++): Promise<RecurringIssue | null> {
++  const row = getDb().select().from(recurringIssues)
++    .where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id)))
++    .get();
++  return row ? toRecurringIssue(row) : null;
++}
++
++export async function listRecurringIssues(orgId: OrgId): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues)
++    .where(orgPredicate(recurringIssues.orgId, orgId))
++    .orderBy(sql`rowid`).all().map(toRecurringIssue);
++}
++
++/** Global sweep for the scheduler; request-facing reads always require orgId. */
++export async function listUnpausedRecurringIssues(): Promise<readonly RecurringIssue[]> {
++  return getDb().select().from(recurringIssues)
++    .where(eq(recurringIssues.paused, false))
++    .orderBy(sql`rowid`).all().map(toRecurringIssue);
++}
++
++export async function countRecurringIssues(orgId: OrgId): Promise<number> {
++  return getDb().select({ value: count() }).from(recurringIssues)
++    .where(orgPredicate(recurringIssues.orgId, orgId)).get()?.value ?? 0;
++}
++
++export async function insertRecurringIssue(
++  input: Omit<RecurringIssue, "id" | "lastOccurrenceOn" | "paused" | "createdBy" | "createdAt" | "updatedAt">,
++  createdBy: UserId,
++  limit: number,
++): Promise<RecurringIssue> {
++  // Keep the quota check and insert together so concurrent creates cannot exceed it.
++  return getDb().transaction((tx) => {
++    const used = tx.select({ value: count() }).from(recurringIssues)
++      .where(orgPredicate(recurringIssues.orgId, input.orgId)).get()?.value ?? 0;
++    if (used + 1 > limit) throw new Error("Recurring issue quota exceeded");
++
++    const stamp = toIsoTimestamp(new Date());
++    const row = tx.insert(recurringIssues).values({
++      ...input,
++      id: newId(),
++      lastOccurrenceOn: null,
++      paused: false,
++      createdBy,
++      createdAt: stamp,
++      updatedAt: stamp,
++    }).returning().get();
++    return toRecurringIssue(row);
++  });
++}
++
++export async function updateRecurringIssue(
++  orgId: OrgId,
++  id: string,
++  patch: Partial<Pick<RecurringIssue, "paused" | "lastOccurrenceOn">>,
++): Promise<RecurringIssue> {
++  const row = getDb().update(recurringIssues)
++    .set({ ...patch, updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(orgPredicate(recurringIssues.orgId, orgId), eq(recurringIssues.id, id)))
++    .returning().get();
++  if (!row) throw new Error(`Recurring issue ${id} not found`);
++  return toRecurringIssue(row);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/billing-service.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/billing-service.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/billing-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/billing-service.ts	2026-10-09 19:23:11
+@@ -16,6 +16,7 @@
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import * as webhookRepo from "@/server/repositories/webhook-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { actorEnvelope, billingResource, requireFound } from "./_support";
+ import type {
+@@ -238,6 +239,8 @@
+       return usage.storageMbUsed;
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
++    case "recurringIssues":
++      return recurringRepo.countRecurringIssues(orgId);
+     case "apiRequestsPerHour":
+       return 0;
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/index.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/index.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/index.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/index.ts	2026-10-09 19:23:11
+@@ -15,6 +15,7 @@
+ export * as featureFlagService from "./feature-flag-service";
+ export * as invitationService from "./invitation-service";
+ export * as issueService from "./issue-service";
++export * as recurringIssueService from "./recurring-issue-service";
+ export * as labelService from "./label-service";
+ export * as memberService from "./member-service";
+ export * as notificationService from "./notification-service";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/recurring-issue-service.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/recurring-issue-service.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/server/services/recurring-issue-service.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/server/services/recurring-issue-service.ts	2026-10-09 19:23:11
+@@ -0,0 +1,59 @@
++import { getLimit } from "@/config/plan-limits";
++import { assertCan } from "@/lib/permissions";
++import { assertNotArchived } from "@/lib/soft-delete";
++import { assertOrgScope } from "@/lib/tenant";
++import { createRecurringIssueSchema } from "@/schemas/recurring-issue";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import type { CreateRecurringIssueInput } from "@/schemas/recurring-issue";
++import type { OrgId } from "@/types/common";
++import type { Actor } from "@/types/member";
++import type { RecurringIssue } from "@/types/recurring-issue";
++import { orgResource, projectResource, requireFound } from "./_support";
++
++export async function createRecurringIssue(
++  actor: Actor,
++  input: CreateRecurringIssueInput,
++): Promise<RecurringIssue> {
++  const parsed = createRecurringIssueSchema.parse(input);
++  assertOrgScope(actor, parsed.orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(parsed.orgId, parsed.projectId),
++    "Project", parsed.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++  assertCan(actor, "issue:create", projectResource(project));
++
++  if (parsed.assigneeId !== null) {
++    const member = await memberRepo.findMember(parsed.orgId, parsed.assigneeId);
++    if (!member || member.status !== "active") {
++      throw new Error("Assignee must be an active organization member");
++    }
++  }
++  const org = requireFound(await orgRepo.findOrgById(parsed.orgId), "Organization", parsed.orgId);
++  return recurringRepo.insertRecurringIssue(parsed, actor.userId, getLimit(org.plan, "recurringIssues"));
++}
++
++export async function setRecurringIssuePaused(
++  actor: Actor,
++  input: { orgId: OrgId; recurringIssueId: string; paused: boolean },
++): Promise<RecurringIssue> {
++  assertOrgScope(actor, input.orgId);
++  const rule = requireFound(
++    await recurringRepo.findRecurringIssueById(input.orgId, input.recurringIssueId),
++    "Recurring issue", input.recurringIssueId,
++  );
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, rule.projectId), "Project", rule.projectId,
++  );
++  assertCan(actor, "issue:create", projectResource(project));
++  return recurringRepo.updateRecurringIssue(input.orgId, rule.id, { paused: input.paused });
++}
++
++export async function listRecurringIssues(actor: Actor, orgId: OrgId): Promise<readonly RecurringIssue[]> {
++  assertOrgScope(actor, orgId);
++  assertCan(actor, "issue:read", orgResource(orgId));
++  return recurringRepo.listRecurringIssues(orgId);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/types/billing.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/types/billing.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/types/billing.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/types/billing.ts	2026-10-09 19:21:54
+@@ -40,6 +40,7 @@
+   | "seats"
+   | "projects"
+   | "issuesPerProject"
++  | "recurringIssues"
+   | "storageMb"
+   | "apiRequestsPerHour"
+   | "webhooks";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/types/recurring-issue.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/types/recurring-issue.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/src/types/recurring-issue.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/src/types/recurring-issue.ts	2026-10-09 19:21:54
+@@ -0,0 +1,22 @@
++import type { IsoTimestamp, OrgId, ProjectId, UserId } from "./common";
++import type { IssuePriority } from "./issue";
++
++export type RecurrenceCadence = "daily" | "weekly";
++
++export interface RecurringIssue {
++  id: string;
++  orgId: OrgId;
++  projectId: ProjectId;
++  title: string;
++  priority: IssuePriority;
++  assigneeId: UserId | null;
++  cadence: RecurrenceCadence;
++  weekday: number | null;
++  timezone: string;
++  startsOn: string;
++  lastOccurrenceOn: string | null;
++  paused: boolean;
++  createdBy: UserId;
++  createdAt: IsoTimestamp;
++  updatedAt: IsoTimestamp;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/tests/services/recurring-issue-service.test.ts /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/tests/services/recurring-issue-service.test.ts
+--- /private/tmp/bench-scratch/75f218e2-8e3c-45b8-9509-52dd59c2e5b5/tests/services/recurring-issue-service.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/3e48091f-0719-4687-a277-02b7877c5af1/tests/services/recurring-issue-service.test.ts	2026-10-09 19:24:42
+@@ -0,0 +1,164 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { ZodError } from "zod";
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { createRecurringIssueSchema } from "@/schemas/recurring-issue";
++import { getDb, recurringIssues } from "@/server/db";
++import { drain, enqueue, resetQueue } from "@/server/jobs/queue";
++import { runRecurringIssueJob } from "@/server/jobs/recurring-issue-job";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as recurringRepo from "@/server/repositories/recurring-issue-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { createRecurringIssue, listRecurringIssues, setRecurringIssuePaused } from "@/server/services/recurring-issue-service";
++import { toIsoTimestamp } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++beforeAll(async () => { cleanup = await useTemporaryDatabase(); });
++beforeEach(() => { getDb().delete(recurringIssues).run(); resetQueue(); });
++afterAll(() => { cleanup(); });
++
++function input(tenant: Tenant) {
++  return {
++    orgId: tenant.org.id,
++    projectId: tenant.project.id,
++    title: "Daily triage",
++    cadence: "daily" as const,
++    timezone: "UTC",
++    startsOn: "2026-03-01",
++  };
++}
++
++describe("recurring issues", () => {
++  it("validates calendar dates, zones and cadence before storing anything", async () => {
++    const tenant = await createTenant("recurring-validation");
++    for (const patch of [
++      { startsOn: "2026-02-30" }, { startsOn: "2026-2-01" },
++      { startsOn: "2025-02-29" }, { timezone: "Unknown/Zone" },
++      { cadence: "weekly" as const }, { weekday: 1 },
++    ]) {
++      await expect(createRecurringIssue(tenant.actors.member, { ...input(tenant), ...patch }))
++        .rejects.toBeInstanceOf(ZodError);
++    }
++    expect(createRecurringIssueSchema.safeParse({ ...input(tenant), startsOn: "2024-02-29" }).success).toBe(true);
++    expect(await listRecurringIssues(tenant.actors.viewer, tenant.org.id)).toEqual([]);
++  });
++
++  it("enforces tenant scope, project state, permissions and active assignees", async () => {
++    const tenant = await createTenant("recurring-scope");
++    const other = await createTenant("recurring-other");
++    await expect(createRecurringIssue(tenant.actors.member, input(other))).rejects.toBeInstanceOf(TenantScopeError);
++    await expect(createRecurringIssue(tenant.actors.member, { ...input(tenant), projectId: other.project.id }))
++      .rejects.toBeInstanceOf(NotFoundError);
++    await expect(createRecurringIssue(tenant.actors.viewer, input(tenant))).rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(createRecurringIssue(tenant.actors.member, { ...input(tenant), assigneeId: other.userIds.member }))
++      .rejects.toThrow();
++    const rule = await createRecurringIssue(tenant.actors.member, input(tenant));
++    expect(rule).toMatchObject({ paused: false, lastOccurrenceOn: null, createdBy: tenant.userIds.member, priority: "none", assigneeId: null });
++    await expect(setRecurringIssuePaused(other.actors.member, { orgId: other.org.id, recurringIssueId: rule.id, paused: true }))
++      .rejects.toBeInstanceOf(NotFoundError);
++    await expect(setRecurringIssuePaused(tenant.actors.viewer, { orgId: tenant.org.id, recurringIssueId: rule.id, paused: true }))
++      .rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(listRecurringIssues(tenant.actors.member, other.org.id)).rejects.toBeInstanceOf(TenantScopeError);
++    await projectRepo.archiveProject(tenant.org.id, tenant.project.id);
++    await expect(createRecurringIssue(tenant.actors.member, input(tenant))).rejects.toBeInstanceOf(AlreadyArchivedError);
++  });
++
++  it("counts paused rules toward the quota and preserves creation order", async () => {
++    const free = await createTenant("recurring-free", "free");
++    await expect(createRecurringIssue(free.actors.member, input(free))).rejects.toThrow();
++    const tenant = await createTenant("recurring-starter", "starter");
++    const rules = [];
++    for (let i = 0; i < 3; i++) {
++      const rule = await createRecurringIssue(tenant.actors.member, input(tenant));
++      rules.push(rule.id);
++      await setRecurringIssuePaused(tenant.actors.member, { orgId: tenant.org.id, recurringIssueId: rule.id, paused: true });
++    }
++    await expect(createRecurringIssue(tenant.actors.member, input(tenant))).rejects.toThrow();
++    expect((await listRecurringIssues(tenant.actors.viewer, tenant.org.id)).map((rule) => rule.id)).toEqual(rules);
++  });
++
++  it("uses local midnight across DST, skips missed days, and emits ordinary issue events", async () => {
++    const tenant = await createTenant("recurring-dst");
++    const rule = await createRecurringIssue(tenant.actors.member, {
++      ...input(tenant), timezone: "America/New_York", assigneeId: tenant.userIds.admin, priority: "high",
++    });
++    const seen: unknown[] = [];
++    const off = subscribe("issue.created", (event) => { seen.push(event); });
++    try {
++      expect((await runRecurringIssueJob(new Date("2026-03-08T04:59:59Z"))).processed).toBe(1);
++      expect((await runRecurringIssueJob(new Date("2026-03-08T05:00:00Z"))).processed).toBe(1);
++      expect((await runRecurringIssueJob(new Date("2026-03-09T03:59:59Z"))).processed).toBe(0);
++      const results = await Promise.all([
++        runRecurringIssueJob(new Date("2026-03-09T04:00:00Z")),
++        runRecurringIssueJob(new Date("2026-03-09T04:00:00Z")),
++      ]);
++      expect(results.map((result) => result.processed)).toEqual([1, 0]);
++      expect(seen).toHaveLength(3);
++      expect(seen[2]).toMatchObject({ actorId: tenant.userIds.member, title: "Daily triage (2026-03-09)" });
++      const issues = await issueRepo.listIssues({ orgId: tenant.org.id, limit: 100 });
++      expect(issues.items.map((issue) => issue.title).sort()).toEqual([
++        "Daily triage (2026-03-07)", "Daily triage (2026-03-08)", "Daily triage (2026-03-09)",
++      ]);
++      expect(issues.items[0]).toMatchObject({ status: "backlog", priority: "high", assigneeId: tenant.userIds.admin, description: null, dueAt: null, labelIds: [] });
++      expect((await recurringRepo.findRecurringIssueById(tenant.org.id, rule.id))?.lastOccurrenceOn).toBe("2026-03-09");
++    } finally { off(); }
++  });
++
++  it("waits for the first weekly occurrence and chooses the latest eligible weekday", async () => {
++    const tenant = await createTenant("recurring-weekly");
++    const rule = await createRecurringIssue(tenant.actors.member, {
++      ...input(tenant), cadence: "weekly", weekday: 1, timezone: "Asia/Tokyo", startsOn: "2026-03-03",
++    });
++    expect((await runRecurringIssueJob(new Date("2026-03-08T14:59:59Z"))).processed).toBe(0);
++    expect((await runRecurringIssueJob(new Date("2026-03-08T15:00:00Z"))).processed).toBe(1);
++    expect((await runRecurringIssueJob(new Date("2026-03-25T12:00:00Z"))).processed).toBe(1);
++    expect((await recurringRepo.findRecurringIssueById(tenant.org.id, rule.id))?.lastOccurrenceOn).toBe("2026-03-23");
++  });
++
++  it("leaves archived projects untouched and pauses creators who lose access", async () => {
++    const tenant = await createTenant("recurring-access");
++    const rule = await createRecurringIssue(tenant.actors.member, input(tenant));
++    await projectRepo.archiveProject(tenant.org.id, tenant.project.id);
++    await runRecurringIssueJob(new Date("2026-03-05T12:00:00Z"));
++    expect(await recurringRepo.findRecurringIssueById(tenant.org.id, rule.id)).toEqual(rule);
++    await projectRepo.restoreProject(tenant.org.id, tenant.project.id);
++    const creator = (await memberRepo.findMember(tenant.org.id, tenant.userIds.member))!;
++    await memberRepo.updateMemberRole(tenant.org.id, creator.id, "viewer");
++    expect((await runRecurringIssueJob(new Date("2026-03-06T12:00:00Z"))).processed).toBe(0);
++    expect(await recurringRepo.findRecurringIssueById(tenant.org.id, rule.id)).toMatchObject({ paused: true, lastOccurrenceOn: null });
++  });
++
++  it("retries quota refusals, drops inactive assignees, and isolates rule failures", async () => {
++    const blocked = await createTenant("recurring-blocked", "starter");
++    const rule = await createRecurringIssue(blocked.actors.member, input(blocked));
++    for (let i = 1; i <= 1000; i++) {
++      await issueRepo.insertIssue(issueInput(blocked.org.id, blocked.project.id), blocked.userIds.member, i);
++    }
++    const healthy = await createTenant("recurring-healthy");
++    await createRecurringIssue(healthy.actors.member, { ...input(healthy), assigneeId: healthy.userIds.admin });
++    const assignee = (await memberRepo.findMember(healthy.org.id, healthy.userIds.admin))!;
++    await memberRepo.archiveMember(healthy.org.id, assignee.id);
++    const now = new Date("2026-03-05T12:00:00Z");
++    expect(await runRecurringIssueJob(now)).toMatchObject({ processed: 1, failed: 1 });
++    expect(await recurringRepo.findRecurringIssueById(blocked.org.id, rule.id)).toEqual(rule);
++    const healthyIssues = await issueRepo.listIssues({ orgId: healthy.org.id, limit: 100 });
++    expect(healthyIssues.items[0].assigneeId).toBeNull();
++    const issues = await issueRepo.listIssues({ orgId: blocked.org.id, limit: 1 });
++    await issueRepo.archiveIssue(blocked.org.id, issues.items[0].id);
++    expect((await runRecurringIssueJob(now)).processed).toBe(1);
++  });
++
++  it("dispatches queued recurring-issues jobs with the current time", async () => {
++    const tenant = await createTenant("recurring-queue");
++    const rule = await createRecurringIssue(tenant.actors.member, { ...input(tenant), startsOn: "2020-01-01" });
++    enqueue({ id: "recurring-test", kind: "recurring-issues", runAt: toIsoTimestamp(new Date(0)), attempts: 0, payload: {} });
++    expect(await drain()).toBe(1);
++    expect((await recurringRepo.findRecurringIssueById(tenant.org.id, rule.id))?.lastOccurrenceOn).toBe(new Date().toISOString().slice(0, 10));
++  });
++});

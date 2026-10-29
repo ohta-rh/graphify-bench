@@ -1,0 +1,167 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/jobs/overdue-issue-job.ts /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/jobs/overdue-issue-job.ts
+--- /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/jobs/overdue-issue-job.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/jobs/overdue-issue-job.ts	2026-10-09 23:57:09
+@@ -7,23 +7,18 @@
+ import { createLogger } from "@/lib/logger";
+ import { shouldFilterArchived } from "@/lib/soft-delete";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+-import * as usageRepo from "@/server/repositories/usage-repository";
++import * as orgRepo from "@/server/repositories/organization-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+-/** How many organizations one pass sweeps. */
+-const ORG_BATCH = 50;
+-
+ /** Archived issues are never overdue — an archived issue has no due date. */
+ const LIVE_ONLY = {} as const;
+ 
+ const logger = createLogger("overdue-issue-job");
+ 
+ /**
+- * Issues already announced this process's lifetime. A later sweep still
+- * finds a still-open, still-overdue issue — this is what keeps the job from
+- * re-emitting `issue.overdue` for it on every pass.
++ * Issues announced during their current consecutive run of overdue sweeps.
+  */
+ const reported = new Set<string>();
+ 
+@@ -45,10 +40,21 @@
+     }
+ 
+     const stamp = toIsoTimestamp(now);
+-    const orgIds = await usageRepo.listOrgIdsForRollup(ORG_BATCH);
++    const orgIds = await orgRepo.listLiveOrgIds();
++    const sweeps = await Promise.all(
++      orgIds.map(async (orgId) => ({
++        orgId,
++        overdue: await issueRepo.listOverdueIssues(orgId, stamp),
++      })),
++    );
++    const currentlyOverdue = new Set(
++      sweeps.flatMap(({ overdue }) => overdue.map((issue) => issue.id)),
++    );
++    for (const issueId of reported) {
++      if (!currentlyOverdue.has(issueId)) reported.delete(issueId);
++    }
+ 
+-    for (const orgId of orgIds) {
+-      const overdue = await issueRepo.listOverdueIssues(orgId, stamp);
++    for (const { orgId, overdue } of sweeps) {
+ 
+       for (const issue of overdue) {
+         if (issue.dueAt === null) continue;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/issue-repository.ts	2026-10-09 23:56:27
++++ /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/issue-repository.ts	2026-10-09 23:57:09
+@@ -14,6 +14,7 @@
+   like,
+   lt,
+   ne,
++  notInArray,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -24,7 +25,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
+-import { ISSUE_STATUSES } from "@/types/issue";
++import { CLOSED_ISSUE_STATUSES, ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -54,7 +55,7 @@
+ import type { SQL } from "drizzle-orm";
+ 
+ /** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+-const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++const TERMINAL_STATUSES = CLOSED_ISSUE_STATUSES;
+ 
+ export async function findIssueById(
+   orgId: OrgId,
+@@ -427,7 +428,7 @@
+           : current.startedAt,
+       completedAt: TERMINAL_STATUSES.includes(status)
+         ? stamp
+-        : current.completedAt,
++        : null,
+       updatedAt: stamp,
+     })
+     .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+@@ -521,7 +522,7 @@
+           livePredicate(issues.archivedAt, {}),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+-          ne(issues.status, "done"),
++          notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         ),
+       ),
+     )
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/organization-repository.ts	2026-10-09 23:57:09
+@@ -137,3 +137,13 @@
+     .all();
+   return rows.map((row) => row.slug);
+ }
++
++/** Every workspace that has not been deleted, including newly created ones. */
++export async function listLiveOrgIds(): Promise<readonly OrgId[]> {
++  const rows = getDb()
++    .select()
++    .from(organizations)
++    .where(isNull(organizations.archivedAt))
++    .all();
++  return rows.map((row) => toOrganization(row).id);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/project-repository.ts /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/project-repository.ts
+--- /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/repositories/project-repository.ts	2026-10-09 23:56:27
++++ /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/repositories/project-repository.ts	2026-10-09 23:57:09
+@@ -3,7 +3,7 @@
+  *
+  * Must call (do not reimplement): archivePatch, restorePatch, shouldFilterArchived, uniqueSlug
+  */
+-import { and, count, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
++import { and, count, desc, eq, inArray, isNotNull, like, lt, notInArray, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import {
+@@ -12,6 +12,7 @@
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+ import { getDb, issues, projects } from "@/server/db";
++import { CLOSED_ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -231,7 +232,7 @@
+   const closed = db
+     .select({ value: count() })
+     .from(issues)
+-    .where(and(scope, eq(issues.status, "done")))
++    .where(and(scope, inArray(issues.status, [...CLOSED_ISSUE_STATUSES])))
+     .get();
+ 
+   const all = db.select({ value: count() }).from(issues).where(scope).get();
+@@ -242,6 +243,7 @@
+     .where(
+       and(
+         scope,
++        notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+         isNotNull(issues.dueAt),
+         lt(issues.dueAt, toIsoTimestamp(new Date())),
+       ),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/services/notification-service.ts /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/58a02399-6b30-408c-bde8-747bca872233/src/server/services/notification-service.ts	2026-10-09 23:56:27
++++ /private/tmp/bench-scratch/866bd69d-6f9e-480e-a0cb-b7ee56cffa71/src/server/services/notification-service.ts	2026-10-09 23:57:09
+@@ -192,7 +192,7 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_due_soon", [payload.assigneeId], {
++    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,

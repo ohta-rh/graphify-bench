@@ -1,0 +1,312 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/actions/projects/create-project.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/actions/projects/create-project.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/actions/projects/create-project.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/actions/projects/create-project.ts	2026-10-14 22:19:30
+@@ -3,9 +3,8 @@
+ /**
+  * Creates a project after the plan's project quota is checked.
+  *
+- * Owner D. Archived projects still occupy the quota, so the count deliberately
+- * includes them — restoring a project must never be blocked by a limit the
+- * restore itself would breach.
++ * Owner D. Only live projects occupy quota; use the source count so a stale
++ * usage cache cannot refuse an available slot.
+  *
+  * Must call (do not reimplement): createProjectSchema, can, getPlanLimits,
+  * getActor, toActionResult
+@@ -41,8 +40,8 @@
+ 
+     const summary = await getOrganizationSummary(actor, input.orgId);
+     const limits = getPlanLimits(summary.organization.plan);
+-    if (summary.usage.projectsUsed >= limits.projects) {
+-      throw new PlanLimitError("projects", limits.projects, summary.usage.projectsUsed);
++    if (summary.projectCount >= limits.projects) {
++      throw new PlanLimitError("projects", limits.projects, summary.projectCount);
+     }
+ 
+     const project = await createProject(actor, input);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/settings/project-settings-form.tsx	2026-10-14 22:19:30
+@@ -70,6 +70,12 @@
+         </p>
+       ) : null}
+ 
++      {state?.ok === false ? (
++        <p role="alert" className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">
++          {state.error.message}
++        </p>
++      ) : null}
++
+       <div className="space-y-1">
+         <label htmlFor="name" className="text-sm font-medium">
+           Name
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/lib/slug.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/lib/slug.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/lib/slug.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/lib/slug.ts	2026-10-14 22:19:30
+@@ -100,3 +100,17 @@
+       : (words[0] ?? "task").slice(0, 3);
+   return letters.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4) || "TASK";
+ }
++
++/** Keeps issue prefixes unique, shortening the base to fit a numeric suffix. */
++export function uniqueProjectKey(input: string, taken: Iterable<string>): string {
++  const base = input.slice(0, 4);
++  const used = new Set(taken);
++  if (!used.has(base)) return base;
++
++  for (let suffix = 2; suffix < 1_000; suffix += 1) {
++    const number = String(suffix);
++    const candidate = `${base.slice(0, 4 - number.length)}${number}`;
++    if (!used.has(candidate)) return candidate;
++  }
++  throw new Error(`Exhausted unique project keys for ${base}`);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/repositories/project-repository.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/repositories/project-repository.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/repositories/project-repository.ts	2026-10-14 22:16:18
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/repositories/project-repository.ts	2026-10-14 22:19:30
+@@ -5,7 +5,7 @@
+  */
+ import { and, count, desc, eq, inArray, isNotNull, like, lt, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+-import { uniqueSlug } from "@/lib/slug";
++import { uniqueProjectKey, uniqueSlug } from "@/lib/slug";
+ import {
+   archivePatch,
+   restorePatch,
+@@ -90,20 +90,20 @@
+   }));
+ }
+ 
+-/**
+- * Counts the organization's projects; the `projects` quota reads this. An
+- * archived project keeps its slot until the retention sweep purges it — its
+- * rows, numbers and address are all still there.
+- */
++/** Counts live projects for quotas, unless archived rows are requested. */
+ export async function countProjects(
+   orgId: OrgId,
+   scope: ArchiveScope = {},
+ ): Promise<number> {
+-  void scope;
+   const row = getDb()
+     .select({ value: count() })
+     .from(projects)
+-    .where(orgPredicate(projects.orgId, orgId))
++    .where(
++      and(
++        orgPredicate(projects.orgId, orgId),
++        livePredicate(projects.archivedAt, scope),
++      ),
++    )
+     .get();
+   return row?.value ?? 0;
+ }
+@@ -111,18 +111,24 @@
+ export async function insertProject(
+   input: CreateProjectInput,
+ ): Promise<Project> {
+-  const taken = await listTakenProjectSlugs(input.orgId);
+-  const slug = uniqueSlug(input.slug, taken);
++  const db = getDb();
++  const taken = db
++    .select({ slug: projects.slug, key: projects.key })
++    .from(projects)
++    .where(orgPredicate(projects.orgId, input.orgId))
++    .all();
++  const slug = uniqueSlug(input.slug, taken.map((row) => row.slug));
++  const key = uniqueProjectKey(input.key, taken.map((row) => row.key));
+   const stamp = toIsoTimestamp(new Date());
+ 
+-  const row = getDb()
++  const row = db
+     .insert(projects)
+     .values({
+       id: newId(),
+       orgId: input.orgId,
+       name: input.name,
+       slug,
+-      key: input.key,
++      key,
+       description: input.description,
+       visibility: input.visibility,
+       status: "active",
+@@ -152,8 +158,7 @@
+       ...(input.visibility === undefined
+         ? {}
+         : { visibility: input.visibility }),
+-      // `status` is a reflection of the project's issues, never a value a
+-      // form hands in; the column keeps what the lifecycle writes.
++      ...(input.status === undefined ? {} : { status: input.status }),
+       ...(input.leadId === undefined ? {} : { leadId: input.leadId }),
+       ...(input.color === undefined ? {} : { color: input.color }),
+       ...(input.targetDate === undefined
+@@ -196,29 +201,28 @@
+   const row = getDb()
+     .update(projects)
+     .set(restorePatch())
+-    .where(and(orgPredicate(projects.orgId, orgId), eq(projects.id, projectId)))
++    .where(
++      and(
++        orgPredicate(projects.orgId, orgId),
++        eq(projects.id, projectId),
++        isNotNull(projects.archivedAt),
++      ),
++    )
+     .returning()
+     .get();
+ 
+-  if (!row) throw new Error(`Project ${projectId} not found`);
++  if (!row) throw new Error(`Archived project ${projectId} not found`);
+   return toProject(row);
+ }
+ 
+-/** Live slugs only — an archived project's address is free for reuse. */
++/** Archived projects retain their addresses so they can be restored. */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+ ): Promise<readonly string[]> {
+   const rows = getDb()
+     .select({ slug: projects.slug })
+     .from(projects)
+-    .where(
+-      and(
+-        ...compact(
+-          orgPredicate(projects.orgId, orgId),
+-          livePredicate(projects.archivedAt, {}),
+-        ),
+-      ),
+-    )
++    .where(orgPredicate(projects.orgId, orgId))
+     .all();
+   return rows.map((row) => row.slug);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/issue-service.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/issue-service.ts	2026-10-14 22:19:30
+@@ -34,8 +34,8 @@
+ import type { Actor } from "@/types/member";
+ 
+ /**
+- * Creates an issue after four gates: tenant scope, the `issue:create`
+- * permission, a live parent project and the plan's per-project issue quota.
++ * Creates an issue after tenant scope, the `issue:create` permission, an
++ * active, live parent project and the plan's per-project issue quota.
+  * Only then is a number allocated and `issue.created` published — everything
+  * reactive (notifications, search, webhooks, the audit log) hangs off that.
+  */
+@@ -52,6 +52,10 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++
++  if (project.status !== "active") {
++    throw new Error("New issues can only be created in an active project");
++  }
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/project-service.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/project-service.ts	2026-10-14 22:19:30
+@@ -3,11 +3,11 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, uniqueSlug, projectKeyFromName
+  */
+-import { wouldExceedLimit } from "@/config/plan-limits";
++import { getLimit, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { projectKeyFromName, uniqueSlug } from "@/lib/slug";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import { assertNotArchived, isArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -40,21 +40,10 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:create", orgResource(input.orgId));
+ 
+-  const org = requireFound(
+-    await orgRepo.findOrgById(input.orgId),
+-    "Organization",
+-    input.orgId,
+-  );
++  await assertProjectHasRoom(input.orgId);
+ 
+-  const used = await projectRepo.countProjects(input.orgId);
+-  if (wouldExceedLimit(org.plan, "projects", used)) {
+-    throw new Error(
+-      `Plan ${org.plan} allows ${used} projects; upgrade to add another`,
+-    );
+-  }
++  const slug = await suggestProjectSlug(input.orgId, input.slug || input.name);
+ 
+-  const slug = await suggestProjectSlug(input.orgId, input.name);
+-
+   const project = await projectRepo.insertProject({
+     ...input,
+     slug,
+@@ -85,6 +74,22 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  if (input.status === "completed" && project.status !== "completed") {
++    const stats = await projectRepo.getProjectStats(input.orgId, input.projectId);
++    if (stats.openIssues > 0) {
++      throw new Error("Cannot complete a project with open issues");
++    }
++  }
++
++  const hasChanges = Object.entries(input).some(
++    ([field, value]) =>
++      field !== "orgId" &&
++      field !== "projectId" &&
++      value !== undefined &&
++      project[field as keyof Project] !== value,
++  );
++  if (!hasChanges) return project;
++
+   return projectRepo.updateProject(input);
+ }
+ 
+@@ -139,6 +144,11 @@
+   );
+   assertCan(actor, "project:archive", projectResource(project));
+ 
++  if (!isArchived(project)) {
++    throw new Error(`Project ${projectId} is not archived`);
++  }
++  await assertProjectHasRoom(orgId);
++
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+ 
+   await emit("project.restored", {
+@@ -198,4 +208,15 @@
+ ): Promise<string> {
+   const taken = await projectRepo.listTakenProjectSlugs(orgId);
+   return uniqueSlug(name, taken);
++}
++
++/** Creating and restoring both consume one live project slot. */
++async function assertProjectHasRoom(orgId: OrgId): Promise<void> {
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  const used = await projectRepo.countProjects(orgId);
++  if (wouldExceedLimit(org.plan, "projects", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows ${getLimit(org.plan, "projects")} projects; upgrade to add another`,
++    );
++  }
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/usage-service.ts /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/usage-service.ts
+--- /private/tmp/bench-scratch/3f3707ef-d899-4338-903c-586ff00f67f0/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/7e84bb74-03cd-4aac-9b67-3b92754244e9/src/server/services/usage-service.ts	2026-10-14 22:19:30
+@@ -86,6 +86,9 @@
+         issuesUsed: -payload.issuesArchived,
+       });
+     }),
++    subscribe("project.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
++    }),
+     subscribe("member.joined", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
+     }),

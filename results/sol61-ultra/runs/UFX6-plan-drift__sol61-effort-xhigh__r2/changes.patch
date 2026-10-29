@@ -1,0 +1,287 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/actions/comments/create-comment.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/actions/comments/create-comment.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/actions/comments/create-comment.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/actions/comments/create-comment.ts	2026-10-09 14:06:45
+@@ -16,7 +16,7 @@
+ import { withAction } from "@/actions/_lib/with-action";
+ import { CACHE_PROFILES, issueTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumeRateLimit } from "@/server/services/rate-limit-service";
+ import { createCommentSchema, type CreateCommentInput } from "@/schemas/comment";
+ import { createComment } from "@/server/services/comment-service";
+ import type { ActionResult } from "@/types/api";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/lib/rate-limit.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/lib/rate-limit.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/lib/rate-limit.ts	2026-10-09 14:06:45
+@@ -32,7 +32,7 @@
+ /** Applied to any key not in the table above. */
+ const DEFAULT_BUCKET: RateLimitConfig = { capacity: 30, refillPerMinute: 10 };
+ 
+-type BucketState = { tokens: number; updatedAt: number };
++type BucketState = { tokens: number; updatedAt: number; capacity: number };
+ 
+ const buckets = new Map<string, BucketState>();
+ 
+@@ -53,9 +53,8 @@
+  * and the plan catalogue can never drift apart: the plan is the source of
+  * the ceiling, this table only sets the relative shape.
+  */
+-function configFor(orgId: OrgId, bucketKey: string): RateLimitConfig {
++function configFor(bucketKey: string, plan: PlanId): RateLimitConfig {
+   const base = getBucketConfig(bucketKey);
+-  const plan = planByOrg.get(orgId) ?? "free";
+   const hourly = getPlanLimits(plan).apiRequestsPerHour;
+   const factor = Number.isFinite(hourly) ? Math.max(1, hourly / 100) : 100;
+ 
+@@ -77,21 +76,32 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  plan: PlanId = planByOrg.get(orgId) ?? "free",
+ ): Promise<RateLimitVerdict> {
+-  const config = configFor(orgId, bucketKey);
++  const config = configFor(bucketKey, plan);
+   const key = `${orgId}:${bucketKey}`;
+   const nowMs = Date.now();
+ 
+-  const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
++  const state = buckets.get(key) ?? {
++    tokens: config.capacity,
++    updatedAt: nowMs,
++    capacity: config.capacity,
++  };
+   const elapsedMinutes = (nowMs - state.updatedAt) / 60_000;
++  // Preserve spent tokens when a plan changes, applying the new burst allowance now.
++  const available = Math.max(0, state.tokens + config.capacity - state.capacity);
+   const tokens = Math.min(
+     config.capacity,
+-    state.tokens + elapsedMinutes * config.refillPerMinute,
++    available + elapsedMinutes * config.refillPerMinute,
+   );
+ 
+   const allowed = tokens >= cost;
+   const remaining = allowed ? tokens - cost : tokens;
+-  buckets.set(key, { tokens: remaining, updatedAt: nowMs });
++  buckets.set(key, {
++    tokens: remaining,
++    updatedAt: nowMs,
++    capacity: config.capacity,
++  });
+ 
+   const deficit = allowed ? config.capacity - remaining : cost - remaining;
+   const minutesToReset =
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/jobs/trial-expiry-job.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/jobs/trial-expiry-job.ts	2026-10-09 14:06:45
+@@ -49,11 +49,8 @@
+         continue;
+       }
+ 
+-      await subscriptionRepo.updateSubscriptionPlan(
+-        orgId,
+-        FALLBACK_PLAN,
+-        subscription.interval,
+-      );
++      const expired = await subscriptionRepo.expireTrial(orgId, stamp);
++      if (!expired) continue;
+ 
+       await emit("billing.plan_changed", {
+         orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/repositories/organization-repository.ts	2026-10-09 14:06:45
+@@ -10,6 +10,8 @@
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
++import { findSubscription } from "./subscription-repository";
++import type { OrganizationRow } from "@/server/db";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -17,13 +19,20 @@
+ import type { OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
+ 
++/** Resolve every domain read against the subscription, including older drifted rows. */
++async function withCurrentPlan(row: OrganizationRow): Promise<Organization> {
++  const org = toOrganization(row);
++  const subscription = await findSubscription(org.id);
++  return { ...org, plan: subscription?.plan ?? org.plan };
++}
++
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+     .from(organizations)
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(row) : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+@@ -32,7 +41,7 @@
+     .from(organizations)
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(row) : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -52,7 +61,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return Promise.all(rows.map((row) => withCurrentPlan(row.org)));
+ }
+ 
+ /**
+@@ -83,7 +92,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ export async function updateOrg(
+@@ -111,7 +120,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+@@ -123,7 +132,7 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  return withCurrentPlan(row);
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/repositories/subscription-repository.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/repositories/subscription-repository.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/repositories/subscription-repository.ts	2026-10-09 14:05:09
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/repositories/subscription-repository.ts	2026-10-09 14:06:45
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -112,8 +112,7 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Choosing a plan ends the trial even if its original period has run out.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -121,14 +120,37 @@
+   const rows = getDb()
+     .select()
+     .from(subscriptions)
++    .where(expiredTrialPredicate(before))
++    .all();
++
++  return rows.map(toSubscription);
++}
++
++/** Recheck trial eligibility at the write so a paid choice cannot be overwritten. */
++export async function expireTrial(
++  orgId: OrgId,
++  before: IsoTimestamp,
++): Promise<Subscription | null> {
++  const row = getDb()
++    .update(subscriptions)
++    .set({ plan: "free", status: "active", updatedAt: before })
+     .where(
+       and(
+-        isNotNull(subscriptions.currentPeriodEnd),
+-        lte(subscriptions.currentPeriodEnd, before),
+-        ne(subscriptions.plan, "free"),
++        orgPredicate(subscriptions.orgId, orgId),
++        expiredTrialPredicate(before),
+       ),
+     )
+-    .all();
++    .returning()
++    .get();
+ 
+-  return rows.map(toSubscription);
++  return row ? toSubscription(row) : null;
++}
++
++function expiredTrialPredicate(before: IsoTimestamp) {
++  return and(
++    eq(subscriptions.status, "trialing"),
++    isNotNull(subscriptions.currentPeriodEnd),
++    lte(subscriptions.currentPeriodEnd, before),
++    ne(subscriptions.plan, "free"),
++  );
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/comment-service.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/comment-service.ts	2026-10-09 14:06:45
+@@ -6,7 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { resolveMentions } from "@/lib/mentions";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumeRateLimit } from "./rate-limit-service";
+ import { archivePatch, assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/invitation-service.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/invitation-service.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/invitation-service.ts	2026-10-09 14:06:45
+@@ -7,7 +7,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { hashToken, randomToken } from "@/lib/hash";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumeRateLimit } from "./rate-limit-service";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/rate-limit-service.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/rate-limit-service.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/rate-limit-service.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/rate-limit-service.ts	2026-10-09 14:06:45
+@@ -0,0 +1,14 @@
++import { consumeRateLimit as consumeBucket } from "@/lib/rate-limit";
++import { findOrgById } from "@/server/repositories/organization-repository";
++import type { RateLimitVerdict } from "@/lib/rate-limit";
++import type { OrgId } from "@/types/common";
++
++/** Workspace buckets always use the current plan, without a process-local plan cache. */
++export async function consumeRateLimit(
++  orgId: OrgId,
++  bucketKey: string,
++  cost = 1,
++): Promise<RateLimitVerdict> {
++  const org = await findOrgById(orgId);
++  return consumeBucket(orgId, bucketKey, cost, org?.plan ?? "free");
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/search-service.ts /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/282b1b3f-7aaf-4dc9-836c-4ad59bcea32e/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/d98e65dd-aa6a-4198-9bed-43d072de8480/src/server/services/search-service.ts	2026-10-09 14:06:45
+@@ -6,7 +6,7 @@
+ import { subscribe } from "@/lib/event-bus";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumeRateLimit } from "./rate-limit-service";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";

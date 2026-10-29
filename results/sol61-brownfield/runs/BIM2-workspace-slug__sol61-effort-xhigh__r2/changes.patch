@@ -1,0 +1,762 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/components/domain/activity/activity-labels.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/components/domain/activity/activity-labels.ts	2026-10-14 17:50:56
+@@ -10,6 +10,7 @@
+ 
+ export const ACTIVITY_LABELS: Readonly<Record<ActivityAction, string>> = {
+   "organization.updated": "updated the organization",
++  "organization.slug_changed": "changed the workspace URL",
+   "project.created": "created a project",
+   "project.updated": "updated a project",
+   "project.archived": "archived a project",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/config/constants.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/config/constants.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/config/constants.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/config/constants.ts	2026-10-14 17:50:56
+@@ -16,6 +16,9 @@
+ /** How long after posting a comment its author may still edit it. */
+ export const COMMENT_EDIT_WINDOW_MINUTES: number = 15;
+ 
++/** How long a retired workspace URL stays usable and reserved. */
++export const ORG_SLUG_HOLD_DAYS: number = 30;
++
+ /** Delivery attempts before the webhook dispatcher parks a delivery. */
+ export const WEBHOOK_MAX_ATTEMPTS: number = 5;
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/schemas/activity.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/schemas/activity.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/schemas/activity.ts	2026-10-14 17:50:56
+@@ -9,6 +9,7 @@
+ 
+ export const activityActionSchema = z.enum([
+   "organization.updated",
++  "organization.slug_changed",
+   "project.created",
+   "project.updated",
+   "project.archived",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/schemas/organization.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/schemas/organization.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/schemas/organization.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/schemas/organization.ts	2026-10-14 17:50:56
+@@ -26,6 +26,11 @@
+   settings: organizationSettingsSchema.partial().optional(),
+ });
+ 
++export const renameOrganizationSlugSchema = z.object({
++  orgId: orgIdSchema,
++  slug: slugSchema,
++});
++
+ export const transferOwnershipSchema = z.object({
+   orgId: orgIdSchema,
+   newOwnerUserId: z.string().min(1),
+@@ -41,5 +46,6 @@
+ >;
+ export type CreateOrganizationInput = z.infer<typeof createOrganizationSchema>;
+ export type UpdateOrganizationInput = z.infer<typeof updateOrganizationSchema>;
++export type RenameOrganizationSlugInput = z.infer<typeof renameOrganizationSlugSchema>;
+ export type DeleteOrganizationInput = z.infer<typeof deleteOrganizationSchema>;
+ export type TransferOwnershipInput = z.infer<typeof transferOwnershipSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/db/migrate.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/db/migrate.ts	2026-10-14 17:50:56
+@@ -67,6 +67,12 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS organizations_slug_idx ON organizations (slug)`,
+   `CREATE INDEX IF NOT EXISTS organizations_owner_idx ON organizations (owner_id)`,
++  `CREATE TABLE IF NOT EXISTS retired_organization_slugs (
++     slug TEXT PRIMARY KEY NOT NULL,
++     org_id TEXT NOT NULL,
++     retired_at TEXT NOT NULL
++   )`,
++  `CREATE INDEX IF NOT EXISTS retired_organization_slugs_org_idx ON retired_organization_slugs (org_id)`,
+   `CREATE TABLE IF NOT EXISTS organization_usage (
+      org_id TEXT PRIMARY KEY NOT NULL,
+      seats_used INTEGER NOT NULL DEFAULT 0,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/db/schema/organizations.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/db/schema/organizations.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/db/schema/organizations.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/db/schema/organizations.ts	2026-10-14 17:50:56
+@@ -33,6 +33,16 @@
+   ],
+ );
+ 
++export const retiredOrganizationSlugs = sqliteTable(
++  "retired_organization_slugs",
++  {
++    slug: text("slug").primaryKey(),
++    orgId: text("org_id").notNull(),
++    retiredAt: text("retired_at").notNull(),
++  },
++  (table) => [index("retired_organization_slugs_org_idx").on(table.orgId)],
++);
++
+ export const organizationUsage = sqliteTable("organization_usage", {
+   orgId: text("org_id").primaryKey(),
+   seatsUsed: integer("seats_used").notNull().default(0),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/repositories/organization-repository.ts	2026-10-14 17:48:31
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/repositories/organization-repository.ts	2026-10-14 17:55:23
+@@ -3,11 +3,12 @@
+  *
+  * Must call (do not reimplement): archivePatch, uniqueSlug
+  */
+-import { and, eq, isNull, like } from "drizzle-orm";
++import { and, eq, gt, isNull, like, ne } from "drizzle-orm";
++import { ORG_SLUG_HOLD_DAYS } from "@/config/constants";
+ import { newId } from "@/lib/id";
+-import { uniqueSlug } from "@/lib/slug";
++import { InvalidSlugError, SLUG_MAX_LENGTH, slugify, uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizations, retiredOrganizationSlugs } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+@@ -16,7 +17,15 @@
+ } from "@/schemas/organization";
+ import type { OrgId, UserId } from "@/types/common";
+ import type { Organization } from "@/types/organization";
++import type { Db } from "@/server/db";
+ 
++const MS_PER_DAY = 24 * 60 * 60 * 1000;
++
++/** Retirements at or before this instant have already been released. */
++function retirementCutoff(now: Date): string {
++  return toIsoTimestamp(new Date(now.getTime() - ORG_SLUG_HOLD_DAYS * MS_PER_DAY));
++}
++
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+     .select()
+@@ -27,12 +36,28 @@
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+-  const row = getDb()
++  const db = getDb();
++  const now = new Date();
++  const row = db
+     .select()
+     .from(organizations)
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  if (row) return toOrganization(row);
++
++  const retired = db
++    .select({ org: organizations })
++    .from(retiredOrganizationSlugs)
++    .innerJoin(organizations, eq(organizations.id, retiredOrganizationSlugs.orgId))
++    .where(
++      and(
++        eq(retiredOrganizationSlugs.slug, slug),
++        gt(retiredOrganizationSlugs.retiredAt, retirementCutoff(now)),
++        isNull(organizations.archivedAt),
++      ),
++    )
++    .get();
++  return retired ? toOrganization(retired.org) : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -56,44 +81,42 @@
+ }
+ 
+ /**
+- * Creates the org row. The slug is de-duplicated here rather than in the
+- * service so a race on the unique index still resolves to a usable slug.
++ * Derives and inserts the slug in one write transaction, including held slugs
++ * in the collision set so creation cannot claim a still-usable old URL.
+  */
+ export async function insertOrg(
+   input: CreateOrganizationInput,
+   ownerId: UserId,
+ ): Promise<Organization> {
+-  const taken = await listTakenOrgSlugs(input.slug);
+-  const slug = uniqueSlug(input.slug, taken);
+-  const stamp = toIsoTimestamp(new Date());
++  return getDb().transaction((tx) => {
++    const now = new Date();
++    const slug = uniqueSlug(input.slug, takenOrgSlugs(tx, input.slug, now));
++    const stamp = toIsoTimestamp(now);
+ 
+-  const row = getDb()
+-    .insert(organizations)
+-    .values({
+-      id: newId(),
+-      name: input.name,
+-      slug,
+-      ownerId,
+-      plan: input.plan,
+-      logoUrl: null,
+-      trialEndsAt: null,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
++    const row = tx
++      .insert(organizations)
++      .values({
++        id: newId(),
++        name: input.name,
++        slug,
++        ownerId,
++        plan: input.plan,
++        logoUrl: null,
++        trialEndsAt: null,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
+ 
+-  return toOrganization(row);
++    return toOrganization(row);
++  }, { behavior: "immediate" });
+ }
+ 
+-/**
+- * Settings and profile patch. `slug` is accepted for the "change workspace
+- * URL" form: the form validates the slug with `slugSchema` before it gets
+- * here, so the column is written as given.
+- */
++/** Settings and profile patch. URL changes go through `renameOrgSlug`. */
+ export async function updateOrg(
+   orgId: OrgId,
+-  patch: UpdateOrganizationInput & { readonly slug?: string },
++  patch: UpdateOrganizationInput,
+ ): Promise<Organization> {
+   const current = await findOrgById(orgId);
+   if (!current) throw new Error(`Organization ${orgId} not found`);
+@@ -104,7 +127,6 @@
+     .update(organizations)
+     .set({
+       ...(patch.name === undefined ? {} : { name: patch.name }),
+-      ...(patch.slug === undefined ? {} : { slug: patch.slug }),
+       ...(patch.logoUrl === undefined ? {} : { logoUrl: patch.logoUrl }),
+       defaultIssueStatus: settings.defaultIssueStatus,
+       allowPublicProjects: settings.allowPublicProjects,
+@@ -120,6 +142,65 @@
+   return toOrganization(row);
+ }
+ 
++/** Checks the chosen URL and swaps its retirement atomically with the slug. */
++export async function renameOrgSlug(
++  orgId: OrgId,
++  slug: string,
++): Promise<{ organization: Organization; from: string } | null> {
++  return getDb().transaction((tx) => {
++    const current = tx
++      .select()
++      .from(organizations)
++      .where(eq(organizations.id, orgId))
++      .get();
++    if (!current) return null;
++    if (current.slug === slug) {
++      return { organization: toOrganization(current), from: current.slug };
++    }
++
++    const now = new Date();
++    const taken = tx
++      .select({ id: organizations.id })
++      .from(organizations)
++      .where(and(eq(organizations.slug, slug), ne(organizations.id, orgId)))
++      .get();
++    const held = tx
++      .select({ slug: retiredOrganizationSlugs.slug })
++      .from(retiredOrganizationSlugs)
++      .where(
++        and(
++          eq(retiredOrganizationSlugs.slug, slug),
++          ne(retiredOrganizationSlugs.orgId, orgId),
++          gt(retiredOrganizationSlugs.retiredAt, retirementCutoff(now)),
++        ),
++      )
++      .get();
++    if (taken || held) throw new InvalidSlugError(slug, "is unavailable");
++
++    const stamp = toIsoTimestamp(now);
++    // Reclaiming an old URL ends its retirement, including any expired hold.
++    tx.delete(retiredOrganizationSlugs)
++      .where(eq(retiredOrganizationSlugs.slug, slug))
++      .run();
++    tx.insert(retiredOrganizationSlugs)
++      .values({ slug: current.slug, orgId, retiredAt: stamp })
++      .onConflictDoUpdate({
++        target: retiredOrganizationSlugs.slug,
++        set: { orgId, retiredAt: stamp },
++      })
++      .run();
++
++    const row = tx
++      .update(organizations)
++      .set({ slug, updatedAt: stamp })
++      .where(eq(organizations.id, orgId))
++      .returning()
++      .get();
++
++    return { organization: toOrganization(row), from: current.slug };
++  }, { behavior: "immediate" });
++}
++
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+   const row = getDb()
+     .update(organizations)
+@@ -136,10 +217,30 @@
+ export async function listTakenOrgSlugs(
+   prefix: string,
+ ): Promise<readonly string[]> {
+-  const rows = getDb()
++  return takenOrgSlugs(getDb(), prefix, new Date());
++}
++
++function takenOrgSlugs(
++  db: Pick<Db, "select">,
++  prefix: string,
++  now: Date,
++): readonly string[] {
++  // uniqueSlug truncates long bases before appending a numeric suffix.
++  const matchingPrefix = slugify(prefix).slice(0, SLUG_MAX_LENGTH - 5);
++  const rows = db
+     .select({ slug: organizations.slug })
+     .from(organizations)
+-    .where(like(organizations.slug, `${prefix}%`))
++    .where(like(organizations.slug, `${matchingPrefix}%`))
+     .all();
+-  return rows.map((row) => row.slug);
++  const retired = db
++    .select({ slug: retiredOrganizationSlugs.slug })
++    .from(retiredOrganizationSlugs)
++    .where(
++      and(
++        like(retiredOrganizationSlugs.slug, `${matchingPrefix}%`),
++        gt(retiredOrganizationSlugs.retiredAt, retirementCutoff(now)),
++      ),
++    )
++    .all();
++  return [...rows, ...retired].map((row) => row.slug);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/services/activity-service.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/services/activity-service.ts	2026-10-14 17:50:56
+@@ -148,6 +148,16 @@
+  */
+ export function registerActivityListeners(): Unsubscribe {
+   const offs: Unsubscribe[] = [
++    subscribe("organization.slug_changed", (payload) =>
++      record(payload.orgId, "organization.slug_changed", {
++        actorId: payload.actorId,
++        subjectKind: "organization",
++        subjectId: payload.orgId,
++        projectId: null,
++        summary: `Workspace URL ${payload.from} → ${payload.to}`,
++        metadata: { from: payload.from, to: payload.to },
++      }).then(() => undefined),
++    ),
+     subscribe("project.created", (payload) =>
+       record(payload.orgId, "project.created", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/services/organization-service.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/services/organization-service.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/server/services/organization-service.ts	2026-10-14 17:50:56
+@@ -17,6 +17,7 @@
+ import type {
+   CreateOrganizationInput,
+   DeleteOrganizationInput,
++  RenameOrganizationSlugInput,
+   UpdateOrganizationInput,
+ } from "@/schemas/organization";
+ import type { OrgId, UserId } from "@/types/common";
+@@ -74,6 +75,31 @@
+   });
+ 
+   return updated;
++}
++
++export async function renameOrganizationSlug(
++  actor: Actor,
++  input: RenameOrganizationSlugInput,
++): Promise<Organization> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "org:update", orgResource(input.orgId));
++  assertValidSlug(input.slug);
++
++  const { organization, from } = requireFound(
++    await orgRepo.renameOrgSlug(input.orgId, input.slug),
++    "Organization",
++    input.orgId,
++  );
++
++  if (from === organization.slug) return organization;
++
++  await emit("organization.slug_changed", {
++    ...envelope(organization.id, actor.userId),
++    from,
++    to: organization.slug,
++  });
++
++  return organization;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/types/activity.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/types/activity.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/types/activity.ts	2026-10-14 17:50:56
+@@ -10,6 +10,7 @@
+  *  bus keys so `ActivityService` can map one to the other mechanically. */
+ export type ActivityAction =
+   | "organization.updated"
++  | "organization.slug_changed"
+   | "project.created"
+   | "project.updated"
+   | "project.archived"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/types/event.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/types/event.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/src/types/event.ts	2026-10-14 17:50:56
+@@ -26,6 +26,7 @@
+  * derive their handler signatures from it.
+  */
+ export interface TaskflowEventMap {
++  "organization.slug_changed": EventEnvelope & { from: string; to: string };
+   "project.created": EventEnvelope & {
+     projectId: ProjectId;
+     name: string;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/tests/services/organization-service.test.ts /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/tests/services/organization-service.test.ts
+--- /private/tmp/bench-scratch/3ffabad1-2741-4edb-8440-5bf228ee0b14/tests/services/organization-service.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/8dfca03e-65d9-4f46-9963-d7afea24e72d/tests/services/organization-service.test.ts	2026-10-14 17:55:23
+@@ -0,0 +1,336 @@
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
++import { ORG_SLUG_HOLD_DAYS } from "@/config/constants";
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { InvalidSlugError, SLUG_MAX_LENGTH } from "@/lib/slug";
++import { TenantScopeError } from "@/lib/tenant";
++import { activityFilterSchema } from "@/schemas/activity";
++import { renameOrganizationSlugSchema } from "@/schemas/organization";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import { listActivity, registerActivityListeners } from "@/server/services/activity-service";
++import {
++  createOrganization,
++  getOrganizationSummary,
++  listOrganizationsForUser,
++  renameOrganizationSlug,
++  resolveOrgBySlug,
++  updateOrganization,
++} from "@/server/services/organization-service";
++import { resolveActorForOrg } from "@/server/services/session-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { TaskflowEventMap, Unsubscribe } from "@/types/event";
++import type { SessionPrincipal } from "@/types/member";
++import { createTenant, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++const START = Date.parse("2026-04-01T12:34:56.789Z");
++const HOLD_MS = ORG_SLUG_HOLD_DAYS * DAY_MS;
++let cleanup: () => void;
++let detachActivity: Unsubscribe;
++const detachers: Unsubscribe[] = [];
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  detachActivity = registerActivityListeners();
++});
++
++beforeEach(() => {
++  vi.useFakeTimers({ toFake: ["Date"] });
++  vi.setSystemTime(START);
++});
++
++afterEach(() => {
++  for (const off of detachers.splice(0)) off();
++  vi.useRealTimers();
++});
++
++afterAll(() => {
++  detachActivity();
++  cleanup();
++});
++
++function captureChanges(): TaskflowEventMap["organization.slug_changed"][] {
++  const seen: TaskflowEventMap["organization.slug_changed"][] = [];
++  detachers.push(subscribe("organization.slug_changed", (event) => {
++    seen.push(event);
++  }));
++  return seen;
++}
++
++function principalFor(tenant: Tenant): SessionPrincipal {
++  return {
++    userId: tenant.userIds.owner,
++    email: `owner@${tenant.org.slug}.test`,
++    activeOrgId: tenant.org.id,
++    expiresAt: toIsoTimestamp("2027-01-01T00:00:00.000Z"),
++  };
++}
++
++function auditChanges(tenant: Tenant) {
++  return listActivity(tenant.actors.owner, {
++    orgId: tenant.org.id,
++    action: ["organization.slug_changed"],
++    limit: 100,
++    cursor: null,
++  });
++}
++
++describe("organization slug renaming", () => {
++  it("uses the exact chosen slug, preserves other fields and announces the admin once", async () => {
++    const tenant = await createTenant("rename-settings");
++    const before = await orgRepo.updateOrg(tenant.org.id, {
++      orgId: tenant.org.id,
++      name: "A display name unrelated to the URL",
++      logoUrl: "https://example.com/logo.png",
++      settings: {
++        defaultIssueStatus: "todo",
++        allowPublicProjects: true,
++        requireTwoFactor: true,
++        digestHourUtc: 19,
++        enabledFlagOverrides: ["csv_export"],
++      },
++    });
++    vi.setSystemTime(START + 1_000);
++    const seen = captureChanges();
++
++    const after = await renameOrganizationSlug(tenant.actors.admin, {
++      orgId: tenant.org.id,
++      slug: "deliberate-url",
++    });
++
++    expect(after).toEqual({
++      ...before,
++      slug: "deliberate-url",
++      updatedAt: toIsoTimestamp(new Date()),
++    });
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(after);
++    expect((await getOrganizationSummary(tenant.actors.owner, tenant.org.id)).organization).toEqual(after);
++    expect(await listOrganizationsForUser(tenant.userIds.owner)).toContainEqual(after);
++    for (const slug of ["rename-settings", "deliberate-url"]) {
++      expect(await resolveOrgBySlug(slug)).toEqual(after);
++      expect(await orgRepo.findOrgBySlug(slug)).toEqual(after);
++      expect(await resolveActorForOrg(principalFor(tenant), slug)).toEqual(tenant.actors.owner);
++    }
++    expect(seen).toEqual([{
++      orgId: tenant.org.id,
++      actorId: tenant.userIds.admin,
++      occurredAt: toIsoTimestamp(new Date()),
++      from: "rename-settings",
++      to: "deliberate-url",
++    }]);
++    const audit = await auditChanges(tenant);
++    expect(audit.items).toHaveLength(1);
++    expect(audit.items[0]).toMatchObject({
++      action: "organization.slug_changed",
++      actorId: tenant.userIds.admin,
++      subjectKind: "organization",
++      subjectId: tenant.org.id,
++      metadata: { from: "rename-settings", to: "deliberate-url" },
++    });
++    expect(activityFilterSchema.safeParse({
++      orgId: tenant.org.id,
++      action: ["organization.slug_changed"],
++    }).success).toBe(true);
++    expect(renameOrganizationSlugSchema.parse({
++      orgId: tenant.org.id,
++      slug: "deliberate-url",
++    })).toEqual({ orgId: tenant.org.id, slug: "deliberate-url" });
++  });
++
++  it("leaves a no-op unchanged and does not extend earlier holds", async () => {
++    const tenant = await createTenant("rename-no-op");
++    const seen = captureChanges();
++    vi.setSystemTime(START + DAY_MS);
++    expect(await renameOrganizationSlug(tenant.actors.owner, {
++      orgId: tenant.org.id,
++      slug: tenant.org.slug,
++    })).toEqual(tenant.org);
++    expect(seen).toHaveLength(0);
++    expect((await auditChanges(tenant)).total).toBe(0);
++
++    const changed = await renameOrganizationSlug(tenant.actors.owner, {
++      orgId: tenant.org.id,
++      slug: "rename-no-op-new",
++    });
++    vi.setSystemTime(START + 10 * DAY_MS);
++    expect(await renameOrganizationSlug(tenant.actors.owner, {
++      orgId: tenant.org.id,
++      slug: changed.slug,
++    })).toEqual(changed);
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(changed);
++    expect(seen).toHaveLength(1);
++    expect((await auditChanges(tenant)).total).toBe(1);
++    vi.setSystemTime(START + DAY_MS + HOLD_MS);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toBeNull();
++  });
++
++  it.each(["member", "viewer"] as const)("denies a %s without changing anything", async (role) => {
++    const tenant = await createTenant(`rename-denied-${role}`);
++    const seen = captureChanges();
++    await expect(renameOrganizationSlug(tenant.actors[role], {
++      orgId: tenant.org.id,
++      slug: `rename-denied-${role}-new`,
++    })).rejects.toBeInstanceOf(PermissionDeniedError);
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(tenant.org);
++    expect(seen).toHaveLength(0);
++    expect((await auditChanges(tenant)).total).toBe(0);
++  });
++
++  it("checks tenant scope before attempting a rename", async () => {
++    const tenant = await createTenant("rename-scope");
++    const other = await createTenant("rename-scope-other");
++    const seen = captureChanges();
++    await expect(renameOrganizationSlug(other.actors.owner, {
++      orgId: tenant.org.id,
++      slug: "rename-scope-new",
++    })).rejects.toBeInstanceOf(TenantScopeError);
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(tenant.org);
++    expect(seen).toHaveLength(0);
++    expect((await auditChanges(tenant)).total).toBe(0);
++  });
++
++  it("rejects bad slug shape, length and reserved names with the shared error", async () => {
++    const tenant = await createTenant("rename-invalid");
++    const seen = captureChanges();
++    for (const slug of ["", "x", "Uppercase", "two--hyphens", "-leading", "api", "a".repeat(SLUG_MAX_LENGTH + 1)]) {
++      expect(renameOrganizationSlugSchema.safeParse({ orgId: tenant.org.id, slug }).success).toBe(false);
++      await expect(renameOrganizationSlug(tenant.actors.owner, {
++        orgId: tenant.org.id,
++        slug,
++      })).rejects.toBeInstanceOf(InvalidSlugError);
++    }
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(tenant.org);
++    expect(seen).toHaveLength(0);
++    expect((await auditChanges(tenant)).total).toBe(0);
++  });
++
++  it.each(["live", "archived", "retired"])("refuses a slug held by a %s workspace without suffixing", async (kind) => {
++    const tenant = await createTenant(`rename-collision-${kind}`);
++    const other = await createTenant(`rename-taken-${kind}`);
++    if (kind === "retired") {
++      await renameOrganizationSlug(other.actors.owner, {
++        orgId: other.org.id,
++        slug: "rename-retired-new",
++      });
++    }
++    if (kind !== "live") await orgRepo.archiveOrg(other.org.id);
++    const seen = captureChanges();
++    await expect(renameOrganizationSlug(tenant.actors.owner, {
++      orgId: tenant.org.id,
++      slug: other.org.slug,
++    })).rejects.toBeInstanceOf(InvalidSlugError);
++    expect(await orgRepo.findOrgById(tenant.org.id)).toEqual(tenant.org);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toEqual(tenant.org);
++    expect(seen).toHaveLength(0);
++    expect((await auditChanges(tenant)).total).toBe(0);
++    const created = await createOrganization(tenant.userIds.owner, {
++      name: "Another workspace",
++      slug: other.org.slug,
++      plan: "free",
++    });
++    expect(created.slug).toBe(`${other.org.slug}-2`);
++  });
++
++  it.each(["rename", "creation"])("releases the old URL at the exact boundary for %s", async (method) => {
++    const tenant = await createTenant(`rename-expiry-${method}`);
++    const other = await createTenant(`rename-expiry-other-${method}`);
++    await renameOrganizationSlug(tenant.actors.owner, {
++      orgId: tenant.org.id,
++      slug: `rename-expiry-new-${method}`,
++    });
++
++    vi.setSystemTime(START + HOLD_MS - 1);
++    expect((await resolveOrgBySlug(tenant.org.slug))?.id).toBe(tenant.org.id);
++    expect((await orgRepo.findOrgBySlug(tenant.org.slug))?.id).toBe(tenant.org.id);
++    expect(await resolveActorForOrg(principalFor(tenant), tenant.org.slug)).toEqual(tenant.actors.owner);
++    expect(await orgRepo.listTakenOrgSlugs(tenant.org.slug)).toContain(tenant.org.slug);
++    await expect(renameOrganizationSlug(other.actors.owner, {
++      orgId: other.org.id,
++      slug: tenant.org.slug,
++    })).rejects.toBeInstanceOf(InvalidSlugError);
++    expect((await createOrganization(other.userIds.owner, {
++      name: "Held slug is suffixed",
++      slug: tenant.org.slug,
++      plan: "free",
++    })).slug).toBe(`${tenant.org.slug}-2`);
++
++    vi.setSystemTime(START + HOLD_MS);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toBeNull();
++    expect(await orgRepo.findOrgBySlug(tenant.org.slug)).toBeNull();
++    expect(await resolveActorForOrg(principalFor(tenant), tenant.org.slug)).toBeNull();
++    expect(await orgRepo.listTakenOrgSlugs(tenant.org.slug)).not.toContain(tenant.org.slug);
++    const reclaimed = method === "rename"
++      ? await renameOrganizationSlug(other.actors.owner, { orgId: other.org.id, slug: tenant.org.slug })
++      : await createOrganization(other.userIds.owner, { name: "Released URL", slug: tenant.org.slug, plan: "free" });
++    expect(reclaimed.slug).toBe(tenant.org.slug);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toEqual(reclaimed);
++    expect(await resolveActorForOrg(principalFor(tenant), tenant.org.slug)).toBeNull();
++  });
++
++  it("keeps each link in a rename chain for its own hold", async () => {
++    const tenant = await createTenant("rename-chain-first");
++    await renameOrganizationSlug(tenant.actors.owner, { orgId: tenant.org.id, slug: "rename-chain-second" });
++    vi.setSystemTime(START + 10 * DAY_MS);
++    const latest = await renameOrganizationSlug(tenant.actors.owner, { orgId: tenant.org.id, slug: "rename-chain-third" });
++    for (const slug of [tenant.org.slug, "rename-chain-second", latest.slug]) {
++      expect(await resolveOrgBySlug(slug)).toEqual(latest);
++      expect(await resolveActorForOrg(principalFor(tenant), slug)).toEqual(tenant.actors.owner);
++    }
++    vi.setSystemTime(START + HOLD_MS);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toBeNull();
++    expect(await resolveOrgBySlug("rename-chain-second")).toEqual(latest);
++    vi.setSystemTime(START + 10 * DAY_MS + HOLD_MS);
++    expect(await resolveOrgBySlug("rename-chain-second")).toBeNull();
++    expect(await resolveOrgBySlug(latest.slug)).toEqual(latest);
++  });
++
++  it("allows renaming back and starts a fresh hold when that URL is replaced again", async () => {
++    const tenant = await createTenant("rename-back-first");
++    await renameOrganizationSlug(tenant.actors.owner, { orgId: tenant.org.id, slug: "rename-back-second" });
++    vi.setSystemTime(START + 5 * DAY_MS);
++    const back = await renameOrganizationSlug(tenant.actors.owner, { orgId: tenant.org.id, slug: tenant.org.slug });
++    expect(await resolveOrgBySlug("rename-back-second")).toEqual(back);
++    vi.setSystemTime(START + HOLD_MS);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toEqual(back);
++    const last = await renameOrganizationSlug(tenant.actors.owner, { orgId: tenant.org.id, slug: "rename-back-last" });
++    vi.setSystemTime(START + 5 * DAY_MS + HOLD_MS);
++    expect(await resolveOrgBySlug("rename-back-second")).toBeNull();
++    expect(await resolveOrgBySlug(tenant.org.slug)).toEqual(last);
++    vi.setSystemTime(START + 2 * HOLD_MS);
++    expect(await resolveOrgBySlug(tenant.org.slug)).toBeNull();
++    expect(await resolveOrgBySlug(last.slug)).toEqual(last);
++  });
++
++  it("includes truncated suffixes and their holds when deriving a long slug", async () => {
++    const base = "long".repeat(SLUG_MAX_LENGTH / 4);
++    const tenant = await createTenant(base);
++    const second = await createOrganization(tenant.userIds.owner, { name: "Second", slug: base, plan: "free" });
++    expect(second.slug).toBe(`${base.slice(0, SLUG_MAX_LENGTH - 5)}-2`);
++    await renameOrganizationSlug({ ...tenant.actors.owner, orgId: second.id }, { orgId: second.id, slug: "long-slug-replacement" });
++    const third = await createOrganization(tenant.userIds.owner, { name: "Third", slug: base, plan: "free" });
++    expect(third.slug).toBe(`${base.slice(0, SLUG_MAX_LENGTH - 5)}-3`);
++  });
++
++  it("keeps general settings updates from bypassing slug retirement", async () => {
++    const tenant = await createTenant("rename-settings-only");
++    const patch = { orgId: tenant.org.id, name: "New name", slug: "bypassed-url" };
++    const updated = await updateOrganization(tenant.actors.owner, patch);
++    expect(updated.slug).toBe(tenant.org.slug);
++    expect(updated.name).toBe(patch.name);
++    expect(await resolveOrgBySlug(patch.slug)).toBeNull();
++  });
++
++  it("publishes once for simultaneous identical renames", async () => {
++    const tenant = await createTenant("rename-concurrent");
++    const seen = captureChanges();
++    const input = { orgId: tenant.org.id, slug: "rename-concurrent-new" };
++    const results = await Promise.all([
++      renameOrganizationSlug(tenant.actors.owner, input),
++      renameOrganizationSlug(tenant.actors.admin, input),
++    ]);
++    expect(results[0]).toEqual(results[1]);
++    expect(seen).toHaveLength(1);
++    expect((await auditChanges(tenant)).total).toBe(1);
++  });
++});

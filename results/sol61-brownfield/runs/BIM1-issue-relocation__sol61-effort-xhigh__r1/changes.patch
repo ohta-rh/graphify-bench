@@ -1,0 +1,780 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/components/domain/activity/activity-labels.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/components/domain/activity/activity-labels.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/components/domain/activity/activity-labels.ts	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/components/domain/activity/activity-labels.ts	2026-10-14 17:55:26
+@@ -16,6 +16,7 @@
+   "project.restored": "restored a project",
+   "issue.created": "created an issue",
+   "issue.updated": "updated an issue",
++  "issue.moved": "moved an issue to another project",
+   "issue.status_changed": "changed status",
+   "issue.assigned": "assigned an issue",
+   "issue.archived": "archived an issue",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/schemas/activity.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/schemas/activity.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/schemas/activity.ts	2026-10-14 17:55:26
+@@ -15,6 +15,7 @@
+   "project.restored",
+   "issue.created",
+   "issue.updated",
++  "issue.moved",
+   "issue.status_changed",
+   "issue.assigned",
+   "issue.archived",
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/schemas/issue.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/schemas/issue.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/schemas/issue.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/schemas/issue.ts	2026-10-14 17:55:26
+@@ -93,6 +93,12 @@
+   toIndex: z.number().int().min(0),
+ });
+ 
++export const moveIssueToProjectSchema = z.object({
++  orgId: orgIdSchema,
++  issueId: issueIdSchema,
++  toProjectId: projectIdSchema,
++});
++
+ const _statusParity: IssueStatus = "in_review" satisfies z.infer<
+   typeof issueStatusSchema
+ >;
+@@ -108,3 +114,4 @@
+ export type AssignIssueInput = z.infer<typeof assignIssueSchema>;
+ export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+ export type MoveIssueInput = z.infer<typeof moveIssueSchema>;
++export type MoveIssueToProjectInput = z.infer<typeof moveIssueToProjectSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/migrate.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/migrate.ts	2026-10-14 17:56:11
+@@ -8,6 +8,20 @@
+ const DEFAULT_DB_PATH = "./data/taskflow.db";
+ const MIGRATIONS_DIR = "./drizzle";
+ 
++/** Also upgrades databases whose issue rows predate permanent numbering. */
++const ISSUE_NUMBER_STATEMENTS: readonly string[] = [
++  `CREATE TABLE IF NOT EXISTS issue_number_counters (
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     last_number INTEGER NOT NULL,
++     PRIMARY KEY (org_id, project_id)
++   )`,
++  `INSERT INTO issue_number_counters (org_id, project_id, last_number)
++   SELECT org_id, project_id, max(number) FROM issues GROUP BY org_id, project_id
++   ON CONFLICT (org_id, project_id) DO UPDATE
++   SET last_number = max(issue_number_counters.last_number, excluded.last_number)`,
++];
++
+ /**
+  * Statements that bring an empty database up to the current schema.
+  *
+@@ -329,7 +343,7 @@
+   sqlite.pragma("journal_mode = WAL");
+ 
+   try {
+-    for (const statement of readMigrationStatements()) {
++    for (const statement of [...readMigrationStatements(), ...ISSUE_NUMBER_STATEMENTS]) {
+       sqlite.exec(statement);
+     }
+   } finally {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/schema/issues.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/schema/issues.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/schema/issues.ts	2026-10-14 17:56:11
+@@ -1,4 +1,4 @@
+-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
++import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+ import {
+   idColumn,
+   softDeleteColumns,
+@@ -42,6 +42,17 @@
+     index("issues_org_archived_idx").on(table.orgId, table.archivedAt),
+     index("issues_org_due_idx").on(table.orgId, table.dueAt),
+   ],
++);
++
++/** Survives moves and deletion of issue rows so issued numbers stay retired. */
++export const issueNumberCounters = sqliteTable(
++  "issue_number_counters",
++  {
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    lastNumber: integer("last_number").notNull(),
++  },
++  (table) => [primaryKey({ columns: [table.orgId, table.projectId] })],
+ );
+ 
+ export const labels = sqliteTable(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/seed.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/seed.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/db/seed.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/db/seed.ts	2026-10-14 17:56:55
+@@ -10,6 +10,7 @@
+ import { getDb } from "@/server/db";
+ import {
+   comments,
++  issueNumberCounters,
+   issues,
+   labels,
+   members,
+@@ -330,6 +331,7 @@
+   const db = getDb();
+   db.delete(comments).run();
+   db.delete(issues).run();
++  db.delete(issueNumberCounters).run();
+   db.delete(labels).run();
+   db.delete(projects).run();
+   db.delete(members).run();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/repositories/issue-repository.ts	2026-10-14 17:53:02
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/repositories/issue-repository.ts	2026-10-14 17:56:55
+@@ -22,7 +22,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issueNumberCounters, issues } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -285,14 +285,11 @@
+   return row?.value ?? 0;
+ }
+ 
+-/**
+- * Next per-project issue number. Archived issues keep their number, so the
+- * max is taken over every row rather than the live ones.
+- */
+-export async function nextIssueNumber(
++/** Includes imported rows as well as numbers retired by moves or deletion. */
++function lastIssueNumber(
+   orgId: OrgId,
+   projectId: ProjectId,
+-): Promise<number> {
++): number {
+   const row = getDb()
+     .select({ value: sql<number | null>`max(${issues.number})` })
+     .from(issues)
+@@ -300,9 +297,45 @@
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const counter = getDb()
++    .select()
++    .from(issueNumberCounters)
++    .where(
++      and(
++        orgPredicate(issueNumberCounters.orgId, orgId),
++        eq(issueNumberCounters.projectId, projectId),
++      ),
++    )
++    .get();
++  return Math.max(row?.value ?? 0, counter?.lastNumber ?? 0);
+ }
+ 
++/** Called in the same transaction as the write that issues or retires a number. */
++function rememberIssueNumber(
++  orgId: OrgId,
++  projectId: ProjectId,
++  lastNumber: number,
++): void {
++  getDb()
++    .insert(issueNumberCounters)
++    .values({ orgId, projectId, lastNumber })
++    .onConflictDoUpdate({
++      target: [issueNumberCounters.orgId, issueNumberCounters.projectId],
++      set: {
++        lastNumber: sql`max(${issueNumberCounters.lastNumber}, excluded.last_number)`,
++      },
++    })
++    .run();
++}
++
++/** The next number follows the highest ever issued in this project. */
++export async function nextIssueNumber(
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<number> {
++  return lastIssueNumber(orgId, projectId) + 1;
++}
++
+ export async function insertIssue(
+   input: CreateIssueInput,
+   authorId: UserId,
+@@ -311,43 +344,46 @@
+   const stamp = toIsoTimestamp(new Date());
+   const db = getDb();
+ 
+-  const row = db
+-    .insert(issues)
+-    .values({
+-      id: newId(),
+-      orgId: input.orgId,
+-      projectId: input.projectId,
+-      number: issueNumber,
+-      title: input.title,
+-      description: input.description,
+-      status: input.status,
+-      priority: input.priority,
+-      authorId,
+-      assigneeId: input.assigneeId,
+-      parentId: input.parentId,
+-      estimate: input.estimate,
+-      dueAt: input.dueAt,
+-      startedAt: null,
+-      completedAt: null,
+-      createdAt: stamp,
+-      updatedAt: stamp,
+-    })
+-    .returning()
+-    .get();
++  return db.transaction(() => {
++    const row = db
++      .insert(issues)
++      .values({
++        id: newId(),
++        orgId: input.orgId,
++        projectId: input.projectId,
++        number: issueNumber,
++        title: input.title,
++        description: input.description,
++        status: input.status,
++        priority: input.priority,
++        authorId,
++        assigneeId: input.assigneeId,
++        parentId: input.parentId,
++        estimate: input.estimate,
++        dueAt: input.dueAt,
++        startedAt: null,
++        completedAt: null,
++        createdAt: stamp,
++        updatedAt: stamp,
++      })
++      .returning()
++      .get();
+ 
+-  if (input.labelIds.length > 0) {
+-    db.insert(issueLabels)
+-      .values(
+-        input.labelIds.map((labelId) => ({
+-          orgId: input.orgId,
+-          issueId: row.id,
+-          labelId,
+-        })),
+-      )
+-      .run();
+-  }
++    if (input.labelIds.length > 0) {
++      db.insert(issueLabels)
++        .values(
++          input.labelIds.map((labelId) => ({
++            orgId: input.orgId,
++            issueId: row.id,
++            labelId,
++          })),
++        )
++        .run();
++    }
+ 
+-  return toIssue(row, input.labelIds);
++    rememberIssueNumber(input.orgId, input.projectId, issueNumber);
++    return toIssue(row, input.labelIds);
++  });
+ }
+ 
+ export async function updateIssue(input: UpdateIssueInput): Promise<Issue> {
+@@ -480,25 +516,39 @@
+   return toIssue(row);
+ }
+ 
+-/**
+- * Re-points an issue at another project. Kept for the import tool's
+- * "merge projects" step, which renumbers in a second pass; the row keeps its
+- * number here so the pass can match it up again.
+- */
++/** Retires the old number and assigns the target's next number in one write. */
+ export async function relocateIssue(
+   orgId: OrgId,
+   issueId: IssueId,
+   projectId: ProjectId,
+ ): Promise<Issue> {
+-  const row = getDb()
+-    .update(issues)
+-    .set({ projectId, updatedAt: toIsoTimestamp(new Date()) })
+-    .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
+-    .returning()
+-    .get();
++  const db = getDb();
++  const row = db.transaction(() => {
++    const current = db
++      .select()
++      .from(issues)
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .get();
++    if (!current) throw new Error(`Issue ${issueId} not found`);
++    if (current.projectId === projectId) return current;
+ 
+-  if (!row) throw new Error(`Issue ${issueId} not found`);
+-  return toIssue(row);
++    const fromProjectId = current.projectId as ProjectId;
++    rememberIssueNumber(orgId, fromProjectId, lastIssueNumber(orgId, fromProjectId));
++    const number = lastIssueNumber(orgId, projectId) + 1;
++    const moved = db
++      .update(issues)
++      .set({ projectId, number, updatedAt: toIsoTimestamp(new Date()) })
++      .where(and(orgPredicate(issues.orgId, orgId), eq(issues.id, issueId)))
++      .returning()
++      .get();
++    if (!moved) throw new Error(`Issue ${issueId} not found`);
++
++    rememberIssueNumber(orgId, projectId, number);
++    return moved;
++  });
++
++  const labels = await listLabelsForIssues(orgId, [issueId]);
++  return toIssue(row, (labels[issueId] ?? []).map((label) => label.id));
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/activity-service.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/activity-service.ts	2026-10-14 17:55:26
+@@ -176,6 +176,21 @@
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.moved", (payload) =>
++      record(payload.orgId, "issue.moved", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.toProjectId,
++        summary: `Moved issue from ${payload.fromProjectId}-${payload.fromNumber} to ${payload.toProjectId}-${payload.toNumber}`,
++        metadata: {
++          fromProjectId: payload.fromProjectId,
++          toProjectId: payload.toProjectId,
++          fromNumber: payload.fromNumber,
++          toNumber: payload.toNumber,
++        },
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/issue-service.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/issue-service.ts	2026-10-14 17:53:02
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/issue-service.ts	2026-10-14 17:55:26
+@@ -27,6 +27,7 @@
+   CreateIssueInput,
+   IssueFilterInput,
+   MoveIssueInput,
++  MoveIssueToProjectInput,
+   UpdateIssueInput,
+ } from "@/schemas/issue";
+ import type { IssueId, OrgId, Page, ProjectId } from "@/types/common";
+@@ -214,12 +215,64 @@
+   return archived;
+ }
+ 
++/** Moves a live issue after checking edit permission and the target's create gates. */
++export async function moveIssueToProject(
++  actor: Actor,
++  input: MoveIssueToProjectInput,
++): Promise<Issue> {
++  assertOrgScope(actor, input.orgId);
++
++  const before = requireFound(
++    await issueRepo.findIssueById(input.orgId, input.issueId),
++    "Issue",
++    input.issueId,
++  );
++  assertCan(actor, "issue:update", issueResource(before));
++  assertNotArchived("Issue", before.id, before);
++
++  if (before.projectId === input.toProjectId) return before;
++
++  const project = requireFound(
++    await projectRepo.findProjectById(input.orgId, input.toProjectId),
++    "Project",
++    input.toProjectId,
++  );
++  assertNotArchived("Project", project.id, project);
++  assertCan(actor, "issue:create", projectResource(project));
++
++  const org = requireFound(
++    await orgRepo.findOrgById(input.orgId),
++    "Organization",
++    input.orgId,
++  );
++  const used = await issueRepo.countIssues(input.orgId, input.toProjectId);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new Error(
++      `Plan ${org.plan} allows no more issues in project ${project.key}`,
++    );
++  }
++
++  const after = await issueRepo.relocateIssue(
++    input.orgId,
++    input.issueId,
++    input.toProjectId,
++  );
++
++  await emit("issue.moved", {
++    ...actorEnvelope(actor),
++    issueId: after.id,
++    fromProjectId: before.projectId,
++    toProjectId: after.projectId,
++    fromNumber: before.number,
++    toNumber: after.number,
++  });
++
++  return after;
++}
++
+ /**
+  * Board drag-and-drop. The index is presentation-only — the board renders by
+  * `updated_at` — so a move is a status change plus a touch.
+- *
+- * TODO(platform): "move" should eventually take a target project as well;
+- * `issueRepo.relocateIssue` is the primitive for that half.
+  */
+ export async function moveIssue(
+   actor: Actor,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/search-service.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/server/services/search-service.ts	2026-10-14 17:55:26
+@@ -144,6 +144,10 @@
+       const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+       if (issue) await indexIssue(payload.orgId, issue);
+     }),
++    subscribe("issue.moved", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/types/activity.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/types/activity.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/types/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/types/activity.ts	2026-10-14 17:55:26
+@@ -16,6 +16,7 @@
+   | "project.restored"
+   | "issue.created"
+   | "issue.updated"
++  | "issue.moved"
+   | "issue.status_changed"
+   | "issue.assigned"
+   | "issue.archived"
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/types/event.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/types/event.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/src/types/event.ts	2026-10-14 17:55:26
+@@ -48,6 +48,13 @@
+     projectId: ProjectId;
+     changedFields: readonly string[];
+   };
++  "issue.moved": EventEnvelope & {
++    issueId: IssueId;
++    fromProjectId: ProjectId;
++    toProjectId: ProjectId;
++    fromNumber: number;
++    toNumber: number;
++  };
+   "issue.status_changed": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/tests/services/issue-move.test.ts /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/tests/services/issue-move.test.ts
+--- /private/tmp/bench-scratch/210b6e1e-ba73-4610-b18c-afd297bfdf4d/tests/services/issue-move.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c9de57eb-7902-4d7d-bcd2-4590b02fe832/tests/services/issue-move.test.ts	2026-10-14 17:59:00
+@@ -0,0 +1,296 @@
++import { eq } from "drizzle-orm";
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { activityFilterSchema } from "@/schemas/activity";
++import { moveIssueToProjectSchema } from "@/schemas/issue";
++import { activityEvents, getDb, issueNumberCounters, issues, searchIndex } from "@/server/db";
++import { runMigrations } from "@/server/db/migrate";
++import * as activityRepo from "@/server/repositories/activity-repository";
++import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as commentRepo from "@/server/repositories/comment-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as labelRepo from "@/server/repositories/label-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { registerActivityListeners } from "@/server/services/activity-service";
++import * as issueService from "@/server/services/issue-service";
++import { registerSearchListeners } from "@/server/services/search-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { PlanId } from "@/types/billing";
++import type { TaskflowEventMap, TaskflowEventType, Unsubscribe } from "@/types/event";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++let detachActivity: Unsubscribe;
++let detachSearch: Unsubscribe;
++const captures: Unsubscribe[] = [];
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  detachActivity = registerActivityListeners();
++  detachSearch = registerSearchListeners();
++});
++
++afterEach(() => {
++  while (captures.length > 0) captures.pop()?.();
++});
++
++afterAll(() => {
++  detachActivity();
++  detachSearch();
++  cleanup();
++});
++
++async function scenario(slug: string, plan: PlanId = "growth") {
++  const tenant = await createTenant(slug, plan);
++  const target = await projectRepo.insertProject({
++    orgId: tenant.org.id,
++    name: "Target project",
++    slug: "target",
++    key: "TGT",
++    description: null,
++    visibility: "private",
++    leadId: null,
++    color: "#6366f1",
++    targetDate: null,
++  });
++  return { ...tenant, target };
++}
++
++function capture<K extends TaskflowEventType>(type: K): TaskflowEventMap[K][] {
++  const seen: TaskflowEventMap[K][] = [];
++  captures.push(subscribe(type, (payload) => { seen.push(payload); }));
++  return seen;
++}
++
++function storedState() {
++  const db = getDb();
++  return {
++    issues: db.select().from(issues).all(),
++    counters: db.select().from(issueNumberCounters).all(),
++    activity: db.select().from(activityEvents).all(),
++    search: db.select().from(searchIndex).all(),
++  };
++}
++
++describe("services/issue-service — move to project", () => {
++  it("renumbers without changing content or links, and updates search, lists, boards and audit", async () => {
++    const tenant = await scenario("move-content");
++    const { org, project, target, actors, userIds } = tenant;
++    const parent = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    const label = await labelRepo.insertLabel({
++      orgId: org.id, name: "move-label", color: "#ef4444", description: null,
++    });
++    const created = await issueService.createIssue(actors.member, {
++      ...issueInput(org.id, project.id),
++      title: "Movable search marker",
++      description: "Preserve this description",
++      priority: "urgent",
++      assigneeId: userIds.admin,
++      parentId: parent.id,
++      estimate: 8,
++      dueAt: toIsoTimestamp("2026-12-01T00:00:00.000Z"),
++      labelIds: [label.id],
++    });
++    await issueService.changeIssueStatus(actors.member, {
++      orgId: org.id, issueId: created.id, status: "in_progress",
++    });
++    await issueService.changeIssueStatus(actors.member, {
++      orgId: org.id, issueId: created.id, status: "done",
++    });
++    const before = (await issueRepo.findIssueById(org.id, created.id))!;
++    const child = await issueService.createIssue(actors.member, {
++      ...issueInput(org.id, project.id), parentId: before.id,
++    });
++    const comment = await commentRepo.insertComment({
++      orgId: org.id, issueId: before.id, body: "Keep this thread",
++      parentId: null, mentionedUserIds: [userIds.owner],
++    }, userIds.admin);
++    const attachment = await attachmentRepo.insertAttachment({
++      orgId: org.id, issueId: before.id, filename: "design.png",
++      contentType: "image/png", sizeBytes: 123,
++    }, userIds.member);
++    const existing = await issueRepo.insertIssue(issueInput(org.id, target.id), userIds.owner, 7);
++    await issueRepo.archiveIssue(org.id, existing.id);
++    const history = await activityRepo.listActivityForSubject(org.id, "issue", before.id);
++
++    const movedEvents = capture("issue.moved");
++    const createdEvents = capture("issue.created");
++    const updatedEvents = capture("issue.updated");
++    const archivedEvents = capture("issue.archived");
++    const statusEvents = capture("issue.status_changed");
++    const after = await issueService.moveIssueToProject(actors.admin, moveIssueToProjectSchema.parse({
++      orgId: org.id, issueId: before.id, toProjectId: target.id,
++    }));
++
++    expect(after).toEqual({ ...before, projectId: target.id, number: 8, updatedAt: expect.any(String) });
++    expect(await issueRepo.findIssueById(org.id, before.id)).toEqual(after);
++    expect(await issueRepo.findIssueById(org.id, parent.id)).toEqual(parent);
++    expect(await issueRepo.findIssueById(org.id, child.id)).toEqual(child);
++    expect(await commentRepo.findCommentById(org.id, comment.id)).toEqual(comment);
++    expect(await attachmentRepo.listAttachments(org.id, before.id)).toEqual([attachment]);
++    expect(await issueRepo.findIssueByNumber(org.id, project.id, before.number)).toBeNull();
++    expect((await issueRepo.findIssueByNumber(org.id, target.id, 8))?.id).toBe(before.id);
++    expect(movedEvents).toEqual([{
++      orgId: org.id, actorId: userIds.admin, occurredAt: expect.any(String),
++      issueId: before.id, fromProjectId: project.id, toProjectId: target.id,
++      fromNumber: before.number, toNumber: 8,
++    }]);
++    expect([createdEvents, updatedEvents, archivedEvents, statusEvents]).toEqual([[], [], [], []]);
++
++    for (const destination of [project, target]) {
++      const inTarget = destination.id === target.id;
++      const page = await issueRepo.listIssues({ orgId: org.id, projectId: destination.id, limit: 100, cursor: null });
++      expect(page.items.some((issue) => issue.id === before.id)).toBe(inTarget);
++      const columns = await issueRepo.listBoardColumns(org.id, destination.id);
++      expect(columns.flatMap((column) => column.issues).some((issue) => issue.id === before.id)).toBe(inTarget);
++      const hits = await searchRepo.searchDocuments({
++        orgId: org.id, projectId: destination.id, q: "Movable search marker",
++        kinds: ["issue"], limit: 25, cursor: null,
++      });
++      expect(hits.items.map((hit) => hit.subjectId)).toEqual(inTarget ? [before.id] : []);
++    }
++
++    const afterHistory = await activityRepo.listActivityForSubject(org.id, "issue", before.id);
++    expect(afterHistory.filter((event) => event.action !== "issue.moved")).toEqual(history);
++    const audit = await activityRepo.listActivity(activityFilterSchema.parse({
++      orgId: org.id, projectId: target.id, action: ["issue.moved"],
++    }));
++    expect(audit.items).toHaveLength(1);
++    expect(audit.items[0]).toMatchObject({
++      action: "issue.moved", actorId: userIds.admin, subjectKind: "issue", subjectId: before.id,
++      projectId: target.id,
++      metadata: { fromProjectId: project.id, toProjectId: target.id, fromNumber: before.number, toNumber: 8 },
++    });
++  });
++
++  it("never reuses numbers when the highest issue moves away or returns, even after migration", async () => {
++    const { org, project, target, actors } = await scenario("move-numbers");
++    const first = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    const move = (toProjectId: typeof target.id) => issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: first.id, toProjectId,
++    });
++    expect((await move(target.id)).number).toBe(1);
++    await runMigrations();
++    const replacement = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    expect(replacement.number).toBe(2);
++    expect((await move(project.id)).number).toBe(3);
++    expect((await move(target.id)).number).toBe(2);
++    expect((await issueService.createIssue(actors.member, issueInput(org.id, project.id))).number).toBe(4);
++    expect((await issueService.createIssue(actors.member, issueInput(org.id, target.id))).number).toBe(3);
++  });
++
++  it("backfills existing numbers and retains them after rows disappear", async () => {
++    const { org, project, actors } = await scenario("move-backfill");
++    const issue = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    getDb().delete(issueNumberCounters).where(eq(issueNumberCounters.orgId, org.id)).run();
++    await runMigrations();
++    getDb().delete(issues).where(eq(issues.id, issue.id)).run();
++    expect(await issueRepo.nextIssueNumber(org.id, project.id)).toBe(issue.number + 1);
++  });
++
++  it("checks edit permission and then target create permission, without making changes", async () => {
++    const { org, project, target, actors } = await scenario("move-permission");
++    const issue = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    const owned = await issueRepo.insertIssue(issueInput(org.id, project.id), actors.viewer.userId, 2);
++    const events = capture("issue.moved");
++    const before = storedState();
++    await expect(issueService.moveIssueToProject(actors.viewer, {
++      orgId: org.id, issueId: issue.id, toProjectId: target.id,
++    })).rejects.toMatchObject({ action: "issue:update" });
++    await expect(issueService.moveIssueToProject(actors.viewer, {
++      orgId: org.id, issueId: owned.id, toProjectId: target.id,
++    })).rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(issueService.moveIssueToProject(actors.viewer, {
++      orgId: org.id, issueId: owned.id, toProjectId: target.id,
++    })).rejects.toMatchObject({ action: "issue:create" });
++    expect(storedState()).toEqual(before);
++    expect(events).toEqual([]);
++  });
++
++  it("rejects cross-workspace inputs and archived or missing resources without changes", async () => {
++    const { org, project, target, actors } = await scenario("move-scope");
++    const other = await createTenant("move-other");
++    const issue = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    const archived = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    await issueService.archiveIssue(actors.member, org.id, archived.id);
++    const foreign = await issueService.createIssue(other.actors.member, issueInput(other.org.id, other.project.id));
++    await projectRepo.archiveProject(org.id, target.id);
++    const missingId = "01HZZZPPPPPPPPPPPPPPPPPPPP";
++    const events = capture("issue.moved");
++    const before = storedState();
++
++    await expect(issueService.moveIssueToProject(other.actors.owner, {
++      orgId: org.id, issueId: issue.id, toProjectId: target.id,
++    })).rejects.toBeInstanceOf(TenantScopeError);
++    for (const issueId of [foreign.id, missingId as typeof issue.id]) {
++      await expect(issueService.moveIssueToProject(actors.member, {
++        orgId: org.id, issueId, toProjectId: project.id,
++      })).rejects.toBeInstanceOf(NotFoundError);
++    }
++    for (const toProjectId of [other.project.id, missingId as typeof project.id]) {
++      await expect(issueService.moveIssueToProject(actors.member, {
++        orgId: org.id, issueId: issue.id, toProjectId,
++      })).rejects.toBeInstanceOf(NotFoundError);
++    }
++    await expect(issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: archived.id, toProjectId: target.id,
++    })).rejects.toBeInstanceOf(AlreadyArchivedError);
++    await expect(issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: issue.id, toProjectId: target.id,
++    })).rejects.toBeInstanceOf(AlreadyArchivedError);
++    expect(storedState()).toEqual(before);
++    expect(events).toEqual([]);
++  });
++
++  it("applies the target quota, allows a freed slot, and keeps a same-project move silent at quota", async () => {
++    const { org, project, target, actors } = await scenario("move-quota", "free");
++    const issue = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    for (let number = 1; number <= 100; number += 1) {
++      await issueRepo.insertIssue(issueInput(org.id, target.id), actors.member.userId, number);
++    }
++    const events = capture("issue.moved");
++    const before = storedState();
++    await expect(issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: issue.id, toProjectId: target.id,
++    })).rejects.toThrow(/allows no more issues/);
++    expect(storedState()).toEqual(before);
++    expect(events).toEqual([]);
++
++    const atQuota = (await issueRepo.findIssueByNumber(org.id, target.id, 100))!;
++    expect(await issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: atQuota.id, toProjectId: target.id,
++    })).toEqual(atQuota);
++    expect(storedState()).toEqual(before);
++    expect(events).toEqual([]);
++
++    await issueService.archiveIssue(actors.member, org.id, atQuota.id);
++    const moved = await issueService.moveIssueToProject(actors.member, {
++      orgId: org.id, issueId: issue.id, toProjectId: target.id,
++    });
++    expect(moved.number).toBe(101);
++    expect(await issueRepo.countIssues(org.id, target.id)).toBe(100);
++    expect(events).toHaveLength(1);
++  });
++
++  it("continues to move board cards by status within their project", async () => {
++    const { org, project, actors } = await scenario("move-board");
++    const issue = await issueService.createIssue(actors.member, issueInput(org.id, project.id));
++    const events = capture("issue.moved");
++    const statusEvents = capture("issue.status_changed");
++    const after = await issueService.moveIssue(actors.member, {
++      orgId: org.id, issueId: issue.id, toStatus: "in_progress", toIndex: 0,
++    });
++    expect(after).toMatchObject({ projectId: project.id, number: issue.number, status: "in_progress" });
++    expect(events).toEqual([]);
++    expect(statusEvents).toHaveLength(1);
++  });
++});

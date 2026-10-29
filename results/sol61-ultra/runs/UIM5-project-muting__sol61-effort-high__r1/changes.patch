@@ -1,0 +1,625 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/db/migrate.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/db/migrate.ts	2026-10-09 14:12:59
+@@ -206,6 +206,7 @@
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      recipient_id TEXT NOT NULL,
++     project_id TEXT,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+@@ -227,6 +228,12 @@
+      digest_only INTEGER NOT NULL DEFAULT 0
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS notification_preferences_pk ON notification_preferences (org_id, user_id, kind)`,
++  `CREATE TABLE IF NOT EXISTS project_mutes (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     project_id TEXT NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS project_mutes_pk ON project_mutes (org_id, user_id, project_id)`,
+   `CREATE TABLE IF NOT EXISTS activity_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+@@ -317,7 +324,7 @@
+ /**
+  * Brings `databasePath` up to date. Generated migrations win when they exist;
+  * otherwise the embedded schema is pushed. Safe to run repeatedly — every
+- * statement is `IF NOT EXISTS`.
++ * table/index statement is `IF NOT EXISTS`, and column upgrades are checked.
+  */
+ export async function runMigrations(
+   databasePath: string = process.env.TASKFLOW_DB_PATH ?? DEFAULT_DB_PATH,
+@@ -331,6 +338,14 @@
+   try {
+     for (const statement of readMigrationStatements()) {
+       sqlite.exec(statement);
++    }
++
++    // CREATE TABLE IF NOT EXISTS cannot add columns to an existing database.
++    const notificationColumns = sqlite.pragma("table_info(notifications)") as {
++      name: string;
++    }[];
++    if (!notificationColumns.some((column) => column.name === "project_id")) {
++      sqlite.exec("ALTER TABLE notifications ADD COLUMN project_id TEXT");
+     }
+   } finally {
+     sqlite.close();
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/db/schema/notifications.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/db/schema/notifications.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/db/schema/notifications.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/db/schema/notifications.ts	2026-10-09 14:12:59
+@@ -21,6 +21,7 @@
+     id: idColumn(),
+     ...tenantColumns,
+     recipientId: text("recipient_id").notNull(),
++    projectId: text("project_id"),
+     kind: text("kind", { enum: NOTIFICATION_KINDS }).notNull(),
+     title: text("title").notNull(),
+     body: text("body").notNull(),
+@@ -54,6 +55,22 @@
+       table.orgId,
+       table.userId,
+       table.kind,
++    ),
++  ],
++);
++
++export const projectMutes = sqliteTable(
++  "project_mutes",
++  {
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    projectId: text("project_id").notNull(),
++  },
++  (table) => [
++    uniqueIndex("project_mutes_pk").on(
++      table.orgId,
++      table.userId,
++      table.projectId,
+     ),
+   ],
+ );
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/_mappers.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/_mappers.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/_mappers.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/_mappers.ts	2026-10-09 14:12:59
+@@ -263,6 +263,7 @@
+     id: brandId<NotificationId>(row.id),
+     orgId: brandId<OrgId>(row.orgId),
+     recipientId: brandId<UserId>(row.recipientId),
++    projectId: row.projectId === null ? null : brandId<ProjectId>(row.projectId),
+     kind: row.kind,
+     title: row.title,
+     body: row.body,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/notification-repository.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/notification-repository.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/notification-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/notification-repository.ts	2026-10-09 14:12:59
+@@ -14,14 +14,15 @@
+   NotificationId,
+   OrgId,
+   Page,
++  ProjectId,
+   UserId,
+ } from "@/types/common";
+ import type { Notification } from "@/types/notification";
+ 
+ type NewNotification = Omit<
+   Notification,
+-  "id" | "createdAt" | "updatedAt" | "readAt"
+->;
++  "id" | "createdAt" | "updatedAt" | "readAt" | "projectId"
++> & { readonly projectId?: ProjectId | null };
+ 
+ export async function listNotifications(
+   input: ListNotificationsInput,
+@@ -102,6 +103,7 @@
+         id: newId(),
+         orgId,
+         recipientId: input.recipientId,
++        projectId: input.projectId ?? null,
+         kind: input.kind,
+         title: input.title,
+         body: input.body,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/project-mute-repository.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/project-mute-repository.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/repositories/project-mute-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/repositories/project-mute-repository.ts	2026-10-09 14:12:59
+@@ -0,0 +1,70 @@
++import { and, eq } from "drizzle-orm";
++import { getDb, projectMutes } from "@/server/db";
++import { orgPredicate } from "./base-repository";
++import { brandId } from "./_mappers";
++import type { OrgId, ProjectId, UserId } from "@/types/common";
++
++export async function muteProject(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<void> {
++  getDb()
++    .insert(projectMutes)
++    .values({ orgId, userId, projectId })
++    .onConflictDoNothing()
++    .run();
++}
++
++export async function unmuteProject(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<void> {
++  getDb()
++    .delete(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .run();
++}
++
++export async function isProjectMuted(
++  orgId: OrgId,
++  userId: UserId,
++  projectId: ProjectId,
++): Promise<boolean> {
++  const row = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++        eq(projectMutes.projectId, projectId),
++      ),
++    )
++    .get();
++  return row !== undefined;
++}
++
++export async function listMutedProjectIds(
++  orgId: OrgId,
++  userId: UserId,
++): Promise<readonly ProjectId[]> {
++  const rows = getDb()
++    .select({ projectId: projectMutes.projectId })
++    .from(projectMutes)
++    .where(
++      and(
++        orgPredicate(projectMutes.orgId, orgId),
++        eq(projectMutes.userId, userId),
++      ),
++    )
++    .all();
++  return rows.map((row) => brandId<ProjectId>(row.projectId));
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/services/digest-service.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/services/digest-service.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/services/digest-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/services/digest-service.ts	2026-10-09 14:13:01
+@@ -8,6 +8,7 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as muteRepo from "@/server/repositories/project-mute-repository";
+ import { renderEmail } from "./email-service";
+ import { buildFlagContext } from "./feature-flag-service";
+ import type { RenderedEmail } from "@/server/services/email-service";
+@@ -40,9 +41,15 @@
+     recipientId,
+     windowStart,
+   );
++  const mutedProjectIds = new Set(
++    await muteRepo.listMutedProjectIds(orgId, recipientId),
++  );
+ 
+   const entries: DigestEntry[] = unread
+-    .filter((notification) => notification.createdAt <= windowEnd)
++    .filter((notification) =>
++      notification.createdAt <= windowEnd &&
++      (notification.projectId === null || !mutedProjectIds.has(notification.projectId)),
++    )
+     .map((notification) => ({
+       notificationId: notification.id,
+       kind: notification.kind,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/services/notification-service.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/server/services/notification-service.ts	2026-10-09 14:14:08
+@@ -11,14 +11,16 @@
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as muteRepo from "@/server/repositories/project-mute-repository";
+ import { toIsoTimestamp } from "@/types/common";
+-import { notificationResource, requireFound } from "./_support";
++import { notificationResource, projectResource, requireFound } from "./_support";
+ import type {
+   ListNotificationsInput,
+   MarkNotificationReadInput,
+   UpdateNotificationPreferenceInput,
+ } from "@/schemas/notification";
+-import type { OrgId, Page, UserId } from "@/types/common";
++import type { OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { FlagContext } from "@/types/feature-flag";
+ import type { Actor } from "@/types/member";
+ import type {
+@@ -33,11 +35,58 @@
+   body: string;
+   href: string;
+   actorId: UserId | null;
++  projectId?: ProjectId | null;
+ };
+ 
+ /** Channels used when a recipient has never touched their preferences. */
+ const DEFAULT_CHANNELS: readonly NotificationChannel[] = ["in_app", "email"];
+ 
++const PERSONAL_KINDS: ReadonlySet<NotificationKind> = new Set([
++  "issue_assigned",
++  "comment_mention",
++  "issue_overdue",
++]);
++
++export async function muteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  await assertProjectRead(actor, orgId, projectId);
++  await muteRepo.muteProject(orgId, actor.userId, projectId);
++}
++
++export async function unmuteProject(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  await assertProjectRead(actor, orgId, projectId);
++  await muteRepo.unmuteProject(orgId, actor.userId, projectId);
++}
++
++export async function listMutedProjectIds(
++  actor: Actor,
++  orgId: OrgId,
++): Promise<readonly ProjectId[]> {
++  assertOrgScope(actor, orgId);
++  return muteRepo.listMutedProjectIds(orgId, actor.userId);
++}
++
++async function assertProjectRead(
++  actor: Actor,
++  orgId: OrgId,
++  projectId: ProjectId,
++): Promise<void> {
++  assertOrgScope(actor, orgId);
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, projectId),
++    "Project",
++    projectId,
++  );
++  assertCan(actor, "project:read", projectResource(project));
++}
++
+ /**
+  * Writes one notification row per recipient, each with the channel set that
+  * recipient's preferences allow. A recipient who has muted every channel is
+@@ -65,12 +114,20 @@
+   for (const recipientId of new Set(recipients)) {
+     if (recipientId === payload.actorId) continue;
+ 
++    const muted =
++      payload.projectId != null &&
++      await muteRepo.isProjectMuted(orgId, recipientId, payload.projectId);
++    if (muted && !PERSONAL_KINDS.has(kind)) continue;
++
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+       recipientId,
+       kind,
+     );
+-    const channels = resolveChannels(preference, flags);
++    const preferredChannels = resolveChannels(preference, flags);
++    const channels = muted
++      ? preferredChannels.filter((channel) => channel !== "email")
++      : preferredChannels;
+     if (channels.length === 0) continue;
+ 
+     rows.push({
+@@ -81,6 +138,7 @@
+       body: payload.body,
+       href: payload.href,
+       actorId: payload.actorId,
++      projectId: payload.projectId ?? null,
+       channels,
+     });
+   }
+@@ -184,6 +242,7 @@
+   subscribe("issue.assigned", async (payload) => {
+     await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
+       title: "You were assigned an issue",
++      projectId: payload.projectId,
+       body: `Issue ${payload.issueId} is now yours`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
+@@ -194,6 +253,7 @@
+     if (payload.assigneeId === null) return;
+     await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
++      projectId: payload.projectId,
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: null,
+@@ -208,6 +268,7 @@
+ 
+     await notify(payload.orgId, "comment_created", watchers, {
+       title: "New comment",
++      projectId: issue?.projectId ?? null,
+       body: `A comment was added to issue ${payload.issueId}`,
+       href: `/issues/${payload.issueId}`,
+       actorId: payload.actorId,
+@@ -220,6 +281,7 @@
+         payload.mentionedUserIds,
+         {
+           title: "You were mentioned",
++          projectId: issue?.projectId ?? null,
+           body: `You were mentioned on issue ${payload.issueId}`,
+           href: `/issues/${payload.issueId}`,
+           actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/types/notification.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/types/notification.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/src/types/notification.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/src/types/notification.ts	2026-10-09 14:12:59
+@@ -1,6 +1,7 @@
+ import type {
+   IsoTimestamp,
+   NotificationId,
++  ProjectId,
+   TenantScoped,
+   Timestamps,
+   UserId,
+@@ -24,6 +25,7 @@
+ export interface Notification extends Timestamps, TenantScoped {
+   readonly id: NotificationId;
+   readonly recipientId: UserId;
++  readonly projectId: ProjectId | null;
+   readonly kind: NotificationKind;
+   readonly title: string;
+   readonly body: string;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/tests/server/project-mutes-migration.test.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/tests/server/project-mutes-migration.test.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/tests/server/project-mutes-migration.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/tests/server/project-mutes-migration.test.ts	2026-10-09 14:14:08
+@@ -0,0 +1,59 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import Database from "better-sqlite3";
++import { expect, it } from "vitest";
++import { runMigrations } from "@/server/db/migrate";
++
++it("upgrades existing notifications and preserves project mutes across migrations and connections", async () => {
++  const dir = mkdtempSync(join(tmpdir(), "taskflow-mute-migration-"));
++  const path = join(dir, "taskflow.db");
++  try {
++    const legacy = new Database(path);
++    try {
++      legacy.exec(`
++        CREATE TABLE notifications (
++          id TEXT PRIMARY KEY NOT NULL,
++          org_id TEXT NOT NULL,
++          recipient_id TEXT NOT NULL,
++          kind TEXT NOT NULL,
++          title TEXT NOT NULL,
++          body TEXT NOT NULL,
++          href TEXT NOT NULL,
++          actor_id TEXT,
++          read_at TEXT,
++          channels TEXT NOT NULL DEFAULT '["in_app"]',
++          created_at TEXT NOT NULL,
++          updated_at TEXT NOT NULL
++        );
++        INSERT INTO notifications (id, org_id, recipient_id, kind, title, body, href, created_at, updated_at)
++          VALUES ('old', 'org', 'user', 'member_joined', 'Welcome', 'Welcome', '/', '2026-06-01', '2026-06-01');
++      `);
++    } finally {
++      legacy.close();
++    }
++    await runMigrations(path);
++    const upgraded = new Database(path);
++    try {
++      expect(upgraded.prepare("SELECT id, project_id FROM notifications").all()).toEqual([
++        { id: "old", project_id: null },
++      ]);
++      upgraded.prepare("INSERT INTO project_mutes (org_id, user_id, project_id) VALUES (?, ?, ?)").run("org", "user", "project");
++      upgraded.prepare("UPDATE notifications SET project_id = ? WHERE id = ?").run("project", "old");
++    } finally {
++      upgraded.close();
++    }
++    await runMigrations(path);
++    const reopened = new Database(path);
++    try {
++      expect(reopened.prepare("SELECT project_id FROM notifications WHERE id = 'old'").get()).toEqual({ project_id: "project" });
++      expect(reopened.prepare("SELECT * FROM project_mutes").all()).toEqual([
++        { org_id: "org", user_id: "user", project_id: "project" },
++      ]);
++    } finally {
++      reopened.close();
++    }
++  } finally {
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/tests/services/project-mutes.test.ts /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/tests/services/project-mutes.test.ts
+--- /private/tmp/bench-scratch/52268418-b1eb-4623-9572-88278de36a51/tests/services/project-mutes.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/c14e9650-6452-4192-9b42-2be55892fcdc/tests/services/project-mutes.test.ts	2026-10-09 14:13:42
+@@ -0,0 +1,172 @@
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { DIGEST_MAX_ENTRIES } from "@/config/constants";
++import { emit } from "@/lib/event-bus";
++import * as permissions from "@/lib/permissions";
++import { TenantScopeError } from "@/lib/tenant";
++import * as notificationRepo from "@/server/repositories/notification-repository";
++import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
++import * as webhookRepo from "@/server/repositories/webhook-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { buildDigest } from "@/server/services/digest-service";
++import * as issueService from "@/server/services/issue-service";
++import {
++  listMutedProjectIds,
++  muteProject,
++  notify,
++  unmuteProject,
++} from "@/server/services/notification-service";
++import { registerWebhookListeners } from "@/server/services/webhook-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { CommentId, ProjectId } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++});
++afterEach(() => {
++  vi.restoreAllMocks();
++  vi.useRealTimers();
++});
++afterAll(() => cleanup());
++
++describe("personal project mutes", () => {
++  it("keeps idempotent mutes personal and guards both mutations like project reads", async () => {
++    const tenant = await createTenant("mute-guards");
++    const other = await createTenant("mute-guards-other");
++    const actor = tenant.actors.viewer;
++    const assertCan = vi.spyOn(permissions, "assertCan");
++
++    await muteProject(actor, tenant.org.id, tenant.project.id);
++    await muteProject(actor, tenant.org.id, tenant.project.id);
++    expect(assertCan).toHaveBeenCalledWith(actor, "project:read", expect.objectContaining({
++      kind: "project", orgId: tenant.org.id, projectId: tenant.project.id,
++    }));
++    expect(await listMutedProjectIds(actor, tenant.org.id)).toEqual([tenant.project.id]);
++    expect(await listMutedProjectIds(tenant.actors.owner, tenant.org.id)).toEqual([]);
++    expect(await listMutedProjectIds(other.actors.viewer, other.org.id)).toEqual([]);
++
++    for (const mutate of [muteProject, unmuteProject]) {
++      await expect(mutate(actor, other.org.id, other.project.id)).rejects.toBeInstanceOf(TenantScopeError);
++      await expect(mutate(actor, tenant.org.id, other.project.id)).rejects.toBeInstanceOf(NotFoundError);
++      await expect(mutate(actor, tenant.org.id, "missing" as ProjectId)).rejects.toBeInstanceOf(NotFoundError);
++      const denied = new permissions.PermissionDeniedError("project:read", {
++        action: "project:read", resourceKind: "project", allowed: false, reason: "denied_by_role",
++      });
++      assertCan.mockImplementationOnce(() => { throw denied; });
++      await expect(mutate(actor, tenant.org.id, tenant.project.id)).rejects.toBe(denied);
++    }
++    await expect(listMutedProjectIds(actor, other.org.id)).rejects.toBeInstanceOf(TenantScopeError);
++    expect(await listMutedProjectIds(actor, tenant.org.id)).toEqual([tenant.project.id]);
++    await unmuteProject(actor, tenant.org.id, tenant.project.id);
++    await unmuteProject(actor, tenant.org.id, tenant.project.id);
++    expect(await listMutedProjectIds(actor, tenant.org.id)).toEqual([]);
++  });
++
++  it.each(["issue_assigned", "comment_mention", "issue_overdue"] as const)(
++    "keeps %s in-app for muted recipients only when their preferences allow it",
++    async (kind) => {
++      const tenant = await createTenant(`mute-${kind}`);
++      const payload = {
++        title: "Personal update", body: "Update", href: "/issues/1", actorId: null,
++        projectId: tenant.project.id,
++      };
++      await muteProject(tenant.actors.member, tenant.org.id, tenant.project.id);
++      const rows = await notify(tenant.org.id, kind, [tenant.userIds.member, tenant.userIds.viewer], payload);
++      expect(rows.find((row) => row.recipientId === tenant.userIds.member)?.channels).toEqual(["in_app"]);
++      expect(rows.find((row) => row.recipientId === tenant.userIds.viewer)?.channels).toEqual(["in_app", "email"]);
++      expect(rows.every((row) => row.projectId === tenant.project.id)).toBe(true);
++
++      await preferenceRepo.upsertPreference({
++        orgId: tenant.org.id, userId: tenant.userIds.member, kind,
++        inApp: false, email: true, digestOnly: true,
++      });
++      expect(await notify(tenant.org.id, kind, [tenant.userIds.member], payload)).toEqual([]);
++      await unmuteProject(tenant.actors.member, tenant.org.id, tenant.project.id);
++      const unmuted = await notify(tenant.org.id, kind, [tenant.userIds.member], payload);
++      expect(unmuted[0]?.channels).toEqual(["email"]);
++    },
++  );
++
++  it("suppresses general project traffic while preserving unrelated notifications and self-exclusion", async () => {
++    const tenant = await createTenant("mute-general");
++    const actor = tenant.actors.member;
++    await muteProject(actor, tenant.org.id, tenant.project.id);
++    const payload = { title: "Update", body: "Update", href: "/", actorId: null };
++    for (const kind of ["comment_created", "issue_status_changed", "issue_due_soon", "project_archived"] as const) {
++      const rows = await notify(tenant.org.id, kind, [actor.userId, tenant.userIds.viewer], {
++        ...payload, projectId: tenant.project.id,
++      });
++      expect(rows.map((row) => row.recipientId)).toEqual([tenant.userIds.viewer]);
++    }
++    expect(await notify(tenant.org.id, "member_joined", [actor.userId], payload)).toHaveLength(1);
++    expect(await notify(tenant.org.id, "comment_created", [actor.userId], { ...payload, projectId: null })).toHaveLength(1);
++    expect(await notify(tenant.org.id, "issue_assigned", [actor.userId], {
++      ...payload, actorId: actor.userId, projectId: tenant.project.id,
++    })).toEqual([]);
++  });
++
++  it("passes projects through issue and comment fan-out without suppressing workspace webhooks", async () => {
++    const tenant = await createTenant("mute-events");
++    const issue = await issueService.createIssue(tenant.actors.member, issueInput(tenant.org.id, tenant.project.id));
++    await muteProject(tenant.actors.member, tenant.org.id, tenant.project.id);
++    const stopWebhooks = registerWebhookListeners();
++    try {
++      await webhookRepo.insertEndpoint({
++        orgId: tenant.org.id, url: "https://example.com/events", eventTypes: ["comment.created"],
++      }, "secret");
++      await emit("comment.created", {
++        orgId: tenant.org.id, actorId: tenant.userIds.admin, occurredAt: issue.createdAt,
++        issueId: issue.id, commentId: "muted-comment" as CommentId,
++        mentionedUserIds: [tenant.userIds.member],
++      });
++      await emit("issue.assigned", {
++        orgId: tenant.org.id, actorId: tenant.userIds.admin, occurredAt: issue.createdAt,
++        issueId: issue.id, projectId: tenant.project.id, previousAssigneeId: null, assigneeId: tenant.userIds.member,
++      });
++      await emit("issue.overdue", {
++        orgId: tenant.org.id, actorId: null, occurredAt: issue.createdAt,
++        issueId: issue.id, projectId: tenant.project.id, dueAt: issue.createdAt, assigneeId: tenant.userIds.member,
++      });
++      const rows = await notificationRepo.listUnreadSince(tenant.org.id, tenant.userIds.member, issue.createdAt);
++      expect(rows.map((row) => row.kind).sort()).toEqual(["comment_mention", "issue_assigned", "issue_overdue"]);
++      expect(rows.every((row) => row.projectId === tenant.project.id && row.channels.join() === "in_app")).toBe(true);
++      const deliveries = await webhookRepo.claimPendingDeliveries(10);
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.eventType).toBe("comment.created");
++    } finally {
++      stopWebhooks();
++    }
++  });
++
++  it("filters current mutes before the digest cap and keeps omitted rows available after unmuting", async () => {
++    const tenant = await createTenant("mute-digest");
++    const start = toIsoTimestamp("2026-06-01T00:00:00.000Z");
++    const end = toIsoTimestamp("2026-06-02T00:00:00.000Z");
++    const payload = { title: "Update", body: "Update", href: "/", actorId: null };
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-06-01T01:00:00.000Z"));
++    const [unrelated] = await notify(tenant.org.id, "member_joined", [tenant.userIds.member], payload);
++    vi.setSystemTime(new Date("2026-06-01T02:00:00.000Z"));
++    for (let i = 0; i < DIGEST_MAX_ENTRIES + 1; i += 1) {
++      await notify(tenant.org.id, "comment_created", [tenant.userIds.member], { ...payload, projectId: tenant.project.id });
++    }
++    await muteProject(tenant.actors.member, tenant.org.id, tenant.project.id);
++    // Even personal notifications retained in-app are excluded from digests.
++    await notify(tenant.org.id, "comment_mention", [tenant.userIds.member], { ...payload, projectId: tenant.project.id });
++    const digest = await buildDigest(tenant.org.id, tenant.userIds.member, start, end);
++    expect(digest?.entries.map((entry) => entry.notificationId)).toEqual([unrelated.id]);
++    await notificationRepo.markRead(tenant.org.id, unrelated.id, end);
++    expect(await buildDigest(tenant.org.id, tenant.userIds.member, start, end)).toBeNull();
++    const unread = await notificationRepo.listUnreadSince(tenant.org.id, tenant.userIds.member, start);
++    expect(unread).toHaveLength(DIGEST_MAX_ENTRIES + 2);
++    expect(unread.every((row) => row.readAt === null)).toBe(true);
++    await unmuteProject(tenant.actors.member, tenant.org.id, tenant.project.id);
++    expect((await buildDigest(tenant.org.id, tenant.userIds.member, start, end))?.entries).toHaveLength(DIGEST_MAX_ENTRIES);
++  });
++});

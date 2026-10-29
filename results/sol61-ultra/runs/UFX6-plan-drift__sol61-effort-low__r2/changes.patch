@@ -1,0 +1,107 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/bfccc39d-acbf-4f9c-9d26-8e9307bc67a0/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/f0e9b449-1ace-4a82-8201-2bc2d0cc83da/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/bfccc39d-acbf-4f9c-9d26-8e9307bc67a0/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/f0e9b449-1ace-4a82-8201-2bc2d0cc83da/src/server/repositories/organization-repository.ts	2026-10-10 00:25:09
+@@ -10,6 +10,7 @@
+ import { getDb, members, organizations } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
++import { findSubscription } from "./subscription-repository";
+ import type {
+   CreateOrganizationInput,
+   UpdateOrganizationInput,
+@@ -23,7 +24,7 @@
+     .from(organizations)
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(toOrganization(row)) : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+@@ -32,7 +33,7 @@
+     .from(organizations)
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? withCurrentPlan(toOrganization(row)) : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -52,7 +53,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return Promise.all(rows.map((row) => withCurrentPlan(toOrganization(row.org))));
+ }
+ 
+ /**
+@@ -83,7 +84,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(toOrganization(row));
+ }
+ 
+ export async function updateOrg(
+@@ -111,7 +112,7 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return withCurrentPlan(toOrganization(row));
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
+@@ -123,7 +124,7 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  return withCurrentPlan(toOrganization(row));
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+@@ -136,4 +137,10 @@
+     .where(like(organizations.slug, `${prefix}%`))
+     .all();
+   return rows.map((row) => row.slug);
++}
++
++/** Resolve on every read so existing stale workspace records need no repair. */
++async function withCurrentPlan(org: Organization): Promise<Organization> {
++  const subscription = await findSubscription(org.id);
++  return subscription ? { ...org, plan: subscription.plan } : org;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/bfccc39d-acbf-4f9c-9d26-8e9307bc67a0/src/server/repositories/subscription-repository.ts /private/tmp/bench-scratch/f0e9b449-1ace-4a82-8201-2bc2d0cc83da/src/server/repositories/subscription-repository.ts
+--- /private/tmp/bench-scratch/bfccc39d-acbf-4f9c-9d26-8e9307bc67a0/src/server/repositories/subscription-repository.ts	2026-10-10 00:24:34
++++ /private/tmp/bench-scratch/f0e9b449-1ace-4a82-8201-2bc2d0cc83da/src/server/repositories/subscription-repository.ts	2026-10-10 00:25:09
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -112,8 +112,8 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Only subscriptions still trialing are eligible; choosing a plan ends the
++ * trial even when the original trial period end remains in the past.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -123,6 +123,7 @@
+     .from(subscriptions)
+     .where(
+       and(
++        eq(subscriptions.status, "trialing"),
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+         ne(subscriptions.plan, "free"),

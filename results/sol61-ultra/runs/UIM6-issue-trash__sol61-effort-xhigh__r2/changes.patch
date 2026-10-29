@@ -1,0 +1,862 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/lib/errors.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/lib/errors.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/lib/errors.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/lib/errors.ts	2026-10-09 14:05:47
+@@ -10,7 +10,7 @@
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+-import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { AlreadyArchivedError, RestoreRefusedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+ import type { ActionResult, AppErrorShape, ErrorCode } from "@/types/api";
+ import { ZodError, type ZodIssue } from "zod";
+@@ -34,6 +34,7 @@
+     error instanceof TenantScopeError ||
+     error instanceof FeatureDisabledError ||
+     error instanceof AlreadyArchivedError ||
++    error instanceof RestoreRefusedError ||
+     error instanceof InvalidSlugError ||
+     error instanceof ZodError
+   );
+@@ -93,6 +94,14 @@
+       code: "conflict",
+       message: error.message,
+       meta: { entity: error.entity, id: error.id },
++    };
++  }
++
++  if (error instanceof RestoreRefusedError) {
++    return {
++      code: "conflict",
++      message: error.message,
++      meta: { reason: error.reason },
+     };
+   }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/lib/soft-delete.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/lib/soft-delete.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/lib/soft-delete.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/lib/soft-delete.ts	2026-10-09 14:05:47
+@@ -4,8 +4,9 @@
+ /**
+  * Soft-delete conventions.
+  *
+- * Issues, projects and comments are never physically removed — they get an
+- * `archived_at` timestamp. Repositories must express "live rows only" through
++ * Issues, projects and comments get an `archived_at` timestamp. Archived
++ * issues can be restored until their plan's retention window ends, then are
++ * permanently purged. Repositories must express "live rows only" through
+  * these helpers so the predicate stays in one place; a raw
+  * `isNull(table.archivedAt)` sprinkled through the data layer is exactly the
+  * drift this module prevents.
+@@ -55,6 +56,21 @@
+   constructor(readonly entity: string, readonly id: string) {
+     super(`${entity} ${id} is already archived.`);
+     this.name = "AlreadyArchivedError";
++  }
++}
++
++export type RestoreRefusedReason =
++  | "not_archived"
++  | "expired"
++  | "project_archived"
++  | "quota";
++
++export class RestoreRefusedError extends Error {
++  readonly code = "conflict" as const;
++
++  constructor(readonly reason: RestoreRefusedReason) {
++    super(`Issue restore refused: ${reason}`);
++    this.name = "RestoreRefusedError";
+   }
+ }
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/db/migrate.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/db/migrate.ts	2026-10-09 14:06:11
+@@ -158,6 +158,12 @@
+   `CREATE INDEX IF NOT EXISTS issues_org_assignee_idx ON issues (org_id, assignee_id)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_archived_idx ON issues (org_id, archived_at)`,
+   `CREATE INDEX IF NOT EXISTS issues_org_due_idx ON issues (org_id, due_at)`,
++  `CREATE TABLE IF NOT EXISTS issue_number_counters (
++     org_id TEXT NOT NULL,
++     project_id TEXT NOT NULL,
++     last_number INTEGER NOT NULL
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS issue_number_counters_pk ON issue_number_counters (org_id, project_id)`,
+   `CREATE TABLE IF NOT EXISTS labels (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/db/schema/issues.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/db/schema/issues.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/db/schema/issues.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/db/schema/issues.ts	2026-10-09 14:06:11
+@@ -57,6 +57,19 @@
+   (table) => [uniqueIndex("labels_org_name_idx").on(table.orgId, table.name)],
+ );
+ 
++/** Purging issue rows must never make their project numbers available again. */
++export const issueNumberCounters = sqliteTable(
++  "issue_number_counters",
++  {
++    ...tenantColumns,
++    projectId: text("project_id").notNull(),
++    lastNumber: integer("last_number").notNull(),
++  },
++  (table) => [
++    uniqueIndex("issue_number_counters_pk").on(table.orgId, table.projectId),
++  ],
++);
++
+ export const issueLabels = sqliteTable(
+   "issue_labels",
+   {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/jobs/cleanup-archived-job.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/jobs/cleanup-archived-job.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/jobs/cleanup-archived-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/jobs/cleanup-archived-job.ts	2026-10-09 14:06:11
+@@ -1,22 +1,19 @@
+ /**
+  * Permanently removes rows archived longer ago than the plan's `retentionDays`.
+  *
+- * Must call (do not reimplement): getPlanLimits, isArchived
++ * Must call (do not reimplement): getPlanLimits
+  */
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { createLogger } from "@/lib/logger";
+-import { isArchived } from "@/lib/soft-delete";
+ import * as activityRepo from "@/server/repositories/activity-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+-import * as searchRepo from "@/server/repositories/search-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { runJob } from "./types";
+ import type { JobResult } from "@/server/jobs/types";
+ 
+ const ORG_BATCH = 25;
+-const PAGE_SIZE = 100;
+ const MS_PER_DAY = 24 * 60 * 60 * 1000;
+ 
+ const logger = createLogger("cleanup-archived-job");
+@@ -26,9 +23,8 @@
+  * promises and no longer: the cut-off comes from `retentionDays`, so an
+  * enterprise tenant keeps years of history where a free one keeps a month.
+  *
+- * Only the search documents are actually dropped here — the issue rows stay,
+- * because the audit log still points at them — while the audit rows past the
+- * window are purged outright.
++ * Expired issues, their dependents and their search documents are purged
++ * together. Audit rows past the same window are purged separately.
+  */
+ export async function runCleanupArchivedJob(now: Date): Promise<JobResult> {
+   return runJob("cleanup-archived", async (result) => {
+@@ -43,20 +39,7 @@
+         new Date(now.getTime() - retentionDays * MS_PER_DAY),
+       );
+ 
+-      const archived = await issueRepo.listIssues({
+-        orgId,
+-        limit: PAGE_SIZE,
+-        cursor: null,
+-        includeArchived: true,
+-      });
+-
+-      for (const issue of archived.items) {
+-        if (!isArchived(issue)) continue;
+-        if (issue.archivedAt === null || issue.archivedAt > cutoff) continue;
+-
+-        await searchRepo.deleteSearchDocument(orgId, "issue", issue.id);
+-        result.processed += 1;
+-      }
++      result.processed += await issueRepo.purgeArchivedIssuesBefore(orgId, cutoff);
+ 
+       try {
+         const purged = await activityRepo.purgeActivityBefore(orgId, cutoff);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/repositories/issue-repository.ts	2026-10-09 14:06:48
+@@ -13,6 +13,7 @@
+   isNull,
+   like,
+   lt,
++  lte,
+   or,
+   sql,
+ } from "drizzle-orm";
+@@ -22,7 +23,16 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import {
++  attachments,
++  comments,
++  getDb,
++  issueLabels,
++  issueNumberCounters,
++  issues,
++  organizationUsage,
++  searchIndex,
++} from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -54,6 +64,7 @@
+ 
+ /** Statuses whose entry stamps `completed_at`; leaving one clears it again. */
+ const TERMINAL_STATUSES: readonly IssueStatus[] = ["done", "canceled"];
++const BYTES_PER_MB = 1024 * 1024;
+ 
+ export async function findIssueById(
+   orgId: OrgId,
+@@ -286,8 +297,8 @@
+ }
+ 
+ /**
+- * Next per-project issue number. Archived issues keep their number, so the
+- * max is taken over every row rather than the live ones.
++ * Next per-project issue number, including archived and permanently purged
++ * issues. The counter preserves the high-water mark when rows are purged.
+  */
+ export async function nextIssueNumber(
+   orgId: OrgId,
+@@ -300,9 +311,119 @@
+       and(orgPredicate(issues.orgId, orgId), eq(issues.projectId, projectId)),
+     )
+     .get();
+-  return (row?.value ?? 0) + 1;
++  const counter = getDb()
++    .select({ value: issueNumberCounters.lastNumber })
++    .from(issueNumberCounters)
++    .where(
++      and(
++        orgPredicate(issueNumberCounters.orgId, orgId),
++        eq(issueNumberCounters.projectId, projectId),
++      ),
++    )
++    .get();
++  return Math.max(row?.value ?? 0, counter?.value ?? 0) + 1;
+ }
+ 
++/**
++ * Purges the entire expired set in one transaction. Subqueries avoid both
++ * listing limits and SQLite's limit on the number of bound issue ids.
++ */
++export async function purgeArchivedIssuesBefore(
++  orgId: OrgId,
++  cutoff: IsoTimestamp,
++): Promise<number> {
++  return getDb().transaction((tx) => {
++    const expired = and(
++      orgPredicate(issues.orgId, orgId),
++      isNotNull(issues.archivedAt),
++      lte(issues.archivedAt, cutoff),
++    );
++    const expiredIds = tx.select({ id: issues.id }).from(issues).where(expired);
++
++    const numbers = tx
++      .select({
++        projectId: issues.projectId,
++        lastNumber: sql<number>`max(${issues.number})`,
++      })
++      .from(issues)
++      .where(expired)
++      .groupBy(issues.projectId)
++      .all();
++
++    if (numbers.length === 0) return 0;
++
++    for (const number of numbers) {
++      tx.insert(issueNumberCounters)
++        .values({ orgId, ...number })
++        .onConflictDoUpdate({
++          target: [issueNumberCounters.orgId, issueNumberCounters.projectId],
++          set: {
++            lastNumber: sql`max(${issueNumberCounters.lastNumber}, ${number.lastNumber})`,
++          },
++        })
++        .run();
++    }
++
++    const expiredAttachments = and(
++      orgPredicate(attachments.orgId, orgId),
++      inArray(attachments.issueId, expiredIds),
++    );
++    const storage = tx
++      .select({
++        value: sql<number | null>`sum((${attachments.sizeBytes} + ${BYTES_PER_MB - 1}) / ${BYTES_PER_MB})`,
++      })
++      .from(attachments)
++      .where(expiredAttachments)
++      .get();
++
++    const expiredComments = and(
++      orgPredicate(comments.orgId, orgId),
++      inArray(comments.issueId, expiredIds),
++    );
++    const commentIds = tx
++      .select({ id: comments.id })
++      .from(comments)
++      .where(expiredComments);
++
++    tx.delete(searchIndex)
++      .where(
++        and(
++          orgPredicate(searchIndex.orgId, orgId),
++          or(
++            and(
++              eq(searchIndex.subjectKind, "issue"),
++              inArray(searchIndex.subjectId, expiredIds),
++            ),
++            and(
++              eq(searchIndex.subjectKind, "comment"),
++              inArray(searchIndex.subjectId, commentIds),
++            ),
++          ),
++        ),
++      )
++      .run();
++    tx.delete(issueLabels)
++      .where(
++        and(
++          orgPredicate(issueLabels.orgId, orgId),
++          inArray(issueLabels.issueId, expiredIds),
++        ),
++      )
++      .run();
++    tx.delete(comments).where(expiredComments).run();
++    tx.delete(attachments).where(expiredAttachments).run();
++    tx.update(organizationUsage)
++      .set({
++        storageMbUsed: sql`${organizationUsage.storageMbUsed} - ${storage?.value ?? 0}`,
++        measuredAt: toIsoTimestamp(new Date()),
++      })
++      .where(eq(organizationUsage.orgId, orgId))
++      .run();
++
++    return tx.delete(issues).where(expired).run().changes;
++  });
++}
++
+ export async function insertIssue(
+   input: CreateIssueInput,
+   authorId: UserId,
+@@ -477,7 +598,8 @@
+     .get();
+ 
+   if (!row) throw new Error(`Issue ${issueId} not found`);
+-  return toIssue(row);
++  const labels = await listLabelsForIssues(orgId, [issueId]);
++  return toIssue(row, (labels[issueId] ?? []).map((label) => label.id));
+ }
+ 
+ /** Cascade behind `ProjectService.archiveProject`; returns the row count. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/repositories/usage-repository.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/repositories/usage-repository.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/repositories/usage-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/repositories/usage-repository.ts	2026-10-09 14:06:11
+@@ -73,8 +73,11 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  // Each upload consumes its size rounded up to whole MB independently.
++  const storage = db
++    .select({
++      value: sql<number | null>`sum((${attachments.sizeBytes} + ${BYTES_PER_MB - 1}) / ${BYTES_PER_MB})`,
++    })
+     .from(attachments)
+     .where(eq(attachments.orgId, orgId))
+     .get();
+@@ -84,7 +87,7 @@
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed: storage?.value ?? 0,
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/activity-service.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/activity-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/activity-service.ts	2026-10-09 14:06:11
+@@ -176,6 +176,15 @@
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.restored", (payload) =>
++      record(payload.orgId, "issue.restored", {
++        actorId: payload.actorId,
++        subjectKind: "issue",
++        subjectId: payload.issueId,
++        projectId: payload.projectId,
++        summary: `Restored issue ${payload.issueId}`,
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/issue-service.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/issue-service.ts	2026-10-09 14:06:48
+@@ -3,10 +3,14 @@
+  *
+  * Must call (do not reimplement): assertCan, assertOrgScope, emit, wouldExceedLimit, assertNotArchived
+  */
+-import { wouldExceedLimit } from "@/config/plan-limits";
++import { getPlanLimits, wouldExceedLimit } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+-import { assertNotArchived } from "@/lib/soft-delete";
++import {
++  assertNotArchived,
++  isArchived,
++  RestoreRefusedError,
++} from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+@@ -212,6 +216,59 @@
+   });
+ 
+   return archived;
++}
++
++export async function restoreIssue(
++  actor: Actor,
++  orgId: OrgId,
++  issueId: IssueId,
++): Promise<Issue> {
++  assertOrgScope(actor, orgId);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(orgId, issueId),
++    "Issue",
++    issueId,
++  );
++  assertCan(actor, "issue:archive", issueResource(issue));
++
++  if (issue.archivedAt === null) {
++    throw new RestoreRefusedError("not_archived");
++  }
++
++  const org = requireFound(
++    await orgRepo.findOrgById(orgId),
++    "Organization",
++    orgId,
++  );
++  const { retentionDays } = getPlanLimits(org.plan);
++  const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
++  if (Date.now() - new Date(issue.archivedAt).getTime() >= retentionMs) {
++    throw new RestoreRefusedError("expired");
++  }
++
++  const project = requireFound(
++    await projectRepo.findProjectById(orgId, issue.projectId),
++    "Project",
++    issue.projectId,
++  );
++  if (isArchived(project)) {
++    throw new RestoreRefusedError("project_archived");
++  }
++
++  const used = await issueRepo.countIssues(orgId, issue.projectId);
++  if (wouldExceedLimit(org.plan, "issuesPerProject", used)) {
++    throw new RestoreRefusedError("quota");
++  }
++
++  const restored = await issueRepo.restoreIssue(orgId, issueId);
++  await emit("issue.restored", {
++    ...actorEnvelope(actor),
++    issueId: restored.id,
++    projectId: restored.projectId,
++  });
++
++  return restored;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/search-service.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/search-service.ts	2026-10-09 14:05:47
+@@ -147,6 +147,10 @@
+     subscribe("issue.archived", async (payload) => {
+       await removeFromIndex(payload.orgId, "issue", payload.issueId);
+     }),
++    subscribe("issue.restored", async (payload) => {
++      const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++      if (issue) await indexIssue(payload.orgId, issue);
++    }),
+     subscribe("comment.created", async (payload) => {
+       const comment = await commentRepo.findCommentById(
+         payload.orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/usage-service.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/usage-service.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/server/services/usage-service.ts	2026-10-09 14:05:47
+@@ -77,6 +77,9 @@
+     subscribe("issue.archived", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { issuesUsed: -1 });
+     }),
++    subscribe("issue.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { issuesUsed: 1 });
++    }),
+     subscribe("project.created", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/types/event.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/types/event.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/src/types/event.ts	2026-10-09 14:05:47
+@@ -61,6 +61,7 @@
+     assigneeId: UserId;
+   };
+   "issue.archived": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
++  "issue.restored": EventEnvelope & { issueId: IssueId; projectId: ProjectId };
+   "issue.overdue": EventEnvelope & {
+     issueId: IssueId;
+     projectId: ProjectId;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/lib/errors.test.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/lib/errors.test.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/lib/errors.test.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/lib/errors.test.ts	2026-10-09 14:06:48
+@@ -11,7 +11,7 @@
+ import { FeatureDisabledError } from "@/lib/feature-flags";
+ import { PermissionDeniedError, explain } from "@/lib/permissions";
+ import { InvalidSlugError } from "@/lib/slug";
+-import { AlreadyArchivedError } from "@/lib/soft-delete";
++import { AlreadyArchivedError, RestoreRefusedError } from "@/lib/soft-delete";
+ import { TenantScopeError } from "@/lib/tenant";
+ import type { OrgId } from "@/types/common";
+ import { makeActor, ORG_A, ORG_B } from "../helpers/factories";
+@@ -53,6 +53,22 @@
+     expect(shape.code).toBe("conflict");
+     expect(shape.meta?.entity).toBe("Issue");
+   });
++
++  it.each(["not_archived", "expired", "project_archived", "quota"] as const)(
++    "maps a %s restore refusal to conflict",
++    (reason) => {
++      const error = new RestoreRefusedError(reason);
++      expect(error).toBeInstanceOf(Error);
++      expect(error.code).toBe("conflict");
++      expect(error.reason).toBe(reason);
++      expect(isDomainError(error)).toBe(true);
++      expect(toAppError(error)).toMatchObject({
++        code: "conflict",
++        message: error.message,
++        meta: { reason },
++      });
++    },
++  );
+ 
+   it("maps an invalid slug to `validation_failed` with a slug field error", () => {
+     const shape = toAppError(new InvalidSlugError("Admin!", "is reserved"));
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/server/issue-trash.test.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/server/issue-trash.test.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/server/issue-trash.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/server/issue-trash.test.ts	2026-10-09 14:07:50
+@@ -0,0 +1,278 @@
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
++import { and, eq } from "drizzle-orm";
++
++vi.mock("@/lib/logger", async () => (await import("./_support/doubles/misc")).loggerModule);
++
++import { getPlanLimits } from "@/config/plan-limits";
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { RestoreRefusedError } from "@/lib/soft-delete";
++import { TenantScopeError } from "@/lib/tenant";
++import { getDb, issues, issueLabels, organizations } from "@/server/db";
++import { runCleanupArchivedJob } from "@/server/jobs/cleanup-archived-job";
++import * as activityRepo from "@/server/repositories/activity-repository";
++import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import * as commentRepo from "@/server/repositories/comment-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as labelRepo from "@/server/repositories/label-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
++import * as searchRepo from "@/server/repositories/search-repository";
++import * as usageRepo from "@/server/repositories/usage-repository";
++import { NotFoundError } from "@/server/services/_support";
++import { registerActivityListeners } from "@/server/services/activity-service";
++import { addAttachment } from "@/server/services/attachment-service";
++import * as issueService from "@/server/services/issue-service";
++import { registerSearchListeners } from "@/server/services/search-service";
++import { registerUsageListeners } from "@/server/services/usage-service";
++import { toIsoTimestamp } from "@/types/common";
++import type { IssueId } from "@/types/common";
++import type { Unsubscribe } from "@/types/event";
++import { createTenant, issueInput, useTemporaryDatabase } from "./_support/fixtures";
++import type { Tenant } from "./_support/fixtures";
++
++const NOW = new Date("2026-06-01T12:34:56.789Z");
++const DAY = 24 * 60 * 60 * 1000;
++const CUTOFF = new Date(NOW.getTime() - getPlanLimits("free").retentionDays * DAY);
++let cleanup: () => void;
++let tenant: Tenant;
++let tenantNumber = 0;
++const detachers: Unsubscribe[] = [];
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  detachers.push(registerActivityListeners(), registerSearchListeners(), registerUsageListeners());
++});
++
++beforeEach(async () => {
++  vi.useFakeTimers({ toFake: ["Date"] });
++  vi.setSystemTime(NOW);
++  tenant = await createTenant(`trash-${++tenantNumber}`, "free");
++  await usageRepo.recomputeUsage(tenant.org.id);
++});
++
++afterEach(() => vi.useRealTimers());
++afterAll(() => {
++  for (const detach of detachers) detach();
++  cleanup();
++});
++
++async function createIssue() {
++  return issueService.createIssue(
++    tenant.actors.member,
++    issueInput(tenant.org.id, tenant.project.id),
++  );
++}
++
++function archiveAt(issueId: IssueId, at: Date) {
++  getDb().update(issues)
++    .set({ archivedAt: toIsoTimestamp(at) })
++    .where(and(eq(issues.orgId, tenant.org.id), eq(issues.id, issueId)))
++    .run();
++}
++
++describe("restoring issues from trash", () => {
++  it("checks tenant scope, existence and permission before refusal reasons", async () => {
++    const issue = await createIssue();
++    const other = await createTenant("trash-other", "free");
++    await expect(issueService.restoreIssue(tenant.actors.owner, other.org.id, issue.id))
++      .rejects.toBeInstanceOf(TenantScopeError);
++    await expect(issueService.restoreIssue(tenant.actors.owner, tenant.org.id, "missing" as IssueId))
++      .rejects.toBeInstanceOf(NotFoundError);
++    await expect(issueService.restoreIssue(tenant.actors.viewer, tenant.org.id, issue.id))
++      .rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(issueService.restoreIssue(tenant.actors.owner, tenant.org.id, issue.id))
++      .rejects.toMatchObject({ reason: "not_archived" });
++  });
++
++  it.each(["author", "assignee"] as const)("allows a viewer who is the %s to restore", async (ownership) => {
++    const issue = await issueService.createIssue(
++      tenant.actors.member,
++      issueInput(tenant.org.id, tenant.project.id, {
++        assigneeId: ownership === "assignee" ? tenant.userIds.viewer : null,
++      }),
++    );
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    const actor = ownership === "author"
++      ? { ...tenant.actors.member, role: "viewer" as const }
++      : tenant.actors.viewer;
++    await expect(issueService.restoreIssue(actor, tenant.org.id, issue.id))
++      .resolves.toMatchObject({ archivedAt: null, number: issue.number });
++  });
++
++  it("restores just before expiry, preserving labels and number and updating all listeners", async () => {
++    const label = await labelRepo.insertLabel({
++      orgId: tenant.org.id, name: "preserved", color: "#123456", description: null,
++    });
++    const issue = await issueService.createIssue(tenant.actors.member, {
++      ...issueInput(tenant.org.id, tenant.project.id), labelIds: [label.id],
++    });
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    archiveAt(issue.id, new Date(CUTOFF.getTime() + 1));
++    const seen: unknown[] = [];
++    const off = subscribe("issue.restored", (event) => { seen.push(event); });
++    try {
++      const restored = await issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id);
++      expect(restored).toMatchObject({ id: issue.id, archivedAt: null, number: issue.number, labelIds: [label.id] });
++      expect(seen).toEqual([expect.objectContaining({
++        orgId: tenant.org.id, actorId: tenant.userIds.member,
++        issueId: issue.id, projectId: issue.projectId, occurredAt: NOW.toISOString(),
++      })]);
++      expect((await usageRepo.getUsage(tenant.org.id)).issuesUsed).toBe(1);
++      expect(await searchRepo.countIndexed(tenant.org.id)).toBe(1);
++      const audit = await activityRepo.listActivity({
++        orgId: tenant.org.id, action: ["issue.restored"], limit: 100, cursor: null,
++      });
++      expect(audit.items).toEqual([expect.objectContaining({
++        action: "issue.restored", subjectKind: "issue", subjectId: issue.id,
++        actorId: tenant.userIds.member, projectId: issue.projectId,
++      })]);
++    } finally {
++      off();
++    }
++  });
++
++  it.each([0, -1])("refuses at or after expiry (%i ms) without writes or events", async (offset) => {
++    const issue = await createIssue();
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    archiveAt(issue.id, new Date(CUTOFF.getTime() + offset));
++    const before = await issueRepo.findIssueById(tenant.org.id, issue.id);
++    const usage = await usageRepo.getUsage(tenant.org.id);
++    const seen = vi.fn();
++    const off = subscribe("issue.restored", seen);
++    try {
++      await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++        .rejects.toEqual(new RestoreRefusedError("expired"));
++      expect(await issueRepo.findIssueById(tenant.org.id, issue.id)).toEqual(before);
++      expect(await usageRepo.getUsage(tenant.org.id)).toEqual(usage);
++      expect(await searchRepo.countIndexed(tenant.org.id)).toBe(0);
++      expect((await activityRepo.listActivity({
++        orgId: tenant.org.id, action: ["issue.restored"], limit: 100, cursor: null,
++      })).total).toBe(0);
++      expect(seen).not.toHaveBeenCalled();
++    } finally {
++      off();
++    }
++  });
++
++  it("uses the workspace's current plan for expiry", async () => {
++    const issue = await createIssue();
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    archiveAt(issue.id, new Date(NOW.getTime() - 45 * DAY));
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++      .rejects.toMatchObject({ reason: "expired" });
++    getDb().update(organizations).set({ plan: "starter" })
++      .where(eq(organizations.id, tenant.org.id)).run();
++    await runCleanupArchivedJob(NOW);
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++      .resolves.toMatchObject({ archivedAt: null });
++  });
++
++  it("refuses restoration into an archived project", async () => {
++    const issue = await createIssue();
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    await projectRepo.archiveProject(tenant.org.id, tenant.project.id);
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++      .rejects.toMatchObject({ reason: "project_archived" });
++    expect((await issueRepo.findIssueById(tenant.org.id, issue.id))?.archivedAt).not.toBeNull();
++  });
++
++  it("counts only live issues in this project for the restore quota", async () => {
++    const issue = await createIssue();
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, issue.id);
++    for (let number = 2; number <= 101; number++) {
++      await issueRepo.insertIssue(issueInput(tenant.org.id, tenant.project.id), tenant.userIds.member, number);
++    }
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++      .rejects.toMatchObject({ reason: "quota" });
++    const last = await issueRepo.findIssueByNumber(tenant.org.id, tenant.project.id, 101);
++    await issueRepo.archiveIssue(tenant.org.id, last!.id);
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id))
++      .resolves.toMatchObject({ archivedAt: null });
++    expect(await issueRepo.countIssues(tenant.org.id, tenant.project.id)).toBe(100);
++  });
++});
++
++describe("permanent issue purge", () => {
++  it("removes dependents and search documents, refunds each attachment and preserves numbers", async () => {
++    const retained = await createIssue();
++    const doomed = await createIssue();
++    const label = await labelRepo.insertLabel({
++      orgId: tenant.org.id, name: "shared-label", color: "#123456", description: null,
++    });
++    await issueRepo.updateIssue({ orgId: tenant.org.id, issueId: doomed.id, labelIds: [label.id] });
++    for (const issue of [doomed, retained]) {
++      for (const sizeBytes of issue === doomed ? [1, 1, 1048577] : [1]) {
++        await addAttachment(tenant.actors.member, {
++          orgId: tenant.org.id, issueId: issue.id, filename: "file.txt",
++          contentType: "text/plain", sizeBytes,
++        });
++      }
++    }
++    const root = await commentRepo.insertComment({
++      orgId: tenant.org.id, issueId: doomed.id, body: "root", parentId: null, mentionedUserIds: [],
++    }, tenant.userIds.member);
++    const reply = await commentRepo.insertComment({
++      orgId: tenant.org.id, issueId: doomed.id, body: "reply", parentId: root.id, mentionedUserIds: [],
++    }, tenant.userIds.member);
++    await commentRepo.archiveComment(tenant.org.id, root.id);
++    for (const comment of [root, reply]) {
++      await searchRepo.upsertSearchDocument(tenant.org.id, "comment", comment.id, comment.body, null);
++    }
++    await issueService.archiveIssue(tenant.actors.member, tenant.org.id, doomed.id);
++    archiveAt(doomed.id, CUTOFF);
++    // A stale issue document must also be removed by the purge itself.
++    await searchRepo.upsertSearchDocument(tenant.org.id, "issue", doomed.id, doomed.title, doomed.projectId);
++    const before = await usageRepo.getUsage(tenant.org.id);
++    expect(before.storageMbUsed).toBe(5);
++    expect((await usageRepo.recomputeUsage(tenant.org.id)).storageMbUsed).toBe(5);
++
++    await runCleanupArchivedJob(NOW);
++
++    expect(await issueRepo.findIssueById(tenant.org.id, doomed.id)).toBeNull();
++    expect(await attachmentRepo.listAttachments(tenant.org.id, doomed.id)).toEqual([]);
++    expect(await commentRepo.findCommentById(tenant.org.id, root.id)).toBeNull();
++    expect(await commentRepo.findCommentById(tenant.org.id, reply.id)).toBeNull();
++    expect(getDb().select().from(issueLabels).where(eq(issueLabels.issueId, doomed.id)).all()).toEqual([]);
++    expect((await labelRepo.listLabels(tenant.org.id)).map((item) => item.id)).toContain(label.id);
++    expect(await searchRepo.countIndexed(tenant.org.id)).toBe(1);
++    const usage = await usageRepo.getUsage(tenant.org.id);
++    expect(usage.storageMbUsed).toBe(1);
++    expect(usage.issuesUsed).toBe(before.issuesUsed);
++    expect((await usageRepo.recomputeUsage(tenant.org.id)).storageMbUsed).toBe(usage.storageMbUsed);
++    await expect(issueService.restoreIssue(tenant.actors.member, tenant.org.id, doomed.id))
++      .rejects.toBeInstanceOf(NotFoundError);
++    expect((await createIssue()).number).toBe(doomed.number + 1);
++    await runCleanupArchivedJob(NOW);
++    expect((await usageRepo.getUsage(tenant.org.id)).storageMbUsed).toBe(1);
++  });
++
++  it("purges every expired issue across projects beyond listing limits and keeps newer rows", async () => {
++    const second = await projectRepo.insertProject({
++      orgId: tenant.org.id, name: "Second", slug: "second", key: "SEC",
++      description: null, visibility: "org", leadId: null, color: "#123456", targetDate: null,
++    });
++    for (const project of [tenant.project, second]) {
++      for (let number = 1; number <= 125; number++) {
++        const issue = await issueRepo.insertIssue(issueInput(tenant.org.id, project.id), tenant.userIds.member, number);
++        archiveAt(issue.id, CUTOFF);
++      }
++    }
++    // Newer live rows would hide all the expired rows behind the first page.
++    vi.setSystemTime(new Date(NOW.getTime() + 1000));
++    for (let number = 126; number <= 235; number++) {
++      await issueRepo.insertIssue(issueInput(tenant.org.id, tenant.project.id), tenant.userIds.member, number);
++    }
++    const recent = await issueRepo.insertIssue(issueInput(tenant.org.id, second.id), tenant.userIds.member, 126);
++    archiveAt(recent.id, new Date(CUTOFF.getTime() + 1));
++    await usageRepo.recomputeUsage(tenant.org.id);
++    const result = await runCleanupArchivedJob(NOW);
++    expect(result.processed).toBeGreaterThanOrEqual(250);
++    expect(await issueRepo.countIssues(tenant.org.id, tenant.project.id, { includeArchived: true })).toBe(110);
++    expect(await issueRepo.countIssues(tenant.org.id, second.id, { includeArchived: true })).toBe(1);
++    expect(await issueRepo.findIssueById(tenant.org.id, recent.id)).not.toBeNull();
++    expect((await usageRepo.getUsage(tenant.org.id)).issuesUsed).toBe(110);
++    await runCleanupArchivedJob(new Date(NOW.getTime() + 1));
++    expect(await issueRepo.findIssueById(tenant.org.id, recent.id)).toBeNull();
++    expect(await issueRepo.nextIssueNumber(tenant.org.id, second.id)).toBe(127);
++  });
++});
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/services/search-service.test.ts /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/services/search-service.test.ts
+--- /private/tmp/bench-scratch/d0471821-e0d2-41f2-8779-8381b7d92fcd/tests/services/search-service.test.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/df361f05-7809-4f7c-b3ad-c4abc65796e2/tests/services/search-service.test.ts	2026-10-09 14:06:48
+@@ -104,7 +104,7 @@
+     expect(fresh.items[0]).toMatchObject({ id: issue.id });
+   });
+ 
+-  it("drops an archived issue from the index", async () => {
++  it("drops an archived issue from the index and reindexes it on restore", async () => {
+     const issue = await issueService.createIssue(
+       tenant.actors.member,
+       issueInput(tenant.org.id, tenant.project.id, { title: "ArchiveIndexMarker" }),
+@@ -129,6 +129,18 @@
+       cursor: null,
+     });
+     expect(after.total).toBe(0);
++
++    await issueService.restoreIssue(tenant.actors.member, tenant.org.id, issue.id);
++
++    const restored = await searchService.search(tenant.actors.member, {
++      orgId: tenant.org.id,
++      q: "ArchiveIndexMarker",
++      kinds: ["issue"],
++      limit: 25,
++      cursor: null,
++    });
++    expect(restored.total).toBe(1);
++    expect(restored.items[0]).toMatchObject({ kind: "issue", id: issue.id });
+   });
+ 
+   it("never returns another tenant's rows", async () => {

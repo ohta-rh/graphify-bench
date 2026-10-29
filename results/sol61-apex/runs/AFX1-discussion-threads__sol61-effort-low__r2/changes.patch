@@ -1,0 +1,325 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/actions/comments/create-comment.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/actions/comments/create-comment.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/actions/comments/create-comment.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/actions/comments/create-comment.ts	2026-10-15 03:39:58
+@@ -11,18 +11,16 @@
+  * getActor, toActionResult
+  */
+ 
+-import { ForbiddenActionError, RateLimitedError } from "@/actions/_lib/action-errors";
++import { ForbiddenActionError } from "@/actions/_lib/action-errors";
+ import { PENDING_COMMENT_ID } from "@/actions/_lib/permission-resources";
+ import { withAction } from "@/actions/_lib/with-action";
+ import { CACHE_PROFILES, issueTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
+ import { createCommentSchema, type CreateCommentInput } from "@/schemas/comment";
+ import { createComment } from "@/server/services/comment-service";
+ import type { ActionResult } from "@/types/api";
+ import type { Comment } from "@/types/comment";
+ 
+-const COMMENT_BUCKET = "comment:create";
+ 
+ const run = withAction<typeof createCommentSchema, Comment>(
+   createCommentSchema,
+@@ -37,11 +35,6 @@
+     });
+     if (!allowed) {
+       throw new ForbiddenActionError("comment:create");
+-    }
+-
+-    const verdict = await consumeRateLimit(input.orgId, COMMENT_BUCKET);
+-    if (!verdict.allowed) {
+-      throw new RateLimitedError(COMMENT_BUCKET, verdict.resetAt);
+     }
+ 
+     const comment = await createComment(actor, input);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/lib/mentions.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/lib/mentions.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/lib/mentions.ts	2026-10-15 03:39:01
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/lib/mentions.ts	2026-10-15 03:40:06
+@@ -11,7 +11,7 @@
+ import type { MemberWithUser } from "@/types/member";
+ 
+ /** `@` must start the line or follow whitespace/punctuation, never an email. */
+-const MENTION_PATTERN = /(^|[\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi;
++const MENTION_PATTERN = /(^|[\s(<[])@([a-z0-9](?:[a-z0-9._+-]*[a-z0-9])?)/gi;
+ 
+ function withoutCode(body: string): string {
+   return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ");
+@@ -46,21 +46,14 @@
+   body: string,
+   members: readonly MemberWithUser[],
+ ): readonly UserId[] {
+-  const byHandle = new Map<string, UserId>();
+-  for (const member of members) {
+-    // Read-only members cannot take part in a discussion, so pinging them
+-    // only produces an alert they can do nothing about.
+-    if (member.role === "viewer") continue;
+-    byHandle.set(handleOf(member), member.userId);
+-  }
+-
++  const handles = new Set(extractMentions(body));
+   const resolved: UserId[] = [];
+   const seen = new Set<UserId>();
+-  for (const handle of extractMentions(body)) {
+-    const userId = byHandle.get(handle);
+-    if (userId === undefined || seen.has(userId)) continue;
+-    seen.add(userId);
+-    resolved.push(userId);
++  for (const member of members) {
++    if (member.status !== "active" || member.archivedAt !== null) continue;
++    if (!handles.has(handleOf(member)) || seen.has(member.userId)) continue;
++    seen.add(member.userId);
++    resolved.push(member.userId);
+   }
+ 
+   return resolved;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/lib/rate-limit.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/lib/rate-limit.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/lib/rate-limit.ts	2026-10-15 03:39:58
+@@ -77,9 +77,10 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  memberKey?: string,
+ ): Promise<RateLimitVerdict> {
+   const config = configFor(orgId, bucketKey);
+-  const key = `${orgId}:${bucketKey}`;
++  const key = JSON.stringify([orgId, bucketKey, memberKey ?? null]);
+   const nowMs = Date.now();
+ 
+   const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/repositories/comment-repository.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/repositories/comment-repository.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/repositories/comment-repository.ts	2026-10-15 03:39:01
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/repositories/comment-repository.ts	2026-10-15 03:40:06
+@@ -73,8 +73,8 @@
+ 
+ /**
+  * The whole thread for one issue, in reading order: top-level comments oldest
+- * first, each followed by its replies. A deleted top-level comment takes its
+- * thread with it — nothing to anchor the replies to once the opener is gone.
++ * first, each followed by all descendants in posting order. Deleted comments
++ * remain as empty placeholders anchoring their replies.
+  */
+ export async function listThread(
+   orgId: OrgId,
+@@ -95,23 +95,31 @@
+ 
+   const decorated: CommentWithAuthor[] = rows.map((row) => ({
+     ...toComment(row.comment),
++    ...(row.comment.archivedAt !== null ? { body: "", mentionedUserIds: [] } : {}),
+     author: toUser(row.author),
+   }));
+ 
++  const byId = new Map(decorated.map((comment) => [comment.id, comment]));
+   const repliesBy = new Map<string, CommentWithAuthor[]>();
+   for (const comment of decorated) {
+     if (comment.parentId === null) continue;
+-    const bucket = repliesBy.get(comment.parentId) ?? [];
++    let root = comment;
++    const seen = new Set<string>([root.id]);
++    while (root.parentId !== null) {
++      const parent = byId.get(root.parentId);
++      if (!parent || seen.has(parent.id)) break;
++      seen.add(parent.id);
++      root = parent;
++    }
++    if (root.parentId !== null) continue;
++    const bucket = repliesBy.get(root.id) ?? [];
+     bucket.push(comment);
+-    repliesBy.set(comment.parentId, bucket);
++    repliesBy.set(root.id, bucket);
+   }
+-
+-  return decorated
+-    .filter((comment) => comment.parentId === null && comment.archivedAt === null)
+-    .map((comment) => ({
+-      comment,
+-      replies: repliesBy.get(comment.id) ?? [],
+-    }));
++  return decorated.filter((comment) => comment.parentId === null).map((comment) => ({
++    comment,
++    replies: repliesBy.get(comment.id) ?? [],
++  }));
+ }
+ 
+ export async function countComments(
+@@ -159,12 +167,12 @@
+ 
+ /** An edit stamps `edited_at`, which the UI shows next to the timestamp. */
+ export async function updateComment(
+-  input: UpdateCommentInput,
++  input: UpdateCommentInput & { mentionedUserIds: readonly UserId[] },
+ ): Promise<Comment> {
+   const stamp = toIsoTimestamp(new Date());
+   const row = getDb()
+     .update(comments)
+-    .set({ body: input.body, editedAt: stamp, updatedAt: stamp })
++    .set({ body: input.body, mentionedUserIds: JSON.stringify(input.mentionedUserIds), editedAt: stamp, updatedAt: stamp })
+     .where(
+       and(
+         orgPredicate(comments.orgId, input.orgId),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/comment-service.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/comment-service.ts	2026-10-15 03:39:01
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/comment-service.ts	2026-10-15 03:39:58
+@@ -56,17 +56,26 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+-  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
++  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET, 1, actor.userId);
+   if (!verdict.allowed) {
+     throw new Error(
+       `Comment rate limit reached; try again after ${verdict.resetAt}`,
+     );
+   }
+ 
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (parent.issueId !== input.issueId) throw new Error("Reply must belong to the same issue");
++  }
++
+   const mentionedUserIds = await resolveMentionedUsers(
+     input.orgId,
+     input.body,
+-    input.mentionedUserIds,
++    actor.userId,
+   );
+ 
+   const comment = await commentRepo.insertComment(
+@@ -107,7 +116,15 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const mentionedUserIds = await resolveMentionedUsers(input.orgId, input.body, comment.authorId);
++  const updated = await commentRepo.updateComment({ ...input, mentionedUserIds });
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++    mentionedUserIds: mentionedUserIds.filter((id) => !comment.mentionedUserIds.includes(id)),
++  });
++  return updated;
+ }
+ 
+ /**
+@@ -163,31 +180,24 @@
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+-  // The window follows the last save: a typo fix a minute before the cut-off
+-  // must not lock the author out of correcting the correction.
+-  const posted = new Date(comment.updatedAt).getTime();
++  const posted = new Date(comment.createdAt).getTime();
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+-/**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The server list wins on disagreement.
+- */
++/** Resolve the body against every active member, excluding its author. */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+-  clientProvided: readonly UserId[],
++  authorId: UserId,
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
+-
+-  const resolved = resolveMentions(body, members.items);
+-  const known = new Set(members.items.map((member) => member.userId));
+-
+-  return [
+-    ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+-  ];
++  const resolved = new Set<UserId>();
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({ orgId, status: "active", limit: MENTION_LOOKUP_LIMIT, cursor });
++    for (const id of resolveMentions(body, page.items)) {
++      if (id !== authorId) resolved.add(id);
++    }
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  return [...resolved];
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/notification-service.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/notification-service.ts	2026-10-15 03:39:58
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -206,7 +207,13 @@
+       ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+       : [];
+ 
+-    await notify(payload.orgId, "comment_created", watchers, {
++    const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++    if (comment?.parentId) {
++      const parent = await commentRepo.findCommentById(payload.orgId, comment.parentId);
++      if (parent && parent.issueId === payload.issueId) watchers.push(parent.authorId);
++    }
++    const mentions = new Set(payload.mentionedUserIds);
++    await notify(payload.orgId, "comment_created", watchers.filter((id) => !mentions.has(id)), {
+       title: "New comment",
+       body: `A comment was added to issue ${payload.issueId}`,
+       href: `/issues/${payload.issueId}`,
+@@ -226,6 +233,15 @@
+         },
+       );
+     }
++  });
++
++  subscribe("comment.updated", async (payload) => {
++    await notify(payload.orgId, "comment_mention", payload.mentionedUserIds, {
++      title: "You were mentioned",
++      body: `You were mentioned on issue ${payload.issueId}`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    });
+   });
+ 
+   subscribe("member.joined", async (payload) => {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/search-service.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/server/services/search-service.ts	2026-10-15 03:39:58
+@@ -154,6 +154,10 @@
+       );
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
++    subscribe("comment.updated", async (payload) => {
++      const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++      if (comment) await indexComment(payload.orgId, comment);
++    }),
+     subscribe("comment.deleted", async (payload) => {
+       await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/types/event.ts /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/types/event.ts
+--- /private/tmp/bench-scratch/61add594-047b-48fc-a1dd-610ccd8fef17/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/cb5cf89a-4cea-463a-9e08-af7cbc8a3149/src/types/event.ts	2026-10-15 03:39:58
+@@ -72,6 +72,11 @@
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
+   };
++  "comment.updated": EventEnvelope & {
++    commentId: CommentId;
++    issueId: IssueId;
++    mentionedUserIds: readonly UserId[];
++  };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };
