@@ -1,0 +1,241 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/lib/storage.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/lib/storage.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/lib/storage.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/lib/storage.ts	2026-10-28 09:03:42
+@@ -0,0 +1,5 @@
++export const BYTES_PER_MB = 1024 * 1024;
++
++export function storageMbForFile(sizeBytes: number): number {
++  return Math.ceil(sizeBytes / BYTES_PER_MB);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/jobs/trial-expiry-job.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/jobs/trial-expiry-job.ts	2026-10-28 09:03:43
+@@ -38,13 +38,15 @@
+ 
+       if (
+         usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.projectsUsed > freeLimits.projects ||
++        usage.storageMbUsed > freeLimits.storageMb
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+           orgId,
+           seats: usage.seatsUsed,
+           projects: usage.projectsUsed,
++          storageMb: usage.storageMbUsed,
+         });
+         continue;
+       }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/repositories/attachment-repository.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/repositories/attachment-repository.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/repositories/attachment-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/repositories/attachment-repository.ts	2026-10-28 09:03:42
+@@ -29,6 +29,18 @@
+   return rows.map(toAttachment);
+ }
+ 
++export async function findAttachmentById(
++  orgId: OrgId,
++  attachmentId: AttachmentId,
++): Promise<IssueAttachment | null> {
++  const row = getDb()
++    .select()
++    .from(attachments)
++    .where(and(orgPredicate(attachments.orgId, orgId), eq(attachments.id, attachmentId)))
++    .get();
++  return row ? toAttachment(row) : null;
++}
++
+ export async function insertAttachment(
+   input: CreateAttachmentInput,
+   uploadedBy: UserId,
+@@ -57,8 +69,8 @@
+ export async function deleteAttachment(
+   orgId: OrgId,
+   attachmentId: AttachmentId,
+-): Promise<void> {
+-  getDb()
++): Promise<IssueAttachment | null> {
++  const row = getDb()
+     .delete(attachments)
+     .where(
+       and(
+@@ -66,7 +78,9 @@
+         eq(attachments.id, attachmentId),
+       ),
+     )
+-    .run();
++    .returning()
++    .get();
++  return row ? toAttachment(row) : null;
+ }
+ 
+ /** Total stored bytes for one tenant; `BillingService` converts to megabytes. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/repositories/usage-repository.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/repositories/usage-repository.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/repositories/usage-repository.ts	2026-10-28 09:03:12
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/repositories/usage-repository.ts	2026-10-28 09:03:43
+@@ -2,6 +2,7 @@
+  * The `organization_usage` counters read by every plan-limit check.
+  */
+ import { and, count, eq, isNull, sql } from "drizzle-orm";
++import { BYTES_PER_MB } from "@/lib/storage";
+ import {
+   attachments,
+   getDb,
+@@ -16,8 +17,6 @@
+ import type { OrgId } from "@/types/common";
+ import type { OrganizationUsage } from "@/types/organization";
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+ /**
+  * Reads the cached counters, materialising a zeroed row the first time an org
+  * is asked about. A limit check must never fail because the rollup has not run.
+@@ -73,9 +72,10 @@
+     .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
+     .get();
+ 
+-  const bytes = db
+-    .select({ value: sql<number | null>`sum(${attachments.sizeBytes})` })
++  const storage = db
++    .select({ value: sql<number | null>`sum((${attachments.sizeBytes} + ${BYTES_PER_MB - 1}) / ${BYTES_PER_MB})` })
+     .from(attachments)
++    .where(eq(attachments.orgId, orgId))
+     .get();
+ 
+   const next = {
+@@ -83,7 +83,7 @@
+     seatsUsed: seats?.value ?? 0,
+     projectsUsed: projectCount?.value ?? 0,
+     issuesUsed: issueCount?.value ?? 0,
+-    storageMbUsed: Math.ceil((bytes?.value ?? 0) / BYTES_PER_MB),
++    storageMbUsed: storage?.value ?? 0,
+     measuredAt: toIsoTimestamp(new Date()),
+   };
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/services/attachment-service.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/services/attachment-service.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/services/attachment-service.ts	2026-10-28 09:03:12
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/services/attachment-service.ts	2026-10-28 09:03:42
+@@ -5,6 +5,7 @@
+  */
+ import { wouldExceedLimit } from "@/config/plan-limits";
+ import { assertCan } from "@/lib/permissions";
++import { storageMbForFile } from "@/lib/storage";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+@@ -19,8 +20,6 @@
+ import type { IssueAttachment } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+ export async function listAttachments(
+   actor: Actor,
+   orgId: OrgId,
+@@ -64,7 +63,7 @@
+   );
+ 
+   const usage = await usageRepo.getUsage(input.orgId);
+-  const requestedMb = Math.ceil(input.sizeBytes / BYTES_PER_MB);
++  const requestedMb = storageMbForFile(input.sizeBytes);
+ 
+   if (
+     wouldExceedLimit(org.plan, "storageMb", usage.storageMbUsed, requestedMb)
+@@ -83,10 +82,7 @@
+   return attachment;
+ }
+ 
+-/**
+- * Removing an attachment gives the megabytes back to the quota — only whole
+- * ones, so a removal can never push the counter below what is really stored.
+- */
++/** Removing an attachment gives back the same amount charged on upload. */
+ export async function removeAttachment(
+   actor: Actor,
+   input: DeleteAttachmentInput,
+@@ -94,7 +90,7 @@
+   assertOrgScope(actor, input.orgId);
+ 
+   const attachment = requireFound(
+-    await findAttachment(input.orgId, input.attachmentId),
++    await attachmentRepo.findAttachmentById(input.orgId, input.attachmentId),
+     "Attachment",
+     input.attachmentId,
+   );
+@@ -106,32 +102,12 @@
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+-  await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
++  const deleted = requireFound(
++    await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId),
++    "Attachment",
++    input.attachmentId,
++  );
+   await usageRepo.incrementUsage(input.orgId, {
+-    storageMbUsed: -Math.floor(attachment.sizeBytes / BYTES_PER_MB),
++    storageMbUsed: -storageMbForFile(deleted.sizeBytes),
+   });
+-}
+-
+-/**
+- * The attachment repository only reads by issue, because that is the only way
+- * the UI ever reaches one. A delete arrives with just an id, so the org's
+- * issues are walked until the row turns up.
+- */
+-async function findAttachment(
+-  orgId: OrgId,
+-  attachmentId: string,
+-): Promise<IssueAttachment | null> {
+-  const page = await issueRepo.listIssues({
+-    orgId,
+-    limit: 100,
+-    cursor: null,
+-  });
+-
+-  for (const issue of page.items) {
+-    const rows = await attachmentRepo.listAttachments(orgId, issue.id);
+-    const match = rows.find((row) => row.id === attachmentId);
+-    if (match) return match;
+-  }
+-
+-  return null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/services/billing-service.ts /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/services/billing-service.ts
+--- /private/tmp/bench-scratch/e9f2f126-5cf8-4d07-8dc5-d666dfd82aea/src/server/services/billing-service.ts	2026-10-28 09:03:12
++++ /private/tmp/bench-scratch/9b1482a4-495a-419e-99eb-949865949226/src/server/services/billing-service.ts	2026-10-28 09:03:43
+@@ -11,7 +11,6 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+-import * as attachmentRepo from "@/server/repositories/attachment-repository";
+ import * as invoiceRepo from "@/server/repositories/invoice-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+@@ -221,13 +220,7 @@
+   return org.plan;
+ }
+ 
+-const BYTES_PER_MB = 1024 * 1024;
+-
+-/**
+- * Maps a quota dimension onto the counter that measures it. Storage is read
+- * from the attachment table itself: the cached counter only moves on the
+- * upload path, so it would lag behind what is actually stored.
+- */
++/** Maps a quota dimension onto the counter that measures it. */
+ async function usageFor(
+   orgId: OrgId,
+   resource: LimitedResource,
+@@ -242,9 +235,7 @@
+     case "issuesPerProject":
+       return usage.issuesUsed;
+     case "storageMb":
+-      return Math.round(
+-        (await attachmentRepo.sumStorageBytes(orgId)) / BYTES_PER_MB,
+-      );
++      return usage.storageMbUsed;
+     case "webhooks":
+       return webhookRepo.countEndpoints(orgId);
+     case "apiRequestsPerHour":

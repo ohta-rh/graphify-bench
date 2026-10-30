@@ -1,0 +1,328 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/actions/comments/create-comment.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/actions/comments/create-comment.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/actions/comments/create-comment.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/actions/comments/create-comment.ts	2026-10-27 19:12:05
+@@ -16,7 +16,7 @@
+ import { withAction } from "@/actions/_lib/with-action";
+ import { CACHE_PROFILES, issueTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumePlanRateLimit as consumeRateLimit } from "@/server/services/plan-rate-limit";
+ import { createCommentSchema, type CreateCommentInput } from "@/schemas/comment";
+ import { createComment } from "@/server/services/comment-service";
+ import type { ActionResult } from "@/types/api";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/actions/members/invite-member.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/actions/members/invite-member.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/actions/members/invite-member.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/actions/members/invite-member.ts	2026-10-27 19:12:05
+@@ -21,7 +21,7 @@
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { CACHE_PROFILES, orgTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumePlanRateLimit as consumeRateLimit } from "@/server/services/plan-rate-limit";
+ import { inviteMemberSchema, type InviteMemberInput } from "@/schemas/member";
+ import { inviteMember } from "@/server/services/invitation-service";
+ import { getOrganizationSummary } from "@/server/services/organization-service";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/lib/rate-limit.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/lib/rate-limit.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/lib/rate-limit.ts	2026-10-27 19:11:59
+@@ -32,7 +32,7 @@
+ /** Applied to any key not in the table above. */
+ const DEFAULT_BUCKET: RateLimitConfig = { capacity: 30, refillPerMinute: 10 };
+ 
+-type BucketState = { tokens: number; updatedAt: number };
++type BucketState = { tokens: number; updatedAt: number; capacity: number };
+ 
+ const buckets = new Map<string, BucketState>();
+ 
+@@ -53,9 +53,9 @@
+  * and the plan catalogue can never drift apart: the plan is the source of
+  * the ceiling, this table only sets the relative shape.
+  */
+-function configFor(orgId: OrgId, bucketKey: string): RateLimitConfig {
++function configFor(orgId: OrgId, bucketKey: string, currentPlan?: PlanId): RateLimitConfig {
+   const base = getBucketConfig(bucketKey);
+-  const plan = planByOrg.get(orgId) ?? "free";
++  const plan = currentPlan ?? planByOrg.get(orgId) ?? "free";
+   const hourly = getPlanLimits(plan).apiRequestsPerHour;
+   const factor = Number.isFinite(hourly) ? Math.max(1, hourly / 100) : 100;
+ 
+@@ -77,21 +77,22 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  currentPlan?: PlanId,
+ ): Promise<RateLimitVerdict> {
+-  const config = configFor(orgId, bucketKey);
++  const config = configFor(orgId, bucketKey, currentPlan);
+   const key = `${orgId}:${bucketKey}`;
+   const nowMs = Date.now();
+ 
+-  const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
++  const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs, capacity: config.capacity };
+   const elapsedMinutes = (nowMs - state.updatedAt) / 60_000;
+   const tokens = Math.min(
+     config.capacity,
+-    state.tokens + elapsedMinutes * config.refillPerMinute,
++    state.tokens + Math.max(0, config.capacity - state.capacity) + elapsedMinutes * config.refillPerMinute,
+   );
+ 
+   const allowed = tokens >= cost;
+   const remaining = allowed ? tokens - cost : tokens;
+-  buckets.set(key, { tokens: remaining, updatedAt: nowMs });
++  buckets.set(key, { tokens: remaining, updatedAt: nowMs, capacity: config.capacity });
+ 
+   const deficit = allowed ? config.capacity - remaining : cost - remaining;
+   const minutesToReset =
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/jobs/trial-expiry-job.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/jobs/trial-expiry-job.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/jobs/trial-expiry-job.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/jobs/trial-expiry-job.ts	2026-10-27 19:12:41
+@@ -6,6 +6,9 @@
+ import { getPlanLimits } from "@/config/plan-limits";
+ import { emit } from "@/lib/event-bus";
+ import { createLogger } from "@/lib/logger";
++import * as invitationRepo from "@/server/repositories/invitation-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as webhookRepo from "@/server/repositories/webhook-repository";
+ import * as subscriptionRepo from "@/server/repositories/subscription-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -36,9 +39,18 @@
+       const orgId = subscription.orgId as OrgId;
+       const usage = await usageRepo.getUsage(orgId);
+ 
++      const [pendingInvitations, issuesPerProject, webhooks] = await Promise.all([
++        invitationRepo.countPendingInvitations(orgId),
++        issueRepo.maxIssuesPerProject(orgId),
++        webhookRepo.countEndpoints(orgId),
++      ]);
++
+       if (
+-        usage.seatsUsed > freeLimits.seats ||
+-        usage.projectsUsed > freeLimits.projects
++        usage.seatsUsed + pendingInvitations > freeLimits.seats ||
++        usage.projectsUsed > freeLimits.projects ||
++        usage.storageMbUsed > freeLimits.storageMb ||
++        issuesPerProject > freeLimits.issuesPerProject ||
++        webhooks > freeLimits.webhooks
+       ) {
+         result.failed += 1;
+         logger.warn("trial expired but tenant is over the free plan", {
+@@ -49,11 +61,8 @@
+         continue;
+       }
+ 
+-      await subscriptionRepo.updateSubscriptionPlan(
+-        orgId,
+-        FALLBACK_PLAN,
+-        subscription.interval,
+-      );
++      const expired = await subscriptionRepo.expireTrial(subscription, stamp);
++      if (!expired) continue;
+ 
+       await emit("billing.plan_changed", {
+         orgId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/issue-repository.ts	2026-10-27 19:12:41
+@@ -264,6 +264,17 @@
+   });
+ }
+ 
++/** Largest live issue count in any project, for per-project plan limits. */
++export async function maxIssuesPerProject(orgId: OrgId): Promise<number> {
++  const rows = getDb()
++    .select({ value: count() })
++    .from(issues)
++    .where(and(eq(issues.orgId, orgId), isNull(issues.archivedAt)))
++    .groupBy(issues.projectId)
++    .all();
++  return rows.reduce((max, row) => Math.max(max, row.value), 0);
++}
++
+ export async function countIssues(
+   orgId: OrgId,
+   projectId: ProjectId,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/organization-repository.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/organization-repository.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/organization-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/organization-repository.ts	2026-10-27 19:11:59
+@@ -7,7 +7,7 @@
+ import { newId } from "@/lib/id";
+ import { uniqueSlug } from "@/lib/slug";
+ import { archivePatch } from "@/lib/soft-delete";
+-import { getDb, members, organizations } from "@/server/db";
++import { getDb, members, organizations, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { toOrganization } from "./_mappers";
+ import type {
+@@ -19,20 +19,22 @@
+ 
+ export async function findOrgById(orgId: OrgId): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(eq(organizations.id, orgId))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? { ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan } : null;
+ }
+ 
+ export async function findOrgBySlug(slug: string): Promise<Organization | null> {
+   const row = getDb()
+-    .select()
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(organizations)
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(and(eq(organizations.slug, slug), isNull(organizations.archivedAt)))
+     .get();
+-  return row ? toOrganization(row) : null;
++  return row ? { ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan } : null;
+ }
+ 
+ /** Every org the user still holds a live membership in. */
+@@ -40,9 +42,10 @@
+   userId: UserId,
+ ): Promise<readonly Organization[]> {
+   const rows = getDb()
+-    .select({ org: organizations })
++    .select({ org: organizations, subscriptionPlan: subscriptions.plan })
+     .from(members)
+     .innerJoin(organizations, eq(organizations.id, members.orgId))
++    .leftJoin(subscriptions, eq(subscriptions.orgId, organizations.id))
+     .where(
+       and(
+         eq(members.userId, userId),
+@@ -52,7 +55,7 @@
+     )
+     .all();
+ 
+-  return rows.map((row) => toOrganization(row.org));
++  return rows.map((row) => ({ ...toOrganization(row.org), plan: row.subscriptionPlan ?? row.org.plan }));
+ }
+ 
+ /**
+@@ -111,10 +114,11 @@
+     .returning()
+     .get();
+ 
+-  return toOrganization(row);
++  return { ...toOrganization(row), plan: current.plan };
+ }
+ 
+ export async function archiveOrg(orgId: OrgId): Promise<Organization> {
++  const current = await findOrgById(orgId);
+   const row = getDb()
+     .update(organizations)
+     .set(archivePatch())
+@@ -123,7 +127,7 @@
+     .get();
+ 
+   if (!row) throw new Error(`Organization ${orgId} not found`);
+-  return toOrganization(row);
++  return { ...toOrganization(row), plan: current?.plan ?? row.plan };
+ }
+ 
+ /** Feeds `uniqueSlug()`; matching on the prefix keeps the scan small. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/subscription-repository.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/subscription-repository.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/repositories/subscription-repository.ts	2026-10-27 19:11:07
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/repositories/subscription-repository.ts	2026-10-27 19:11:59
+@@ -1,7 +1,7 @@
+ /**
+  * Subscription rows; one active row per organization.
+  */
+-import { and, isNotNull, lte, ne } from "drizzle-orm";
++import { and, eq, isNotNull, lte, ne } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, subscriptions } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -112,8 +112,7 @@
+ 
+ /**
+  * Feeds the trial-expiry job; cross-tenant by design, it sweeps every org.
+- * Every paid subscription starts life as a trial whose first period is the
+- * trial window, so "a paid plan whose period has run out" is the whole test.
++ * Only subscriptions still trialing can expire.
+  */
+ export async function listTrialsEndingBefore(
+   before: IsoTimestamp,
+@@ -126,9 +125,30 @@
+         isNotNull(subscriptions.currentPeriodEnd),
+         lte(subscriptions.currentPeriodEnd, before),
+         ne(subscriptions.plan, "free"),
++        eq(subscriptions.status, "trialing"),
+       ),
+     )
+     .all();
+ 
+   return rows.map(toSubscription);
++}
++
++/** Expire only a trial that has not changed since it was selected. */
++export async function expireTrial(
++  subscription: Subscription,
++  before: IsoTimestamp,
++): Promise<Subscription | null> {
++  const row = getDb()
++    .update(subscriptions)
++    .set({ plan: "free", status: "active", updatedAt: toIsoTimestamp(new Date()) })
++    .where(and(
++      orgPredicate(subscriptions.orgId, subscription.orgId),
++      eq(subscriptions.id, subscription.id),
++      eq(subscriptions.status, "trialing"),
++      eq(subscriptions.plan, subscription.plan),
++      lte(subscriptions.currentPeriodEnd, before),
++    ))
++    .returning()
++    .get();
++  return row ? toSubscription(row) : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/comment-service.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/comment-service.ts	2026-10-27 19:12:05
+@@ -6,7 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { resolveMentions } from "@/lib/mentions";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumePlanRateLimit as consumeRateLimit } from "@/server/services/plan-rate-limit";
+ import { archivePatch, assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/invitation-service.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/invitation-service.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/invitation-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/invitation-service.ts	2026-10-27 19:12:05
+@@ -7,7 +7,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { hashToken, randomToken } from "@/lib/hash";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumePlanRateLimit as consumeRateLimit } from "@/server/services/plan-rate-limit";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as invitationRepo from "@/server/repositories/invitation-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/plan-rate-limit.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/plan-rate-limit.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/plan-rate-limit.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/plan-rate-limit.ts	2026-10-27 19:12:05
+@@ -0,0 +1,9 @@
++import { consumeRateLimit } from "@/lib/rate-limit";
++import * as orgRepo from "@/server/repositories/organization-repository";
++import type { OrgId } from "@/types/common";
++
++/** Resolve the current tenant plan on each request, including existing mismatches. */
++export async function consumePlanRateLimit(orgId: OrgId, bucketKey: string, cost = 1) {
++  const org = await orgRepo.findOrgById(orgId);
++  return consumeRateLimit(orgId, bucketKey, cost, org?.plan ?? "free");
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/search-service.ts /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/0c110422-40cf-4165-9763-04e441aea1e9/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/d2f5153c-bcb5-44b5-bd8e-5f966a437846/src/server/services/search-service.ts	2026-10-27 19:12:05
+@@ -6,7 +6,7 @@
+ import { subscribe } from "@/lib/event-bus";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
++import { consumePlanRateLimit as consumeRateLimit } from "@/server/services/plan-rate-limit";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";

@@ -1,0 +1,605 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/app/(dashboard)/[orgSlug]/activity/page.tsx /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/app/(dashboard)/[orgSlug]/activity/page.tsx
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/app/(dashboard)/[orgSlug]/activity/page.tsx	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/app/(dashboard)/[orgSlug]/activity/page.tsx	2026-10-28 11:07:02
+@@ -17,7 +17,8 @@
+ import { can } from "@/lib/permissions";
+ import { groupByDay, listActivity } from "@/server/services/activity-service";
+ import { buildFlagContext } from "@/server/services/feature-flag-service";
+-import { listMembers } from "@/server/services/member-service";
++import { findUsersByIds } from "@/server/repositories/user-repository";
++import { activityFilterSchema } from "@/schemas/activity";
+ import { searchParamsPaginationSchema } from "@/schemas/pagination";
+ import type { User } from "@/types/member";
+ import { loadTenantContext } from "../_lib/tenant-context";
+@@ -30,8 +31,6 @@
+   title: "Activity",
+ };
+ 
+-const MEMBER_LOOKUP_LIMIT = 100;
+-
+ export default async function Page(props: {
+   params: Promise<PageParams>;
+   searchParams: Promise<Record<string, string | string[] | undefined>>;
+@@ -57,18 +56,22 @@
+ 
+   const pagination = searchParamsPaginationSchema.parse(search);
+ 
+-  const [page, members] = await Promise.all([
+-    listActivity(actor, {
+-      orgId: org.id,
+-      limit: pagination.perPage,
+-      cursor: pagination.cursor ?? null,
+-    }),
+-    listMembers(actor, { orgId: org.id, limit: MEMBER_LOOKUP_LIMIT }),
+-  ]);
+-
++  const filter = activityFilterSchema.parse({
++    orgId: org.id,
++    projectId: search.projectId,
++    since: search.since,
++    until: search.until,
++    limit: pagination.perPage,
++    cursor: pagination.cursor ?? null,
++  });
++  const page = await listActivity(actor, filter);
++  const actorIds = [...new Set(page.items.flatMap((event) =>
++    event.actorId === null ? [] : [event.actorId],
++  ))];
++  const users = await findUsersByIds(actorIds);
+   const actors: Record<string, User> = {};
+-  for (const member of members.items) {
+-    actors[member.userId] = member.user;
++  for (const user of users) {
++    actors[user.id] = user;
+   }
+ 
+   return (
+@@ -80,7 +83,7 @@
+         </p>
+       </header>
+ 
+-      <ActivityFeed groups={groupByDay(page.items)} actors={actors} actor={actor} />
++      <ActivityFeed groups={groupByDay(page.items)} actors={actors} actor={actor} plan={org.plan} />
+     </div>
+   );
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/app/api/export/activity/route.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/app/api/export/activity/route.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/app/api/export/activity/route.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/app/api/export/activity/route.ts	2026-10-28 11:06:35
+@@ -14,15 +14,13 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { can } from "@/lib/permissions";
+ import { exportActivitySchema } from "@/schemas/activity";
+-import { listActivity } from "@/server/services/activity-service";
++import { listActivityForExport } from "@/server/services/activity-service";
+ import { buildFlagContext } from "@/server/services/feature-flag-service";
+ import { getOrganizationSummary } from "@/server/services/organization-service";
+ import type { ActivityEvent } from "@/types/activity";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-const EXPORT_PAGE_LIMIT = 100;
+-
+ const COLUMNS: readonly string[] = [
+   "occurredAt",
+   "action",
+@@ -48,7 +46,7 @@
+       return failure("forbidden", "Exporting the audit log requires an admin.");
+     }
+ 
+-    if (!isEnabled("csv_export", buildFlagContext(actor, organization))) {
++    if ((url.searchParams.get("format") ?? "csv") === "csv" && !isEnabled("csv_export", buildFlagContext(actor, organization))) {
+       return failure("forbidden", "CSV export is not included in this plan.");
+     }
+ 
+@@ -61,22 +59,21 @@
+     if (!parsed.success) {
+       return failure(
+         "validation_failed",
+-        "since and until must be ISO-8601 timestamps.",
++        "since and until must be ISO-8601 timestamps, with until at or after since.",
+       );
+     }
+ 
+-    const page = await listActivity(actor, {
++    const items = await listActivityForExport(actor, {
+       orgId: parsed.data.orgId,
+       since: parsed.data.since,
+       until: parsed.data.until,
+-      limit: EXPORT_PAGE_LIMIT,
+     });
+ 
+     if (parsed.data.format === "json") {
+-      return Response.json({ items: page.items, total: page.total });
++      return Response.json({ items, total: items.length });
+     }
+ 
+-    const csv = toCsv(page.items.map(toRow), COLUMNS);
++    const csv = toCsv(items.map(toRow), COLUMNS);
+     return new Response(csv, {
+       headers: csvResponseHeaders(`taskflow-activity-${organization.slug}.csv`),
+     });
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/components/domain/activity/activity-feed.tsx /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/components/domain/activity/activity-feed.tsx
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/components/domain/activity/activity-feed.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/components/domain/activity/activity-feed.tsx	2026-10-28 11:07:02
+@@ -80,7 +80,7 @@
+                     />
+                   ) : null}
+                   <span>
+-                    <strong>{author?.name ?? "Taskflow"}</strong>{" "}
++                    <strong>{author?.name ?? event.actorId ?? "Taskflow"}</strong>{" "}
+                     {activityLabel(event.action)} — {event.summary}
+                     <span className="ml-2 text-neutral-500">
+                       {formatRelative(event.occurredAt)}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/schemas/activity.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/schemas/activity.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/schemas/activity.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/schemas/activity.ts	2026-10-28 11:06:16
+@@ -50,13 +50,18 @@
+     since: isoTimestampSchema.optional(),
+     until: isoTimestampSchema.optional(),
+   })
+-  .extend(pageRequestSchema.shape);
++  .extend(pageRequestSchema.shape)
++  .refine((value) => !value.since || !value.until || Date.parse(value.since) <= Date.parse(value.until), {
++    message: "until must not be before since", path: ["until"],
++  });
+ 
+ export const exportActivitySchema = z.object({
+   orgId: orgIdSchema,
+   since: isoTimestampSchema,
+   until: isoTimestampSchema,
+   format: z.enum(["csv", "json"]).default("csv"),
++}).refine((value) => Date.parse(value.since) <= Date.parse(value.until), {
++  message: "until must not be before since", path: ["until"],
+ });
+ 
+ export type ActivityFilterInput = z.infer<typeof activityFilterSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/repositories/activity-repository.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/repositories/activity-repository.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/repositories/activity-repository.ts	2026-10-28 11:05:36
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/repositories/activity-repository.ts	2026-10-28 11:06:16
+@@ -1,7 +1,7 @@
+ /**
+  * Append-only audit log. Never updated, never deleted before the plan's retention window.
+  */
+-import { and, count, desc, eq, gte, inArray, lt } from "drizzle-orm";
++import { and, count, desc, eq, gte, inArray, lt, lte } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { activityEvents, getDb } from "@/server/db";
+ import { orgPredicate } from "./base-repository";
+@@ -9,6 +9,7 @@
+ import { toActivityEvent } from "./_mappers";
+ import type { ActivityFilterInput } from "@/schemas/activity";
+ import type { ActivityEvent, ActivitySubjectKind } from "@/types/activity";
++import { toIsoTimestamp } from "@/types/common";
+ import type { IsoTimestamp, OrgId, Page } from "@/types/common";
+ 
+ export async function insertActivity(
+@@ -25,10 +26,8 @@
+       subjectId: event.subjectId,
+       projectId: event.projectId,
+       summary: event.summary,
+-      // The summary is the audited fact; the scalar bag is presentation-only
+-      // and is reconstructed by the readers that need it.
+-      metadata: "{}",
+-      occurredAt: event.occurredAt,
++      metadata: JSON.stringify(event.metadata),
++      occurredAt: toIsoTimestamp(event.occurredAt),
+     })
+     .returning()
+     .get();
+@@ -39,6 +38,9 @@
+ export async function listActivity(
+   input: ActivityFilterInput,
+ ): Promise<Page<ActivityEvent>> {
++  if (input.since && input.until && Date.parse(input.until) < Date.parse(input.since)) {
++    throw new Error("until must not be before since");
++  }
+   const db = getDb();
+   const sort = {
+     sortColumn: activityEvents.occurredAt,
+@@ -61,12 +63,10 @@
+       : eq(activityEvents.subjectKind, input.subjectKind),
+     input.since === undefined
+       ? undefined
+-      : gte(activityEvents.occurredAt, input.since),
+-    // Half-open on the right so consecutive windows tile without overlap:
+-    // [since, until) followed by [until, next).
++      : gte(activityEvents.occurredAt, toIsoTimestamp(input.since)),
+     input.until === undefined
+       ? undefined
+-      : lt(activityEvents.occurredAt, input.until),
++      : lte(activityEvents.occurredAt, toIsoTimestamp(input.until)),
+   );
+ 
+   const total = db
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/activity-service.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/activity-service.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/activity-service.ts	2026-10-28 11:05:36
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/activity-service.ts	2026-10-28 11:07:11
+@@ -10,6 +10,7 @@
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as activityRepo from "@/server/repositories/activity-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { activityResource } from "./_support";
+ import type { ActivityFilterInput, ExportActivityInput } from "@/schemas/activity";
+@@ -19,12 +20,13 @@
+   ActivityGroup,
+   ActivitySubjectKind,
+ } from "@/types/activity";
+-import type { OrgId, Page, ProjectId, UserId } from "@/types/common";
++import type { IsoTimestamp, OrgId, Page, ProjectId, UserId } from "@/types/common";
+ import type { Unsubscribe } from "@/types/event";
+ import type { Actor } from "@/types/member";
+ 
+ export type ActivityRecordInput = {
+   actorId: UserId | null;
++  occurredAt?: IsoTimestamp;
+   subjectKind: ActivitySubjectKind;
+   subjectId: string;
+   projectId: ProjectId | null;
+@@ -39,6 +41,7 @@
+   "actorId",
+   "subjectKind",
+   "subjectId",
++  "projectId",
+   "summary",
+ ] as const;
+ 
+@@ -61,7 +64,7 @@
+     projectId: input.projectId,
+     summary: input.summary,
+     metadata: input.metadata ?? {},
+-    occurredAt: toIsoTimestamp(new Date()),
++    occurredAt: input.occurredAt ?? toIsoTimestamp(new Date()),
+   });
+ }
+ 
+@@ -116,31 +119,49 @@
+     throw new Error("CSV export is not included in this plan");
+   }
+ 
+-  const page = await activityRepo.listActivity({
+-    orgId: input.orgId,
+-    since: input.since,
+-    until: input.until,
+-    limit: 100,
+-    cursor: null,
+-  });
++  const items = await listActivityForExport(actor, input);
+ 
+   if (input.format === "json") {
+-    return JSON.stringify(page.items, null, 2);
++    return JSON.stringify(items, null, 2);
+   }
+ 
+   return toCsv(
+-    page.items.map((event) => ({
++    items.map((event) => ({
+       occurredAt: event.occurredAt,
+       action: event.action,
+       actorId: event.actorId,
+       subjectKind: event.subjectKind,
+       subjectId: event.subjectId,
++      projectId: event.projectId,
+       summary: event.summary,
+     })),
+     [...EXPORT_COLUMNS],
+   );
+ }
+ 
++/** Reads the complete, tenant-scoped range using the feed's stable keyset order. */
++export async function listActivityForExport(
++  actor: Actor,
++  input: Pick<ExportActivityInput, "orgId" | "since" | "until">,
++): Promise<readonly ActivityEvent[]> {
++  assertOrgScope(actor, input.orgId);
++  assertCan(actor, "activity:export", activityResource(input.orgId));
++  if (Date.parse(input.until) < Date.parse(input.since)) {
++    throw new Error("until must not be before since");
++  }
++  const items: ActivityEvent[] = [];
++  let cursor: string | null = null;
++  do {
++    const page: Page<ActivityEvent> = await activityRepo.listActivity({
++      orgId: input.orgId, since: input.since, until: input.until,
++      limit: 100, cursor,
++    });
++    items.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  return items;
++}
++
+ /**
+  * Attaches one handler per audited event type. Called once from
+  * `event-registry`; the returned function detaches all of them, which is what
+@@ -151,15 +172,31 @@
+     subscribe("project.created", (payload) =>
+       record(payload.orgId, "project.created", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "project",
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+         summary: `Created project ${payload.name}`,
+       }).then(() => undefined),
+     ),
++    subscribe("project.updated", (payload) =>
++      record(payload.orgId, "project.updated", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "project", subjectId: payload.projectId, projectId: payload.projectId,
++        summary: "Updated project", metadata: { changedFields: payload.changedFields.join(", ") },
++      }).then(() => undefined),
++    ),
++    subscribe("project.restored", (payload) =>
++      record(payload.orgId, "project.restored", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "project", subjectId: payload.projectId, projectId: payload.projectId,
++        summary: "Restored project",
++      }).then(() => undefined),
++    ),
+     subscribe("project.archived", (payload) =>
+       record(payload.orgId, "project.archived", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "project",
+         subjectId: payload.projectId,
+         projectId: payload.projectId,
+@@ -169,6 +206,7 @@
+     subscribe("issue.created", (payload) =>
+       record(payload.orgId, "issue.created", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+         projectId: payload.projectId,
+@@ -176,40 +214,94 @@
+         metadata: { priority: payload.priority },
+       }).then(() => undefined),
+     ),
++    subscribe("issue.updated", (payload) =>
++      record(payload.orgId, "issue.updated", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "issue", subjectId: payload.issueId, projectId: payload.projectId,
++        summary: "Updated issue", metadata: { changedFields: payload.changedFields.join(", ") },
++      }).then(() => undefined),
++    ),
++    subscribe("issue.archived", (payload) =>
++      record(payload.orgId, "issue.archived", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "issue", subjectId: payload.issueId, projectId: payload.projectId,
++        summary: "Archived issue",
++      }).then(() => undefined),
++    ),
+     subscribe("issue.status_changed", (payload) =>
+       record(payload.orgId, "issue.status_changed", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+-        // A status move is a fact about the issue, not about the project's
+-        // structure; the project column is reserved for structural changes.
+-        projectId: null,
++        projectId: payload.projectId,
+         summary: `Status ${payload.from} → ${payload.to}`,
+         metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
+     subscribe("issue.assigned", (payload) =>
+       record(payload.orgId, "issue.assigned", {
+-        // The row is about the assignee: that is who the feed should name.
+-        actorId: payload.assigneeId,
++        actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "issue",
+         subjectId: payload.issueId,
+         projectId: payload.projectId,
+         summary: `Assigned to ${payload.assigneeId}`,
++        metadata: { previousAssigneeId: payload.previousAssigneeId, assigneeId: payload.assigneeId },
+       }).then(() => undefined),
+     ),
+-    subscribe("comment.created", (payload) =>
++    subscribe("comment.created", async (payload) =>
+       record(payload.orgId, "comment.created", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "comment",
+         subjectId: payload.commentId,
+-        projectId: null,
++        projectId: payload.projectId ?? (await issueRepo.findIssueById(payload.orgId, payload.issueId))?.projectId ?? null,
+         summary: `Commented on issue ${payload.issueId}`,
+       }).then(() => undefined),
+     ),
++    subscribe("comment.updated", async (payload) =>
++      record(payload.orgId, "comment.updated", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "comment", subjectId: payload.commentId,
++        projectId: payload.projectId ?? (await issueRepo.findIssueById(payload.orgId, payload.issueId))?.projectId ?? null,
++        summary: `Edited comment on issue ${payload.issueId}`,
++      }).then(() => undefined),
++    ),
++    subscribe("comment.deleted", async (payload) =>
++      record(payload.orgId, "comment.deleted", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "comment", subjectId: payload.commentId,
++        projectId: payload.projectId ?? (await issueRepo.findIssueById(payload.orgId, payload.issueId))?.projectId ?? null,
++        summary: `Deleted comment on issue ${payload.issueId}`,
++      }).then(() => undefined),
++    ),
++    subscribe("member.joined", (payload) =>
++      record(payload.orgId, "member.joined", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "member", subjectId: payload.memberId, projectId: null,
++        summary: `Member joined as ${payload.role}`, metadata: { userId: payload.userId, role: payload.role },
++      }).then(() => undefined),
++    ),
++    subscribe("member.removed", (payload) =>
++      record(payload.orgId, "member.removed", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "member", subjectId: payload.memberId, projectId: null,
++        summary: "Removed member", metadata: { userId: payload.userId },
++      }).then(() => undefined),
++    ),
++    subscribe("flag.toggled", (payload) =>
++      record(payload.orgId, "flag.toggled", {
++        actorId: payload.actorId, occurredAt: payload.occurredAt,
++        subjectKind: "feature_flag", subjectId: payload.flag, projectId: null,
++        summary: `${payload.enabled ? "Enabled" : "Disabled"} feature ${payload.flag}`,
++        metadata: { flag: payload.flag, enabled: payload.enabled },
++      }).then(() => undefined),
++    ),
+     subscribe("member.invited", (payload) =>
+       record(payload.orgId, "member.invited", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "member",
+         subjectId: payload.email,
+         projectId: null,
+@@ -219,19 +311,23 @@
+     subscribe("member.role_changed", (payload) =>
+       record(payload.orgId, "member.role_changed", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "member",
+         subjectId: payload.memberId,
+         projectId: null,
+         summary: `Role ${payload.from} → ${payload.to}`,
++        metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
+     subscribe("billing.plan_changed", (payload) =>
+       record(payload.orgId, "billing.plan_changed", {
+         actorId: payload.actorId,
++        occurredAt: payload.occurredAt,
+         subjectKind: "subscription",
+         subjectId: payload.orgId,
+         projectId: null,
+         summary: `Plan ${payload.from} → ${payload.to}`,
++        metadata: { from: payload.from, to: payload.to },
+       }).then(() => undefined),
+     ),
+   ];
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/comment-service.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/comment-service.ts	2026-10-28 11:06:16
+@@ -78,6 +78,7 @@
+     ...actorEnvelope(actor),
+     commentId: comment.id,
+     issueId: comment.issueId,
++    projectId: issue.projectId,
+     mentionedUserIds,
+   });
+ 
+@@ -107,7 +108,19 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  const updated = await commentRepo.updateComment(input);
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++    projectId: issue.projectId,
++  });
++  return updated;
+ }
+ 
+ /**
+@@ -129,6 +142,11 @@
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
+   const { archivedAt } = archivePatch();
+   const archived = await commentRepo.archiveComment(
+     input.orgId,
+@@ -140,6 +158,7 @@
+     occurredAt: archivedAt,
+     commentId: archived.id,
+     issueId: archived.issueId,
++    projectId: issue.projectId,
+   });
+ 
+   return archived;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/feature-flag-service.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/feature-flag-service.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/feature-flag-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/feature-flag-service.ts	2026-10-28 11:07:02
+@@ -6,6 +6,7 @@
+ import { emit } from "@/lib/event-bus";
+ import { isEnabled, snapshotFlags } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
++import { assertOrgScope } from "@/lib/tenant";
+ import { getFlagDefinition } from "@/config/feature-flags";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import { actorEnvelope, orgResource, requireFound } from "./_support";
+@@ -53,6 +54,7 @@
+   actor: Actor,
+   input: ToggleFeatureFlagInput,
+ ): Promise<Organization> {
++  assertOrgScope(actor, input.orgId);
+   assertCan(actor, "org:manage_flags", orgResource(input.orgId));
+ 
+   const org = requireFound(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/organization-service.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/organization-service.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/organization-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/organization-service.ts	2026-10-28 11:07:02
+@@ -67,6 +67,7 @@
+   // `organization.updated` key, and inventing one would widen the contract.
+   await record(input.orgId, "organization.updated", {
+     actorId: actor.userId,
++    occurredAt: updated.updatedAt,
+     subjectKind: "organization",
+     subjectId: updated.id,
+     projectId: null,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/project-service.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/server/services/project-service.ts	2026-10-28 11:06:16
+@@ -85,7 +85,13 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+-  return projectRepo.updateProject(input);
++  const updated = await projectRepo.updateProject(input);
++  await emit("project.updated", {
++    ...actorEnvelope(actor),
++    projectId: updated.id,
++    changedFields: Object.keys(input).filter((key) => key !== "orgId" && key !== "projectId"),
++  });
++  return updated;
+ }
+ 
+ /**
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/types/event.ts /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/types/event.ts
+--- /private/tmp/bench-scratch/c93d820d-3848-4894-8700-3193911ce8e0/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/25a5f379-a602-45c3-8892-090d018a053b/src/types/event.ts	2026-10-28 11:06:16
+@@ -31,6 +31,7 @@
+     name: string;
+     slug: string;
+   };
++  "project.updated": EventEnvelope & { projectId: ProjectId; changedFields: readonly string[] };
+   "project.archived": EventEnvelope & {
+     projectId: ProjectId;
+     issuesArchived: number;
+@@ -71,8 +72,10 @@
+     commentId: CommentId;
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
++    projectId?: ProjectId;
+   };
+-  "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
++  "comment.updated": EventEnvelope & { commentId: CommentId; issueId: IssueId; projectId?: ProjectId };
++  "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId; projectId?: ProjectId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };
+   "member.role_changed": EventEnvelope & {

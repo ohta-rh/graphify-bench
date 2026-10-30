@@ -1,0 +1,346 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/_project-visibility.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/_project-visibility.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/_project-visibility.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/_project-visibility.ts	2026-10-27 13:31:36
+@@ -0,0 +1,21 @@
++import { and, eq, inArray, ne, or } from "drizzle-orm";
++import { getDb, projectMembers, projects } from "@/server/db";
++import { hasRoleAtLeast } from "@/types/member";
++import type { Actor } from "@/types/member";
++import type { SQL } from "drizzle-orm";
++
++/** Predicate for queries already scoped to the actor's organization. */
++export function projectVisibilityPredicate(actor: Actor): SQL | undefined {
++  if (actor.isPlatformStaff || hasRoleAtLeast(actor.role, "admin")) return undefined;
++
++  return or(
++    ne(projects.visibility, "private"),
++    eq(projects.leadId, actor.userId),
++    inArray(
++      projects.id,
++      getDb().select({ id: projectMembers.projectId }).from(projectMembers).where(
++        and(eq(projectMembers.orgId, actor.orgId), eq(projectMembers.userId, actor.userId)),
++      ),
++    ),
++  );
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/issue-repository.ts	2026-10-27 13:31:36
+@@ -22,13 +22,15 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issues, projects } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import { toIssue } from "./_mappers";
+ import { listLabelsForIssues } from "./label-repository";
++import { projectVisibilityPredicate } from "./_project-visibility";
++import type { Actor } from "@/types/member";
+ import type {
+   CreateIssueInput,
+   IssueFilterInput,
+@@ -141,9 +143,14 @@
+ 
+ export async function listIssues(
+   input: IssueFilterInput,
++  actor?: Actor,
+ ): Promise<Page<Issue>> {
+   const db = getDb();
+-  const filters = issueFilters(input);
++  const visibility = actor ? projectVisibilityPredicate(actor) : undefined;
++  const filters = [
++    ...issueFilters(input),
++    ...compact(visibility ? inArray(issues.projectId, db.select({ id: projects.id }).from(projects).where(and(orgPredicate(projects.orgId, input.orgId), visibility))) : undefined),
++  ];
+   const sort = { sortColumn: issues.createdAt, idColumn: issues.id };
+ 
+   const total = db
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/project-repository.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/project-repository.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/repositories/project-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/repositories/project-repository.ts	2026-10-27 13:31:36
+@@ -17,6 +17,8 @@
+ import { livePredicate, orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+ import { toProject } from "./_mappers";
++import { projectVisibilityPredicate } from "./_project-visibility";
++import type { Actor } from "@/types/member";
+ import type {
+   CreateProjectInput,
+   ListProjectsInput,
+@@ -51,6 +53,7 @@
+ 
+ export async function listProjects(
+   input: ListProjectsInput,
++  actor?: Actor,
+ ): Promise<Page<Project>> {
+   const db = getDb();
+   const sort = { sortColumn: projects.createdAt, idColumn: projects.id };
+@@ -63,6 +66,7 @@
+ 
+   const filters = compact(
+     orgPredicate(projects.orgId, input.orgId),
++    actor ? projectVisibilityPredicate(actor) : undefined,
+     livePredicate(projects.archivedAt, scope),
+     input.status === undefined ? undefined : eq(projects.status, input.status),
+     input.query === undefined
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/attachment-service.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/attachment-service.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/attachment-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/attachment-service.ts	2026-10-27 13:31:50
+@@ -10,6 +10,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { assertIssueVisible } from "./issue-service";
+ import { issueResource, requireFound } from "./_support";
+ import type {
+   CreateAttachmentInput,
+@@ -33,6 +34,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   return attachmentRepo.listAttachments(orgId, issueId);
+@@ -55,6 +57,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+   const org = requireFound(
+@@ -101,6 +104,7 @@
+     "Issue",
+     attachment.issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "issue:update", issueResource(issue));
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/comment-service.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/comment-service.ts	2026-10-27 13:31:43
+@@ -12,6 +12,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import { assertIssueVisible } from "./issue-service";
+ import {
+   actorEnvelope,
+   commentResource,
+@@ -53,6 +54,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -100,6 +102,12 @@
+     "Comment",
+     input.commentId,
+   );
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -126,6 +134,12 @@
+     "Comment",
+     input.commentId,
+   );
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
+@@ -157,6 +171,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "comment:read", issueResource(issue));
+ 
+   return commentRepo.listThread(orgId, issueId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/issue-service.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/issue-service.ts	2026-10-27 13:31:43
+@@ -14,8 +14,10 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertProjectVisible, canViewProject } from "./project-service";
+ import {
+   actorEnvelope,
++  NotFoundError,
+   issueResource,
+   orgResource,
+   projectResource,
+@@ -33,6 +35,13 @@
+ import type { Issue, IssueBoardColumn, IssueWithRelations } from "@/types/issue";
+ import type { Actor } from "@/types/member";
+ 
++export async function assertIssueVisible(actor: Actor, issue: Issue): Promise<void> {
++  const project = await projectRepo.findProjectById(issue.orgId, issue.projectId);
++  if (!project || !(await canViewProject(actor, project))) {
++    throw new NotFoundError("Issue", issue.id);
++  }
++}
++
+ /**
+  * Creates an issue after four gates: tenant scope, the `issue:create`
+  * permission, a live parent project and the plan's per-project issue quota.
+@@ -50,6 +59,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
+ 
+@@ -91,6 +101,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueVisible(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -120,6 +131,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueVisible(actor, before);
+   assertCan(actor, "issue:update", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -158,6 +170,7 @@
+     "Issue",
+     input.issueId,
+   );
++  await assertIssueVisible(actor, before);
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
+@@ -200,6 +213,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "issue:archive", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+@@ -241,6 +255,7 @@
+     "Issue",
+     issueId,
+   );
++  await assertIssueVisible(actor, issue);
+   assertCan(actor, "issue:read", issueResource(issue));
+ 
+   const labels = await labelRepo.listLabelsForIssues(orgId, [issue.id]);
+@@ -259,10 +274,8 @@
+   input: IssueFilterInput,
+ ): Promise<Page<Issue>> {
+   assertOrgScope(actor, input.orgId);
+-  // A cross-project list is an org-wide read; per-project visibility is
+-  // enforced when the caller opens an individual issue.
+   assertCan(actor, "issue:read", orgResource(input.orgId));
+-  return issueRepo.listIssues(input);
++  return issueRepo.listIssues(input, actor);
+ }
+ 
+ export async function getBoard(
+@@ -277,6 +290,7 @@
+     "Project",
+     projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "issue:read", projectResource(project));
+ 
+   return issueRepo.listBoardColumns(orgId, projectId);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/project-service.ts /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/d4776c8d-a937-4622-93ae-261c5c291544/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/567c8423-0ee4-4e27-8f39-5707f2d4044c/src/server/services/project-service.ts	2026-10-27 13:31:36
+@@ -12,8 +12,11 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as projectRepo from "@/server/repositories/project-repository";
++import * as projectMemberRepo from "@/server/repositories/project-member-repository";
++import { hasRoleAtLeast } from "@/types/member";
+ import {
+   actorEnvelope,
++  NotFoundError,
+   orgResource,
+   projectResource,
+   requireFound,
+@@ -28,6 +31,16 @@
+ import type { Actor } from "@/types/member";
+ import type { Project, ProjectWithStats } from "@/types/project";
+ 
++export async function canViewProject(actor: Actor, project: Project): Promise<boolean> {
++  if (actor.orgId !== project.orgId) return false;
++  if (project.visibility !== "private" || actor.isPlatformStaff || hasRoleAtLeast(actor.role, "admin") || project.leadId === actor.userId) return true;
++  return projectMemberRepo.isProjectMember(project.orgId, project.id, actor.userId);
++}
++
++export async function assertProjectVisible(actor: Actor, project: Project): Promise<void> {
++  if (!(await canViewProject(actor, project))) throw new NotFoundError("Project", project.id);
++}
++
+ /**
+  * Creates a project once the plan still has room for one. The key is derived
+  * from the name when the caller left it blank, so the issue numbering scheme
+@@ -82,6 +95,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -103,6 +117,7 @@
+     "Project",
+     input.projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
+@@ -137,6 +152,7 @@
+     "Project",
+     projectId,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:archive", projectResource(project));
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+@@ -161,6 +177,7 @@
+     "Project",
+     slug,
+   );
++  await assertProjectVisible(actor, project);
+   assertCan(actor, "project:read", projectResource(project));
+ 
+   return {
+@@ -176,7 +193,7 @@
+   assertOrgScope(actor, input.orgId);
+   assertCan(actor, "project:read", orgResource(input.orgId));
+ 
+-  const page = await projectRepo.listProjects(input);
++  const page = await projectRepo.listProjects(input, actor);
+ 
+   const items = await Promise.all(
+     page.items.map(async (project) => ({

@@ -1,0 +1,140 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/2706fa6f-6493-445d-a3db-64f3a7faa290/src/server/repositories/_paging.ts /private/tmp/bench-scratch/ba04f621-3043-4dfa-8fab-79791ea77d41/src/server/repositories/_paging.ts
+--- /private/tmp/bench-scratch/2706fa6f-6493-445d-a3db-64f3a7faa290/src/server/repositories/_paging.ts	2026-10-27 13:38:51
++++ /private/tmp/bench-scratch/ba04f621-3043-4dfa-8fab-79791ea77d41/src/server/repositories/_paging.ts	2026-10-27 13:39:12
+@@ -2,10 +2,10 @@
+  * Private paging helpers shared by the repositories in this directory.
+  *
+  * Not part of the public data-access surface — repositories re-export nothing
+- * from here. Keyset (cursor) pagination is expressed as a range on the sort
+- * column, which lets SQLite serve every page from the `(org_id, <sort>)` index.
++ * from here. Keyset (cursor) pagination follows the sort column and ID used
++ * by the repositories' descending order.
+  */
+-import { lt } from "drizzle-orm";
++import { and, eq, lt, or } from "drizzle-orm";
+ import { decodeCursor, encodeCursor } from "./base-repository";
+ import { makePage } from "@/types/common";
+ import type { Page } from "@/types/common";
+@@ -30,9 +30,12 @@
+   const decoded = decodeCursor(cursor);
+   if (!decoded) return undefined;
+ 
+-  // Listings are newest first, so the next page is everything older than the
+-  // last row the caller was shown.
+-  return lt(sort.sortColumn, decoded.sortValue);
++  // Include rows with the same sort value and a smaller ID, matching the
++  // secondary descending order used by each listing.
++  return or(
++    lt(sort.sortColumn, decoded.sortValue),
++    and(eq(sort.sortColumn, decoded.sortValue), lt(sort.idColumn, decoded.id)),
++  );
+ }
+ 
+ /** SQLite tolerates a `LIMIT` of `n + 1`; that extra row is the has-more probe. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/2706fa6f-6493-445d-a3db-64f3a7faa290/tests/repositories/keyset-pagination.test.ts /private/tmp/bench-scratch/ba04f621-3043-4dfa-8fab-79791ea77d41/tests/repositories/keyset-pagination.test.ts
+--- /private/tmp/bench-scratch/2706fa6f-6493-445d-a3db-64f3a7faa290/tests/repositories/keyset-pagination.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/ba04f621-3043-4dfa-8fab-79791ea77d41/tests/repositories/keyset-pagination.test.ts	2026-10-27 13:39:24
+@@ -0,0 +1,103 @@
++import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import * as activityRepo from "@/server/repositories/activity-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as notificationRepo from "@/server/repositories/notification-repository";
++import { toIsoTimestamp } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Page } from "@/types/common";
++import type { Tenant } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++let tenant: Tenant;
++let other: Tenant;
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  tenant = await createTenant("keyset-main");
++  other = await createTenant("keyset-other");
++
++  vi.useFakeTimers({ toFake: ["Date"] });
++  try {
++    for (let i = 0; i < 10; i++) {
++      const owner = i < 7 ? tenant : other;
++      const timestamp = toIsoTimestamp(new Date(Date.UTC(2026, 1, 1, 0, i % 3)));
++      vi.setSystemTime(new Date(timestamp));
++      const number = await issueRepo.nextIssueNumber(owner.org.id, owner.project.id);
++      await issueRepo.insertIssue(issueInput(owner.org.id, owner.project.id), owner.userIds.owner, number);
++      await notificationRepo.insertNotification(owner.org.id, {
++        orgId: owner.org.id,
++        recipientId: tenant.userIds.owner,
++        kind: "issue_assigned",
++        title: "Assigned",
++        body: "Assigned",
++        href: "/issues",
++        actorId: null,
++        channels: ["in_app"],
++      });
++      await activityRepo.insertActivity({
++        orgId: owner.org.id,
++        action: "issue.created",
++        actorId: owner.userIds.owner,
++        subjectKind: "issue",
++        subjectId: `issue-${i}`,
++        projectId: owner.project.id,
++        summary: "Created issue",
++        metadata: {},
++        occurredAt: timestamp,
++      });
++    }
++  } finally {
++    vi.useRealTimers();
++  }
++});
++
++afterAll(() => cleanup());
++
++async function expectCompletePages<T extends { id: string; orgId: string }>(
++  list: (limit: number, cursor: string | null) => Promise<Page<T>>,
++) {
++  const large = await list(100, null);
++  expect(large.total).toBe(7);
++  expect(large.items).toHaveLength(7);
++  expect(large.items.every((item) => item.orgId === tenant.org.id)).toBe(true);
++  const expected = large.items.map((item) => item.id);
++  expect(new Set(expected).size).toBe(7);
++
++  for (let size = 1; size <= 8; size++) {
++    const ids: string[] = [];
++    let cursor: string | null = null;
++    do {
++      const page = await list(size, cursor);
++      expect(page.total).toBe(7);
++      expect(page.items.every((item) => item.orgId === tenant.org.id)).toBe(true);
++      ids.push(...page.items.map((item) => item.id));
++      expect(ids.length).toBeLessThanOrEqual(7);
++      cursor = page.nextCursor;
++    } while (cursor);
++    expect(ids).toEqual(expected);
++  }
++}
++
++describe("keyset pagination with tied timestamps", () => {
++  it("pages project issues in order", async () => {
++    await expectCompletePages((limit, cursor) => issueRepo.listIssues({
++      orgId: tenant.org.id, projectId: tenant.project.id, limit, cursor,
++    }));
++  });
++
++  it("pages notifications in order", async () => {
++    await expectCompletePages((limit, cursor) => notificationRepo.listNotifications({
++      orgId: tenant.org.id, recipientId: tenant.userIds.owner, unreadOnly: false, limit, cursor,
++    }));
++  });
++
++  it("pages activity in order", async () => {
++    await expectCompletePages((limit, cursor) => activityRepo.listActivity({
++      orgId: tenant.org.id, limit, cursor,
++    }));
++  });
++});

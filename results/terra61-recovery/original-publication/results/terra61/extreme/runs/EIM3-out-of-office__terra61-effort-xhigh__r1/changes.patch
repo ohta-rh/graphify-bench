@@ -1,0 +1,442 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/schemas/member.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/schemas/member.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/schemas/member.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/schemas/member.ts	2026-10-28 11:09:56
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ import {
+   emailSchema,
++  isoTimestampSchema,
+   memberIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+@@ -71,3 +72,13 @@
+ export type RemoveMemberInput = z.infer<typeof removeMemberSchema>;
+ export type ListMembersInput = z.infer<typeof listMembersSchema>;
+ export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
++
++export const setAbsenceSchema = z.object({
++  orgId: orgIdSchema,
++  userId: userIdSchema,
++  delegateUserId: userIdSchema.nullable().default(null),
++  startsAt: isoTimestampSchema,
++  endsAt: isoTimestampSchema,
++  note: z.string().max(200).nullable().default(null),
++});
++export type SetAbsenceInput = z.infer<typeof setAbsenceSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/db/migrate.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/db/migrate.ts	2026-10-28 11:09:56
+@@ -90,6 +90,15 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS members_org_user_idx ON members (org_id, user_id)`,
+   `CREATE INDEX IF NOT EXISTS members_org_role_idx ON members (org_id, role)`,
++  `CREATE TABLE IF NOT EXISTS member_absences (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     delegate_user_id TEXT,
++     starts_at TEXT NOT NULL,
++     ends_at TEXT NOT NULL,
++     note TEXT
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS member_absences_org_user_idx ON member_absences (org_id, user_id)`,
+   `CREATE TABLE IF NOT EXISTS invitations (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/db/schema/members.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/db/schema/members.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/db/schema/members.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/db/schema/members.ts	2026-10-28 11:09:56
+@@ -55,3 +55,16 @@
+ export type MemberRow = typeof members.$inferSelect;
+ export type NewMemberRow = typeof members.$inferInsert;
+ export type InvitationRow = typeof invitations.$inferSelect;
++
++export const memberAbsences = sqliteTable(
++  "member_absences",
++  {
++    ...tenantColumns,
++    userId: text("user_id").notNull(),
++    delegateUserId: text("delegate_user_id"),
++    startsAt: text("starts_at").notNull(),
++    endsAt: text("ends_at").notNull(),
++    note: text("note"),
++  },
++  (table) => [uniqueIndex("member_absences_org_user_idx").on(table.orgId, table.userId)],
++);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/repositories/member-absence-repository.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/repositories/member-absence-repository.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/repositories/member-absence-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/repositories/member-absence-repository.ts	2026-10-28 11:10:07
+@@ -0,0 +1,47 @@
++import { and, eq } from "drizzle-orm";
++import { getDb, memberAbsences } from "@/server/db";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
++import type { MemberAbsence } from "@/types/member";
++import { findMember } from "./member-repository";
++
++export async function findAbsence(orgId: OrgId, userId: UserId): Promise<MemberAbsence | null> {
++  const row = getDb().select().from(memberAbsences).where(and(
++    eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, userId),
++  )).get();
++  return row ? {
++    orgId: row.orgId as OrgId,
++    userId: row.userId as UserId,
++    delegateUserId: row.delegateUserId as UserId | null,
++    startsAt: row.startsAt as IsoTimestamp,
++    endsAt: row.endsAt as IsoTimestamp,
++    note: row.note,
++  } : null;
++}
++
++export async function upsertAbsence(absence: MemberAbsence): Promise<MemberAbsence> {
++  getDb().insert(memberAbsences).values(absence).onConflictDoUpdate({
++    target: [memberAbsences.orgId, memberAbsences.userId],
++    set: {
++      delegateUserId: absence.delegateUserId,
++      startsAt: absence.startsAt,
++      endsAt: absence.endsAt,
++      note: absence.note,
++    },
++  }).run();
++  return (await findAbsence(absence.orgId, absence.userId))!;
++}
++
++export async function deleteAbsence(orgId: OrgId, userId: UserId): Promise<void> {
++  getDb().delete(memberAbsences).where(and(
++    eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, userId),
++  )).run();
++}
++
++/** Resolve a single delegation at the action's instant, without chaining. */
++export async function activeDelegate(orgId: OrgId, userId: UserId, at: Date): Promise<UserId | null> {
++  const absence = await findAbsence(orgId, userId);
++  const time = at.getTime();
++  if (!absence?.delegateUserId || time < Date.parse(absence.startsAt) || time >= Date.parse(absence.endsAt)) return null;
++  const delegate = await findMember(orgId, absence.delegateUserId);
++  return delegate?.status === "active" ? absence.delegateUserId : null;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/repositories/member-repository.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/repositories/member-repository.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/repositories/member-repository.ts	2026-10-28 11:10:07
+@@ -6,7 +6,7 @@
+ import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+-import { getDb, members, users } from "@/server/db";
++import { getDb, memberAbsences, members, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -164,12 +164,21 @@
+   orgId: OrgId,
+   memberId: MemberId,
+ ): Promise<Member> {
+-  const row = getDb()
+-    .update(members)
+-    .set({ ...archivePatch(), status: "suspended" })
+-    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
+-    .returning()
+-    .get();
++  const row = getDb().transaction((tx) => {
++    const removed = tx.update(members)
++      .set({ ...archivePatch(), status: "suspended" })
++      .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
++      .returning().get();
++    if (removed) {
++      tx.delete(memberAbsences).where(and(
++        eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, removed.userId),
++      )).run();
++      tx.update(memberAbsences).set({ delegateUserId: null }).where(and(
++        eq(memberAbsences.orgId, orgId), eq(memberAbsences.delegateUserId, removed.userId),
++      )).run();
++    }
++    return removed;
++  });
+ 
+   if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
+   return toMember(row);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/issue-service.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/issue-service.ts	2026-10-28 11:10:15
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import { activeDelegate } from "@/server/repositories/member-absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -66,7 +67,10 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const assigneeId = input.assigneeId && input.assigneeId !== actor.userId
++    ? (await activeDelegate(input.orgId, input.assigneeId, new Date())) ?? input.assigneeId
++    : input.assigneeId;
++  const issue = await issueRepo.insertIssue({ ...input, assigneeId }, actor.userId, number);
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -77,6 +81,16 @@
+     priority: issue.priority,
+   });
+ 
++  if (issue.assigneeId !== null) {
++    await emit("issue.assigned", {
++      ...actorEnvelope(actor),
++      issueId: issue.id,
++      projectId: issue.projectId,
++      previousAssigneeId: null,
++      assigneeId: issue.assigneeId,
++    });
++  }
++
+   return issue;
+ }
+ 
+@@ -161,13 +175,16 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  const assigneeId = input.assigneeId && input.assigneeId !== actor.userId
++    ? (await activeDelegate(input.orgId, input.assigneeId, new Date())) ?? input.assigneeId
++    : input.assigneeId;
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+-    input.assigneeId,
++    assigneeId,
+   );
+ 
+-  if (input.assigneeId === null) {
++  if (assigneeId === null) {
+     await emit("issue.updated", {
+       ...actorEnvelope(actor),
+       issueId: after.id,
+@@ -182,7 +199,7 @@
+     issueId: after.id,
+     projectId: after.projectId,
+     previousAssigneeId: before.assigneeId,
+-    assigneeId: input.assigneeId,
++    assigneeId,
+   });
+ 
+   return after;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/member-service.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/member-service.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/member-service.ts	2026-10-28 11:10:07
+@@ -6,16 +6,19 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import { setAbsenceSchema } from "@/schemas/member";
++import * as absenceRepo from "@/server/repositories/member-absence-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
+   ListMembersInput,
++  SetAbsenceInput,
+   RemoveMemberInput,
+   UpdateMemberRoleInput,
+ } from "@/schemas/member";
+ import type { MemberId, OrgId, Page, UserId } from "@/types/common";
+-import type { Actor, Member, MemberWithUser, Role } from "@/types/member";
++import type { Actor, Member, MemberAbsence, MemberWithUser, Role } from "@/types/member";
+ 
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+@@ -147,4 +150,38 @@
+       "An organization must keep at least one owner; transfer ownership first",
+     );
+   }
++}
++
++async function requireActiveMember(orgId: OrgId, userId: UserId): Promise<Member> {
++  const member = await memberRepo.findMember(orgId, userId);
++  return requireFound(member?.status === "active" ? member : null, "Member", userId);
++}
++
++export async function setAbsence(actor: Actor, input: SetAbsenceInput): Promise<MemberAbsence> {
++  assertOrgScope(actor, input.orgId);
++  const member = await requireActiveMember(input.orgId, input.userId);
++  if (actor.userId !== input.userId) assertCan(actor, "member:update_role", memberResource(member));
++  const absence = setAbsenceSchema.parse(input);
++  if (Date.parse(absence.endsAt) <= Date.parse(absence.startsAt)) {
++    throw new Error("Absence end must be after its start");
++  }
++  if (absence.delegateUserId !== null) {
++    if (absence.delegateUserId === absence.userId) throw new Error("A member cannot delegate to themselves");
++    await requireActiveMember(absence.orgId, absence.delegateUserId);
++  }
++  return absenceRepo.upsertAbsence(absence);
++}
++
++export async function clearAbsence(actor: Actor, orgId: OrgId, userId: UserId): Promise<void> {
++  assertOrgScope(actor, orgId);
++  const member = await requireActiveMember(orgId, userId);
++  if (actor.userId !== userId) assertCan(actor, "member:update_role", memberResource(member));
++  await absenceRepo.deleteAbsence(orgId, userId);
++}
++
++export async function getAbsence(actor: Actor, orgId: OrgId, userId: UserId): Promise<MemberAbsence | null> {
++  assertOrgScope(actor, orgId);
++  await requireActiveMember(orgId, userId);
++  const absence = await absenceRepo.findAbsence(orgId, userId);
++  return absence && Date.parse(absence.endsAt) > Date.now() ? absence : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/notification-service.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/server/services/notification-service.ts	2026-10-28 11:10:15
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import { activeDelegate } from "@/server/repositories/member-absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -192,7 +193,8 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
++    const recipient = (await activeDelegate(payload.orgId, payload.assigneeId, new Date(payload.occurredAt))) ?? payload.assigneeId;
++    await notify(payload.orgId, "issue_overdue", [recipient], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+@@ -214,10 +216,15 @@
+     });
+ 
+     if (payload.mentionedUserIds.length > 0) {
++      const recipients = new Set(payload.mentionedUserIds);
++      for (const userId of payload.mentionedUserIds) {
++        const delegate = await activeDelegate(payload.orgId, userId, new Date(payload.occurredAt));
++        if (delegate) recipients.add(delegate);
++      }
+       await notify(
+         payload.orgId,
+         "comment_mention",
+-        payload.mentionedUserIds,
++        [...recipients],
+         {
+           title: "You were mentioned",
+           body: `You were mentioned on issue ${payload.issueId}`,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/types/member.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/types/member.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/src/types/member.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/src/types/member.ts	2026-10-28 11:09:56
+@@ -46,6 +46,14 @@
+   readonly lastSeenAt: IsoTimestamp | null;
+ }
+ 
++export interface MemberAbsence extends TenantScoped {
++  readonly userId: UserId;
++  readonly delegateUserId: UserId | null;
++  readonly startsAt: IsoTimestamp;
++  readonly endsAt: IsoTimestamp;
++  readonly note: string | null;
++}
++
+ /** A member joined with the user record it points at, for list UIs. */
+ export interface MemberWithUser extends Member {
+   readonly user: User;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/tests/services/member-absence.test.ts /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/tests/services/member-absence.test.ts
+--- /private/tmp/bench-scratch/671b2285-9308-405f-8b96-10df2902ccc4/tests/services/member-absence.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/d95a5ce6-8c4a-4a44-852f-c6652dc8919e/tests/services/member-absence.test.ts	2026-10-28 11:10:55
+@@ -0,0 +1,96 @@
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++
++import { emit, subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { TenantScopeError } from "@/lib/tenant";
++import * as memberRepo from "@/server/repositories/member-repository";
++import * as issueService from "@/server/services/issue-service";
++import * as members from "@/server/services/member-service";
++import { NotFoundError } from "@/server/services/_support";
++import { listNotifications } from "@/server/services/notification-service";
++import { toIsoTimestamp } from "@/types/common";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++import type { Tenant } from "../server/_support/fixtures";
++import type { CommentId, UserId } from "@/types/common";
++import type { NotificationKind } from "@/types/notification";
++
++let cleanup: () => void;
++let tenant: Tenant;
++const start = toIsoTimestamp("2026-06-01T00:00:00Z");
++const end = toIsoTimestamp("2026-06-02T00:00:00Z");
++
++beforeAll(async () => {
++  cleanup = await useTemporaryDatabase();
++  tenant = await createTenant("absence");
++});
++afterEach(() => vi.useRealTimers());
++afterAll(() => cleanup());
++
++function input(userId: UserId, delegateUserId: UserId | null = tenant.userIds.admin) {
++  return { orgId: tenant.org.id, userId, delegateUserId, startsAt: start, endsAt: end, note: null };
++}
++async function alerts(userId: UserId, kind: NotificationKind) {
++  return (await listNotifications(tenant.actors.owner, {
++    orgId: tenant.org.id, recipientId: userId, unreadOnly: false, kind: [kind], limit: 100, cursor: null,
++  })).items;
++}
++
++describe("member absence", () => {
++  it("validates membership, permissions, dates, and scheduled reads", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-05-31T00:00:00Z"));
++    const absence = input(tenant.userIds.member);
++    await expect(members.setAbsence(tenant.actors.viewer, absence)).rejects.toBeInstanceOf(PermissionDeniedError);
++    await expect(members.setAbsence(tenant.actors.member, { ...absence, delegateUserId: absence.userId })).rejects.toThrow();
++    await expect(members.setAbsence(tenant.actors.member, { ...absence, endsAt: start })).rejects.toThrow();
++    await expect(members.setAbsence(tenant.actors.member, { ...absence, delegateUserId: "ZZZZZZZZZZZZZZZZZZZZZZZZZZ" as UserId })).rejects.toBeInstanceOf(NotFoundError);
++    await expect(members.getAbsence({ ...tenant.actors.member, orgId: "other" as Tenant["org"]["id"] }, tenant.org.id, absence.userId)).rejects.toBeInstanceOf(TenantScopeError);
++    expect(await members.setAbsence(tenant.actors.member, absence)).toEqual(absence);
++    expect(await members.getAbsence(tenant.actors.viewer, tenant.org.id, absence.userId)).toEqual(absence);
++    vi.setSystemTime(new Date(end));
++    expect(await members.getAbsence(tenant.actors.viewer, tenant.org.id, absence.userId)).toBeNull();
++  });
++
++  it("redirects assignments once, honors self assignment and the exclusive end", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date(start));
++    await members.setAbsence(tenant.actors.member, input(tenant.userIds.member));
++    await members.setAbsence(tenant.actors.admin, input(tenant.userIds.admin, tenant.userIds.viewer));
++    const events: UserId[] = [];
++    const off = subscribe("issue.assigned", (event) => { events.push(event.assigneeId); });
++    try {
++      const issue = await issueService.createIssue(tenant.actors.owner, issueInput(tenant.org.id, tenant.project.id, { assigneeId: tenant.userIds.member }));
++      expect(issue.assigneeId).toBe(tenant.userIds.admin);
++      expect(events).toEqual([tenant.userIds.admin]);
++      expect((await alerts(tenant.userIds.admin, "issue_assigned")).some((n) => n.href.endsWith(issue.id))).toBe(true);
++      expect((await alerts(tenant.userIds.member, "issue_assigned")).some((n) => n.href.endsWith(issue.id))).toBe(false);
++      const taken = await issueService.assignIssue(tenant.actors.member, { orgId: tenant.org.id, issueId: issue.id, assigneeId: tenant.userIds.member });
++      expect(taken.assigneeId).toBe(tenant.userIds.member);
++      const redirected = await issueService.assignIssue(tenant.actors.owner, { orgId: tenant.org.id, issueId: issue.id, assigneeId: tenant.userIds.member });
++      expect(redirected.assigneeId).toBe(tenant.userIds.admin);
++      vi.setSystemTime(new Date(end));
++      const ended = await issueService.assignIssue(tenant.actors.owner, { orgId: tenant.org.id, issueId: issue.id, assigneeId: tenant.userIds.member });
++      expect(ended.assigneeId).toBe(tenant.userIds.member);
++    } finally { off(); }
++  });
++
++  it("routes overdue and deduplicates mention alerts, then clears removed delegates", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date(start));
++    await members.setAbsence(tenant.actors.member, input(tenant.userIds.member));
++    const issue = await issueService.createIssue(tenant.actors.member, issueInput(tenant.org.id, tenant.project.id));
++    await emit("issue.overdue", { orgId: tenant.org.id, actorId: null, occurredAt: start, issueId: issue.id, projectId: issue.projectId, dueAt: start, assigneeId: tenant.userIds.member });
++    expect((await alerts(tenant.userIds.admin, "issue_overdue")).some((n) => n.href.endsWith(issue.id))).toBe(true);
++    expect((await alerts(tenant.userIds.member, "issue_overdue")).some((n) => n.href.endsWith(issue.id))).toBe(false);
++    await emit("comment.created", { orgId: tenant.org.id, actorId: tenant.userIds.owner, occurredAt: start, commentId: "comment" as CommentId, issueId: issue.id, mentionedUserIds: [tenant.userIds.member, tenant.userIds.admin] });
++    expect((await alerts(tenant.userIds.member, "comment_mention")).filter((n) => n.href.endsWith(issue.id))).toHaveLength(1);
++    expect((await alerts(tenant.userIds.admin, "comment_mention")).filter((n) => n.href.endsWith(issue.id))).toHaveLength(1);
++    const admin = await memberRepo.findMember(tenant.org.id, tenant.userIds.admin);
++    await members.removeMember(tenant.actors.owner, { orgId: tenant.org.id, memberId: admin!.id });
++    expect((await members.getAbsence(tenant.actors.member, tenant.org.id, tenant.userIds.member))?.delegateUserId).toBeNull();
++    await expect(members.getAbsence(tenant.actors.owner, tenant.org.id, tenant.userIds.admin)).rejects.toBeInstanceOf(NotFoundError);
++  });
++});

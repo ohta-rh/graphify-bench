@@ -1,0 +1,159 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/repositories/project-repository.ts /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/repositories/project-repository.ts
+--- /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/repositories/project-repository.ts	2026-10-29 11:06:22
++++ /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/repositories/project-repository.ts	2026-10-29 11:06:50
+@@ -90,20 +90,15 @@
+   }));
+ }
+ 
+-/**
+- * Counts the organization's projects; the `projects` quota reads this. An
+- * archived project keeps its slot until the retention sweep purges it — its
+- * rows, numbers and address are all still there.
+- */
++/** Counts projects in the requested archive scope. */
+ export async function countProjects(
+   orgId: OrgId,
+   scope: ArchiveScope = {},
+ ): Promise<number> {
+-  void scope;
+   const row = getDb()
+     .select({ value: count() })
+     .from(projects)
+-    .where(orgPredicate(projects.orgId, orgId))
++    .where(and(orgPredicate(projects.orgId, orgId), livePredicate(projects.archivedAt, scope)))
+     .get();
+   return row?.value ?? 0;
+ }
+@@ -113,6 +108,14 @@
+ ): Promise<Project> {
+   const taken = await listTakenProjectSlugs(input.orgId);
+   const slug = uniqueSlug(input.slug, taken);
++  const keys = new Set(await listTakenProjectKeys(input.orgId));
++  const baseKey = input.key;
++  let key = baseKey;
++  for (let suffix = 2; keys.has(key); suffix += 1) {
++    const ending = String(suffix);
++    if (ending.length >= 4) throw new Error("Exhausted unique project keys");
++    key = `${baseKey.slice(0, 4 - ending.length)}${ending}`;
++  }
+   const stamp = toIsoTimestamp(new Date());
+ 
+   const row = getDb()
+@@ -122,7 +125,7 @@
+       orgId: input.orgId,
+       name: input.name,
+       slug,
+-      key: input.key,
++      key,
+       description: input.description,
+       visibility: input.visibility,
+       status: "active",
+@@ -152,8 +155,7 @@
+       ...(input.visibility === undefined
+         ? {}
+         : { visibility: input.visibility }),
+-      // `status` is a reflection of the project's issues, never a value a
+-      // form hands in; the column keeps what the lifecycle writes.
++      ...(input.status === undefined ? {} : { status: input.status }),
+       ...(input.leadId === undefined ? {} : { leadId: input.leadId }),
+       ...(input.color === undefined ? {} : { color: input.color }),
+       ...(input.targetDate === undefined
+@@ -204,23 +206,21 @@
+   return toProject(row);
+ }
+ 
+-/** Live slugs only — an archived project's address is free for reuse. */
++/** Archived projects retain their addresses and keys. */
+ export async function listTakenProjectSlugs(
+   orgId: OrgId,
+ ): Promise<readonly string[]> {
+   const rows = getDb()
+     .select({ slug: projects.slug })
+     .from(projects)
+-    .where(
+-      and(
+-        ...compact(
+-          orgPredicate(projects.orgId, orgId),
+-          livePredicate(projects.archivedAt, {}),
+-        ),
+-      ),
+-    )
++    .where(orgPredicate(projects.orgId, orgId))
+     .all();
+   return rows.map((row) => row.slug);
++}
++
++export async function listTakenProjectKeys(orgId: OrgId): Promise<readonly string[]> {
++  return getDb().select({ key: projects.key }).from(projects)
++    .where(orgPredicate(projects.orgId, orgId)).all().map((row) => row.key);
+ }
+ 
+ /** Open/closed/overdue counters plus the last write, for the project card. */
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/issue-service.ts /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/issue-service.ts	2026-10-29 11:06:50
+@@ -52,6 +52,9 @@
+   );
+   assertNotArchived("Project", project.id, project);
+   assertCan(actor, "issue:create", projectResource(project));
++  if (project.status !== "active") {
++    throw new Error("Cannot create an issue in an inactive project");
++  }
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/project-service.ts /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/project-service.ts
+--- /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/project-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/project-service.ts	2026-10-29 11:06:50
+@@ -53,7 +53,7 @@
+     );
+   }
+ 
+-  const slug = await suggestProjectSlug(input.orgId, input.name);
++  const slug = await suggestProjectSlug(input.orgId, input.slug);
+ 
+   const project = await projectRepo.insertProject({
+     ...input,
+@@ -85,6 +85,15 @@
+   assertCan(actor, "project:update", projectResource(project));
+   assertNotArchived("Project", project.id, project);
+ 
++  if (input.status === "completed" && project.status !== "completed") {
++    const stats = await projectRepo.getProjectStats(input.orgId, input.projectId);
++    if (stats.openIssues > 0) throw new Error("Cannot complete a project with open issues");
++  }
++  if (input.status === "completed" && project.status === "completed" &&
++      Object.keys(input).every((key) => ["orgId", "projectId", "status"].includes(key))) {
++    return project;
++  }
++
+   return projectRepo.updateProject(input);
+ }
+ 
+@@ -138,6 +147,13 @@
+     projectId,
+   );
+   assertCan(actor, "project:archive", projectResource(project));
++
++  if (project.archivedAt === null) throw new Error("Project is not archived");
++  const org = requireFound(await orgRepo.findOrgById(orgId), "Organization", orgId);
++  const used = await projectRepo.countProjects(orgId);
++  if (wouldExceedLimit(org.plan, "projects", used)) {
++    throw new Error(`Plan ${org.plan} allows ${used} projects; upgrade to restore another`);
++  }
+ 
+   const restored = await projectRepo.restoreProject(orgId, projectId);
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/usage-service.ts /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/usage-service.ts
+--- /private/tmp/bench-scratch/6fd40c65-2909-4d4b-a4b0-b1cfe4c52df8/src/server/services/usage-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/b01d7c49-168b-4196-8cf6-d2cc323d4c00/src/server/services/usage-service.ts	2026-10-29 11:06:50
+@@ -86,6 +86,9 @@
+         issuesUsed: -payload.issuesArchived,
+       });
+     }),
++    subscribe("project.restored", async (payload) => {
++      await usageRepo.incrementUsage(payload.orgId, { projectsUsed: 1 });
++    }),
+     subscribe("member.joined", async (payload) => {
+       await usageRepo.incrementUsage(payload.orgId, { seatsUsed: 1 });
+     }),

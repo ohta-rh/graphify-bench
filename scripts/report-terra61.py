@@ -63,6 +63,7 @@ def load(directory, tasks, prefixes):
             wall_seconds=wall/1000, cost_usd=metrics['total_cost_usd'],
             input_tokens=metrics['uncached_equivalent_all'], output_tokens=metrics['output_tokens_all'],
             runtime=meta.get('runtime', 'claude'), started_at=meta['started_at'], timed_out=timeout,
+            recovery_protocol=meta.get('recovery_protocol'),
             cost_basis=metrics.get('cost_basis', 'cli_list_price'), num_turns=metrics.get('num_turns')))
     return rows
 
@@ -171,6 +172,8 @@ DATA['quarantined_attempts'] = sum(len(list((OUT / name / 'quarantine').glob('*'
 DATA['known_cost_sum'] = sum(r['cost_usd'] for r in all_rows if r['cost_usd'] is not None)
 DATA['unknown_cost_runs'] = sum(r['cost_usd'] is None for r in all_rows)
 DATA['timed_out_runs'] = sum(r['timed_out'] for r in all_rows)
+DATA['recovery_promotion'] = read(OUT/'recovery-promotion.json')
+DATA['recovered_cells'] = sum(bool(r['recovery_protocol']) for r in all_rows)
 DATA['grading_notes'] = notes
 DATA['bootstrap'] = dict(unit='task', repeats='average within task before resampling', resamples=10000, seed=7, interval='percentile 95%')
 DATA['metric_definitions'] = dict(wall_seconds='Solver CLI only, excluding copying and grading.',
@@ -232,12 +235,22 @@ limits = [
     'このチャットではブラウザーのfile://アクセスがポリシーで拒否されているため、描画表示は未確認。別プロトコル等による迂回は行わず、HTML構造・データ・リンクを検証する。',
 ]
 timeout_by_set = '、'.join(name+str(sum(v['timed_out'] for v in s['arms'].values()))+'件' for name,s in DATA['sets'].items() if any(v['timed_out'] for v in s['arms'].values()))
-limits.append(f'時間切れは合計{DATA["timed_out_runs"]}件（{timeout_by_set}）。これらを除外した正答率や、推定費用不明分を0扱いした総額は示さない。ホスト停止や通信との切り分けは確定しておらず、特にultra/apexの合否・時間をモデル能力だけに帰属できない。')
+if DATA['timed_out_runs']:
+    limits.append(f'時間切れは合計{DATA["timed_out_runs"]}件（{timeout_by_set}）。これらを除外した正答率や、推定費用不明分を0扱いした総額は示さない。ホスト停止や通信との切り分けは確定しておらず、特にultra/apexの合否・時間をモデル能力だけに帰属できない。')
+else:
+    limits.append('現在の596件に時間切れは0件。元の40件の時間切れとその使用量不明費用は、初回結果のアーカイブで確認できる。')
+if DATA['recovered_cells']:
+    limits.append(f'ユーザー許可により元の時間切れ40件を再測定し、うち{DATA["recovered_cells"]}件を主結果に置換した。元の596件・462件合格の全成果物はresults/terra61-recovery/original-publicationに保存。残る556件は名目30分、置換40件はsolver時間上限なし・caffeinateによるスリープ抑止で、時間条件が混在する。時間切れだけを選んだ再測定であり、均一条件のモデル順位とは解釈できない。旧40件の使用量不明費用は新しい小計に含まれない。')
+    limits.append('旧時間切れ40件すべての実行時間帯にMacのSleepイベントが重なっていた（results/terra61-recovery/timeout-diagnosis.json）。これはスリープが唯一の原因である証明ではない。再測定では問題・モデル・effort・採点基準を維持し、スリープ抑止と時間上限を変更した。')
+    section_notice='<p class="col"><strong>時間切れ再測定を反映した混合条件の結果。</strong>元の時間切れ40件を時間上限なし・スリープ抑止で再測定し置換しています。<a href="report-terra61-recovery-ja.html">再測定の詳細</a>と下の測定条件を参照してください。</p>'
+else:
+    section_notice=''
 review_issues = [n for n in notes if n['issue']=='visible_test_review_issue']
 if review_issues:
     limits.append('可視テストレビューで要注意の変更: '+ '、'.join(n['run_id'] for n in review_issues)+'。既存digestの件数上限を外し、テスト期待値も上限+5件に変更。タスクの全ウィンドウ取得という文言との解釈の余地があるが、上限撤廃は明示されていない。元のhidden合格を維持し、問題点をgrading-notes.jsonに開示した。')
 unknown_note=f' 使用量不明の{DATA["unknown_cost_runs"]}実行を費用小計から除外。' if DATA['unknown_cost_runs'] else ''
 section='<!-- TERRA61-START -->\n<section id="terra61"><h2 class="col">GPT-6.1 Terra: 全6セット</h2><p class="col">測定日（JST）: '+html.escape('〜'.join([dates[0],dates[-1]]) if len(dates)>1 else dates[0])+f'。596実行の採点完了。基本単価換算の小計 ${DATA["known_cost_sum"]:.4f}。{unknown_note}</p>'+table(HEADERS,ROWS)
+section=section.replace('<h2 class="col">GPT-6.1 Terra: 全6セット</h2>', '<h2 class="col">GPT-6.1 Terra: 全6セット</h2>'+section_notice)
 section=section.replace('<section id="terra61">', '<section id="terra61"><style>#terra61 table.rep{min-width:720px}#terra61 table.rep th,#terra61 table.rep td{white-space:nowrap}.terra61-scroll-hint{display:none}@media(max-width:760px){.terra61-scroll-hint{display:block;font-size:12px;color:var(--ink-2)}}</style>')
 section=section.replace('<div class="tbl">', '<p class="terra61-scroll-hint col">表は横にスクロールして全項目を確認できます。</p><div class="tbl">', 1)
 for name,s in DATA['sets'].items():
@@ -271,6 +284,8 @@ page_path.write_text(re.sub(r'<!-- TERRA61-START -->.*?<!-- TERRA61-END -->\n{0,
 readme=ROOT/'README.md'; original_readme=readme.read_text(); content=original_readme
 content=re.sub(r'<!-- TERRA61-README-START -->.*?<!-- TERRA61-README-END -->\n{0,2}','',content,flags=re.S)
 block='<!-- TERRA61-README-START -->\n**GPT-6.1 Terra, all six sets:** 596 solver and graded runs at low/medium/high/xhigh. Independent Codex runtime; Claude turn/budget caps cannot be enforced identically. Runtime, host load and date differences apply. Base Standard solver cost subtotal $'+f'{DATA["known_cost_sum"]:.4f}'+', not an invoice. [Data and paired task CIs](results/terra61/REPORT.md), [JSON](results/terra61/analysis.json), [CSV](results/terra61/runs.csv), [Japanese HTML](docs/report-terra61-ja.html).\n\n'+md_table(HEADERS,ROWS)+'\n<!-- TERRA61-README-END -->\n\n'
+if DATA['recovered_cells']:
+    block=block.replace('\n\n'+md_table(HEADERS,ROWS), '\n\n**Mixed deadline conditions:** 40 prior timeouts replaced with no-wall-deadline, sleep-prevented reruns; remaining556 retain nominal30min. Original596 archived; not a uniform-deadline ranking. [Recovery details](results/terra61-recovery/REPORT.md).\n\n'+md_table(HEADERS,ROWS))
 anchor='Paired mean differences over tasks with 95% bootstrap CIs.'
 if content.count(anchor)!=1: raise SystemExit('README anchor changed; standalone Terra data preserved')
 if readme.read_text()!=original_readme: raise SystemExit('README was concurrently edited; standalone Terra data preserved, retry only the report')

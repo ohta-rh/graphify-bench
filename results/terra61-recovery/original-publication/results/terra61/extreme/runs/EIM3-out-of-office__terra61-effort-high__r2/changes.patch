@@ -1,0 +1,320 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/schemas/member.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/schemas/member.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/schemas/member.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/schemas/member.ts	2026-10-28 11:16:50
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ import {
+   emailSchema,
++  isoTimestampSchema,
+   memberIdSchema,
+   orgIdSchema,
+   pageRequestSchema,
+@@ -71,3 +72,13 @@
+ export type RemoveMemberInput = z.infer<typeof removeMemberSchema>;
+ export type ListMembersInput = z.infer<typeof listMembersSchema>;
+ export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
++
++export const setAbsenceSchema = z.object({
++  orgId: orgIdSchema,
++  userId: userIdSchema,
++  delegateUserId: userIdSchema.nullable().default(null),
++  startsAt: isoTimestampSchema,
++  endsAt: isoTimestampSchema,
++  note: z.string().max(200).nullable().default(null),
++});
++export type SetAbsenceInput = z.infer<typeof setAbsenceSchema>;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/db/migrate.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/db/migrate.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/db/migrate.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/db/migrate.ts	2026-10-28 11:16:50
+@@ -90,6 +90,15 @@
+    )`,
+   `CREATE UNIQUE INDEX IF NOT EXISTS members_org_user_idx ON members (org_id, user_id)`,
+   `CREATE INDEX IF NOT EXISTS members_org_role_idx ON members (org_id, role)`,
++  `CREATE TABLE IF NOT EXISTS member_absences (
++     org_id TEXT NOT NULL,
++     user_id TEXT NOT NULL,
++     delegate_user_id TEXT,
++     starts_at TEXT NOT NULL,
++     ends_at TEXT NOT NULL,
++     note TEXT
++   )`,
++  `CREATE UNIQUE INDEX IF NOT EXISTS member_absences_org_user_idx ON member_absences (org_id, user_id)`,
+   `CREATE TABLE IF NOT EXISTS invitations (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/db/schema/members.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/db/schema/members.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/db/schema/members.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/db/schema/members.ts	2026-10-28 11:16:50
+@@ -55,3 +55,16 @@
+ export type MemberRow = typeof members.$inferSelect;
+ export type NewMemberRow = typeof members.$inferInsert;
+ export type InvitationRow = typeof invitations.$inferSelect;
++
++export const memberAbsences = sqliteTable(
++  "member_absences",
++  {
++    orgId: text("org_id").notNull(),
++    userId: text("user_id").notNull(),
++    delegateUserId: text("delegate_user_id"),
++    startsAt: text("starts_at").notNull(),
++    endsAt: text("ends_at").notNull(),
++    note: text("note"),
++  },
++  (table) => [uniqueIndex("member_absences_org_user_idx").on(table.orgId, table.userId)],
++);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/repositories/absence-repository.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/repositories/absence-repository.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/repositories/absence-repository.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/repositories/absence-repository.ts	2026-10-28 11:17:00
+@@ -0,0 +1,39 @@
++import { and, eq } from "drizzle-orm";
++import { getDb, memberAbsences } from "@/server/db";
++import type { SetAbsenceInput } from "@/schemas/member";
++import type { IsoTimestamp, OrgId, UserId } from "@/types/common";
++import type { MemberAbsence } from "@/types/member";
++
++export async function findAbsence(orgId: OrgId, userId: UserId): Promise<MemberAbsence | null> {
++  const row = getDb().select().from(memberAbsences).where(and(
++    eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, userId),
++  )).get();
++  return row ? {
++    orgId: row.orgId as OrgId,
++    userId: row.userId as UserId,
++    delegateUserId: row.delegateUserId as UserId | null,
++    startsAt: row.startsAt as IsoTimestamp,
++    endsAt: row.endsAt as IsoTimestamp,
++    note: row.note,
++  } : null;
++}
++
++export async function upsertAbsence(input: SetAbsenceInput): Promise<MemberAbsence> {
++  getDb().insert(memberAbsences).values(input).onConflictDoUpdate({
++    target: [memberAbsences.orgId, memberAbsences.userId],
++    set: { delegateUserId: input.delegateUserId, startsAt: input.startsAt, endsAt: input.endsAt, note: input.note },
++  }).run();
++  return (await findAbsence(input.orgId, input.userId))!;
++}
++
++export async function deleteAbsence(orgId: OrgId, userId: UserId): Promise<void> {
++  getDb().delete(memberAbsences).where(and(eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, userId))).run();
++}
++
++/** Resolve one level only, at the time of the event. */
++export async function activeDelegate(orgId: OrgId, userId: UserId, at: Date): Promise<UserId | null> {
++  const absence = await findAbsence(orgId, userId);
++  const time = at.getTime();
++  if (!absence || time < Date.parse(absence.startsAt) || time >= Date.parse(absence.endsAt)) return null;
++  return absence.delegateUserId;
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/repositories/member-repository.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/repositories/member-repository.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/repositories/member-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/repositories/member-repository.ts	2026-10-28 11:17:00
+@@ -6,7 +6,7 @@
+ import { and, count, desc, eq, isNull, like, or } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { archivePatch, shouldFilterArchived } from "@/lib/soft-delete";
+-import { getDb, members, users } from "@/server/db";
++import { getDb, memberAbsences, members, users } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+ import { orgPredicate } from "./base-repository";
+ import { compact, keysetPredicate, probeLimit, toPage } from "./_paging";
+@@ -164,12 +164,17 @@
+   orgId: OrgId,
+   memberId: MemberId,
+ ): Promise<Member> {
+-  const row = getDb()
+-    .update(members)
+-    .set({ ...archivePatch(), status: "suspended" })
+-    .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
+-    .returning()
+-    .get();
++  const row = getDb().transaction((db) => {
++    const removed = db.update(members)
++      .set({ ...archivePatch(), status: "suspended" })
++      .where(and(orgPredicate(members.orgId, orgId), eq(members.id, memberId)))
++      .returning().get();
++    if (removed) {
++      db.delete(memberAbsences).where(and(eq(memberAbsences.orgId, orgId), eq(memberAbsences.userId, removed.userId))).run();
++      db.update(memberAbsences).set({ delegateUserId: null }).where(and(eq(memberAbsences.orgId, orgId), eq(memberAbsences.delegateUserId, removed.userId))).run();
++    }
++    return removed;
++  });
+ 
+   if (!row) throw new Error(`Member ${memberId} not found in org ${orgId}`);
+   return toMember(row);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/issue-service.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/issue-service.ts	2026-10-28 11:17:08
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertNotArchived } from "@/lib/soft-delete";
+ import { assertOrgScope } from "@/lib/tenant";
++import { activeDelegate } from "@/server/repositories/absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as labelRepo from "@/server/repositories/label-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -66,7 +67,10 @@
+   }
+ 
+   const number = await issueRepo.nextIssueNumber(input.orgId, input.projectId);
+-  const issue = await issueRepo.insertIssue(input, actor.userId, number);
++  const assigneeId = input.assigneeId && input.assigneeId !== actor.userId
++    ? (await activeDelegate(input.orgId, input.assigneeId, new Date())) ?? input.assigneeId
++    : input.assigneeId;
++  const issue = await issueRepo.insertIssue({ ...input, assigneeId }, actor.userId, number);
+ 
+   await emit("issue.created", {
+     ...actorEnvelope(actor),
+@@ -161,10 +165,13 @@
+   assertCan(actor, "issue:assign", issueResource(before));
+   assertNotArchived("Issue", before.id, before);
+ 
++  const assigneeId = input.assigneeId && input.assigneeId !== actor.userId
++    ? (await activeDelegate(input.orgId, input.assigneeId, new Date())) ?? input.assigneeId
++    : input.assigneeId;
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+     input.issueId,
+-    input.assigneeId,
++    assigneeId,
+   );
+ 
+   if (input.assigneeId === null) {
+@@ -182,7 +189,7 @@
+     issueId: after.id,
+     projectId: after.projectId,
+     previousAssigneeId: before.assigneeId,
+-    assigneeId: input.assigneeId,
++    assigneeId: assigneeId!,
+   });
+ 
+   return after;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/member-service.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/member-service.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/member-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/member-service.ts	2026-10-28 11:17:00
+@@ -6,16 +6,18 @@
+ import { emit } from "@/lib/event-bus";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import * as absenceRepo from "@/server/repositories/absence-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
+ import { hasRoleAtLeast } from "@/types/member";
+ import { actorEnvelope, memberResource, requireFound } from "./_support";
+ import type {
++  SetAbsenceInput,
+   ListMembersInput,
+   RemoveMemberInput,
+   UpdateMemberRoleInput,
+ } from "@/schemas/member";
+ import type { MemberId, OrgId, Page, UserId } from "@/types/common";
+-import type { Actor, Member, MemberWithUser, Role } from "@/types/member";
++import type { Actor, Member, MemberAbsence, MemberWithUser, Role } from "@/types/member";
+ 
+ /** How many members are scanned when counting the remaining owners. */
+ const OWNER_SCAN_LIMIT = 100;
+@@ -147,4 +149,37 @@
+       "An organization must keep at least one owner; transfer ownership first",
+     );
+   }
++}
++
++async function requireActiveMember(orgId: OrgId, userId: UserId): Promise<Member> {
++  const member = await memberRepo.findMember(orgId, userId);
++  return requireFound(member?.status === "active" ? member : null, "Member", userId);
++}
++
++export async function setAbsence(actor: Actor, input: SetAbsenceInput): Promise<MemberAbsence> {
++  assertOrgScope(actor, input.orgId);
++  const member = await requireActiveMember(input.orgId, input.userId);
++  if (actor.userId !== input.userId) assertCan(actor, "member:update_role", memberResource(member));
++  if (!Number.isFinite(Date.parse(input.startsAt)) || !Number.isFinite(Date.parse(input.endsAt)) || Date.parse(input.endsAt) <= Date.parse(input.startsAt)) {
++    throw new Error("Absence end must be after its start");
++  }
++  if (input.delegateUserId !== null) {
++    if (input.delegateUserId === input.userId) throw new Error("A member cannot delegate to themselves");
++    await requireActiveMember(input.orgId, input.delegateUserId);
++  }
++  return absenceRepo.upsertAbsence(input);
++}
++
++export async function clearAbsence(actor: Actor, orgId: OrgId, userId: UserId): Promise<void> {
++  assertOrgScope(actor, orgId);
++  const member = await requireActiveMember(orgId, userId);
++  if (actor.userId !== userId) assertCan(actor, "member:update_role", memberResource(member));
++  await absenceRepo.deleteAbsence(orgId, userId);
++}
++
++export async function getAbsence(actor: Actor, orgId: OrgId, userId: UserId): Promise<MemberAbsence | null> {
++  assertOrgScope(actor, orgId);
++  await requireActiveMember(orgId, userId);
++  const absence = await absenceRepo.findAbsence(orgId, userId);
++  return absence && Date.now() < Date.parse(absence.endsAt) ? absence : null;
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/notification-service.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/server/services/notification-service.ts	2026-10-28 11:17:08
+@@ -7,6 +7,7 @@
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
++import { activeDelegate } from "@/server/repositories/absence-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+@@ -181,6 +182,16 @@
+   if (registered) return;
+   registered = true;
+ 
++  subscribe("issue.created", async (payload) => {
++    if (payload.assigneeId === null) return;
++    await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
++      title: "You were assigned an issue",
++      body: `Issue ${payload.issueId} is now yours`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    });
++  });
++
+   subscribe("issue.assigned", async (payload) => {
+     await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
+       title: "You were assigned an issue",
+@@ -192,7 +203,8 @@
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
+-    await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
++    const recipient = (await activeDelegate(payload.orgId, payload.assigneeId, new Date(payload.occurredAt))) ?? payload.assigneeId;
++    await notify(payload.orgId, "issue_overdue", [recipient], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+       href: `/issues/${payload.issueId}`,
+@@ -214,10 +226,14 @@
+     });
+ 
+     if (payload.mentionedUserIds.length > 0) {
++      const delegates = await Promise.all(payload.mentionedUserIds.map((userId) =>
++        activeDelegate(payload.orgId, userId, new Date(payload.occurredAt)),
++      ));
++      const recipients = [...payload.mentionedUserIds, ...delegates.filter((id): id is UserId => id !== null)];
+       await notify(
+         payload.orgId,
+         "comment_mention",
+-        payload.mentionedUserIds,
++        recipients,
+         {
+           title: "You were mentioned",
+           body: `You were mentioned on issue ${payload.issueId}`,
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/types/member.ts /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/types/member.ts
+--- /private/tmp/bench-scratch/5ddbb8c9-34f9-4935-b054-9f540843f3b0/src/types/member.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/48171f04-e33d-4e75-b718-5e0f87c63878/src/types/member.ts	2026-10-28 11:16:50
+@@ -87,3 +87,11 @@
+ export function hasRoleAtLeast(role: Role, atLeast: Role): boolean {
+   return ROLE_RANK[role] >= ROLE_RANK[atLeast];
+ }
++
++export interface MemberAbsence extends TenantScoped {
++  readonly userId: UserId;
++  readonly delegateUserId: UserId | null;
++  readonly startsAt: IsoTimestamp;
++  readonly endsAt: IsoTimestamp;
++  readonly note: string | null;
++}

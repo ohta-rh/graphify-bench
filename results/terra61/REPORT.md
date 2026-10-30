@@ -6,28 +6,28 @@
 | 通常45問 | medium | 45/45 | 39 | 24.1 s | $0.0184 |
 | 通常45問 | high | 45/45 | 38 | 27.8 s | $0.0198 |
 | 通常45問 | xhigh | 45/45 | 38 | 22.1 s | $0.0222 |
-| 難問 | low | 32/32 | 29 | 37.7 s | $0.0314（費用不明1件） |
+| 難問 | low | 32/32 | 30 | 37.2 s | $0.0300 |
 | 難問 | medium | 32/32 | 32 | 38.4 s | $0.0293 |
 | 難問 | high | 32/32 | 32 | 37.8 s | $0.0309 |
 | 難問 | xhigh | 32/32 | 32 | 44.8 s | $0.0393 |
-| 超難問 | low | 24/24 | 15 | 59.2 s | $0.0513（費用不明6件） |
-| 超難問 | medium | 24/24 | 14 | 60.9 s | $0.0683（費用不明8件） |
-| 超難問 | high | 24/24 | 19 | 58.8 s | $0.0718（費用不明1件） |
-| 超難問 | xhigh | 24/24 | 16 | 90.6 s | $0.1008（費用不明4件） |
+| 超難問 | low | 24/24 | 21 | 57.2 s | $0.0596 |
+| 超難問 | medium | 24/24 | 20 | 52.0 s | $0.0683 |
+| 超難問 | high | 24/24 | 20 | 58.8 s | $0.0698 |
+| 超難問 | xhigh | 24/24 | 20 | 81.1 s | $0.1020 |
 | 極難問 | low | 24/24 | 16 | 48.8 s | $0.0656 |
 | 極難問 | medium | 24/24 | 18 | 51.9 s | $0.0722 |
 | 極難問 | high | 24/24 | 17 | 71.0 s | $0.0880 |
 | 極難問 | xhigh | 24/24 | 18 | 105.4 s | $0.1312 |
-| apex | low | 12/12 | 6 | 73.0 s | $0.0705（費用不明3件） |
-| apex | medium | 12/12 | 4 | 1034.9 s | $0.0739（費用不明6件） |
-| apex | high | 12/12 | 6 | 97.2 s | $0.0747（費用不明4件） |
-| apex | xhigh | 12/12 | 5 | 2094.4 s | $0.1238（費用不明7件） |
+| apex | low | 12/12 | 9 | 58.3 s | $0.0694 |
+| apex | medium | 12/12 | 9 | 82.3 s | $0.0739 |
+| apex | high | 12/12 | 10 | 77.1 s | $0.0820 |
+| apex | xhigh | 12/12 | 10 | 129.0 s | $0.1331 |
 | brownfield | low | 12/12 | 9 | 43.5 s | $0.0592 |
 | brownfield | medium | 12/12 | 7 | 55.6 s | $0.0638 |
 | brownfield | high | 12/12 | 7 | 60.2 s | $0.0766 |
 | brownfield | xhigh | 12/12 | 6 | 94.9 s | $0.1204 |
 
-Base-rate solver cost subtotal: $30.1743; unknown cost runs: 40. Quarantined infrastructure attempts: 23.
+Base-rate solver cost subtotal: $33.9228; unknown cost runs: 0. Quarantined infrastructure attempts: 23.
 
 Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
@@ -105,7 +105,7 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
 | 条件 | 正解 | 時間中央値 | 推定費用中央値 |
 |---|---|---|---|
-| Terra · low | 29/32 | 37.7 s | $0.0314 |
+| Terra · low | 30/32 | 37.2 s | $0.0300 |
 | Terra · medium | 32/32 | 38.4 s | $0.0293 |
 | Terra · high | 32/32 | 37.8 s | $0.0309 |
 | Terra · xhigh | 32/32 | 44.8 s | $0.0393 |
@@ -137,16 +137,16 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 |---|---|---|---|
 | Terra · xhigh − Terra · high | +0.0 [+0.0, +0.0] pt | +0.0163 [+0.0093, +0.0240] USD | +6.0 [-0.8, +13.2] s |
 | Terra · xhigh − Terra · medium | +0.0 [+0.0, +0.0] pt | +0.0193 [+0.0115, +0.0277] USD | -32.2 [-117.7, +15.0] s |
-| Terra · xhigh − Terra · low | +9.4 [+0.0, +18.8] pt | N/A | -72.5 [-237.2, +13.2] s |
+| Terra · xhigh − Terra · low | +6.2 [+0.0, +15.6] pt | +0.0209 [+0.0115, +0.0314] USD | +9.5 [+2.7, +16.0] s |
 | Terra · high − Terra · medium | +0.0 [+0.0, +0.0] pt | +0.0030 [+0.0003, +0.0063] USD | -38.3 [-122.4, +7.5] s |
-| Terra · high − Terra · low | +9.4 [+0.0, +18.8] pt | N/A | -78.6 [-245.5, +8.0] s |
-| Terra · medium − Terra · low | +9.4 [+0.0, +18.8] pt | N/A | -40.3 [-245.5, +119.0] s |
-| Terra · low − Opus 5.5 · low | -9.4 [-18.8, +0.0] pt | N/A | +86.5 [+0.1, +252.9] s |
-| Terra · low − Sonnet 5 · low | -3.1 [-18.8, +15.6] pt | N/A | +4.6 [-112.9, +193.0] s |
-| Terra · low − Sonnet 5.5 · low | -9.4 [-18.8, +0.0] pt | N/A | +75.3 [-11.5, +240.5] s |
-| Terra · low − Haiku 5.5 · low | -9.4 [-18.8, +0.0] pt | N/A | +68.2 [-21.9, +237.7] s |
-| Terra · low − Grok 4.7 · low | -9.4 [-18.8, +0.0] pt | N/A | +15.3 [-95.6, +202.5] s |
-| Terra · low − GPT-6 Luna · low | +6.2 [-9.4, +25.0] pt | N/A | +62.4 [-39.1, +237.8] s |
+| Terra · high − Terra · low | +6.2 [+0.0, +15.6] pt | +0.0047 [-0.0005, +0.0104] USD | +3.4 [-2.0, +9.3] s |
+| Terra · medium − Terra · low | +6.2 [+0.0, +15.6] pt | +0.0016 [-0.0017, +0.0051] USD | +41.7 [-1.6, +122.4] s |
+| Terra · low − Opus 5.5 · low | -6.2 [-15.6, +0.0] pt | -0.2130 [-0.2549, -0.1775] USD | +4.5 [-1.3, +10.3] s |
+| Terra · low − Sonnet 5 · low | +0.0 [-12.5, +15.6] pt | -0.4578 [-0.6553, -0.2895] USD | -77.4 [-121.3, -40.4] s |
+| Terra · low − Sonnet 5.5 · low | -6.2 [-15.6, +0.0] pt | -0.1155 [-0.1393, -0.0958] USD | -6.7 [-14.8, +0.5] s |
+| Terra · low − Haiku 5.5 · low | -6.2 [-15.6, +0.0] pt | +0.0156 [+0.0122, +0.0191] USD | -13.9 [-23.8, -4.3] s |
+| Terra · low − Grok 4.7 · low | -6.2 [-15.6, +0.0] pt | -0.0997 [-0.1319, -0.0705] USD | -66.7 [-101.4, -39.3] s |
+| Terra · low − GPT-6 Luna · low | +9.4 [-3.1, +25.0] pt | +0.0205 [+0.0142, +0.0254] USD | -19.7 [-43.2, -5.6] s |
 | Terra · medium − Opus 5.5 · medium | +0.0 [+0.0, +0.0] pt | -0.3180 [-0.4005, -0.2496] USD | +28.9 [-22.5, +118.1] s |
 | Terra · medium − Sonnet 5 · medium | +3.1 [+0.0, +9.4] pt | -0.6461 [-0.8803, -0.4426] USD | -85.5 [-174.7, +25.1] s |
 | Terra · medium − Sonnet 5.5 · medium | +6.2 [+0.0, +15.6] pt | -0.1222 [-0.1456, -0.1019] USD | +27.9 [-20.9, +115.7] s |
@@ -169,10 +169,10 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
 | 条件 | 正解 | 時間中央値 | 推定費用中央値 |
 |---|---|---|---|
-| Terra · low | 15/24 | 59.2 s | $0.0513 |
-| Terra · medium | 14/24 | 60.9 s | $0.0683 |
-| Terra · high | 19/24 | 58.8 s | $0.0718 |
-| Terra · xhigh | 16/24 | 90.6 s | $0.1008 |
+| Terra · low | 21/24 | 57.2 s | $0.0596 |
+| Terra · medium | 20/24 | 52.0 s | $0.0683 |
+| Terra · high | 20/24 | 58.8 s | $0.0698 |
+| Terra · xhigh | 20/24 | 81.1 s | $0.1020 |
 | Opus 5.5 · low | 21/24 | 78.1 s | $0.4654 |
 | Opus 5.5 · medium | 23/24 | 152.3 s | $0.8502 |
 | Opus 5.5 · high | 24/24 | 209.0 s | $1.2373 |
@@ -203,39 +203,39 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
 | 先 − 後 | 正答率差 [95% CI] | 費用差 [95% CI] | 時間差 [95% CI] |
 |---|---|---|---|
-| Terra · xhigh − Terra · high | -12.5 [-25.0, +0.0] pt | N/A | +750.4 [+78.5, +1567.4] s |
-| Terra · xhigh − Terra · medium | +8.3 [-20.8, +37.5] pt | N/A | -466.7 [-1970.0, +1038.8] s |
-| Terra · xhigh − Terra · low | +4.2 [-16.7, +25.0] pt | N/A | -215.4 [-1391.4, +1057.6] s |
-| Terra · high − Terra · medium | +20.8 [-8.3, +50.0] pt | N/A | -1217.1 [-2323.8, -171.3] s |
-| Terra · high − Terra · low | +16.7 [+0.0, +33.3] pt | N/A | -965.8 [-1716.4, -293.2] s |
-| Terra · medium − Terra · low | -4.2 [-29.2, +25.0] pt | N/A | +251.3 [-1147.4, +1410.3] s |
-| Terra · low − Opus 5.5 · low | -25.0 [-45.8, -8.3] pt | N/A | +1187.7 [+330.1, +2260.1] s |
-| Terra · low − Sonnet 5 · low | -33.3 [-50.0, -16.7] pt | N/A | +1206.9 [+346.9, +2276.7] s |
-| Terra · low − Sonnet 5.5 · low | -29.2 [-50.0, -8.3] pt | N/A | +1210.1 [+346.9, +2286.1] s |
-| Terra · low − Haiku 5.5 · low | -25.0 [-45.8, -8.3] pt | N/A | +1145.5 [+280.9, +2226.7] s |
-| Terra · low − Grok 4.7 · low | -33.3 [-50.0, -16.7] pt | N/A | +1027.7 [+165.0, +2093.5] s |
-| Terra · low − GPT-6.1 Sol · low | -20.8 [-50.0, +4.2] pt | N/A | +1190.6 [+334.2, +2259.7] s |
-| Terra · low − GPT-6 Luna · low | +0.0 [-29.2, +25.0] pt | N/A | +1179.4 [+311.5, +2257.0] s |
-| Terra · medium − Opus 5.5 · medium | -37.5 [-62.5, -16.7] pt | N/A | +1371.6 [+498.8, +2343.6] s |
-| Terra · medium − Sonnet 5 · medium | -33.3 [-58.3, -12.5] pt | N/A | +1453.3 [+569.1, +2451.3] s |
-| Terra · medium − Sonnet 5.5 · medium | -25.0 [-54.2, +0.0] pt | N/A | +1447.6 [+566.6, +2440.8] s |
-| Terra · medium − Haiku 5.5 · medium | -29.2 [-54.2, -4.2] pt | N/A | +1346.1 [+466.0, +2333.0] s |
-| Terra · medium − Grok 4.7 · medium | -37.5 [-66.7, -8.3] pt | N/A | +880.1 [-22.7, +1877.3] s |
-| Terra · medium − GPT-6.1 Sol · medium | -29.2 [-58.3, -4.2] pt | N/A | +1418.7 [+538.4, +2405.8] s |
-| Terra · medium − GPT-6 Luna · medium | -25.0 [-54.2, +4.2] pt | N/A | +1456.5 [+566.2, +2462.9] s |
-| Terra · high − Opus 5.5 · high | -20.8 [-45.8, +0.0] pt | N/A | +97.6 [-147.1, +517.6] s |
-| Terra · high − Sonnet 5 · high | -20.8 [-45.8, +0.0] pt | N/A | +175.5 [-73.8, +604.9] s |
-| Terra · high − Sonnet 5.5 · high | -12.5 [-33.3, +0.0] pt | N/A | +188.3 [-55.7, +610.6] s |
-| Terra · high − Haiku 5.5 · high | -12.5 [-33.3, +4.2] pt | N/A | +68.4 [-176.2, +487.2] s |
-| Terra · high − Grok 4.7 · high | -20.8 [-45.8, +0.0] pt | N/A | -639.9 [-965.1, -170.8] s |
-| Terra · high − GPT-6.1 Sol · high | -16.7 [-37.5, +0.0] pt | N/A | +104.5 [-161.9, +534.7] s |
-| Terra · high − GPT-6 Luna · high | -12.5 [-41.7, +12.5] pt | N/A | +196.8 [-34.7, +607.6] s |
-| Terra · xhigh − Opus 5.5 · xhigh | -33.3 [-54.2, -12.5] pt | N/A | +668.9 [-111.1, +1561.9] s |
-| Terra · xhigh − Sonnet 5 · xhigh | -29.2 [-45.8, -12.5] pt | N/A | +755.8 [-17.5, +1644.3] s |
-| Terra · xhigh − Sonnet 5.5 · xhigh | -29.2 [-45.8, -12.5] pt | N/A | +762.7 [-20.7, +1662.8] s |
-| Terra · xhigh − Haiku 5.5 · xhigh | -33.3 [-54.2, -12.5] pt | N/A | +632.0 [-153.9, +1532.7] s |
-| Terra · xhigh − GPT-6.1 Sol · xhigh | -29.2 [-45.8, -12.5] pt | N/A | +761.3 [-10.9, +1644.4] s |
-| Terra · xhigh − GPT-6 Luna · xhigh | -25.0 [-45.8, -4.2] pt | N/A | +836.8 [+69.4, +1721.6] s |
+| Terra · xhigh − Terra · high | +0.0 [+0.0, +0.0] pt | +0.0368 [+0.0215, +0.0541] USD | -12.3 [-73.3, +28.7] s |
+| Terra · xhigh − Terra · medium | +0.0 [-12.5, +12.5] pt | +0.0388 [+0.0281, +0.0530] USD | +30.7 [+21.3, +40.6] s |
+| Terra · xhigh − Terra · low | -4.2 [-25.0, +12.5] pt | +0.0499 [+0.0350, +0.0689] USD | +30.6 [+19.6, +42.5] s |
+| Terra · high − Terra · medium | +0.0 [-12.5, +12.5] pt | +0.0020 [-0.0074, +0.0120] USD | +43.0 [+2.6, +102.1] s |
+| Terra · high − Terra · low | -4.2 [-25.0, +12.5] pt | +0.0131 [+0.0046, +0.0212] USD | +43.0 [-0.3, +103.1] s |
+| Terra · medium − Terra · low | -4.2 [-12.5, +0.0] pt | +0.0111 [+0.0017, +0.0215] USD | -0.0 [-8.1, +9.2] s |
+| Terra · low − Opus 5.5 · low | +0.0 [+0.0, +0.0] pt | -0.4378 [-0.5399, -0.3357] USD | -21.3 [-31.1, -11.4] s |
+| Terra · low − Sonnet 5 · low | -8.3 [-20.8, +0.0] pt | -0.2246 [-0.2887, -0.1627] USD | -2.1 [-14.0, +7.9] s |
+| Terra · low − Sonnet 5.5 · low | -4.2 [-16.7, +8.3] pt | -0.2217 [-0.2824, -0.1620] USD | +1.1 [-6.2, +8.2] s |
+| Terra · low − Haiku 5.5 · low | +0.0 [-12.5, +12.5] pt | -0.0021 [-0.0318, +0.0216] USD | -63.5 [-86.9, -40.8] s |
+| Terra · low − Grok 4.7 · low | -8.3 [-20.8, +0.0] pt | -0.2477 [-0.3048, -0.1873] USD | -181.3 [-227.4, -134.8] s |
+| Terra · low − GPT-6.1 Sol · low | +4.2 [-20.8, +29.2] pt | -0.0422 [-0.0604, -0.0252] USD | -18.4 [-34.8, -4.4] s |
+| Terra · low − GPT-6 Luna · low | +25.0 [-4.2, +54.2] pt | +0.0412 [+0.0304, +0.0508] USD | -29.6 [-50.6, -11.6] s |
+| Terra · medium − Opus 5.5 · medium | -12.5 [-25.0, +0.0] pt | -0.8558 [-1.1110, -0.6198] USD | -88.8 [-120.2, -59.4] s |
+| Terra · medium − Sonnet 5 · medium | -8.3 [-20.8, +0.0] pt | -0.2521 [-0.3241, -0.1821] USD | -7.0 [-21.3, +6.2] s |
+| Terra · medium − Sonnet 5.5 · medium | +0.0 [-16.7, +16.7] pt | -0.2378 [-0.3036, -0.1723] USD | -12.8 [-26.1, -1.0] s |
+| Terra · medium − Haiku 5.5 · medium | -4.2 [-20.8, +12.5] pt | -0.0647 [-0.1299, -0.0055] USD | -114.3 [-150.8, -78.7] s |
+| Terra · medium − Grok 4.7 · medium | -12.5 [-33.3, +8.3] pt | -0.6827 [-0.8474, -0.5147] USD | -580.3 [-686.1, -469.8] s |
+| Terra · medium − GPT-6.1 Sol · medium | -4.2 [-16.7, +8.3] pt | -0.0964 [-0.1361, -0.0631] USD | -41.7 [-63.4, -22.9] s |
+| Terra · medium − GPT-6 Luna · medium | +0.0 [-29.2, +29.2] pt | +0.0604 [+0.0482, +0.0734] USD | -3.8 [-19.6, +14.0] s |
+| Terra · high − Opus 5.5 · high | -16.7 [-41.7, +0.0] pt | -1.0805 [-1.3589, -0.8072] USD | -102.6 [-156.2, -35.2] s |
+| Terra · high − Sonnet 5 · high | -16.7 [-41.7, +0.0] pt | -0.4212 [-0.5464, -0.2942] USD | -24.7 [-81.0, +49.2] s |
+| Terra · high − Sonnet 5.5 · high | -8.3 [-25.0, +0.0] pt | -0.4132 [-0.5397, -0.2834] USD | -11.9 [-62.8, +55.7] s |
+| Terra · high − Haiku 5.5 · high | -8.3 [-29.2, +8.3] pt | -0.1412 [-0.2101, -0.0707] USD | -131.8 [-187.3, -64.2] s |
+| Terra · high − Grok 4.7 · high | -16.7 [-41.7, +0.0] pt | -1.0512 [-1.2231, -0.8686] USD | -840.1 [-992.8, -682.5] s |
+| Terra · high − GPT-6.1 Sol · high | -12.5 [-33.3, +0.0] pt | -0.1819 [-0.2487, -0.1192] USD | -95.7 [-177.1, -2.3] s |
+| Terra · high − GPT-6 Luna · high | -8.3 [-33.3, +16.7] pt | +0.0562 [+0.0479, +0.0644] USD | -3.4 [-40.1, +53.4] s |
+| Terra · xhigh − Opus 5.5 · xhigh | -16.7 [-41.7, +0.0] pt | -2.1020 [-2.6131, -1.6354] USD | -294.1 [-358.5, -234.8] s |
+| Terra · xhigh − Sonnet 5 · xhigh | -12.5 [-33.3, +0.0] pt | -1.1221 [-1.5849, -0.7169] USD | -207.2 [-293.4, -129.0] s |
+| Terra · xhigh − Sonnet 5.5 · xhigh | -12.5 [-33.3, +0.0] pt | -1.0672 [-1.4869, -0.6819] USD | -200.3 [-289.4, -118.0] s |
+| Terra · xhigh − Haiku 5.5 · xhigh | -16.7 [-41.7, +0.0] pt | -0.3779 [-0.5493, -0.2307] USD | -330.9 [-414.0, -256.0] s |
+| Terra · xhigh − GPT-6.1 Sol · xhigh | -12.5 [-33.3, +0.0] pt | -0.2456 [-0.3112, -0.1786] USD | -201.7 [-278.4, -124.2] s |
+| Terra · xhigh − GPT-6 Luna · xhigh | -8.3 [-29.2, +8.3] pt | +0.0787 [+0.0657, +0.0932] USD | -126.1 [-182.9, -80.9] s |
 
 ## 極難問
 
@@ -313,10 +313,10 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
 | 条件 | 正解 | 時間中央値 | 推定費用中央値 |
 |---|---|---|---|
-| Terra · low | 6/12 | 73.0 s | $0.0705 |
-| Terra · medium | 4/12 | 1034.9 s | $0.0739 |
-| Terra · high | 6/12 | 97.2 s | $0.0747 |
-| Terra · xhigh | 5/12 | 2094.4 s | $0.1238 |
+| Terra · low | 9/12 | 58.3 s | $0.0694 |
+| Terra · medium | 9/12 | 82.3 s | $0.0739 |
+| Terra · high | 10/12 | 77.1 s | $0.0820 |
+| Terra · xhigh | 10/12 | 129.0 s | $0.1331 |
 | Opus 5.5 · low | 12/12 | 99.8 s | $0.6395 |
 | Opus 5.5 · medium | 12/12 | 241.1 s | $1.3044 |
 | Opus 5.5 · high | 12/12 | 275.5 s | $1.8398 |
@@ -343,35 +343,35 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 
 | 先 − 後 | 正答率差 [95% CI] | 費用差 [95% CI] | 時間差 [95% CI] |
 |---|---|---|---|
-| Terra · xhigh − Terra · high | -8.3 [-41.7, +25.0] pt | N/A | +627.8 [-1026.9, +2457.2] s |
-| Terra · xhigh − Terra · medium | +8.3 [-33.3, +50.0] pt | N/A | -42.8 [-1818.8, +1709.6] s |
-| Terra · xhigh − Terra · low | -8.3 [-50.0, +33.3] pt | N/A | +1057.0 [-793.0, +3044.8] s |
-| Terra · high − Terra · medium | +16.7 [+0.0, +33.3] pt | N/A | -670.5 [-1750.1, +489.2] s |
-| Terra · high − Terra · low | +0.0 [-25.0, +25.0] pt | N/A | +429.2 [-740.0, +1491.2] s |
-| Terra · medium − Terra · low | -16.7 [-33.3, +0.0] pt | N/A | +1099.8 [+265.3, +1926.0] s |
-| Terra · low − Opus 5.5 · low | -50.0 [-75.0, -25.0] pt | N/A | +766.1 [+116.6, +1481.0] s |
-| Terra · low − Sonnet 5 · low | -8.3 [-41.7, +25.0] pt | N/A | +263.5 [-433.0, +989.9] s |
-| Terra · low − Sonnet 5.5 · low | -41.7 [-66.7, -16.7] pt | N/A | +769.3 [+122.9, +1480.5] s |
-| Terra · low − Haiku 5.5 · low | -50.0 [-75.0, -25.0] pt | N/A | +693.1 [+45.1, +1368.6] s |
-| Terra · low − Grok 4.7 · low | -41.7 [-75.0, +0.0] pt | N/A | +506.1 [-199.0, +1245.2] s |
-| Terra · low − GPT-6.1 Sol · low | -33.3 [-50.0, -16.7] pt | N/A | +755.6 [+111.1, +1448.3] s |
-| Terra · medium − Opus 5.5 · medium | -66.7 [-83.3, -50.0] pt | N/A | +1756.4 [+835.2, +2612.2] s |
-| Terra · medium − Sonnet 5 · medium | -25.0 [-41.7, -8.3] pt | N/A | +1301.6 [+386.4, +2174.1] s |
-| Terra · medium − Sonnet 5.5 · medium | -66.7 [-83.3, -50.0] pt | N/A | +1849.6 [+911.5, +2719.7] s |
-| Terra · medium − Haiku 5.5 · medium | -58.3 [-75.0, -50.0] pt | N/A | +1730.7 [+801.3, +2594.2] s |
-| Terra · medium − Grok 4.7 · medium | -66.7 [-83.3, -50.0] pt | N/A | +1003.5 [+177.4, +1826.7] s |
-| Terra · medium − GPT-6.1 Sol · medium | -50.0 [-75.0, -25.0] pt | N/A | +1785.8 [+886.8, +2619.8] s |
-| Terra · high − Opus 5.5 · high | -50.0 [-75.0, -25.0] pt | N/A | +1031.8 [+244.5, +1836.0] s |
-| Terra · high − Sonnet 5 · high | -8.3 [-33.3, +16.7] pt | N/A | +319.0 [-510.3, +1186.2] s |
-| Terra · high − Sonnet 5.5 · high | -50.0 [-75.0, -25.0] pt | N/A | +1066.9 [+287.4, +1854.0] s |
-| Terra · high − Haiku 5.5 · high | -41.7 [-50.0, -25.0] pt | N/A | +946.7 [+152.9, +1731.8] s |
-| Terra · high − Grok 4.7 · high | -41.7 [-66.7, -16.7] pt | N/A | -118.5 [-1026.9, +780.4] s |
-| Terra · high − GPT-6.1 Sol · high | -33.3 [-50.0, -16.7] pt | N/A | +997.4 [+249.2, +1743.5] s |
-| Terra · xhigh − Opus 5.5 · xhigh | -58.3 [-91.7, -25.0] pt | N/A | +1432.7 [+290.3, +2727.4] s |
-| Terra · xhigh − Sonnet 5 · xhigh | -25.0 [-75.0, +33.3] pt | N/A | +843.9 [-308.1, +2169.0] s |
-| Terra · xhigh − Sonnet 5.5 · xhigh | -50.0 [-91.7, +0.0] pt | N/A | +1384.7 [+151.2, +2711.7] s |
-| Terra · xhigh − Haiku 5.5 · xhigh | -58.3 [-91.7, -25.0] pt | N/A | +1392.5 [+229.3, +2655.5] s |
-| Terra · xhigh − GPT-6.1 Sol · xhigh | -58.3 [-91.7, -25.0] pt | N/A | +1403.8 [+255.4, +2709.3] s |
+| Terra · xhigh − Terra · high | +0.0 [+0.0, +0.0] pt | +0.0452 [+0.0297, +0.0621] USD | +118.4 [+32.3, +265.1] s |
+| Terra · xhigh − Terra · medium | +8.3 [+0.0, +25.0] pt | +0.0537 [+0.0474, +0.0597] USD | +115.2 [+36.5, +250.6] s |
+| Terra · xhigh − Terra · low | +8.3 [+0.0, +25.0] pt | +0.0569 [+0.0461, +0.0688] USD | +88.8 [-75.9, +278.0] s |
+| Terra · high − Terra · medium | +8.3 [+0.0, +25.0] pt | +0.0085 [-0.0077, +0.0230] USD | -3.2 [-18.2, +11.4] s |
+| Terra · high − Terra · low | +8.3 [+0.0, +25.0] pt | +0.0117 [+0.0056, +0.0178] USD | -29.6 [-126.6, +31.5] s |
+| Terra · medium − Terra · low | +0.0 [+0.0, +0.0] pt | +0.0032 [-0.0066, +0.0140] USD | -26.4 [-127.6, +34.9] s |
+| Terra · low − Opus 5.5 · low | -25.0 [-58.3, +0.0] pt | -0.6913 [-0.9324, -0.4850] USD | -9.4 [-70.5, +75.2] s |
+| Terra · low − Sonnet 5 · low | +16.7 [-33.3, +66.7] pt | -2.2791 [-3.3007, -1.3906] USD | -512.0 [-654.6, -391.6] s |
+| Terra · low − Sonnet 5.5 · low | -16.7 [-58.3, +16.7] pt | -0.3567 [-0.4859, -0.2502] USD | -6.2 [-55.8, +74.3] s |
+| Terra · low − Haiku 5.5 · low | -25.0 [-58.3, +0.0] pt | -0.0988 [-0.2143, -0.0048] USD | -82.4 [-135.7, -19.6] s |
+| Terra · low − Grok 4.7 · low | -16.7 [-58.3, +16.7] pt | -0.4406 [-0.6094, -0.2673] USD | -269.4 [-381.6, -155.8] s |
+| Terra · low − GPT-6.1 Sol · low | -8.3 [-25.0, +0.0] pt | -0.0947 [-0.1369, -0.0588] USD | -19.9 [-68.5, +43.7] s |
+| Terra · medium − Opus 5.5 · medium | -25.0 [-58.3, +0.0] pt | -1.2908 [-1.6360, -0.9682] USD | -145.2 [-192.5, -94.2] s |
+| Terra · medium − Sonnet 5 · medium | +16.7 [+0.0, +33.3] pt | -2.4298 [-3.2570, -1.7912] USD | -600.1 [-715.8, -493.2] s |
+| Terra · medium − Sonnet 5.5 · medium | -25.0 [-58.3, +0.0] pt | -0.4510 [-0.6298, -0.2899] USD | -52.0 [-87.9, -18.5] s |
+| Terra · medium − Haiku 5.5 · medium | -16.7 [-58.3, +16.7] pt | -0.1898 [-0.2819, -0.0962] USD | -170.9 [-226.8, -113.6] s |
+| Terra · medium − Grok 4.7 · medium | -25.0 [-58.3, +0.0] pt | N/A | -898.1 [-1084.1, -707.5] s |
+| Terra · medium − GPT-6.1 Sol · medium | -8.3 [-25.0, +0.0] pt | -0.1493 [-0.2067, -0.0973] USD | -115.8 [-188.5, -46.7] s |
+| Terra · high − Opus 5.5 · high | -16.7 [-50.0, +0.0] pt | -1.6884 [-1.9997, -1.3890] USD | -202.5 [-243.1, -165.8] s |
+| Terra · high − Sonnet 5 · high | +25.0 [+0.0, +58.3] pt | -3.4564 [-4.4054, -2.5993] USD | -915.3 [-1018.6, -799.1] s |
+| Terra · high − Sonnet 5.5 · high | -16.7 [-50.0, +0.0] pt | -0.8013 [-1.0117, -0.5946] USD | -167.4 [-207.6, -127.5] s |
+| Terra · high − Haiku 5.5 · high | -8.3 [-25.0, +0.0] pt | -0.3823 [-0.5641, -0.1977] USD | -287.6 [-370.8, -196.3] s |
+| Terra · high − Grok 4.7 · high | -8.3 [-50.0, +25.0] pt | N/A | -1352.8 [-1556.3, -1079.2] s |
+| Terra · high − GPT-6.1 Sol · high | +0.0 [+0.0, +0.0] pt | -0.2800 [-0.3446, -0.1995] USD | -236.9 [-314.5, -152.0] s |
+| Terra · xhigh − Opus 5.5 · xhigh | -16.7 [-50.0, +0.0] pt | -2.9759 [-3.4249, -2.6138] USD | -311.0 [-429.7, -156.6] s |
+| Terra · xhigh − Sonnet 5 · xhigh | +16.7 [+0.0, +50.0] pt | -3.9913 [-4.7470, -3.2195] USD | -899.8 [-1054.1, -773.0] s |
+| Terra · xhigh − Sonnet 5.5 · xhigh | -8.3 [-50.0, +25.0] pt | -1.8101 [-2.2451, -1.3472] USD | -359.0 [-478.2, -244.4] s |
+| Terra · xhigh − Haiku 5.5 · xhigh | -16.7 [-50.0, +0.0] pt | -0.6100 [-0.7997, -0.4141] USD | -351.1 [-495.9, -206.0] s |
+| Terra · xhigh − GPT-6.1 Sol · xhigh | -16.7 [-50.0, +0.0] pt | -0.3761 [-0.4394, -0.2874] USD | -339.9 [-456.5, -215.4] s |
 
 ## brownfield
 
@@ -458,8 +458,10 @@ Complete matrix; see REPORT.md and analysis.json for paired task comparisons.
 - mock不足等の採点例外と可視テスト変更の問題はgrading-notes.jsonに記録し、元の合否を保持。合否は指定されたhidden specによるもので、可視テスト全体の成功は主張しない。テスト例外だけでは本番の正否は確定できない。
 - 参考モデルの過去の入力ハッシュは一部保存されていないため、同じ問題ID・反復による対応比較は入力バイト完全一致の証明ではない。Terraの入力は開始前に145ファイルと497コーパスファイルのハッシュを保存した。
 - このチャットではブラウザーのfile://アクセスがポリシーで拒否されているため、描画表示は未確認。別プロトコル等による迂回は行わず、HTML構造・データ・リンクを検証する。
-- 時間切れは合計40件（hard1件、ultra19件、apex20件）。これらを除外した正答率や、推定費用不明分を0扱いした総額は示さない。ホスト停止や通信との切り分けは確定しておらず、特にultra/apexの合否・時間をモデル能力だけに帰属できない。
-- 可視テストレビューで要注意の変更: UIM4-workspace-time-zone__terra61-effort-high__r1、UIM4-workspace-time-zone__terra61-effort-xhigh__r2。既存digestの件数上限を外し、テスト期待値も上限+5件に変更。タスクの全ウィンドウ取得という文言との解釈の余地があるが、上限撤廃は明示されていない。元のhidden合格を維持し、問題点をgrading-notes.jsonに開示した。
+- 現在の596件に時間切れは0件。元の40件の時間切れとその使用量不明費用は、初回結果のアーカイブで確認できる。
+- ユーザー許可により元の時間切れ40件を再測定し、うち40件を主結果に置換した。元の596件・462件合格の全成果物はresults/terra61-recovery/original-publicationに保存。残る556件は名目30分、置換40件はsolver時間上限なし・caffeinateによるスリープ抑止で、時間条件が混在する。時間切れだけを選んだ再測定であり、均一条件のモデル順位とは解釈できない。旧40件の使用量不明費用は新しい小計に含まれない。
+- 旧時間切れ40件すべての実行時間帯にMacのSleepイベントが重なっていた（results/terra61-recovery/timeout-diagnosis.json）。これはスリープが唯一の原因である証明ではない。再測定では問題・モデル・effort・採点基準を維持し、スリープ抑止と時間上限を変更した。
+- 可視テストレビューで要注意の変更: UIM4-workspace-time-zone__terra61-effort-high__r1、UIM4-workspace-time-zone__terra61-effort-medium__r1、UIM4-workspace-time-zone__terra61-effort-medium__r2、UIM4-workspace-time-zone__terra61-effort-xhigh__r2。既存digestの件数上限を外し、テスト期待値も上限+5件に変更。タスクの全ウィンドウ取得という文言との解釈の余地があるが、上限撤廃は明示されていない。元のhidden合格を維持し、問題点をgrading-notes.jsonに開示した。
 
 Pricing: https://developers.openai.com/api/docs/models/gpt-6.1-terra
 Resume command: bash scripts/run-terra61.sh (preserves completed cells; frozen input-manifest.json and matching snapshot required).

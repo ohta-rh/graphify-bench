@@ -1,0 +1,413 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/actions/comments/create-comment.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/actions/comments/create-comment.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/actions/comments/create-comment.ts	2026-09-02 11:21:08
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/actions/comments/create-comment.ts	2026-10-29 11:06:04
+@@ -5,25 +5,22 @@
+  *
+  * Owner D. The notification fan-out itself is not triggered here — the service
+  * emits `comment.created` and `NotificationService` subscribes to it. This
+- * action only validates, authorizes, charges the rate limit and revalidates.
++ * action validates, authorizes and revalidates; the service charges the rate limit.
+  *
+- * Must call (do not reimplement): createCommentSchema, can, consumeRateLimit,
++ * Must call (do not reimplement): createCommentSchema, can,
+  * getActor, toActionResult
+  */
+ 
+-import { ForbiddenActionError, RateLimitedError } from "@/actions/_lib/action-errors";
++import { ForbiddenActionError } from "@/actions/_lib/action-errors";
+ import { PENDING_COMMENT_ID } from "@/actions/_lib/permission-resources";
+ import { withAction } from "@/actions/_lib/with-action";
+ import { CACHE_PROFILES, issueTag, revalidateTagged } from "@/lib/cache";
+ import { can } from "@/lib/permissions";
+-import { consumeRateLimit } from "@/lib/rate-limit";
+ import { createCommentSchema, type CreateCommentInput } from "@/schemas/comment";
+ import { createComment } from "@/server/services/comment-service";
+ import type { ActionResult } from "@/types/api";
+ import type { Comment } from "@/types/comment";
+ 
+-const COMMENT_BUCKET = "comment:create";
+-
+ const run = withAction<typeof createCommentSchema, Comment>(
+   createCommentSchema,
+   async (raw, actor) => {
+@@ -37,11 +34,6 @@
+     });
+     if (!allowed) {
+       throw new ForbiddenActionError("comment:create");
+-    }
+-
+-    const verdict = await consumeRateLimit(input.orgId, COMMENT_BUCKET);
+-    if (!verdict.allowed) {
+-      throw new RateLimitedError(COMMENT_BUCKET, verdict.resetAt);
+     }
+ 
+     const comment = await createComment(actor, input);
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/components/domain/comment/comment-thread.tsx /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/components/domain/comment/comment-thread.tsx
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/components/domain/comment/comment-thread.tsx	2026-09-02 11:09:12
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/components/domain/comment/comment-thread.tsx	2026-10-29 11:05:27
+@@ -5,7 +5,6 @@
+  */
+ import { EmptyState } from "@/components/ui/empty-state";
+ import { can } from "@/lib/permissions";
+-import { isLive } from "@/lib/soft-delete";
+ import type { CommentId } from "@/types/common";
+ import type { CommentThreadNode } from "@/types/comment";
+ import type { Actor } from "@/types/member";
+@@ -36,7 +35,7 @@
+     return null;
+   }
+ 
+-  const visible = orderThread(nodes).filter((node) => isLive(node.comment));
++  const visible = orderThread(nodes);
+ 
+   if (visible.length === 0) {
+     return <EmptyState title="No comments yet" description="Start the thread." />;
+@@ -54,8 +53,7 @@
+               onDelete={onDelete}
+               {...(onEdit !== undefined ? { onEdit } : {})}
+             />
+-            {node.replies
+-              .filter(isLive)
++            {[...node.replies]
+               .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+               .map((reply) => (
+                 <CommentItem
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/lib/mentions.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/lib/mentions.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/lib/mentions.ts	2026-10-29 11:04:24
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/lib/mentions.ts	2026-10-29 11:06:04
+@@ -11,10 +11,26 @@
+ import type { MemberWithUser } from "@/types/member";
+ 
+ /** `@` must start the line or follow whitespace/punctuation, never an email. */
+-const MENTION_PATTERN = /(^|[\s(<[])@([a-z0-9][a-z0-9._-]{0,38}[a-z0-9])/gi;
++const MENTION_PATTERN = /(^|[\s(<[])@([a-z0-9_%+\-]+(?:\.[a-z0-9_%+\-]+)*)/gi;
+ 
+ function withoutCode(body: string): string {
+-  return body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ");
++  let fence: { character: string; length: number } | null = null;
++  const lines = body.split("\n").map((line) => {
++    if (fence !== null) {
++      const closing = /^[ \t]{0,3}(`+|~+)[ \t]*\r?$/.exec(line);
++      if (closing && closing[1]![0] === fence.character && closing[1]!.length >= fence.length) {
++        fence = null;
++      }
++      return " ";
++    }
++    const opening = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
++    if (opening) {
++      fence = { character: opening[1]![0]!, length: opening[1]!.length };
++      return " ";
++    }
++    return line;
++  });
++  return lines.join("\n").replace(/(`+)(?!`)[\s\S]*?\1(?!`)/g, " ");
+ }
+ 
+ /** The handle Taskflow addresses a member by, derived from their email. */
+@@ -46,21 +62,23 @@
+   body: string,
+   members: readonly MemberWithUser[],
+ ): readonly UserId[] {
+-  const byHandle = new Map<string, UserId>();
++  const byHandle = new Map<string, UserId[]>();
+   for (const member of members) {
+-    // Read-only members cannot take part in a discussion, so pinging them
+-    // only produces an alert they can do nothing about.
+-    if (member.role === "viewer") continue;
+-    byHandle.set(handleOf(member), member.userId);
++    if (member.status !== "active" || member.archivedAt !== null) continue;
++    const handle = handleOf(member);
++    const ids = byHandle.get(handle) ?? [];
++    ids.push(member.userId);
++    byHandle.set(handle, ids);
+   }
+ 
+   const resolved: UserId[] = [];
+   const seen = new Set<UserId>();
+   for (const handle of extractMentions(body)) {
+-    const userId = byHandle.get(handle);
+-    if (userId === undefined || seen.has(userId)) continue;
+-    seen.add(userId);
+-    resolved.push(userId);
++    for (const userId of byHandle.get(handle) ?? []) {
++      if (seen.has(userId)) continue;
++      seen.add(userId);
++      resolved.push(userId);
++    }
+   }
+ 
+   return resolved;
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/lib/rate-limit.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/lib/rate-limit.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/lib/rate-limit.ts	2026-09-02 11:08:10
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/lib/rate-limit.ts	2026-10-29 11:05:09
+@@ -77,9 +77,10 @@
+   orgId: OrgId,
+   bucketKey: string,
+   cost = 1,
++  subjectId?: string,
+ ): Promise<RateLimitVerdict> {
+   const config = configFor(orgId, bucketKey);
+-  const key = `${orgId}:${bucketKey}`;
++  const key = JSON.stringify([orgId, bucketKey, subjectId ?? null]);
+   const nowMs = Date.now();
+ 
+   const state = buckets.get(key) ?? { tokens: config.capacity, updatedAt: nowMs };
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/repositories/comment-repository.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/repositories/comment-repository.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/repositories/comment-repository.ts	2026-10-29 11:04:24
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/repositories/comment-repository.ts	2026-10-29 11:06:04
+@@ -73,8 +73,7 @@
+ 
+ /**
+  * The whole thread for one issue, in reading order: top-level comments oldest
+- * first, each followed by its replies. A deleted top-level comment takes its
+- * thread with it — nothing to anchor the replies to once the opener is gone.
++ * first, each followed by all descendants. Deleted comments remain as placeholders.
+  */
+ export async function listThread(
+   orgId: OrgId,
+@@ -90,28 +89,34 @@
+         eq(comments.issueId, issueId),
+       ),
+     )
+-    .orderBy(asc(comments.createdAt))
++    .orderBy(asc(comments.createdAt), asc(comments.id))
+     .all();
+ 
+   const decorated: CommentWithAuthor[] = rows.map((row) => ({
+     ...toComment(row.comment),
++    body: row.comment.archivedAt === null ? row.comment.body : "",
+     author: toUser(row.author),
+   }));
+ 
++  const byId = new Map(decorated.map((comment) => [comment.id, comment]));
+   const repliesBy = new Map<string, CommentWithAuthor[]>();
+   for (const comment of decorated) {
+     if (comment.parentId === null) continue;
+-    const bucket = repliesBy.get(comment.parentId) ?? [];
++    let parent = byId.get(comment.parentId);
++    const visited = new Set<string>([comment.id]);
++    while (parent && parent.parentId !== null && !visited.has(parent.id)) {
++      visited.add(parent.id);
++      parent = byId.get(parent.parentId);
++    }
++    if (!parent || parent.parentId !== null || visited.has(parent.id)) continue;
++    const bucket = repliesBy.get(parent.id) ?? [];
+     bucket.push(comment);
+-    repliesBy.set(comment.parentId, bucket);
++    repliesBy.set(parent.id, bucket);
+   }
+ 
+   return decorated
+-    .filter((comment) => comment.parentId === null && comment.archivedAt === null)
+-    .map((comment) => ({
+-      comment,
+-      replies: repliesBy.get(comment.id) ?? [],
+-    }));
++    .filter((comment) => comment.parentId === null)
++    .map((comment) => ({ comment, replies: repliesBy.get(comment.id) ?? [] }));
+ }
+ 
+ export async function countComments(
+@@ -160,11 +165,12 @@
+ /** An edit stamps `edited_at`, which the UI shows next to the timestamp. */
+ export async function updateComment(
+   input: UpdateCommentInput,
++  mentionedUserIds: readonly UserId[],
+ ): Promise<Comment> {
+   const stamp = toIsoTimestamp(new Date());
+   const row = getDb()
+     .update(comments)
+-    .set({ body: input.body, editedAt: stamp, updatedAt: stamp })
++    .set({ body: input.body, mentionedUserIds: JSON.stringify(mentionedUserIds), editedAt: stamp, updatedAt: stamp })
+     .where(
+       and(
+         orgPredicate(comments.orgId, input.orgId),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/comment-service.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/comment-service.ts	2026-10-29 11:04:24
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/comment-service.ts	2026-10-29 11:05:09
+@@ -56,7 +56,16 @@
+   assertCan(actor, "comment:create", issueResource(issue));
+   assertNotArchived("Issue", issue.id, issue);
+ 
+-  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
++  if (input.parentId !== null) {
++    const parent = requireFound(
++      await commentRepo.findCommentById(input.orgId, input.parentId),
++      "Comment",
++      input.parentId,
++    );
++    if (parent.issueId !== input.issueId) throw new Error("Parent comment belongs to another issue");
++  }
++
++  const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET, 1, actor.userId);
+   if (!verdict.allowed) {
+     throw new Error(
+       `Comment rate limit reached; try again after ${verdict.resetAt}`,
+@@ -66,7 +75,7 @@
+   const mentionedUserIds = await resolveMentionedUsers(
+     input.orgId,
+     input.body,
+-    input.mentionedUserIds,
++    actor.userId,
+   );
+ 
+   const comment = await commentRepo.insertComment(
+@@ -107,7 +116,17 @@
+     throw new Error("The edit window for this comment has closed");
+   }
+ 
+-  return commentRepo.updateComment(input);
++  const mentionedUserIds = await resolveMentionedUsers(input.orgId, input.body, comment.authorId);
++  const previouslyMentioned = new Set(comment.mentionedUserIds);
++  const newlyMentionedUserIds = mentionedUserIds.filter((id) => !previouslyMentioned.has(id));
++  const updated = await commentRepo.updateComment(input, mentionedUserIds);
++  await emit("comment.updated", {
++    ...actorEnvelope(actor),
++    commentId: updated.id,
++    issueId: updated.issueId,
++    mentionedUserIds: newlyMentionedUserIds,
++  });
++  return updated;
+ }
+ 
+ /**
+@@ -163,31 +182,28 @@
+ }
+ 
+ function isPastEditWindow(comment: Comment): boolean {
+-  // The window follows the last save: a typo fix a minute before the cut-off
+-  // must not lock the author out of correcting the correction.
+-  const posted = new Date(comment.updatedAt).getTime();
++  const posted = new Date(comment.createdAt).getTime();
+   return Date.now() - posted > EDIT_WINDOW_MS;
+ }
+ 
+-/**
+- * Union of the ids the client already resolved (optimistic UI) and the ones
+- * parsed out of the body server-side. The server list wins on disagreement.
+- */
++/** Resolve against all active members in this organization. */
+ async function resolveMentionedUsers(
+   orgId: OrgId,
+   body: string,
+-  clientProvided: readonly UserId[],
++  authorId: UserId,
+ ): Promise<readonly UserId[]> {
+-  const members = await memberRepo.listMembers({
+-    orgId,
+-    limit: MENTION_LOOKUP_LIMIT,
+-    cursor: null,
+-  });
++  const members = [];
++  let cursor: string | null = null;
++  do {
++    const page = await memberRepo.listMembers({
++      orgId,
++      limit: MENTION_LOOKUP_LIMIT,
++      cursor,
++      status: "active",
++    });
++    members.push(...page.items);
++    cursor = page.nextCursor;
++  } while (cursor !== null);
+ 
+-  const resolved = resolveMentions(body, members.items);
+-  const known = new Set(members.items.map((member) => member.userId));
+-
+-  return [
+-    ...new Set([...resolved, ...clientProvided.filter((id) => known.has(id))]),
+-  ];
++  return resolveMentions(body, members).filter((id) => id !== authorId);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/notification-service.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/notification-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/notification-service.ts	2026-10-29 11:05:19
+@@ -8,6 +8,7 @@
+ import { assertCan } from "@/lib/permissions";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
++import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+@@ -48,6 +49,7 @@
+   kind: NotificationKind,
+   recipients: readonly UserId[],
+   payload: NotificationPayload,
++  excludeActor = true,
+ ): Promise<readonly Notification[]> {
+   if (recipients.length === 0) return [];
+ 
+@@ -63,7 +65,7 @@
+   const rows = [];
+ 
+   for (const recipientId of new Set(recipients)) {
+-    if (recipientId === payload.actorId) continue;
++    if (excludeActor && recipientId === payload.actorId) continue;
+ 
+     const preference = await preferenceRepo.getPreference(
+       orgId,
+@@ -202,9 +204,15 @@
+ 
+   subscribe("comment.created", async (payload) => {
+     const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
+-    const watchers = issue
+-      ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+-      : [];
++    const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++    const parent = comment?.parentId
++      ? await commentRepo.findCommentById(payload.orgId, comment.parentId)
++      : null;
++    const mentions = new Set(payload.mentionedUserIds);
++    const watchers = [
++      ...(issue ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])] : []),
++      ...(parent && parent.issueId === payload.issueId ? [parent.authorId] : []),
++    ].filter((id) => !mentions.has(id));
+ 
+     await notify(payload.orgId, "comment_created", watchers, {
+       title: "New comment",
+@@ -226,6 +234,15 @@
+         },
+       );
+     }
++  });
++
++  subscribe("comment.updated", async (payload) => {
++    await notify(payload.orgId, "comment_mention", payload.mentionedUserIds, {
++      title: "You were mentioned",
++      body: `You were mentioned on issue ${payload.issueId}`,
++      href: `/issues/${payload.issueId}`,
++      actorId: payload.actorId,
++    }, false);
+   });
+ 
+   subscribe("member.joined", async (payload) => {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/search-service.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/search-service.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/server/services/search-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/server/services/search-service.ts	2026-10-29 11:05:19
+@@ -154,6 +154,10 @@
+       );
+       if (comment) await indexComment(payload.orgId, comment);
+     }),
++    subscribe("comment.updated", async (payload) => {
++      const comment = await commentRepo.findCommentById(payload.orgId, payload.commentId);
++      if (comment) await indexComment(payload.orgId, comment);
++    }),
+     subscribe("comment.deleted", async (payload) => {
+       await removeFromIndex(payload.orgId, "comment", payload.commentId);
+     }),
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/types/event.ts /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/types/event.ts
+--- /private/tmp/bench-scratch/eff5b162-d235-4554-83fc-d31ba1094cd3/src/types/event.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/0e743e94-8661-4966-a93b-24788ddabe70/src/types/event.ts	2026-10-29 11:05:09
+@@ -72,6 +72,11 @@
+     issueId: IssueId;
+     mentionedUserIds: readonly UserId[];
+   };
++  "comment.updated": EventEnvelope & {
++    commentId: CommentId;
++    issueId: IssueId;
++    mentionedUserIds: readonly UserId[];
++  };
+   "comment.deleted": EventEnvelope & { commentId: CommentId; issueId: IssueId };
+   "member.invited": EventEnvelope & { email: string; role: Role };
+   "member.joined": EventEnvelope & { memberId: MemberId; userId: UserId; role: Role };

@@ -1,0 +1,40 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "result": "The browser submits the form to `createIssueAction` in [src/actions/issues/create-issue.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/actions/issues/create-issue.ts). The path has checks at the page, action, and service layers before `insertIssue` writes the row.\n\n1. **The page prepares the form.** The new-issue [page.tsx](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/app/(dashboard)/[orgSlug]/projects/[projectSlug]/issues/new/page.tsx) loads the organization, actor, and project with `loadProjectContext`. It checks `can(actor, \"issue:create\", ...)` and returns `notFound()` if denied. It also looks up the plan’s `issuesPerProject` limit and counts the project’s issues **including archived ones**; a full project sees a quota message instead of the form. Otherwise, it loads members and labels and passes `createIssueAction` to `IssueForm`.\n\n2. **The browser validates and submits.** In [issue-form.tsx](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/components/domain/issue/issue-form.tsx), React Hook Form uses `zodResolver(createIssueSchema)`. A valid submission goes through `useFormAction` to the action. `CreateIssueInput`, inferred from [createIssueSchema](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/schemas/issue.ts), includes organization and project IDs, title, description, status, priority, assignee, parent, estimate, due date, and labels. The schema enforces, among other things, a 3–200 character title, a maximum of 20 labels, valid status and priority values, and an integer estimate from 0 to 100. It supplies defaults such as `backlog`, `none`, null optional values, and an empty label array.\n\n3. **The action validates again and resolves the member.** `createIssueAction(raw: unknown)` calls its `run` wrapper created by `withAction` in [with-action.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/actions/_lib/with-action.ts). The wrapper first calls `safeParse`; invalid input becomes a stamped error `ActionResult` without reaching the handler. For valid input, `requireActorFor(input.orgId)` in [actor.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/lib/actor.ts) obtains the cookie-backed `SessionPrincipal`, checks that the session is usable and has an active organization, finds the requested organization, and calls `resolveActorForOrg`. That function in [session-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/session-service.ts) requires an active membership, constructs the org-scoped `Actor`, and updates the member’s last-seen time.\n\n4. **The action checks permission and quota.** Its handler calls `can` with an issue-shaped `PermissionResource`. In [permissions.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/lib/permissions.ts), the tenant must match; platform staff bypass the role matrix, while `issue:create` otherwise requires at least the `member` role. A denial throws `ForbiddenActionError`. Next, `assertProjectHasRoom` obtains the organization’s plan through `getOrganizationSummary` and `getPlanLimits`, then calls `listIssues` with `includeArchived: true`. At or above the limit it throws `PlanLimitError`.\n\n5. **The service independently guards the write.** `createIssue(actor, input)` in [issue-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/issue-service.ts) asserts tenant scope, finds the project within that organization, rejects a missing or archived project, and calls `assertCan` for `issue:create` on the project resource. It then finds the organization, calls `countIssues`, and checks `wouldExceedLimit` against the plan. There is a distinction between the quota checks: the action explicitly includes archived issues, while this service call uses `countIssues`’ default live-only scope.\n\n6. **The repository writes the issue.** `nextIssueNumber` in [issue-repository.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/repositories/issue-repository.ts) takes the maximum number for the organization and project, including archived rows, and adds one. `insertIssue` creates an ID and timestamp, inserts the submitted fields with the actor as author, sets `startedAt` and `completedAt` to null, and inserts any label associations into `issue_labels`. It returns an `Issue`. The SQLite tables and the `IssueRow` and `NewIssueRow` types are defined in [schema/issues.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/db/schema/issues.ts); the issue table has a unique index on project and number.\n\n7. **The service publishes consequences.** After insertion, `createIssue` awaits `emit(\"issue.created\", ...)` with the actor envelope and issue ID, project ID, title, assignee, and priority. The typed in-process bus in [event-bus.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/lib/event-bus.ts) runs subscribers concurrently and waits for them to settle; a subscriber failure is reported to error sinks and does not fail the emit or its siblings. Node instrumentation registers the listeners through [event-registry.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/event-registry.ts). For this event:\n   - `registerActivityListeners` records an issue-created activity with the actor, title, and priority.\n   - `registerSearchListeners` re-reads the issue and `indexIssue` upserts its title and description into search.\n   - `registerUsageListeners` increments the organization’s `issuesUsed`.\n   - `registerWebhookListeners` queues delivery rows for enabled organization endpoints subscribed to `issue.created`; the webhook delivery job handles them later.\n\n   These listeners live respectively in [activity-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/activity-service.ts), [search-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/search-service.ts), [usage-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/usage-service.ts), and [webhook-service.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/server/services/webhook-service.ts). Creating an issue with an assignee does not itself emit `issue.assigned`; the notification listener subscribes to that separate event.\n\n8. **The result returns to the form.** After the service returns, the action revalidates the organization, project, and new issue cache tags. `withAction` then revalidates the static `issues` tag and returns a timestamped successful `ActionResult<Issue>`. Exceptions along the way are converted by `toActionResult` into a stamped failure. In [use-form-action.ts](/private/tmp/bench-scratch/29243b53-2af6-4378-b3d7-607ea1f25507/src/hooks/use-form-action.ts), pending state disables the submit button; failure displays the returned error message, while success clears the error and resets the form.",
+  "session_id": "01a17aa2-b987-7ea3-8495-2affb46cc37f",
+  "duration_ms": 40574,
+  "total_cost_usd": 0.0486852,
+  "usage": {
+    "input_tokens": 28902,
+    "output_tokens": 2468,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 148864,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    }
+  },
+  "modelUsage": {
+    "gpt-6.1-terra": {
+      "inputTokens": 28902,
+      "outputTokens": 2468,
+      "cacheReadInputTokens": 148864,
+      "cacheCreationInputTokens": 0,
+      "costUSD": 0.0486852
+    }
+  },
+  "subagent_stats": {
+    "spawned": 0
+  },
+  "runtime": "codex",
+  "cost_basis": "estimated_standard_list_price",
+  "native_usage": {
+    "input_tokens": 177766,
+    "cached_input_tokens": 148864,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2468,
+    "reasoning_output_tokens": 0
+  }
+}

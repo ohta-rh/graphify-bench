@@ -1,0 +1,263 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/repositories/issue-repository.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/repositories/issue-repository.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/repositories/issue-repository.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/repositories/issue-repository.ts	2026-10-27 13:24:56
+@@ -22,7 +22,7 @@
+   restorePatch,
+   shouldFilterArchived,
+ } from "@/lib/soft-delete";
+-import { attachments, comments, getDb, issueLabels, issues } from "@/server/db";
++import { attachments, comments, getDb, issueLabels, issues, projects } from "@/server/db";
+ import { ISSUE_STATUSES } from "@/types/issue";
+ import { toIsoTimestamp } from "@/types/common";
+ import { livePredicate, orgPredicate } from "./base-repository";
+@@ -509,13 +509,18 @@
+   now: IsoTimestamp,
+ ): Promise<readonly Issue[]> {
+   const rows = getDb()
+-    .select()
++    .select({ issue: issues })
+     .from(issues)
++    .innerJoin(
++      projects,
++      and(eq(projects.id, issues.projectId), eq(projects.orgId, issues.orgId)),
++    )
+     .where(
+       and(
+         ...compact(
+           orgPredicate(issues.orgId, orgId),
+           livePredicate(issues.archivedAt, {}),
++          livePredicate(projects.archivedAt, {}),
+           isNotNull(issues.dueAt),
+           lt(issues.dueAt, now),
+           inArray(issues.status, ["backlog", "todo", "in_progress", "in_review"]),
+@@ -525,5 +530,5 @@
+     .orderBy(issues.dueAt)
+     .all();
+ 
+-  return rows.map((row) => toIssue(row));
++  return rows.map((row) => toIssue(row.issue));
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/_issue-write-guard.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/_issue-write-guard.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/_issue-write-guard.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/_issue-write-guard.ts	2026-10-27 13:24:56
+@@ -0,0 +1,15 @@
++import { assertNotArchived } from "@/lib/soft-delete";
++import * as projectRepo from "@/server/repositories/project-repository";
++import type { Issue } from "@/types/issue";
++import { requireFound } from "./_support";
++
++/** Check the issue before its project so an archived issue reports itself. */
++export async function assertIssueWritable(issue: Issue): Promise<void> {
++  assertNotArchived("Issue", issue.id, issue);
++  const project = requireFound(
++    await projectRepo.findProjectById(issue.orgId, issue.projectId),
++    "Project",
++    issue.projectId,
++  );
++  assertNotArchived("Project", project.id, project);
++}
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/attachment-service.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/attachment-service.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/attachment-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/attachment-service.ts	2026-10-27 13:24:56
+@@ -10,6 +10,7 @@
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
+ import * as usageRepo from "@/server/repositories/usage-repository";
++import { assertIssueWritable } from "./_issue-write-guard";
+ import { issueResource, requireFound } from "./_support";
+ import type {
+   CreateAttachmentInput,
+@@ -56,6 +57,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertIssueWritable(issue);
+ 
+   const org = requireFound(
+     await orgRepo.findOrgById(input.orgId),
+@@ -102,6 +104,7 @@
+     attachment.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(issue));
++  await assertIssueWritable(issue);
+ 
+   await attachmentRepo.deleteAttachment(input.orgId, input.attachmentId);
+   await usageRepo.incrementUsage(input.orgId, {
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/comment-service.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/comment-service.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/comment-service.ts	2026-09-02 11:45:38
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/comment-service.ts	2026-10-27 13:24:56
+@@ -12,6 +12,7 @@
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as memberRepo from "@/server/repositories/member-repository";
++import { assertIssueWritable } from "./_issue-write-guard";
+ import {
+   actorEnvelope,
+   commentResource,
+@@ -54,7 +55,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "comment:create", issueResource(issue));
+-  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueWritable(issue);
+ 
+   const verdict = await consumeRateLimit(input.orgId, COMMENT_CREATE_BUCKET);
+   if (!verdict.allowed) {
+@@ -103,6 +104,13 @@
+   assertCan(actor, "comment:update", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
+ 
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  await assertIssueWritable(issue);
++
+   if (comment.authorId === actor.userId && isPastEditWindow(comment)) {
+     throw new Error("The edit window for this comment has closed");
+   }
+@@ -128,6 +136,13 @@
+   );
+   assertCan(actor, "comment:delete", commentResource(comment));
+   assertNotArchived("Comment", comment.id, comment);
++
++  const issue = requireFound(
++    await issueRepo.findIssueById(input.orgId, comment.issueId),
++    "Issue",
++    comment.issueId,
++  );
++  await assertIssueWritable(issue);
+ 
+   const { archivedAt } = archivePatch();
+   const archived = await commentRepo.archiveComment(
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/issue-service.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/issue-service.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/src/server/services/issue-service.ts	2026-09-02 11:14:43
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/src/server/services/issue-service.ts	2026-10-27 13:24:56
+@@ -14,6 +14,7 @@
+ import * as projectRepo from "@/server/repositories/project-repository";
+ import * as commentRepo from "@/server/repositories/comment-repository";
+ import * as attachmentRepo from "@/server/repositories/attachment-repository";
++import { assertIssueWritable } from "./_issue-write-guard";
+ import {
+   actorEnvelope,
+   issueResource,
+@@ -92,7 +93,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+-  assertNotArchived("Issue", before.id, before);
++  await assertIssueWritable(before);
+ 
+   const after = await issueRepo.updateIssue(input);
+ 
+@@ -121,7 +122,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:update", issueResource(before));
+-  assertNotArchived("Issue", before.id, before);
++  await assertIssueWritable(before);
+ 
+   if (before.status === input.status) return before;
+ 
+@@ -159,7 +160,7 @@
+     input.issueId,
+   );
+   assertCan(actor, "issue:assign", issueResource(before));
+-  assertNotArchived("Issue", before.id, before);
++  await assertIssueWritable(before);
+ 
+   const after = await issueRepo.setIssueAssignee(
+     input.orgId,
+@@ -201,7 +202,7 @@
+     issueId,
+   );
+   assertCan(actor, "issue:archive", issueResource(issue));
+-  assertNotArchived("Issue", issue.id, issue);
++  await assertIssueWritable(issue);
+ 
+   const archived = await issueRepo.archiveIssue(orgId, issueId);
+ 
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/tests/services/archived-project-freeze.test.ts /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/tests/services/archived-project-freeze.test.ts
+--- /private/tmp/bench-scratch/3b176a4b-8df1-4220-a401-32149f54b3fc/tests/services/archived-project-freeze.test.ts	1970-01-01 09:00:00
++++ /private/tmp/bench-scratch/5bcbdd72-c4e4-4c2b-9dea-c4b4a55b9aca/tests/services/archived-project-freeze.test.ts	2026-10-27 13:25:23
+@@ -0,0 +1,79 @@
++import { afterAll, beforeAll, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/id", () => import("../server/_support/doubles/id"));
++vi.mock("@/lib/logger", async () => (await import("../server/_support/doubles/misc")).loggerModule);
++vi.mock("@/lib/rate-limit", async () => (await import("../server/_support/doubles/misc")).rateLimitModule);
++
++import { subscribe } from "@/lib/event-bus";
++import { PermissionDeniedError } from "@/lib/permissions";
++import { resetOverdueTracking, runOverdueIssueJob } from "@/server/jobs/overdue-issue-job";
++import * as commentRepo from "@/server/repositories/comment-repository";
++import * as issueRepo from "@/server/repositories/issue-repository";
++import * as usageRepo from "@/server/repositories/usage-repository";
++import * as attachments from "@/server/services/attachment-service";
++import * as comments from "@/server/services/comment-service";
++import * as issues from "@/server/services/issue-service";
++import * as projects from "@/server/services/project-service";
++import { createTenant, issueInput, useTemporaryDatabase } from "../server/_support/fixtures";
++
++let cleanup: () => void;
++beforeAll(async () => { cleanup = await useTemporaryDatabase(); });
++afterAll(() => cleanup());
++
++it("freezes issue writes and overdue announcements until the project is restored", async () => {
++  const tenant = await createTenant("project-freeze");
++  const { org, project, actors } = tenant;
++  const issue = await issues.createIssue(actors.member, issueInput(org.id, project.id, { dueAt: "2020-01-01T00:00:00.000Z" }));
++  const comment = await comments.createComment(actors.member, { orgId: org.id, issueId: issue.id, body: "Original", parentId: null, mentionedUserIds: [] });
++  const upload = { orgId: org.id, issueId: issue.id, filename: "file.txt", contentType: "text/plain", sizeBytes: 100 };
++  const attachment = await attachments.addAttachment(actors.member, upload);
++  await usageRepo.recomputeUsage(org.id);
++  await projects.archiveProject(actors.admin, { orgId: org.id, projectId: project.id, archiveIssues: false });
++
++  const emitted: string[] = [];
++  const off = [
++    subscribe("issue.updated", () => { emitted.push("updated"); }),
++    subscribe("issue.status_changed", () => { emitted.push("status"); }),
++    subscribe("issue.assigned", () => { emitted.push("assigned"); }),
++    subscribe("issue.archived", () => { emitted.push("archived"); }),
++    subscribe("comment.created", () => { emitted.push("comment created"); }),
++    subscribe("comment.deleted", () => { emitted.push("comment deleted"); }),
++    subscribe("issue.overdue", () => { emitted.push("overdue"); }),
++  ];
++  try {
++    const target = { orgId: org.id, issueId: issue.id };
++    const writes = [
++      () => issues.updateIssue(actors.member, { ...target, title: "Changed" }),
++      () => issues.changeIssueStatus(actors.member, { ...target, status: "todo" }),
++      () => issues.moveIssue(actors.member, { ...target, toStatus: "backlog", toIndex: 0 }),
++      () => issues.assignIssue(actors.member, { ...target, assigneeId: tenant.userIds.member }),
++      () => issues.assignIssue(actors.member, { ...target, assigneeId: null }),
++      () => issues.archiveIssue(actors.admin, org.id, issue.id),
++      () => comments.createComment(actors.member, { ...target, body: "New", parentId: null, mentionedUserIds: [] }),
++      () => comments.updateComment(actors.member, { orgId: org.id, commentId: comment.id, body: "Changed" }),
++      () => comments.deleteComment(actors.member, { orgId: org.id, commentId: comment.id }),
++      () => attachments.addAttachment(actors.member, upload),
++      () => attachments.removeAttachment(actors.member, { orgId: org.id, attachmentId: attachment.id }),
++    ];
++    for (const write of writes) await expect(write()).rejects.toMatchObject({ name: "AlreadyArchivedError", entity: "Project", id: project.id });
++    await expect(issues.updateIssue(actors.viewer, { ...target, title: "Denied" })).rejects.toBeInstanceOf(PermissionDeniedError);
++    expect((await issues.getIssue(actors.member, org.id, issue.id)).issue).toEqual(issue);
++    expect(await comments.getThread(actors.member, org.id, issue.id)).toHaveLength(1);
++    expect(await attachments.listAttachments(actors.member, org.id, issue.id)).toHaveLength(1);
++    resetOverdueTracking();
++    await runOverdueIssueJob(new Date("2026-01-01T00:00:00Z"));
++    expect(emitted).toEqual([]);
++
++    await commentRepo.archiveComment(org.id, comment.id);
++    await expect(comments.deleteComment(actors.member, { orgId: org.id, commentId: comment.id })).rejects.toMatchObject({ name: "AlreadyArchivedError", entity: "Comment" });
++    await issueRepo.archiveIssue(org.id, issue.id);
++    await expect(issues.updateIssue(actors.member, { ...target, title: "Denied" })).rejects.toMatchObject({ name: "AlreadyArchivedError", entity: "Issue" });
++    await issueRepo.restoreIssue(org.id, issue.id);
++    await projects.restoreProject(actors.admin, org.id, project.id);
++    await issues.updateIssue(actors.member, { ...target, title: "Unfrozen" });
++    await runOverdueIssueJob(new Date("2026-01-01T00:00:00Z"));
++    expect(emitted).toEqual(["updated", "overdue"]);
++  } finally {
++    off.forEach((unsubscribe) => unsubscribe());
++  }
++});

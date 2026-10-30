@@ -1,0 +1,391 @@
+# graphify-bench
+
+Does [graphify](https://github.com/Graphify-Labs/graphify) (a code and document knowledge graph with a `graphify query` CLI) reduce the tokens a Claude Code agent spends on a mid-size Next.js codebase? This repository measures it with real headless Claude Code sessions instead of graphify's own synthetic `graphify benchmark` estimate.
+
+It now also measures a second, structurally different prebuilt index — [MemPalace](https://github.com/MemPalace/mempalace) 3.9.0, embedding + BM25 over text chunks rather than an AST graph — so that a null result on graphify can be attributed to *this index* or to *the whole idea*.
+
+A third index shape followed on 2026-09-03: [code-graph-rag](https://github.com/vitali87/code-graph-rag) 0.0.845, a Tree-sitter AST graph stored in Memgraph and reached through its MCP server, measured with its LLM-free tools only (`semantic_search`, `get_code_snippet`, `structural_search`, …; the tool's own NL→Cypher path was deliberately left out so the arm measures the graph, not a second model).
+
+**What this measures that public leaderboards do not.** Aggregate indices such as the Artificial Analysis Intelligence Index (AA Index) and coding benchmarks such as CursorBench sum a model up in one score per suite. That score cannot fully show how a model handles the everyday engineering work a team does in its own codebase. Every task here is that kind of work, set in one realistic multi-tenant SaaS the model has never seen:
+
+- find the code behind a feature, and trace what a change would break;
+- fix a bug from an incident report that names only the symptoms;
+- build a feature from a product spec or a terse ticket;
+- reconcile that ticket with ADRs and stale documents that contradict it.
+
+Each task is graded by a key or a hidden test the agent never sees, and every run also records its cost, turns and wall time.
+
+## Headline
+
+940 runs, 65 tasks, 25 conditions, one repetition each, about $183 of API spend. Every run's `result.json` and full transcript is committed.
+
+**For Sonnet 5 on a code-only corpus, graphify changes nothing measurable. It starts paying off when the explorer is weak (Haiku 4.5) or when the questions span documentation and code, and it is clearly counter-productive when a literal grep would do.**
+
+**Swapping the AST graph for a semantic index does not rescue the idea: MemPalace is worse than baseline on every code-task comparison and loses accuracy on doc↔code tasks.** Across nine paired comparisons it wins none.
+
+| setting | tokens (graphify − baseline) | cost | accuracy (graphify / baseline) | report |
+|---|---|---|---|---|
+| Sonnet 5, 45 code tasks | +32k [−8k, +75k], crosses 0 | −$0.006, crosses 0 | 78% / 84% | [`results/combined`](results/combined/REPORT.md) |
+| Sonnet 5, 45 code tasks, baseline without subagents | +107k [+38k, +180k], graphify higher | +$0.066 [+0.037, +0.101] | 78% / 84% | [`results/structural`](results/structural/REPORT.md) |
+| Sonnet 5, strict hook (first raw read blocked) | no change vs plain graphify; the block never fired in 45 runs | | 78% | same |
+| Haiku 4.5, 45 code tasks | **−119k [−245k, −12k]** | −$0.016, crosses 0 | 82% / 80% | same |
+| Sonnet 5, 20 doc↔code tasks (corpus with 139 spec/design docs) | −129k [−325k, +33k], crosses 0 | **−$0.084 [−0.180, −0.005]** | **80% / 70%** | [`results/docs`](results/docs/REPORT.md) |
+| Haiku 4.5, 20 doc↔code tasks | **−161k [−317k, −25k]** | **−$0.030 [−0.060, −0.004]** | 75% / 80% | same |
+
+MemPalace, measured on the same tasks and graded the same way (differences are `mempalace − reference`):
+
+| setting | tokens | cost | accuracy (mempalace / reference) | report |
+|---|---|---|---|---|
+| Sonnet 5, 45 code tasks, vs `baseline` | **+170k [+66k, +288k]** | **+$0.137 [+0.078, +0.205]** | 80% / 84% | [`results/mempalace`](results/mempalace/REPORT.md) |
+| Sonnet 5, 45 code tasks, vs `graphify` | **+138k [+31k, +255k]** | **+$0.143 [+0.084, +0.212]** | 80% / 78% | same |
+| Sonnet 5, 45 code tasks, vs `baseline-nosub` | **+246k [+157k, +355k]** | **+$0.209 [+0.152, +0.270]** | 80% / 84% | same |
+| Haiku 4.5, 45 code tasks, vs `haiku-baseline` | crosses 0 | **+$0.035 [+0.010, +0.062]** | 76% / 80% | same |
+| Sonnet 5, 20 doc↔code tasks, vs `graphify-v2` | crosses 0 | **+$0.086 [+0.009, +0.164]** | **60% / 80%** | same |
+| Haiku 4.5, 20 doc↔code tasks, vs `haiku-graphify-v2` | crosses 0 | crosses 0 | **55% / 75%** | same |
+
+code-graph-rag (`cgr`), measured on the same tasks and graded the same way (differences are `cgr − reference`):
+
+| setting | tokens | cost | accuracy (cgr / reference) | report |
+|---|---|---|---|---|
+| Sonnet 5, 45 code tasks, vs `baseline` | **+95k [+44k, +145k]** | crosses 0 | 82% / 84% | [`results/cgr`](results/cgr/REPORT.md) |
+| Sonnet 5, 45 code tasks, vs `graphify` | **+63k [+6k, +114k]** | crosses 0 | 82% / 78% | same |
+| Sonnet 5, 45 code tasks, vs `mempalace` | crosses 0 | **−$0.133 [−0.197, −0.079]** | 82% / 80% | same |
+| Sonnet 5, 45 code tasks, vs `baseline-nosub` | **+171k [+109k, +234k]** | **+$0.076 [+0.048, +0.104]** | 82% / 84% | same |
+| Haiku 4.5, 45 code tasks, vs `haiku-baseline` | crosses 0 | crosses 0 | **73% / 80%** | same |
+| Haiku 4.5, 45 code tasks, vs `haiku-graphify` | **+194k [+35k, +369k]** | **+$0.027 [+0.001, +0.058]** | **73% / 82%** | same |
+| Sonnet 5, 20 doc↔code tasks, vs `baseline` | crosses 0 | crosses 0 | 75% / 70% | same |
+| Sonnet 5, 20 doc↔code tasks, vs `graphify-v2` | crosses 0 | crosses 0 | 75% / 80% | same |
+| Sonnet 5, 20 doc↔code tasks, vs `mempalace-v2` | crosses 0 | crosses 0 | **75% / 60%** | same |
+| Haiku 4.5, 20 doc↔code tasks, vs `haiku-graphify-v2` | **+248k [+139k, +352k]** | **+$0.049 [+0.028, +0.072]** | 75% / 75% | same |
+
+**A third index shape does not change the sign.** On Sonnet 5 code tasks `cgr` costs the same as `baseline` and spends 39% more tokens over 2.8× the turns (median 14 vs 5): its nine tools return small, symbol-sized results (353 KB across 45 runs, an eleventh of MemPalace's 4.0 MB), so the agent chains `semantic_search` → `get_code_snippet` six times per run and pays the fixed context on every turn. Against `graphify` it is +28% tokens at the same cost with two more correct answers; against `mempalace` it is the one real win in thirteen comparisons, −22% cost with a CI clear of zero. On Haiku 4.5 it hurts (73% accuracy, 9 of 45 runs never called a tool, one exhausted 60 turns). On the doc↔code set its `semantic_search` embeds functions only — the 1,442 Markdown `Section` nodes are in the graph but unsearchable — yet accuracy still lands above `baseline` and `mempalace-v2` and below `graphify-v2`, with every cost and token CI crossing zero at n=20. Design and caveats: [`docs/plan/CGR.md`](docs/plan/CGR.md); single-page Japanese report: [`docs/report-cgr-ja.html`](docs/report-cgr-ja.html).
+
+**Runtime levers**, measured on the same 45 code tasks with Sonnet 5. These arms add no index and no tool — they change only how `claude -p` is invoked, which is the one thing that has actually moved the numbers in this repository.
+
+| setting | tokens | cost | accuracy (arm / reference) | wall median | report |
+|---|---|---|---|---|---|
+| `--effort medium`, vs `baseline` | **−81k [−138k, −31k]** | **−$0.049 [−0.082, −0.022]** | 80% / 84% | 16 s vs 29 s | [`results/levers`](results/levers/REPORT.md) |
+| `--effort low`, vs `baseline` | **−133k [−192k, −80k]** | **−$0.087 [−0.119, −0.059]** | 80% / 84% | 16 s vs 29 s | same |
+| `--effort medium`, vs `baseline-nosub` | crosses 0 | **+$0.023 [+0.002, +0.044]** | 80% / 84% | 16 s vs 33 s | same |
+| `--effort low`, vs `baseline-nosub` | **−58k [−118k, −0.004k]** | crosses 0 | 80% / 84% | 16 s vs 33 s | same |
+| Explore subagent pinned to Haiku, vs `baseline` | **+270k [+104k, +466k]** | crosses 0 | 80% / 84% | 20 s vs 29 s | same |
+| Explore subagent pinned to Haiku, vs `baseline-nosub` | **+345k [+179k, +526k]** | **+$0.091 [+0.056, +0.132]** | 80% / 84% | 20 s vs 33 s | same |
+| **both levers** (`--effort low` + no subagents), vs `baseline` | **−159k [−217k, −110k]** | **−$0.124 [−0.162, −0.092]** | 84% / 84% | 16 s vs 29 s | same |
+| both levers, vs `baseline-nosub` | **−84k [−136k, −34k]** | **−$0.052 [−0.076, −0.030]** | 84% / 84% | 16 s vs 33 s | same |
+| both levers, vs `--effort low` alone | **−26k [−53k, −2.6k]** | **−$0.037 [−0.050, −0.026]** | 84% / 80% | 16 s vs 16 s | same |
+| lean tool allowlist, vs both levers | crosses 0 | crosses 0 | 82% / 84% | 18 s vs 16 s | [`results/lean`](results/lean/REPORT.md) |
+| turn-economy `CLAUDE.md`, vs both levers | crosses 0 | crosses 0 | 84% / 84% | 17 s vs 16 s | same |
+| Haiku 4.5 + no subagents, vs both levers | **+366k [+224k, +534k]** | crosses 0 | 82% / 84% | 55 s vs 16 s | same |
+| Haiku + no subagents, vs `haiku-baseline` | crosses 0 | crosses 0 | 82% / 80% | 55 s vs 52 s | same |
+| **all four levers at once**, vs both levers | **+253k [+126k, +400k]** | crosses 0 (−14%) | 76% / 84% | 44 s vs 16 s | same |
+| all four, vs Haiku + no subagents | **−114k [−210k, −25k]** | **−$0.018 [−0.036, −0.003]** | 76% / 82% | 44 s vs 55 s | same |
+| all four, vs `baseline` | crosses 0 | **−$0.140 [−0.180, −0.102]** | 76% / 84% | 44 s vs 29 s | same |
+
+**Lowering reasoning effort is the only lever here that is cheaper *and* faster, but it cannot beat simply banning subagents.** Read the two levers on separate axes: at a fixed effort, banning subagents cuts tokens and cost but never wall time (+4 s at high, −0.5 s at low); at a fixed subagent setting, `--effort low` halves wall time whether or not subagents are allowed. The speed belongs to effort, the savings mostly to the ban, and the combination keeps both while recovering the two tasks low effort alone loses (see [`docs/report-ja.html`](docs/report-ja.html)). Against plain `baseline`, `--effort low` cuts tokens 25% and cost 26% with CIs clear of zero and roughly halves wall time; the thinking-token share falls monotonically (37% → 20% → 16%), which is what confirms the flag actually took effect rather than the arm merely writing less. Against the fairer `baseline-nosub` reference, `--effort medium` is *more* expensive and `--effort low` wins only on tokens — so `--disallowedTools Agent`, found in Phase 8, remains the strongest single lever measured here. The accuracy cost is two tasks (84% → 80%), both `locate`, and both effort arms lost the same two; at n=45 with one repetition that gap is not separable from noise.
+
+**The two levers stack, but they overlap: together they save about three quarters of what their separate savings would suggest.** Applied at once, `--effort low` plus `--disallowedTools Agent` is the cheapest condition measured anywhere in this repository — 37% fewer tokens and 42% less cost than `baseline`, at the *same* 84% accuracy — yet that −159k is only 76% of the −209k the two arms' individual savings add up to, because both levers cut the same resource and the second one cannot re-cut what the first already removed. Each still earns its place: the combination beats `--effort low` alone by −26k/−$0.037 and `baseline-nosub` alone by −84k/−$0.052, both with CIs clear of zero. The accuracy cost of low effort also disappears here — with no subagent to delegate to, the main session searches for itself and recovers one of the two `locate` tasks `--effort low` alone was losing.
+
+**Nothing beats those two levers, and the decomposition says why.** Restricting the tool set, telling the agent to spend fewer turns, and swapping in Haiku 4.5 were measured on the same 45 tasks: all three land with every CI crossing zero against `--effort low` + no subagents. `--tools Read,Grep,Glob,Bash,Edit` really does strip tool schemas from the request (`--tools ""` floors the prefix at 13.5k tokens versus 21.1k by default), but that particular allowlist measures ~620 tokens *larger* than just removing `Agent`, so there was never a fixed cost there to win — what it changes is behaviour, moving search from shell `grep` to the `Grep` tool. The turn-economy `CLAUDE.md` cost exactly zero accuracy (38/45, category for category) and still moved turns only −0.53, because the two existing levers had already pulled the median to 6. And Haiku is a third of the price but spends 2.8× the tokens, 2.2× the turns and 3.5× the wall time, which cancels out to the same bill at lower accuracy. Splitting `uncached_all` into fixed context (`first_turn_cache_creation` × turns) and the rest explains the dead end: **35% of what `effort-low-nosub` spends is the cost of merely holding a 6-turn session open**, versus 17% for `baseline` — the levers cut the moving half by 58% and cannot touch the fixed half from a prompt or a tool allowlist. Note that `first_turn_cache_creation` alone is *not* request size; a warm cache shifts tokens from creation to read, which is why the lean-tools row looks smaller there while its actual prefix is larger.
+
+**The levers do compose once the model itself is weak.** `all-in` (Haiku + no subagents + lean tools + turn economy) posts the lowest median cost measured anywhere in this repository, $0.081, and beats `baseline` by 52% with a CI clear of zero — but not `effort-low-nosub`, against which its −14% cost crosses zero while accuracy falls 84% → 76% and wall time nearly triples. What is real is `all-in` versus Haiku-plus-no-subagents: −9.6% tokens and −7.3% cost, both CIs clear of zero. The same two levers that did nothing on Sonnet 5 do something on Haiku, which is consistent with the rest of this table: a cutting lever is worth exactly as much as the waste it has left to cut.
+
+**Pinning exploration to Haiku works mechanically and still loses.** The project-local `.claude/agents/Explore.md` override fired on all 15 runs that delegated to `Explore` (Haiku carried 150k–3.35M tokens each, 54% of the arm's tokens and 28% of its cost, while the main session stayed on Sonnet), but a weak explorer searches inefficiently enough to erase its own price advantage: +59% tokens against `baseline` and +101% against `baseline-nosub`. The 8 runs that chose the `general-purpose` agent instead stayed on Sonnet entirely — the override covers `Explore` only.
+
+**Model comparison: Opus 5.5, Sonnet 5, Sonnet 5.5 and Haiku 5.5** (2026-09-25 to 29, Haiku 5.5 on 2026-10-08; Claude Code 2.1.282/2.1.284/2.1.293, no index or tool — only `--model` and `--effort` change). 1,577 runs, $978 at list price, every model at `--effort` low, medium, high and xhigh on four task sets that differ in difficulty and prompt style (see "Hidden-test sets: the design concept" below). Totals over the four efforts:
+
+| set | Opus 5.5 | Sonnet 5 | Sonnet 5.5 | Haiku 5.5 (added 2026-10-08) |
+|---|---|---|---|---|
+| code 45 | 153/180, $0.29/correct | 145/180, $0.32/correct | 156/180, $0.13/correct | 147/180, $0.02/correct |
+| hard 16×2 | 128/128, $0.43/correct | 124/128, $0.76/correct | 126/128, $0.23/correct | 128/128, $0.06/correct |
+| ultra 12×2 | 92/96, $1.25/correct | 92/96, $0.61/correct | 87/96, $0.62/correct | 88/96, $0.25/correct |
+| extreme 12×2 | 90/96, $1.63/correct | 65/96, $3.47/correct | 87/96, $0.83/correct | 75/96, $0.37/correct |
+| apex 6×2 (2026-10-08) | 48/48, $1.76/correct | 29/48, $5.19/correct | 46/48, $0.99/correct | 46/48, $0.44/correct |
+| brownfield 6×2 (2026-10-09) | 37/48, $1.73/correct | 17/48, $6.15/correct | 29/48, $1.07/correct | 38/48, $0.34/correct |
+
+**On symptom-only work Sonnet 5.5 closes the gap to Opus 5.5 that Sonnet 5 left open, at about half the cost.** On the extreme set (all 12 arms measured together on one CLI build) Sonnet 5.5 beats Sonnet 5 at matched effort by $1.27–$1.98 and 313–471 s per run and by +25 to +33 points of accuracy at medium, high and xhigh (paired CIs clear of zero); Sonnet 5 ran 60–90 turns and delegated to a subagent in ~80% of low/medium runs, Sonnet 5.5 ran 12–34 turns and never delegated. Against Opus 5.5 the accuracy difference is not established at any effort (90/96 vs 87/96), while Opus costs $0.26–$1.23 more and takes 14–105 s longer per run. On the spec-heavy ultra set Sonnet 5 and 5.5 cost the same and Sonnet 5.5 is slightly less accurate; on hard and code-45 Sonnet 5.5 is the cheapest arm. Sonnet 5.5 xhigh costs 1.3–2.6× its high setting with no accuracy gain. Interpretation (in the report): Sonnet 5.5 high and Opus 5.5 low are interchangeable defaults — equal accuracy on every set, Sonnet 5.5 high slightly cheaper, Opus 5.5 low about a quarter faster; Opus's earlier edge was discovery on symptom-only prompts, which is exactly where Sonnet 5.5 improved. Caveats: on code-45, hard and ultra the Sonnet 5.5 arms were added later on a newer CLI at concurrency 6 (the others ran at 3), so read their wall times with care; the hard/ultra/extreme tasks were authored by Opus and Fable subagents; costs are list-price equivalents. Single-page Japanese report with the summary and interpretation: [`docs/report-opus-ja.html`](docs/report-opus-ja.html); data: [`results/opus`](results/opus/REPORT.md), [`results/hard`](results/hard/REPORT.md), [`results/ultra`](results/ultra/REPORT.md), [`results/models/extreme`](results/models/extreme/REPORT.md). To benchmark another model, use the project skill [`.claude/skills/model-bench`](.claude/skills/model-bench/SKILL.md).
+
+**Haiku 5.5 matches Sonnet 5.5 when the prompt carries the spec and falls behind on symptom-only work.** Added 2026-10-08 (Claude Code 2.1.293, concurrency 6, the same caps per set; 500 runs, $60.72 at list price, 0 quota stops, 0 audit violations). It solved every hard task at every effort and 88/96 ultra runs (Sonnet 5.5: 126/128 and 87/96), but 147/180 on code-45 and 75/96 on extreme (Sonnet 5.5: 156/180 and 87/96); on extreme at low effort it is 17 points behind Sonnet 5.5 with a paired CI clear of zero. Its cost per correct answer is the lowest of the Claude arms on every set (0.14–0.45× Sonnet 5.5), but it runs 2–3× as many turns on ultra and extreme and takes 55–177 s longer per extreme run (paired CIs clear of zero), and high adds nothing over medium; xhigh adds 2–3 correct runs on ultra and extreme at 1.7–2.3× the per-run cost of high. On code-45 it is perfect on reference and explain and weakest on impact (12/27 at low–high vs 17/27 for Sonnet 5.5). Reading: a cheap model keeps up when discovery is done by the prompt, which is consistent with the discovery hypothesis below; for interactive coding Sonnet 5.5 or Opus 5.5 low remain the defaults.
+
+![Accuracy by task set and effort, every model](docs/img/model-accuracy-by-set.svg)
+
+![List-price cost per correct answer by task set and effort, every model](docs/img/model-cost-by-set.svg)
+
+Both charts show one row per model and effort (Sol offers no xhigh, marked n/a; Grok's xhigh arm was measured on extreme only), so the effort trend inside each model is visible: Sonnet 5.5 on brownfield climbs from 42% at low to 75% at xhigh, Haiku 5.5 on extreme from 67% to 88%. A cell marked `n/N` is still being measured. Regenerate with `python3 scripts/plot-model-heatmaps.py`; the plotting script was written by Grok 4.7 (through the `grok-coder` agent) from a spec, then reviewed.
+
+**Two more sets, built to test whether Sonnet 5.5 really matches Opus 5.5** (2026-10-08/09; six Fable 5.1-authored tasks each, independently re-validated; all 16 Claude arms × 2 reps at 160 turns / $12; 384 runs, $514 at list price, 0 audit violations). *apex* raises the extreme set's bar (12+ files, 20–24 hidden cases, three or more traps per task). *brownfield* combines an incomplete spec, contradictory documentation with a stated precedence rule, and drifted duplicate code in every task. On apex the top models did not separate: Opus 5.5 48/48, Sonnet 5.5 46/48, Haiku 5.5 46/48 (Opus − Sonnet 5.5 +4.2 points, task-bootstrap CI [0.0, +12.5]) — the prompts spelled out the invariants meant as traps, so the discovery the set was built to demand never happened. On brownfield Sonnet 5.5 fell to 29/48 while Opus 5.5 held 37/48 and Haiku 5.5 38/48 (Opus − Sonnet 5.5 +16.7 [−4.2, +39.6]; Haiku − Sonnet 5.5 +18.8 [0.0, +43.8]); Sonnet 5.5 missed every run of the issue-filter task (0/8 vs Haiku 6/8) and gained with effort (5/12 at low → 9/12 at xhigh). With six tasks per set none of these differences is established, but the direction is the first one against Sonnet 5.5: it keeps pace when the spec is clean and drops when the agent has to decide which document governs and fill the gaps from the repository. One brownfield task (project cloning) defeated almost every arm, Opus 5.5 included (0/8): the ADR requires the clone to be searchable and metered at once although it publishes no `project.created` / `issue.created`, and nearly every run left that to the event listeners. Data: [`results/models/apex`](results/models/apex/REPORT.md), [`results/models/brownfield`](results/models/brownfield/REPORT.md); authoring briefs in [`tasks/briefs/`](tasks/briefs/).
+
+**All models in detail** (Haiku 5.5, Sonnet 5.5, Opus 5.5, Sonnet 5, Grok 4.7, GPT-6.1 Sol, and GPT-6 Luna while its run is in progress; matched cells, pooled over low/medium/high because Grok and Sol have no xhigh): [`docs/report-effort-summary-ja.html`](docs/report-effort-summary-ja.html), regenerated by `python3 scripts/report-effort-summary.py`. It adds paired accuracy differences against Sonnet 5.5 with task-bootstrap CIs, code-45 results by category and effort, effort-scaling tables, per-task pass counts for the hidden-test sets, speed medians and p90, and capped-run counts. Costs come from different sources (Claude API report, Grok Build report, Codex list-price estimate) and the agent CLIs differ, so cross-vendor rows are runtime-inclusive comparisons.
+
+<!-- SOL61-README-START -->
+**GPT-6.1 Sol, code-45 addition** (2026-09-30〜2026-10-01, Asia/Tokyo): all 45 original code tasks at reasoning low, medium and high, one repetition each, codex-cli 0.159.0, concurrency 3. 135 graded runs, $8.6251 at estimated standard list price. Same task prompts, baseline answer contract and graders as the existing comparison. The quota interrupted the run after 89 cells; the remaining 46 resumed the next day without replacing completed outcomes.
+
+| effort | correct | accuracy | median cost | cost/correct | median wall |
+|---|---:|---:|---:|---:|---:|
+| low | 38/45 | 84.4% | $0.0425 | $0.0669 | 24.2 s |
+| medium | 39/45 | 86.7% | $0.0417 | $0.0729 | 30.3 s |
+| high | 39/45 | 86.7% | $0.0554 | $0.0831 | 36.7 s |
+
+The effort comparison uses the same Codex runtime with interleaved execution. Claude rows are contextual comparisons: the agent CLI, tool set, system prompt, delegation and execution date differ. Codex runs have a 30-minute wall cap; the original Claude 60-turn/$4 caps are not enforced by this adapter. These results cover code-45 only. Paired task bootstrap CIs, categories and limits: [`results/sol61`](results/sol61/REPORT.md); machine-readable [`analysis.json`](results/sol61/analysis.json) and [`runs.csv`](results/sol61/runs.csv); Japanese HTML [`report-sol61-ja.html`](docs/report-sol61-ja.html), also appended to [`report-opus-ja.html`](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> scripts/run-sol61.sh` (completed cells are skipped).
+<!-- SOL61-README-END -->
+
+<!-- SOL61-EXTREME-README-START -->
+**GPT-6.1 Sol, extreme addition** (2026-10-01〜2026-10-02, Asia/Tokyo): the 12 original symptom-only tasks, 2 repetitions at low/medium/high, 72 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price total: $18.3684.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 18/24 (75.0%) | $0.1715 | $0.2139 | 132.7 s | 153.8 s |
+| medium | 19/24 (79.2%) | $0.2409 | $0.3030 | 273.3 s | 256.7 s |
+| high | 21/24 (87.5%) | $0.3851 | $0.4172 | 466.0 s | 424.2 s |
+
+Paired comparisons average repeats per task and bootstrap all 12 tasks. Claude reference totals use the same 72 low/medium/high cells (xhigh excluded). The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 120-turn/$8 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-extreme`](results/sol61-extreme/REPORT.md), [`analysis.json`](results/sol61-extreme/analysis.json), [`runs.csv`](results/sol61-extreme/runs.csv). Japanese HTML: [`report-sol61-extreme-ja.html`](docs/report-sol61-extreme-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> scripts/run-sol61.sh extreme`.
+<!-- SOL61-EXTREME-README-END -->
+
+<!-- LUNA-README-START -->
+**GPT-6 Luna, all four sets:** 500 solver and graded runs at low/medium/high/xhigh. Independent Codex runtime; Claude turn/budget caps cannot be enforced identically. Concurrent Haiku host load and runtime/date differences apply. Base Standard solver cost subtotal $6.9047, not an invoice. [Data and paired task CIs](results/luna/REPORT.md), [JSON](results/luna/analysis.json), [CSV](results/luna/runs.csv), [Japanese HTML](docs/report-luna-ja.html).
+
+| セット | effort | 採点済み/予定 | 正解 | 時間中央値 | 推定費用中央値 |
+|---|---|---|---|---|---|
+| 通常45問 | low | 45/45 | 35 | 23.1 s | $0.0027 |
+| 通常45問 | medium | 45/45 | 32 | 25.8 s | $0.0022 |
+| 通常45問 | high | 45/45 | 37 | 36.5 s | $0.0027 |
+| 通常45問 | xhigh | 45/45 | 38 | 29.0 s | $0.0035 |
+| 難問 | low | 32/32 | 27 | 47.0 s | $0.0043 |
+| 難問 | medium | 32/32 | 26 | 35.2 s | $0.0042 |
+| 難問 | high | 32/32 | 31 | 50.8 s | $0.0050 |
+| 難問 | xhigh | 32/32 | 29 | 59.3 s | $0.0067 |
+| 超難問 | low | 24/24 | 15 | 76.7 s | $0.0169 |
+| 超難問 | medium | 24/24 | 20 | 54.2 s | $0.0109 |
+| 超難問 | high | 24/24 | 22 | 96.1 s | $0.0165 |
+| 超難問 | xhigh | 24/24 | 22 | 172.1 s | $0.0252 |
+| 極難問 | low | 24/24 | 9 | 92.8 s | $0.0230 |
+| 極難問 | medium | 24/24 | 9 | 86.4 s | $0.0144 |
+| 極難問 | high | 24/24 | 14 | 123.0 s | $0.0248 |
+| 極難問 | xhigh | 24/24 | 16 | 302.0 s | $0.0457 |
+<!-- LUNA-README-END -->
+
+<!-- SOL61-ULTRA-README-START -->
+**GPT-6.1 Sol, ultra addition** (2026-10-09〜2026-10-10, Asia/Tokyo): the 12 original ultra tasks, 2 repetitions at low/medium/high/xhigh, 96 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price total: $21.2704.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 20/24 (83.3%) | $0.1109 | $0.1245 | 59.5 s | 76.9 s |
+| medium | 21/24 (87.5%) | $0.1546 | $0.1932 | 84.8 s | 100.1 s |
+| high | 23/24 (95.8%) | $0.2244 | $0.2677 | 137.0 s | 197.1 s |
+| xhigh | 23/24 (95.8%) | $0.3733 | $0.3725 | 247.8 s | 290.8 s |
+
+Paired comparisons average repeats per task and bootstrap all 12 tasks. Reference model totals use the same 96 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 120-turn/$8 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-ultra`](results/sol61-ultra/REPORT.md), [`analysis.json`](results/sol61-ultra/analysis.json), [`runs.csv`](results/sol61-ultra/runs.csv). Japanese HTML: [`report-sol61-ultra-ja.html`](docs/report-sol61-ultra-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-ultra.sh`.
+<!-- SOL61-ULTRA-README-END -->
+
+<!-- SOL61-APEX-README-START -->
+**GPT-6.1 Sol, apex addition** (2026-10-14〜2026-10-15, Asia/Tokyo): the 6 original apex tasks, 2 repetitions at low/medium/high/xhigh, 48 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price amount: $15.4701.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 10/12 (83.3%) | $0.1438 | $0.2088 | 108.7 s | 129.6 s |
+| medium | 10/12 (83.3%) | $0.2064 | $0.2782 | 191.7 s | 199.2 s |
+| high | 10/12 (83.3%) | $0.3900 | $0.4452 | 347.4 s | 317.1 s |
+| xhigh | 12/12 (100.0%) | $0.5532 | $0.5123 | 547.7 s | 538.5 s |
+
+Paired comparisons average repeats per task and bootstrap all 6 tasks. Reference model totals use the same 48 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 160-turn/$12 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-apex`](results/sol61-apex/REPORT.md), [`analysis.json`](results/sol61-apex/analysis.json), [`runs.csv`](results/sol61-apex/runs.csv). Japanese HTML: [`report-sol61-apex-ja.html`](docs/report-sol61-apex-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-additional.sh`.
+<!-- SOL61-APEX-README-END -->
+
+<!-- SOL61-BROWNFIELD-README-START -->
+**GPT-6.1 Sol, brownfield addition** (2026-10-10〜2026-10-14, Asia/Tokyo): the 6 original brownfield tasks, 2 repetitions at low/medium/high/xhigh, 48 graded runs. Existing hidden tests are installed only after the agent exits. Estimated base standard list-price amount: $11.0096（使用量不明の実行を除いた小計）.
+
+| effort | 正解 | 費用中央値/実行 | 費用/正解 | wall 中央値 | wall 平均 |
+|---|---:|---:|---:|---:|---:|
+| low | 8/12 (66.7%) | $0.1491 | N/A | 102.1 s | 1003.6 s |
+| medium | 6/12 (50.0%) | $0.2038 | N/A | 127.7 s | 1111.7 s |
+| high | 6/12 (50.0%) | $0.3062 | N/A | 261.0 s | 1244.0 s |
+| xhigh | 8/12 (66.7%) | $0.4072 | $0.6184 | 492.8 s | 488.2 s |
+
+Paired comparisons average repeats per task and bootstrap all 6 tasks. Reference model totals use the same 48 low/medium/high/xhigh cells. The runtime, delegation, execution dates and caps differ: Sol uses a 30-minute wall cap and cannot enforce the Claude 160-turn/$12 cap. Base-rate cost estimates cannot identify per-request long-context surcharges from cumulative usage. Data and CIs: [`results/sol61-brownfield`](results/sol61-brownfield/REPORT.md), [`analysis.json`](results/sol61-brownfield/analysis.json), [`runs.csv`](results/sol61-brownfield/runs.csv). Japanese HTML: [`report-sol61-brownfield-ja.html`](docs/report-sol61-brownfield-ja.html), also appended to the [model comparison](docs/report-opus-ja.html). Reproduce: `BENCH_CORPUS_V1=<code-only snapshot> bash scripts/run-sol61-additional.sh`.
+<!-- SOL61-BROWNFIELD-README-END -->
+
+<!-- TERRA61-README-START -->
+**GPT-6.1 Terra, all six sets:** 596 solver and graded runs at low/medium/high/xhigh. Independent Codex runtime; Claude turn/budget caps cannot be enforced identically. Runtime, host load and date differences apply. Base Standard solver cost subtotal $30.1743, not an invoice. [Data and paired task CIs](results/terra61/REPORT.md), [JSON](results/terra61/analysis.json), [CSV](results/terra61/runs.csv), [Japanese HTML](docs/report-terra61-ja.html).
+
+| セット | effort | 採点済み/予定 | 正解 | 時間中央値 | 推定費用中央値 |
+|---|---|---|---|---|---|
+| 通常45問 | low | 45/45 | 39 | 23.9 s | $0.0179 |
+| 通常45問 | medium | 45/45 | 39 | 24.1 s | $0.0184 |
+| 通常45問 | high | 45/45 | 38 | 27.8 s | $0.0198 |
+| 通常45問 | xhigh | 45/45 | 38 | 22.1 s | $0.0222 |
+| 難問 | low | 32/32 | 29 | 37.7 s | $0.0314（費用不明1件） |
+| 難問 | medium | 32/32 | 32 | 38.4 s | $0.0293 |
+| 難問 | high | 32/32 | 32 | 37.8 s | $0.0309 |
+| 難問 | xhigh | 32/32 | 32 | 44.8 s | $0.0393 |
+| 超難問 | low | 24/24 | 15 | 59.2 s | $0.0513（費用不明6件） |
+| 超難問 | medium | 24/24 | 14 | 60.9 s | $0.0683（費用不明8件） |
+| 超難問 | high | 24/24 | 19 | 58.8 s | $0.0718（費用不明1件） |
+| 超難問 | xhigh | 24/24 | 16 | 90.6 s | $0.1008（費用不明4件） |
+| 極難問 | low | 24/24 | 16 | 48.8 s | $0.0656 |
+| 極難問 | medium | 24/24 | 18 | 51.9 s | $0.0722 |
+| 極難問 | high | 24/24 | 17 | 71.0 s | $0.0880 |
+| 極難問 | xhigh | 24/24 | 18 | 105.4 s | $0.1312 |
+| apex | low | 12/12 | 6 | 73.0 s | $0.0705（費用不明3件） |
+| apex | medium | 12/12 | 4 | 1034.9 s | $0.0739（費用不明6件） |
+| apex | high | 12/12 | 6 | 97.2 s | $0.0747（費用不明4件） |
+| apex | xhigh | 12/12 | 5 | 2094.4 s | $0.1238（費用不明7件） |
+| brownfield | low | 12/12 | 9 | 43.5 s | $0.0592 |
+| brownfield | medium | 12/12 | 7 | 55.6 s | $0.0638 |
+| brownfield | high | 12/12 | 7 | 60.2 s | $0.0766 |
+| brownfield | xhigh | 12/12 | 6 | 94.9 s | $0.1204 |
+<!-- TERRA61-README-END -->
+
+Paired mean differences over tasks with 95% bootstrap CIs. Tokens are `uncached_equivalent_all`: input + cache write + cache read summed over every model in `modelUsage`, so subagent traffic counts.
+
+Three findings behind the table:
+
+- **Baseline's efficiency on code comes from Claude Code itself, not from reading less.** Sonnet delegates exploration to an Explore subagent in about half its runs and never reads much. Taking the subagent away made baseline *cheaper* (−75k tokens, −$0.073), and against that fairer reference graphify is clearly worse. graphify never spawned a subagent in 255 runs.
+- **The doc-vs-code contradiction hunt is where the graph earns its keep.** Twelve contradictions were planted in the documentation. With graphify, Sonnet found them in 4 of 4 domain tasks (mean F1 0.94) versus 2 of 4 (0.68) without, at −29% cost with a CI that excludes zero. This is the only category where Sonnet's accuracy moved.
+- **The problem is the shape, not the graph.** MemPalace indexes the same corpus by embedding + BM25 instead of by AST structure, and does worse than graphify: +138k tokens and +$0.14 against it on the code set, +246k against the fairer subagent-free baseline. Two reasons. Like graphify it stops the agent delegating (1 subagent in 45 runs, versus baseline's 31 in 65), and its hits are 16 KB chunks that the agent then re-opens with `Read` — so retrieval is *added to* file reading rather than replacing it. On doc↔code work it is also less accurate (60% vs graphify-v2's 80%), and the damage is concentrated in `reference` and `impact`: "top-k most similar" cannot answer "every file that references this symbol", which is exactly what an edge-walking graph is for.
+- **Several graphify features never ran.** Across all graphify-arm runs the agent used `query`, `explain` and `path` only. `affected`, `god-nodes`, `save-result` and `reflect` were called zero times, so the cross-session memory loop was never under test. The strict hook is self-suppressing: the CLAUDE.md instruction makes the agent query first, and a recent query disables the block for 30 minutes.
+
+A measurement lesson worth stating up front: the result JSON's `usage` block covers the main session only. On that metric graphify looks about +290% worse on code tasks, purely because baseline's subagent tokens go uncounted. Reports keep both rows so the distortion stays visible.
+
+## What is compared
+
+| Condition | What the agent gets |
+|---|---|
+| `baseline` | Plain Claude Code. `--setting-sources project` hides the user-level graphify skill; the project `CLAUDE.md` carries only the shared answer-format contract. |
+| `graphify` / `graphify-v2` | Exactly what `graphify install --project` produces: the `## graphify` section in `CLAUDE.md`, the PreToolUse nudge hooks on `Bash|Grep` and `Read|Glob`, the project-local skill, plus a prebuilt frozen `graphify-out/`. v1 is the code-only graph; v2 adds semantic extraction of the docs. No `memory/` or `LESSONS.md` carry-over: every run starts from a fresh copy of the corpus. |
+| `graphify-strict`, `-strict-v2` | Same plus `hook-guard read --strict`. |
+| `baseline-nosub` | Baseline with `--disallowedTools Agent`. |
+| `effort-medium`, `effort-low` | Baseline's overlay byte for byte, invoked with `--effort medium` / `low` instead of the default `high`. Nothing in the corpus copy differs, so `run.meta.json` records the effort that actually ran. |
+| `haiku-explore` | Baseline's `CLAUDE.md` byte for byte plus one `.claude/agents/Explore.md` declaring `model: haiku`. A project agent named `Explore` overrides Claude Code's built-in, so delegated exploration runs on Haiku while the main session stays on Sonnet. No instruction text changes — the arm varies *who explores*, not what the agent is told. |
+| `lean-tools` | `effort-low-nosub` plus `--tools Read,Grep,Glob,Bash,Edit`. `--tools` is an allowlist that *replaces* the built-in set and removes the other tools' schemas from the request, unlike `--allowedTools`, which only filters permissions. `Edit` stays because `fix` tasks are graded by running the test suite. |
+| `few-turns` | `effort-low-nosub` with one overlay change: `CLAUDE.md` is baseline's file byte for byte plus a `## Working economy` section (locate with `Grep -n`, read line ranges, batch independent calls into one turn, never re-read, stop when the evidence suffices). The answer-format contract is untouched. |
+| `haiku-nosub` | `baseline-nosub` on `claude-haiku-4-5`. No `--effort` override: Haiku 4.5 does not honour the flag (measured), so declaring one would record a treatment that never ran. |
+| `all-in` | The union of the three above: Haiku, no subagents, the lean tool allowlist and the turn-economy `CLAUDE.md`. |
+| `mempalace` / `mempalace-v2` | MemPalace 3.9.0: a `## mempalace` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `mempalace-mcp` server reached via `--mcp-config --strict-mcp-config`, exposing `mempalace_search` over a prebuilt ChromaDB index. The index is built once per corpus generation and **cloned into a private temp directory per run**, never into the corpus copy. v1 indexes the code, v2 the code and `docs/`. |
+| `cgr` / `cgr-v2` | code-graph-rag 0.0.845: a `## code-graph-rag` section in `CLAUDE.md` (baseline's text byte-for-byte plus that section) and the `code-graph-rag mcp-server` reached via `--mcp-config --strict-mcp-config`. The Tree-sitter AST graph lives in a shared Memgraph + Qdrant stack (`cgr daemon up`), indexed once per corpus generation from a staging tree by `pnpm cgr:build v1|v2`; nothing is cloned per run. `--disallowedTools` removes `ask_agent`, `query_code_graph` (external NL→Cypher LLM) and every write / index / staging-read tool, leaving nine LLM-free read-only graph tools. |
+| `haiku-*` | The same overlays with `claude-haiku-4-5`. |
+| `effort-high`, `effort-xhigh` | Baseline's overlay with `--effort high` / `xhigh` spelled out (`effort-high` equals the harness default, re-measured on the current CLI). |
+| `opus-effort-{low,medium,high,xhigh}` | The matching Sonnet effort arm with only the model swapped to `claude-opus-5-5`. |
+| `sonnet55-effort-{low,medium,high,xhigh}` | The matching Sonnet effort arm with only the model swapped to `claude-sonnet-5-5`. |
+
+All arms run `claude -p --output-format json` with effort `high`, the same turn and budget caps, and a shuffled task order. Metrics come from the result JSON (`usage`, `modelUsage`, `total_cost_usd`, `num_turns`) and the JSONL transcript (tool calls by name, tool-result bytes, `graph.json` direct reads, hook denials, graphify subcommands used).
+
+## The corpus: Taskflow
+
+An original, LLM-generated multi-tenant project/issue-management SaaS, built for this benchmark so the model cannot know it from training data.
+
+| | |
+|---|---|
+| Code (`corpus-v1`) | Next.js 16.3.4 App Router with Server Actions and `proxy.ts`, React 19.2.8, TypeScript 5.9.3, Tailwind 4, Drizzle ORM + better-sqlite3, Zod 4, Vitest 4. 477 source and test files, 40,944 lines. Contract-first: types, schemas, Drizzle schema and the cross-cutting hubs (`can()`, event bus, feature flags, plan limits, tenant scoping, soft delete) were written first, then five workers filled disjoint directories. `tsc`, `eslint`, 617 tests, `next build` and a runtime smoke over all 34 routes pass. |
+| Docs (`corpus-v2`) | 139 Markdown files, 261k words: requirements (168 `REQ-###`), basic and detailed design (228 `DES-###`), 22 ADRs, API catalogue, data dictionary, screen specs, test plan, runbooks, postmortems, decision log. 5,840 cross-references, every cited code path verified to exist (`pnpm docs:check`). 12 deliberate doc-vs-code contradictions, recorded outside the corpus in `tasks/keys/docs-discrepancies.json`. |
+| Graph v1 | 2,545 nodes, 10,202 edges, 120 labeled communities, 4.6 s, no LLM. |
+| Graph v2 | 3,245 nodes, 13,014 edges, 139 communities, 1,429 doc↔code edges. Docs extracted by Sonnet subagents per graphify's extraction spec, about $7. |
+
+## Tasks
+
+105 tasks in six files, all with mechanical, rubric or hidden-test keys (`pnpm keys:derive --check` reproduces all 34 derived keys).
+
+| File | Tasks | Categories |
+|---|---|---|
+| [`tasks/tasks.json`](tasks/tasks.json) | 15 | locate, reference, explain, impact, fix (3 each) |
+| [`tasks/tasks-ext.json`](tasks/tasks-ext.json) | 30 | same, 6 each |
+| [`tasks/tasks-docs.json`](tasks/tasks-docs.json) | 20 | locate, reference, explain, impact, **discrepancy** (4 each) |
+| [`tasks/tasks-hard.json`](tasks/tasks-hard.json) | 16 | fix, implement (8 each), hidden-test graded |
+| [`tasks/tasks-ultra.json`](tasks/tasks-ultra.json) | 12 | fix, implement (6 each), hidden-test graded |
+| [`tasks/tasks-extreme.json`](tasks/tasks-extreme.json) | 12 | fix, implement (6 each), hidden-test graded, Fable-authored |
+
+Graders: set F1 against key paths (locate, reference, impact, discrepancy), a blind Haiku judge with a 5-element rubric (explain), and an injected bug whose Vitest spec must go red → green (fix). Seven tasks are deliberately grep-trivial controls. Token savings are only claimed on the iso-accuracy subset, following [arXiv:2608.13568](https://arxiv.org/html/2608.13568).
+
+### Hidden-test sets: the design concept
+
+The first 65 tasks were built to ask whether an *index* saves tokens, so they are mostly retrieval questions; by the time they were used to compare *models*, every arm sat at the same ~84% ceiling (Haiku 4.5 included). The three later sets exist to separate models, and each was designed from what the previous one failed to show.
+
+**What every hidden-test task shares.**
+
+- **Graded only by a spec the agent never sees.** `task.hidden` copies `tasks/<set>/<ID>/hidden.test.ts` into the run directory *after* the agent exits, overwriting anything at that path, and `spec` runs only that file. Pass = exit 0. No LLM judge, so no rubric ceiling.
+- **The visible suite gives nothing away.** With the bug patch applied (fix tasks) or on the pristine corpus (implement tasks), `tsc` is clean and all 617 visible tests pass, so running the tests does not point at the defect.
+- **Validated independently, not on the author's word.** Every task ships a reference `solution.patch`, and each one is re-checked by a separate script on a fresh clone. The script confirms three things: the bug state is green on the visible suite and red on the hidden spec; the solution applies with `git apply`; and the solution then passes the hidden spec twice, the full suite and `tsc`. Authors also record two or three plausible partial solutions that still fail (`VALIDATION.md`).
+- **Fair.** The hidden spec checks only behaviour the prompt plus the codebase's conventions determine. New exports it calls are pinned by name and signature. Error kinds are either stated or follow an existing convention.
+- **No cheating.** The filesystem is not sandboxed, so a run could in principle read this repository's reference solutions. From the ultra set on, every prompt carries [`tasks/ultra/RULES.txt`](tasks/ultra/RULES.txt): work only in the working copy, never look for grading tests or solutions, never make tests pass by tampering or special-casing. [`scripts/audit-scope.py`](scripts/audit-scope.py) checks every transcript for paths outside the run's own clone and for any mention of benchmark artefacts. It found 0 violations in the 693 code-45 and hard runs; files an agent writes under `/tmp` for its own experiments are counted separately and are not violations.
+- **Selection is never by outcome.** No task was kept or dropped because of how any model scored on it; difficulty is set by design, so no set is tilted toward or against a model.
+
+**How the sets differ, and why.**
+
+| set | written by | what the prompt gives | what the reference solution touches | what it was meant to fix |
+|---|---|---|---|---|
+| hard | Opus subagents | symptoms (fix) or a spec with pinned exports (implement); ~1,300 chars | ≥3 files, ≥2 layers | the 45-task ceiling |
+| ultra | Opus subagents | detailed specs: exact exports, module paths and every rule; ~3,300 chars, ~14 code names per prompt | ≥5 files, ≥3 layers, 3–4 interacting defects or a subsystem | Opus scoring 32/32 on hard at every effort |
+| extreme | Fable 5.1 subagents | symptom-only incident reports or product specs; no existing file, function or table named, only new exports pinned | ≥8 files, ≥3 layers, ≥15 hidden cases, one deliberate trap each | ultra being solved by both models alike |
+| apex | one Fable 5.1 author | symptom reports or product specs with an explicit expected-behaviour list; 3,800–8,900 chars | 9–36 files (four tasks ≥12), 20–24 hidden cases, three or more traps (scale/ordering invariants, fix-in-the-wrong-place, second cause) | Sonnet 5.5 matching Opus 5.5 on extreme |
+| brownfield | one Fable 5.1 author | a terse ticket that omits rules, points at a superseded product note, and leaves an ADR plus `docs/README.md` precedence to find; the debt is in the code | 8–12 files, 15–18 hidden cases, traps for following the wrong document, fixing one copy, and filling a gap by guessing | the same |
+
+**Why the ultra set did not separate the models, and what the extreme set tests.** Both models answered the ultra tasks at 95–96% (interim, 130 of 192 runs), and at matched effort Sonnet 5 cost about half as much. Compared across sets, the ultra prompts are what changed. They are 2.5× longer and name ~14 identifiers. Sonnet, which delegated exploration to a subagent in 25–69% of runs on the other sets, delegated in 0% of ultra runs. And the Opus/Sonnet token ratio flipped from 0.23–0.47 to 1.16–1.63. The working hypothesis is that Opus 5.5's advantage is *discovery*: finding the right places with few turns, not implementing a known change. When the prompt does the discovery for the agent, a cheaper model keeps up. The extreme set removes that help on purpose (symptoms and product policy only, plus a trap that a careful near-complete fix falls into), so it tests the hypothesis directly. Its authoring briefs are in [`tasks/briefs/`](tasks/briefs/).
+
+**What apex and brownfield showed.** apex confirms the discovery hypothesis from the other side: its prompts were written to make every hidden case derivable, and in doing so they named the very invariants that were meant as traps (for example, an inbox that lists every alert "however many, with no entry duplicated or missing across pages") — and Haiku 5.5 then scored like Opus. brownfield keeps the discovery in the repository: the rules the ticket omits are fixed by an ADR, a sibling feature or a schema constraint, and the precedence among documents is itself a document to find. That is where Sonnet 5.5 fell behind. A harder set that separates models has to make the agent find what governs, not hand it a longer list of requirements.
+
+## Running it
+
+```bash
+pnpm install
+(cd corpus/taskflow && pnpm install --frozen-lockfile)
+pnpm exec tsx scripts/patch-overlay.ts        # point the hooks at this machine's graphify
+
+pnpm bench:pilot -- --only REF1-assertcan-callers,FIX1-issue-tenant-leak
+nohup pnpm bench:full > results/full.log 2>&1 &                                   # code set 1
+nohup env BENCH_RESULTS_DIR=results/ext pnpm bench:full -- --tasks tasks/tasks-ext.json > results/ext/full.log 2>&1 &
+nohup env BENCH_RESULTS_DIR=results/structural pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions graphify-strict,baseline-nosub,haiku-baseline,haiku-graphify > results/structural/full.log 2>&1 &
+nohup env BENCH_RESULTS_DIR=results/docs pnpm bench:full -- --tasks tasks/tasks-docs.json \
+  --conditions baseline,graphify-v2,graphify-strict-v2,haiku-baseline,haiku-graphify-v2 > results/docs/full.log 2>&1 &
+
+# MemPalace arms. Build the index once per corpus generation first; the code
+# arms need a corpus WITHOUT docs/, which is what corpus-v1 was.
+pnpm palace:build v1 && pnpm palace:build v2
+nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions mempalace,haiku-mempalace --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/mempalace/full.log 2>&1 &
+nohup env BENCH_RESULTS_DIR=results/mempalace pnpm bench:full -- --tasks tasks/tasks-docs.json \
+  --conditions mempalace-v2,haiku-mempalace-v2 --reps 1 --concurrency 3 >> results/mempalace/full.log 2>&1 &
+
+# Runtime levers. No index and no MCP server; the code arms need the same
+# docs-free corpus-v1 snapshot the mempalace code arms used.
+nohup env BENCH_RESULTS_DIR=results/levers pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions effort-medium,effort-low,haiku-explore,effort-low-nosub --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/levers/full.log 2>&1 &
+
+# Leaner still: tool allowlist, turn economy, the cheap model, and all of them
+# at once. `scripts/run-lean.sh` is exactly this invocation.
+nohup env BENCH_RESULTS_DIR=results/lean pnpm bench:full -- --tasks tasks/tasks.json,tasks/tasks-ext.json \
+  --conditions lean-tools,few-turns,haiku-nosub,all-in --reps 1 --concurrency 3 --corpus <corpus-v1-snapshot> > results/lean/full.log 2>&1 &
+
+pnpm bench:collect && pnpm bench:grade && pnpm bench:analyze && pnpm bench:report   # per results dir
+pnpm bench:report:combined && pnpm bench:report:structural && pnpm bench:report:docs
+pnpm bench:analyze:levers && pnpm bench:report:levers
+pnpm bench:analyze:lean && pnpm bench:report:lean && python3 scripts/sanity-lean.py
+```
+
+Requirements: Node 25, pnpm 10, Claude Code 2.1.x logged in, `graphifyy==0.9.53`. Conditions are declared in `bench/conditions.ts`. Environment variables: `BENCH_MODEL`, `BENCH_EFFORT`, `BENCH_REPS`, `BENCH_MAX_BUDGET_USD`, `BENCH_RESULTS_DIR`.
+
+## Layout
+
+```
+bench/       harness: run / matrix / collect / grade / analyze / report / conditions / features / speed (TypeScript, 274 tests)
+corpus/      the frozen Taskflow app (code: corpus-v1) plus its docs/ layer (corpus-v2)
+overlays/    per-condition files copied onto a fresh corpus clone before each run (v1, v2, strict deltas, mempalace, cgr)
+tasks/       three task files, keys/, rubrics, bugs/*.patch, docs-discrepancies.json
+results/     runs/ ext/ (code sets), structural/, docs/, combined/, mempalace/, levers/, lean/, cgr/ — raw result.json + transcript.jsonl per run
+.palaces/    gitignored MemPalace indexes; rebuild with `pnpm palace:build v1|v2` (stats in docs/plan/MEMPALACE.md)
+.cgr/        committed manifests of the code-graph-rag indexes; rebuild with `cgr daemon up && pnpm cgr:build v1|v2` (docs/plan/CGR.md)
+docs/plan/   design, implementation plan, research notes, corpus and graph build records (Japanese)
+```
+
+## Caveats
+
+- One corpus, one repetition per task. Bootstrap CIs resample tasks, so within-task run noise is unmeasured. Treat direction, not magnitude, as the finding.
+- The arms differ in more than the graph: the graphify arms carry the skill text and per-read nudges, and they never spawn subagents. That is what a real user gets, so nothing is subtracted.
+- The strict-hook result is a null about a knob that never engaged, not evidence that forcing graph-first exploration does nothing.
+- `graph.json` (4.6 MB v1, 6.2 MB v2) was opened directly in a handful of graphify runs; the nudge hooks do not guard `graphify-out/`.
+- Doc extraction cost is estimated at chars/4, not metered.
+- code-graph-rag's headline feature — natural-language questions compiled to Cypher by a second LLM (`query_code_graph`, `ask_agent`) — is **not measured**: those tools were disallowed so that no external model's tokens hide outside `result.json`. The `cgr` arms measure its LLM-free graph tools only, and its `semantic_search` embeds functions, not the Markdown sections it also indexes. Read the numbers as "what an AST graph in a database does for the agent", not as a verdict on the product. Its MCP server needs `mcp<2` pinned (0.0.845 declares no upper bound and mcp 2.x removed `Server.list_tools`) and `QDRANT_URL` set, or the server dies / searches an empty local store — both recorded in `docs/plan/CGR.md`.
+- MemPalace is a **conversation-memory** system; this benchmark repurposes its secondary project-file indexing for code search. Its published 96.6% R@5 is a LongMemEval conversation-recall figure and has nothing to do with what is measured here. Only 1 of its 45 MCP tools (`mempalace_search`) was ever called, so its cross-session memory loop is as untested as graphify's `save-result`/`reflect`.
+- The `mempalace` arms run with `--strict-mcp-config` and so are the only arms that do not also carry the measuring host's own MCP servers (present elsewhere as deferred names only). Fixed-overhead comparisons include that asymmetry.
+- Wall-clock numbers in the `--speed` section were measured at concurrency 3 on one machine and are secondary. Per-tool-call latency is the sturdier half: it shows `mempalace_search` at ~43 ms against `graphify query` at ~294 ms, and graphify's PreToolUse hook adding ~55 ms to every `Read`.
+- `graphify benchmark` numbers such as "70x fewer tokens" are synthetic estimates from node counts and fixed sample questions. They are not comparable to these measurements.
+- The `--effort` arms are compared against a `baseline` measured at effort `high`, which is this harness's default and not Claude Code's. They say what lowering effort does here, not what a default-configured session would spend.
+- `--effort` and `--disallowedTools Agent` both reduce the same thing — how much exploring and thinking the agent does — so their savings are not independent, and this benchmark has not measured the two applied together.
+- The Haiku-explore override covers the `Explore` agent only. In 8 of 23 delegating runs the model chose the `general-purpose` agent, which inherits the main model, so the arm is a partial treatment by construction.

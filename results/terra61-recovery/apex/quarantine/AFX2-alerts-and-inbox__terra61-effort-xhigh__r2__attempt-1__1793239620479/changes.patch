@@ -1,0 +1,246 @@
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/lib/permissions.ts /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/lib/permissions.ts
+--- /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/lib/permissions.ts	2026-09-02 10:42:36
++++ /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/lib/permissions.ts	2026-10-29 11:06:57
+@@ -113,6 +113,11 @@
+     return { ...base, allowed: false, reason: "denied_cross_tenant" };
+   }
+ 
++  if ((action === "notification:read" || action === "notification:manage") &&
++      resource.kind === "notification" && resource.recipientId !== actor.userId) {
++    return { ...base, allowed: false, reason: "denied_by_role" };
++  }
++
+   if (actor.isPlatformStaff === true) {
+     return { ...base, allowed: true, reason: "granted_by_staff" };
+   }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/server/repositories/notification-repository.ts /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/server/repositories/notification-repository.ts
+--- /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/server/repositories/notification-repository.ts	2026-10-29 11:06:04
++++ /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/server/repositories/notification-repository.ts	2026-10-29 11:06:57
+@@ -1,7 +1,7 @@
+ /**
+  * In-app notification rows and unread counters.
+  */
+-import { and, count, desc, eq, gte, inArray, isNull } from "drizzle-orm";
++import { and, count, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+ import { newId } from "@/lib/id";
+ import { getDb, notifications } from "@/server/db";
+ import { toIsoTimestamp } from "@/types/common";
+@@ -32,6 +32,7 @@
+   const filters = compact(
+     orgPredicate(notifications.orgId, input.orgId),
+     eq(notifications.recipientId, input.recipientId),
++    sql`EXISTS (SELECT 1 FROM json_each(${notifications.channels}) WHERE value = 'in_app')`,
+     input.unreadOnly ? isNull(notifications.readAt) : undefined,
+     input.kind === undefined || input.kind.length === 0
+       ? undefined
+@@ -70,6 +71,7 @@
+       and(
+         orgPredicate(notifications.orgId, orgId),
+         eq(notifications.recipientId, recipientId),
++        sql`EXISTS (SELECT 1 FROM json_each(${notifications.channels}) WHERE value = 'in_app')`,
+         isNull(notifications.readAt),
+       ),
+     )
+@@ -123,6 +125,7 @@
+   orgId: OrgId,
+   notificationId: NotificationId,
+   at: IsoTimestamp,
++  recipientId: UserId,
+ ): Promise<Notification> {
+   const row = getDb()
+     .update(notifications)
+@@ -131,6 +134,7 @@
+       and(
+         orgPredicate(notifications.orgId, orgId),
+         eq(notifications.id, notificationId),
++        eq(notifications.recipientId, recipientId),
+       ),
+     )
+     .returning()
+@@ -145,15 +149,13 @@
+   recipientId: UserId,
+   at: IsoTimestamp,
+ ): Promise<number> {
+-  // The recipient column only routes the bell; the inbox itself is the
+-  // organization's, so "all" means every unread row of the tenant.
+-  void recipientId;
+   const rows = getDb()
+     .update(notifications)
+     .set({ readAt: at, updatedAt: at })
+     .where(
+       and(
+         orgPredicate(notifications.orgId, orgId),
++        eq(notifications.recipientId, recipientId),
+         isNull(notifications.readAt),
+       ),
+     )
+@@ -184,4 +186,21 @@
+     .all();
+ 
+   return rows.map(toNotification);
++}
++
++/** Insert at most one unread plan alert for each resource and recipient. */
++export async function insertPlanLimitNotification(
++  orgId: OrgId,
++  input: NewNotification,
++): Promise<Notification | null> {
++  const db = getDb();
++  const existing = db.select({ id: notifications.id }).from(notifications).where(and(
++    orgPredicate(notifications.orgId, orgId),
++    eq(notifications.recipientId, input.recipientId),
++    eq(notifications.kind, "plan_limit_reached"),
++    eq(notifications.title, input.title),
++    isNull(notifications.readAt),
++  )).get();
++  if (existing) return null;
++  return insertNotification(orgId, input);
+ }
+diff -ruN --exclude=node_modules --exclude=.next --exclude=.git /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/server/services/notification-service.ts /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/server/services/notification-service.ts
+--- /private/tmp/bench-scratch/39a9e93c-f0c1-4e47-b394-7c1480e17654/src/server/services/notification-service.ts	2026-10-29 11:06:04
++++ /private/tmp/bench-scratch/e009ea0b-3068-47bf-874b-37d6296812e8/src/server/services/notification-service.ts	2026-10-29 11:06:57
+@@ -6,10 +6,12 @@
+ import { subscribe } from "@/lib/event-bus";
+ import { isEnabled } from "@/lib/feature-flags";
+ import { assertCan } from "@/lib/permissions";
++import { issuePath, settingsPath } from "@/lib/url";
+ import { assertOrgScope } from "@/lib/tenant";
+ import * as issueRepo from "@/server/repositories/issue-repository";
+ import * as notificationRepo from "@/server/repositories/notification-repository";
+ import * as orgRepo from "@/server/repositories/organization-repository";
++import * as projectRepo from "@/server/repositories/project-repository";
+ import * as preferenceRepo from "@/server/repositories/notification-preference-repository";
+ import { toIsoTimestamp } from "@/types/common";
+ import { notificationResource, requireFound } from "./_support";
+@@ -115,6 +117,7 @@
+     input.orgId,
+     input.notificationId,
+     toIsoTimestamp(new Date()),
++    actor.userId,
+   );
+ }
+ 
+@@ -181,27 +184,58 @@
+   if (registered) return;
+   registered = true;
+ 
++  subscribe("issue.created", async (payload) => {
++    if (payload.assigneeId === null) return;
++    const href = await issueHref(payload.orgId, payload.issueId);
++    if (!href) return;
++    await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
++      title: "You were assigned an issue",
++      body: `Issue ${payload.issueId} is now yours`,
++      href,
++      actorId: payload.actorId,
++    });
++  });
++
++  subscribe("issue.status_changed", async (payload) => {
++    const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++    if (!issue?.assigneeId) return;
++    const href = await issueHref(payload.orgId, payload.issueId);
++    if (!href) return;
++    await notify(payload.orgId, "issue_status_changed", [issue.assigneeId], {
++      title: "Issue status changed",
++      body: `Issue ${payload.issueId} moved from ${payload.from} to ${payload.to}`,
++      href,
++      actorId: payload.actorId,
++    });
++  });
++
+   subscribe("issue.assigned", async (payload) => {
++    const href = await issueHref(payload.orgId, payload.issueId);
++    if (!href) return;
+     await notify(payload.orgId, "issue_assigned", [payload.assigneeId], {
+       title: "You were assigned an issue",
+       body: `Issue ${payload.issueId} is now yours`,
+-      href: `/issues/${payload.issueId}`,
++      href,
+       actorId: payload.actorId,
+     });
+   });
+ 
+   subscribe("issue.overdue", async (payload) => {
+     if (payload.assigneeId === null) return;
++    const href = await issueHref(payload.orgId, payload.issueId);
++    if (!href) return;
+     await notify(payload.orgId, "issue_overdue", [payload.assigneeId], {
+       title: "An issue is overdue",
+       body: `Issue ${payload.issueId} was due ${payload.dueAt}`,
+-      href: `/issues/${payload.issueId}`,
++      href,
+       actorId: null,
+     });
+   });
+ 
+   subscribe("comment.created", async (payload) => {
+     const issue = await issueRepo.findIssueById(payload.orgId, payload.issueId);
++    const href = await issueHref(payload.orgId, payload.issueId);
++    if (!href) return;
+     const watchers = issue
+       ? [issue.authorId, ...(issue.assigneeId ? [issue.assigneeId] : [])]
+       : [];
+@@ -209,7 +243,7 @@
+     await notify(payload.orgId, "comment_created", watchers, {
+       title: "New comment",
+       body: `A comment was added to issue ${payload.issueId}`,
+-      href: `/issues/${payload.issueId}`,
++      href,
+       actorId: payload.actorId,
+     });
+ 
+@@ -221,28 +255,47 @@
+         {
+           title: "You were mentioned",
+           body: `You were mentioned on issue ${payload.issueId}`,
+-          href: `/issues/${payload.issueId}`,
++          href,
+           actorId: payload.actorId,
+         },
+       );
+     }
+   });
+ 
+-  // The welcome goes to the person who joined; the owner sees them on the
+-  // members page anyway.
+   subscribe("member.joined", async (payload) => {
+     const org = requireFound(
+       await orgRepo.findOrgById(payload.orgId),
+       "Organization",
+       payload.orgId,
+     );
+-    await notify(payload.orgId, "member_joined", [payload.userId], {
++    await notify(payload.orgId, "member_joined", [org.ownerId], {
+       title: "A new member joined",
+       body: `${payload.userId} joined ${org.name} as ${payload.role}`,
+-      href: "/settings/members",
+-      actorId: null,
++      href: settingsPath(org.slug, "members"),
++      actorId: payload.userId,
+     });
+   });
++  subscribe("billing.limit_exceeded", async (payload) => {
++    const org = await orgRepo.findOrgById(payload.orgId);
++    if (!org) return;
++    const flags: FlagContext = { orgId: org.id, userId: null, plan: org.plan, role: null, overrides: org.settings.enabledFlagOverrides };
++    const preference = await preferenceRepo.getPreference(org.id, org.ownerId, "plan_limit_reached");
++    const channels = resolveChannels(preference, flags);
++    if (channels.length === 0) return;
++    await notificationRepo.insertPlanLimitNotification(org.id, {
++      orgId: org.id, recipientId: org.ownerId, kind: "plan_limit_reached",
++      title: `Plan limit reached: ${payload.resource}`,
++      body: `The ${payload.resource} limit of ${payload.limit} has been reached.`,
++      href: settingsPath(org.slug, "billing"), actorId: null, channels,
++    });
++  });
++}
++
++async function issueHref(orgId: OrgId, issueId: import("@/types/common").IssueId): Promise<string | null> {
++  const [org, issue] = await Promise.all([orgRepo.findOrgById(orgId), issueRepo.findIssueById(orgId, issueId)]);
++  if (!org || !issue) return null;
++  const project = await projectRepo.findProjectById(orgId, issue.projectId);
++  return project ? issuePath(org.slug, project.slug, issue.number) : null;
+ }
+ 
+ registerFanOut();
