@@ -581,6 +581,7 @@ describe("runtime lever arms", () => {
     ["haiku55-effort-xhigh", "effort-xhigh"],
     ["fable52-effort-low", "effort-low"],
     ["fable52-effort-medium", "effort-medium"],
+    ["fable52-effort-high", "effort-high"],
   ])("%s is %s with only the model swapped", (opus, sonnet) => {
     const o = getCondition(opus);
     const s = getCondition(sonnet);

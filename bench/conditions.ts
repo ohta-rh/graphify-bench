@@ -127,7 +127,7 @@ export const SONNET55_MODEL = "claude-sonnet-5-5";
 /** Haiku 5.5, measured beside Sonnet 5 / Sonnet 5.5 / Opus 5.5 at the same effort levels. */
 export const HAIKU55_MODEL = "claude-haiku-5-5";
 
-/** Fable 5.2, measured beside the other Claude arms. Only low and medium are registered so far. */
+/** Fable 5.2, measured beside the other Claude arms. low, medium and high are registered so far. */
 export const FABLE52_MODEL = "claude-fable-5-2";
 
 /**
@@ -684,6 +684,14 @@ export const CONDITIONS: readonly ConditionSpec[] = [
     model: FABLE52_MODEL,
     effort: "medium",
     note: "`effort-medium` on Fable 5.2 — only the model differs.",
+  },
+  {
+    name: "fable52-effort-high",
+    overlays: ["baseline"],
+    corpus: "v1",
+    model: FABLE52_MODEL,
+    effort: "high",
+    note: "`effort-high` on Fable 5.2 — only the model differs.",
   },
   {
     name: "grok-effort-low",

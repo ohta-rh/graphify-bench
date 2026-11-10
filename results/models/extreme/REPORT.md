@@ -1,6 +1,6 @@
 # graphify-bench results
 
-Generated 2026-11-10T00:29:46.227Z. 528 runs over 12 tasks, conditions: effort-high, effort-low, effort-medium, effort-xhigh, fable52-effort-low, fable52-effort-medium, grok-effort-high, grok-effort-low, grok-effort-medium, grok-effort-xhigh, haiku55-effort-high, haiku55-effort-low, haiku55-effort-medium, haiku55-effort-xhigh, opus-effort-high, opus-effort-low, opus-effort-medium, opus-effort-xhigh, sonnet55-effort-high, sonnet55-effort-low, sonnet55-effort-medium, sonnet55-effort-xhigh.
+Generated 2026-11-10T06:20:16.457Z. 552 runs over 12 tasks, conditions: effort-high, effort-low, effort-medium, effort-xhigh, fable52-effort-high, fable52-effort-low, fable52-effort-medium, grok-effort-high, grok-effort-low, grok-effort-medium, grok-effort-xhigh, haiku55-effort-high, haiku55-effort-low, haiku55-effort-medium, haiku55-effort-xhigh, opus-effort-high, opus-effort-low, opus-effort-medium, opus-effort-xhigh, sonnet55-effort-high, sonnet55-effort-low, sonnet55-effort-medium, sonnet55-effort-xhigh.
 
 ## 1. Environment
 
@@ -22,6 +22,7 @@ The `Model` line above is the harness default; arms that override it are listed 
 | `effort-low` | `claude-sonnet-5` | `baseline` | – | As `effort-medium`, one notch further down: baseline with `--effort low`. |
 | `effort-medium` | `claude-sonnet-5` | `baseline` | – | A RUNTIME LEVER, not a tool: the baseline overlay byte for byte, invoked with `--effort medium` instead of the harness default `high`. Thinking tokens bill as output, so the reduction is arithmetically certain and the open question is entirely about accuracy. |
 | `effort-xhigh` | `claude-sonnet-5` | `baseline` | – | As `effort-high`, one notch up: baseline with `--effort xhigh`. |
+| `fable52-effort-high` | `claude-fable-5-2` | `baseline` | – | `effort-high` on Fable 5.2 — only the model differs. |
 | `fable52-effort-low` | `claude-fable-5-2` | `baseline` | – | `effort-low` on Fable 5.2 — only the model differs. |
 | `fable52-effort-medium` | `claude-fable-5-2` | `baseline` | – | `effort-medium` on Fable 5.2 — only the model differs. |
 | `grok-effort-high` | `grok-4.7` | `baseline` | – | As `grok-effort-low`, at `--effort high`. No xhigh arm. |
@@ -49,6 +50,7 @@ The `Model` line above is the harness default; arms that override it are listed 
 | effort-low | 24 | **3,877,194** (3,344,850–5,122,750) | 3,402,205 | 1.728 | 60.0 | 25 in 21 run(s) | 465 | 0 | 0 | 280 | 0 | 75.0% (18/24) | 4,597,097 |
 | effort-medium | 24 | **6,138,706** (3,757,975–7,269,753) | 4,648,323 | 2.396 | 66.0 | 26 in 19 run(s) | 715 | 0 | 0 | 301 | 0 | 66.7% (16/24) | 6,222,712 |
 | effort-xhigh | 24 | **8,754,070** (7,372,507–10,291,246) | 8,754,070 | 3.052 | 90.5 | 0 in 0 run(s) | 959 | 0 | 0 | 650 | 0 | 58.3% (14/24) | 8,668,269 |
+| fable52-effort-high | 24 | **3,407,515** (2,242,599–4,071,489) | 3,407,515 | 5.078 | 33.0 | 0 in 0 run(s) | 44 | 0 | 0 | 914 | 0 | 91.7% (22/24) | 3,122,779 |
 | fable52-effort-low | 24 | **971,049** (837,428–1,202,503) | 971,049 | 2.452 | 15.0 | 0 in 0 run(s) | 48 | 0 | 0 | 414 | 0 | 91.7% (22/24) | 941,454 |
 | fable52-effort-medium | 24 | **1,281,949** (972,982–1,727,513) | 1,281,949 | 2.940 | 18.0 | 0 in 0 run(s) | 52 | 0 | 0 | 480 | 0 | 91.7% (22/24) | 1,244,826 |
 | grok-effort-high | 24 | **6,467,123** (4,923,674–7,433,592) | 6,467,123 | 1.368 | 54.5 | 0 in 0 run(s) | 0 | 0 | 0 | 0 | 0 | 70.8% (17/24) | 5,955,898 |
@@ -78,6 +80,7 @@ Fixed overhead, reported separately so readers can subtract it (architecture.md 
 | effort-low | 12,377 |
 | effort-medium | 12,371 |
 | effort-xhigh | 12,378 |
+| fable52-effort-high | 10,279 |
 | fable52-effort-low | 10,198 |
 | fable52-effort-medium | 10,197 |
 | grok-effort-high | 0 |
@@ -140,6 +143,7 @@ Section 5 reports what each category *cost*. This one reports whether it was *an
 | `effort-low` | 6/12 · 0.500 | 12/12 · 1.000 |
 | `effort-medium` | 6/12 · 0.500 | 10/12 · 0.833 |
 | `effort-xhigh` | 5/12 · 0.417 | 9/12 · 0.750 |
+| `fable52-effort-high` | 10/12 · 0.833 | 12/12 · 1.000 |
 | `fable52-effort-low` | 10/12 · 0.833 | 12/12 · 1.000 |
 | `fable52-effort-medium` | 10/12 · 0.833 | 12/12 · 1.000 |
 | `grok-effort-high` | 8/12 · 0.667 | 9/12 · 0.750 |
@@ -1455,6 +1459,142 @@ Per category (primary metric `uncached_equivalent_all`):
 
 **Verdict.** `fable52-effort-medium` vs `fable52-effort-low` over 12 paired tasks: tokens higher by 296,316 (95% CI [157,288, 431,403]); cost higher by 0.3710 (95% CI [0.2223, 0.5197]); turns higher by 2.4 (95% CI [1.2, 3.8]); accuracy 91.7% vs 91.7% (22/24 vs 22/24).
 
+### `fable52-effort-high` vs `opus-effort-high`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| opus-effort-high | 24 | **2,100,439** (1,485,746–2,792,455) | 2,100,439 | 1.583 | 29.0 | 0 in 0 run(s) | 1 | 0 | 0 | 665 | 0 | 91.7% (22/24) | 2,137,201 |
+| fable52-effort-high | 24 | **3,407,515** (2,242,599–4,071,489) | 3,407,515 | 5.078 | 33.0 | 0 in 0 run(s) | 44 | 0 | 0 | 914 | 0 | 91.7% (22/24) | 3,122,779 |
+
+Paired difference (`fable52-effort-high` − `opus-effort-high`), all 12 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 12 | 1,052,879.1 | [751,199.3, 1,428,388.0] | 62.9% | fable52-effort-high higher |
+| uncached_equivalent | 12 | 1,052,879.1 | [762,442.8, 1,426,146.7] | 62.9% | fable52-effort-high higher |
+| total_cost_usd | 12 | 3.3128 | [2.9890, 3.6083] | 226.4% | fable52-effort-high higher |
+| num_turns | 12 | 1.1 | [-1.6, 3.9] | 7.6% | **CI crosses 0 — no detectable difference** |
+
+Iso-accuracy subset (10/12 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 10 | 1,036,683.3 | [731,726.4, 1,465,044.7] | 63.4% | fable52-effort-high higher |
+| uncached_equivalent | 10 | 1,036,683.3 | [729,325.1, 1,492,355.8] | 63.4% | fable52-effort-high higher |
+| total_cost_usd | 10 | 3.2462 | [2.8369, 3.5787] | 225.6% | fable52-effort-high higher |
+| num_turns | 10 | 1.2 | [-1.7, 4.3] | 7.9% | **CI crosses 0 — no detectable difference** |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| fix | 6 | 940,625.2 | [649,392.8, 1,296,614.5] | 66.8% | fable52-effort-high higher |
+| implement | 6 | 1,165,133.1 | [738,626.4, 1,840,272.2] | 58.9% | fable52-effort-high higher |
+
+**Verdict.** `fable52-effort-high` vs `opus-effort-high` over 12 paired tasks: tokens higher by 1,052,879 (95% CI [751,199, 1,428,388]); cost higher by 3.3128 (95% CI [2.9890, 3.6083]); turns no detectable difference; accuracy 91.7% vs 91.7% (22/24 vs 22/24).
+
+### `fable52-effort-high` vs `sonnet55-effort-high`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sonnet55-effort-high | 24 | **930,070** (586,891–1,145,141) | 930,070 | 0.621 | 16.0 | 0 in 0 run(s) | 0 | 0 | 0 | 366 | 0 | 95.8% (23/24) | 950,116 |
+| fable52-effort-high | 24 | **3,407,515** (2,242,599–4,071,489) | 3,407,515 | 5.078 | 33.0 | 0 in 0 run(s) | 44 | 0 | 0 | 914 | 0 | 91.7% (22/24) | 3,122,779 |
+
+Paired difference (`fable52-effort-high` − `sonnet55-effort-high`), all 12 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 12 | 2,216,189.8 | [1,783,103.7, 2,673,406.6] | 270.9% | fable52-effort-high higher |
+| uncached_equivalent | 12 | 2,216,189.8 | [1,790,190.3, 2,662,601.8] | 270.9% | fable52-effort-high higher |
+| total_cost_usd | 12 | 4.2424 | [3.7711, 4.6040] | 735.5% | fable52-effort-high higher |
+| num_turns | 12 | 13.7 | [11.1, 16.5] | 90.0% | fable52-effort-high higher |
+
+Iso-accuracy subset (10/12 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 10 | 2,215,565.0 | [1,686,250.1, 2,736,116.7] | 267.8% | fable52-effort-high higher |
+| uncached_equivalent | 10 | 2,215,565.0 | [1,678,216.0, 2,724,932.0] | 267.8% | fable52-effort-high higher |
+| total_cost_usd | 10 | 4.2178 | [3.6964, 4.6473] | 721.5% | fable52-effort-high higher |
+| num_turns | 10 | 14.2 | [11.1, 17.4] | 94.5% | fable52-effort-high higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| fix | 6 | 2,014,130.2 | [1,461,372.0, 2,503,206.0] | 280.4% | fable52-effort-high higher |
+| implement | 6 | 2,418,249.4 | [1,794,982.0, 3,035,641.9] | 261.3% | fable52-effort-high higher |
+
+**Verdict.** `fable52-effort-high` vs `sonnet55-effort-high` over 12 paired tasks: tokens higher by 2,216,190 (95% CI [1,783,104, 2,673,407]); cost higher by 4.2424 (95% CI [3.7711, 4.6040]); turns higher by 13.7 (95% CI [11.1, 16.5]); accuracy 91.7% vs 95.8% (22/24 vs 23/24).
+
+### `fable52-effort-high` vs `fable52-effort-low`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fable52-effort-low | 24 | **971,049** (837,428–1,202,503) | 971,049 | 2.452 | 15.0 | 0 in 0 run(s) | 48 | 0 | 0 | 414 | 0 | 91.7% (22/24) | 941,454 |
+| fable52-effort-high | 24 | **3,407,515** (2,242,599–4,071,489) | 3,407,515 | 5.078 | 33.0 | 0 in 0 run(s) | 44 | 0 | 0 | 914 | 0 | 91.7% (22/24) | 3,122,779 |
+
+Paired difference (`fable52-effort-high` − `fable52-effort-low`), all 12 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 12 | 2,116,886.5 | [1,698,979.1, 2,517,700.3] | 219.1% | fable52-effort-high higher |
+| uncached_equivalent | 12 | 2,116,886.5 | [1,674,281.1, 2,542,131.9] | 219.1% | fable52-effort-high higher |
+| total_cost_usd | 12 | 2.4057 | [2.1039, 2.6747] | 103.8% | fable52-effort-high higher |
+| num_turns | 12 | 14.6 | [12.0, 17.1] | 100.2% | fable52-effort-high higher |
+
+Iso-accuracy subset (11/12 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 11 | 2,181,325.5 | [1,724,754.7, 2,600,842.0] | 232.8% | fable52-effort-high higher |
+| uncached_equivalent | 11 | 2,181,325.5 | [1,740,904.7, 2,632,319.5] | 232.8% | fable52-effort-high higher |
+| total_cost_usd | 11 | 2.4772 | [2.1916, 2.7153] | 109.2% | fable52-effort-high higher |
+| num_turns | 11 | 15.4 | [13.0, 17.6] | 106.9% | fable52-effort-high higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| fix | 6 | 1,740,585.7 | [1,161,526.1, 2,332,671.3] | 187.1% | fable52-effort-high higher |
+| implement | 6 | 2,493,187.4 | [2,021,246.2, 2,942,632.3] | 251.1% | fable52-effort-high higher |
+
+**Verdict.** `fable52-effort-high` vs `fable52-effort-low` over 12 paired tasks: tokens higher by 2,116,887 (95% CI [1,698,979, 2,517,700]); cost higher by 2.4057 (95% CI [2.1039, 2.6747]); turns higher by 14.6 (95% CI [12.0, 17.1]); accuracy 91.7% vs 91.7% (22/24 vs 22/24).
+
+### `fable52-effort-high` vs `fable52-effort-medium`
+
+| condition | runs | **uncached_all median (IQR)** | uncached_main median | cost USD median | turns median | subagents | Read | Grep | Glob | Bash | Bash(graphify) | accuracy | T2S (all) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fable52-effort-medium | 24 | **1,281,949** (972,982–1,727,513) | 1,281,949 | 2.940 | 18.0 | 0 in 0 run(s) | 52 | 0 | 0 | 480 | 0 | 91.7% (22/24) | 1,244,826 |
+| fable52-effort-high | 24 | **3,407,515** (2,242,599–4,071,489) | 3,407,515 | 5.078 | 33.0 | 0 in 0 run(s) | 44 | 0 | 0 | 914 | 0 | 91.7% (22/24) | 3,122,779 |
+
+Paired difference (`fable52-effort-high` − `fable52-effort-medium`), all 12 tasks:
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 12 | 1,820,570.9 | [1,471,443.5, 2,137,966.8] | 147.9% | fable52-effort-high higher |
+| uncached_equivalent | 12 | 1,820,570.9 | [1,470,489.9, 2,132,030.4] | 147.9% | fable52-effort-high higher |
+| total_cost_usd | 12 | 2.0348 | [1.8232, 2.2258] | 76.1% | fable52-effort-high higher |
+| num_turns | 12 | 12.2 | [10.3, 14.0] | 71.8% | fable52-effort-high higher |
+
+Iso-accuracy subset (11/12 tasks where every graded run of both arms succeeded):
+
+| metric | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| uncached_equivalent_all | 11 | 1,877,953.0 | [1,507,542.0, 2,201,016.3] | 156.6% | fable52-effort-high higher |
+| uncached_equivalent | 11 | 1,877,953.0 | [1,521,337.5, 2,180,068.1] | 156.6% | fable52-effort-high higher |
+| total_cost_usd | 11 | 2.0717 | [1.8724, 2.2539] | 78.9% | fable52-effort-high higher |
+| num_turns | 11 | 12.7 | [10.8, 14.3] | 75.9% | fable52-effort-high higher |
+
+Per category (primary metric `uncached_equivalent_all`):
+
+| category | tasks | mean diff | 95% CI | mean relative | verdict |
+|---|---|---|---|---|---|
+| fix | 6 | 1,483,767.5 | [1,024,088.8, 1,944,341.4] | 131.9% | fable52-effort-high higher |
+| implement | 6 | 2,157,374.3 | [1,824,749.6, 2,435,487.1] | 164.0% | fable52-effort-high higher |
+
+**Verdict.** `fable52-effort-high` vs `fable52-effort-medium` over 12 paired tasks: tokens higher by 1,820,571 (95% CI [1,471,444, 2,137,967]); cost higher by 2.0348 (95% CI [1.8232, 2.2258]); turns higher by 12.2 (95% CI [10.3, 14.0]); accuracy 91.7% vs 91.7% (22/24 vs 22/24).
+
 ## 8. Features never exercised
 
 graphify exposes more than `query`. The table counts, per arm, how many times each subcommand was invoked across all runs (and, in parentheses, how many runs used it at least once). A zero column is the point: it means the benchmark never put that feature under measurement, so nothing here — positive or negative — can be read as evidence about it.
@@ -1465,6 +1605,7 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `effort-low` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `effort-medium` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `effort-xhigh` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
+| `fable52-effort-high` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `fable52-effort-low` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `fable52-effort-medium` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
 | `grok-effort-high` | 24 | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **0** |
@@ -1490,6 +1631,7 @@ graphify exposes more than `query`. The table counts, per arm, how many times ea
 | `effort-low` | 0 | n/a (no graph) | 0 (0) |
 | `effort-medium` | 0 | n/a (no graph) | 0 (0) |
 | `effort-xhigh` | 0 | n/a (no graph) | 0 (0) |
+| `fable52-effort-high` | 0 | n/a (no graph) | 0 (0) |
 | `fable52-effort-low` | 0 | n/a (no graph) | 0 (0) |
 | `fable52-effort-medium` | 0 | n/a (no graph) | 0 (0) |
 | `grok-effort-high` | 0 | n/a (no graph) | 0 (0) |
@@ -1523,6 +1665,7 @@ Session timings, median (IQR) in ms:
 | `effort-low` | 24 | 428,053 (301,823–479,049) | 313,056 (244,927–455,043) | 420,187 (358,754–510,042) | 1,860 (1,512–2,418) | 27 (10–31) |
 | `effort-medium` | 24 | 519,534 (390,728–762,453) | 402,023 (266,285–473,368) | 576,512 (422,027–739,350) | 2,263 (1,725–5,237) | 27 (12–31) |
 | `effort-xhigh` | 24 | 648,312 (592,946–827,576) | 646,438 (579,462–825,606) | 622,786 (550,851–802,049) | 2,390 (1,701–3,203) | 30 (28–37) |
+| `fable52-effort-high` | 24 | 412,341 (392,581–435,082) | 410,876 (392,048–434,507) | 375,887 (355,139–401,411) | 1,308 (1,237–1,512) | 191 (163–319) |
 | `fable52-effort-low` | 24 | 159,433 (135,089–211,835) | 154,364 (134,560–208,637) | 134,738 (113,104–190,013) | 2,003 (1,447–2,225) | 176 (158–284) |
 | `fable52-effort-medium` | 24 | 199,677 (156,248–251,919) | 199,141 (155,735–245,364) | 180,190 (140,635–224,155) | 1,921 (1,378–2,215) | 190 (156–297) |
 | `grok-effort-high` | 24 | 1,072,268 (990,773–1,451,920) | 1,070,709 (989,266–1,450,279) | 1,060,569 (955,004–1,392,834) | – | – |
@@ -1554,6 +1697,7 @@ Per-tool-call latency, median (IQR) in ms, pooled over calls:
 | `effort-low` | 7 (4–11) | 37 (25–1,468) | 11 (9–85,657) |
 | `effort-medium` | 7 (5–11) | 46 (29–1,673) | 12 (8–17) |
 | `effort-xhigh` | 8 (5–11) | 41 (29–94) | – |
+| `fable52-effort-high` | 22 (9–255) | 57 (39–95) | – |
 | `fable52-effort-low` | 233 (12–246) | 64 (36–170) | – |
 | `fable52-effort-medium` | 244 (226–260) | 63 (39–261) | – |
 | `grok-effort-high` | – | – | – |
@@ -1587,6 +1731,7 @@ Thinking tokens are billed as output and are a **subset** of `output_tokens`, no
 | `effort-low` | 24 | 161,562 | 571,243 | 28.3% |
 | `effort-medium` | 24 | 288,111 | 714,015 | 40.4% |
 | `effort-xhigh` | 24 | 761,955 | 1,345,528 | 56.6% |
+| `fable52-effort-high` | 24 | 439,625 | 975,068 | 45.1% |
 | `fable52-effort-low` | 24 | 125,698 | 387,572 | 32.4% |
 | `fable52-effort-medium` | 24 | 158,471 | 471,393 | 33.6% |
 | `grok-effort-high` | 24 | 0 | 0 | – |
@@ -1616,6 +1761,7 @@ That helper's size is a deterministic function of the task prompt, so every Sonn
 | `effort-low` | 0 | 0 | 0 | 98,114,644 | 0 | 0 | $0.00 | $0.00 | $0.00 | $40.02 | $0.00 | $0.00 |
 | `effort-medium` | 0 | 0 | 0 | 134,520,875 | 0 | 0 | $0.00 | $0.00 | $0.00 | $54.35 | $0.00 | $0.00 |
 | `effort-xhigh` | 0 | 0 | 0 | 202,488,068 | 0 | 0 | $0.00 | $0.00 | $0.00 | $68.93 | $0.00 | $0.00 |
+| `fable52-effort-high` | 75,615,720 | 0 | 0 | 0 | 0 | 0 | $116.56 | $0.00 | $0.00 | $0.00 | $0.00 | $0.00 |
 | `fable52-effort-low` | 24,810,443 | 0 | 0 | 0 | 0 | 0 | $58.83 | $0.00 | $0.00 | $0.00 | $0.00 | $0.00 |
 | `fable52-effort-medium` | 31,922,018 | 0 | 0 | 0 | 0 | 0 | $67.73 | $0.00 | $0.00 | $0.00 | $0.00 | $0.00 |
 | `grok-effort-high` | 0 | 0 | 0 | 0 | 0 | 151,740,655 | $0.00 | $0.00 | $0.00 | $0.00 | $0.00 | $33.96 |
@@ -1647,6 +1793,7 @@ Caveats that bound the reading: `first_turn_cache_creation` and `num_turns` are 
 | `effort-low` | 24 | 3,877,194 | 60 | 12,377 | 729,195 | 3,158,736 | 18.4% |
 | `effort-medium` | 24 | 6,138,706 | 66 | 12,371 | 814,734 | 5,561,732 | 15.0% |
 | `effort-xhigh` | 24 | 8,754,070 | 91 | 12,378 | 1,166,940 | 7,580,279 | 13.8% |
+| `fable52-effort-high` | 24 | 3,407,515 | 33 | 10,279 | 343,778 | 3,036,892 | 10.1% |
 | `fable52-effort-low` | 24 | 971,049 | 15 | 10,198 | 155,675 | 808,681 | 15.6% |
 | `fable52-effort-medium` | 24 | 1,281,949 | 18 | 10,197 | 193,685 | 1,093,179 | 14.3% |
 | `grok-effort-high` | 24 | 6,467,123 | 55 | 0 | 0 | 6,467,123 | 0.0% |
@@ -1672,6 +1819,7 @@ Caveats that bound the reading: `first_turn_cache_creation` and `num_turns` are 
 - `effort-low`: **25** subagent(s) spawned across **21**/24 run(s). T2S all-model 4,597,097 vs main-session-only 4,038,338.
 - `effort-medium`: **26** subagent(s) spawned across **19**/24 run(s). T2S all-model 6,222,712 vs main-session-only 5,397,871.
 - `effort-xhigh`: **0** subagent(s) spawned across **0**/24 run(s). T2S all-model 8,668,269 vs main-session-only 8,668,269.
+- `fable52-effort-high`: **0** subagent(s) spawned across **0**/24 run(s). T2S all-model 3,122,779 vs main-session-only 3,122,779.
 - `fable52-effort-low`: **0** subagent(s) spawned across **0**/24 run(s). T2S all-model 941,454 vs main-session-only 941,454.
 - `fable52-effort-medium`: **0** subagent(s) spawned across **0**/24 run(s). T2S all-model 1,244,826 vs main-session-only 1,244,826.
 - `grok-effort-high`: **0** subagent(s) spawned across **0**/24 run(s). T2S all-model 5,955,898 vs main-session-only 5,955,898.
@@ -1744,6 +1892,8 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **4*
 | `EFX5-closed-workspace__effort-medium__r2` | effort-medium | EFX5-closed-workspace | false | completed |
 | `EFX5-closed-workspace__effort-xhigh__r1` | effort-xhigh | EFX5-closed-workspace | false | completed |
 | `EFX5-closed-workspace__effort-xhigh__r2` | effort-xhigh | EFX5-closed-workspace | false | completed |
+| `EFX5-closed-workspace__fable52-effort-high__r1` | fable52-effort-high | EFX5-closed-workspace | false | completed |
+| `EFX5-closed-workspace__fable52-effort-high__r2` | fable52-effort-high | EFX5-closed-workspace | false | completed |
 | `EFX5-closed-workspace__fable52-effort-low__r1` | fable52-effort-low | EFX5-closed-workspace | false | completed |
 | `EFX5-closed-workspace__fable52-effort-low__r2` | fable52-effort-low | EFX5-closed-workspace | false | completed |
 | `EFX5-closed-workspace__fable52-effort-medium__r1` | fable52-effort-medium | EFX5-closed-workspace | false | completed |
@@ -1804,7 +1954,7 @@ Harness failures (`is_error`, or `terminal_reason` other than `completed`): **4*
 
 ## 14. Limitations
 
-- N = 528 runs over 12 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
+- N = 552 runs over 12 tasks; a single corpus and a single model. These results do not generalize to other codebases or models.
 - Bootstrap resamples tasks, so the interval reflects task-to-task variation, not within-task run noise.
 - Where a CI crosses zero the honest reading is "no difference detected at this N", not "no difference exists".
 - The fixed ~21k-token system-prompt/tool-definition overhead is included in both arms and not subtracted (see §2).
