@@ -35,6 +35,7 @@ SETS = [
 ]
 
 MODELS = [
+    ("Fable 5.2", "fable52-effort"),
     ("Opus 5.5", "opus-effort"),
     ("Sonnet 5.5", "sonnet55-effort"),
     ("Haiku 5.5", "haiku55-effort"),
