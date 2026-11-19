@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write two SVG heatmaps of model accuracy and cost by task set and effort.
+"""Write three SVG heatmaps of model accuracy, cost and time by task set and effort.
 
 Usage (from repo root):
   python3 scripts/plot-model-heatmaps.py
@@ -7,6 +7,7 @@ Usage (from repo root):
 Writes:
   docs/img/model-accuracy-by-set.svg
   docs/img/model-cost-by-set.svg
+  docs/img/model-time-by-set.svg
 
 Standard library only. Output is deterministic for the same graded runs.
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import statistics
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -112,6 +114,8 @@ def load_runs(dirs: list[str]) -> dict[tuple[str, str, int], dict]:
             runs[key] = {
                 "ok": bool(grade["success"]),
                 "cost": metrics.get("total_cost_usd") or 0.0,
+                # Whole-process wall clock; result.json duration_ms stops early on async subagents.
+                "wall": ((meta.get("claude") or meta.get("codex") or {}).get("wall_ms") or 0) / 1000,
             }
     return runs
 
@@ -123,7 +127,7 @@ def aggregate(runs: dict, prefix: str, effort: str, expected: int) -> dict:
     n = len(rows)
     if n == 0:
         return {"kind": "empty", "n": 0, "expected": expected, "correct": 0,
-                "accuracy": None, "cost_per_correct": None}
+                "accuracy": None, "cost_per_correct": None, "median_wall": None}
     correct = sum(1 for r in rows if r["ok"])
     cost_sum = sum(r["cost"] for r in rows)
     return {
@@ -133,6 +137,7 @@ def aggregate(runs: dict, prefix: str, effort: str, expected: int) -> dict:
         "correct": correct,
         "accuracy": correct / n,
         "cost_per_correct": (cost_sum / correct) if correct else None,
+        "median_wall": statistics.median(r["wall"] for r in rows),
     }
 
 
@@ -144,6 +149,7 @@ def not_offered_cell(expected: int) -> dict:
         "correct": 0,
         "accuracy": None,
         "cost_per_correct": None,
+        "median_wall": None,
     }
 
 
@@ -165,6 +171,13 @@ def cost_step(cost_per_correct: float) -> int:
     log_min = math.log10(0.003)
     log_max = math.log10(3.0)
     raw = 100.0 + (log_v - log_min) / (log_max - log_min) * 600.0
+    return snap_step(raw)
+
+
+def time_step(seconds: float) -> int:
+    log_min = math.log10(10.0)
+    log_max = math.log10(1500.0)
+    raw = 100.0 + (math.log10(max(seconds, 1.0)) - log_min) / (log_max - log_min) * 600.0
     return snap_step(raw)
 
 
@@ -349,6 +362,16 @@ def render_svg(kind: str, matrix: list[list[list[dict]]], title: str, subtitle: 
                     )
                     parts.append(cell_rect(x, y, f"step-{step}", title_tip))
                     parts.append(cell_texts(cx, cy, pct, sub, text_class_for_step(step)))
+                elif kind == "time":
+                    wall = cell["median_wall"]
+                    step = time_step(wall)
+                    time_text = f"{int(round(wall))} s"
+                    title_tip = (
+                        f'{model_label} · {effort} · {set_label}: median {time_text} · '
+                        f'{cell["n"]} runs'
+                    )
+                    parts.append(cell_rect(x, y, f"step-{step}", title_tip))
+                    parts.append(cell_texts(cx, cy, time_text, sub, text_class_for_step(step)))
                 else:
                     cpc = cell["cost_per_correct"]
                     if cpc is None:
@@ -416,11 +439,21 @@ def main() -> None:
         "Codex and Grok costs are estimates.",
     )
 
+    time_svg = render_svg(
+        "time",
+        matrix,
+        "Median wall-clock time per run by task set and effort",
+        "Seconds from start to exit, all graded runs (passed or not); darker = slower (log scale). "
+        "— = not measured; n/N = still running; n/a = effort not offered.",
+    )
+    (out_dir / "model-time-by-set.svg").write_text(time_svg, encoding="utf-8")
+
     accuracy_path.write_text(accuracy_svg, encoding="utf-8")
     cost_path.write_text(cost_svg, encoding="utf-8")
 
     print("docs/img/model-accuracy-by-set.svg")
     print("docs/img/model-cost-by-set.svg")
+    print("docs/img/model-time-by-set.svg")
 
 
 if __name__ == "__main__":
