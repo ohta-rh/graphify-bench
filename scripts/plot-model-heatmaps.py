@@ -24,14 +24,15 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 EFFORTS = ("low", "medium", "high", "xhigh")
 
 # Models that do not offer xhigh; their xhigh rows always render as "not offered".
-# Grok 4.7 gained an xhigh arm on the extreme set; its other xhigh cells read "not measured".
-NO_XHIGH_PREFIXES = frozenset({"sol61-effort"})
+# None at present: GPT-6.1 Sol's xhigh arms were measured in the six-set completion run.
+# Grok 4.7 has an xhigh arm on the extreme set only; its other xhigh cells read "not measured".
+NO_XHIGH_PREFIXES: frozenset[str] = frozenset()
 
 SETS = [
-    ("code-45", ["results/opus", "results/sol61", "results/luna/code45", "results/terra61/code45", "results/sol62/code45"], 45),
-    ("hard", ["results/hard", "results/luna/hard", "results/terra61/hard", "results/sol62/hard"], 32),
+    ("code-45", ["results/opus", "results/sol61", "results/sol61-completion/code45", "results/luna/code45", "results/terra61/code45", "results/sol62/code45"], 45),
+    ("hard", ["results/hard", "results/sol61-completion/hard", "results/luna/hard", "results/terra61/hard", "results/sol62/hard"], 32),
     ("ultra", ["results/ultra", "results/sol61-ultra", "results/luna/ultra", "results/terra61/ultra", "results/sol62/ultra"], 24),
-    ("extreme", ["results/models/extreme", "results/sol61-extreme", "results/luna/extreme", "results/terra61/extreme", "results/sol62/extreme"], 24),
+    ("extreme", ["results/models/extreme", "results/sol61-extreme", "results/sol61-completion/extreme", "results/luna/extreme", "results/terra61/extreme", "results/sol62/extreme"], 24),
     ("apex", ["results/models/apex", "results/sol61-apex", "results/terra61/apex", "results/sol62/apex"], 12),
     ("brownfield", ["results/models/brownfield", "results/luna/brownfield", "results/sol61-brownfield", "results/terra61/brownfield", "results/sol62/brownfield"], 12),
 ]
